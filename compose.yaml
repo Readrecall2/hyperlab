@@ -1,0 +1,39 @@
+name: hyperlab
+services:
+  dashboard:
+    build: .
+    image: hyperlab:local
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      HYPERLAB_MODE: readonly
+      HYPERLAB_DATA_DIR: /data
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  collector:
+    build: .
+    image: hyperlab:local
+    command: ["collect", "--interval-seconds", "60", "--samples", "0", "--network", "mainnet"]
+    environment:
+      HYPERLAB_MODE: readonly
+      HYPERLAB_DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped

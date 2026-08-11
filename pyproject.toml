@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyperlab"
+version = "0.2.0"
+description = "Safety-first multi-strategy research and backtesting lab for Hyperliquid"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Jj" }]
+dependencies = [
+  "hyperliquid-python-sdk==0.24.0",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "jinja2>=3.1,<4",
+]
+
+[project.optional-dependencies]
+research = [
+  "duckdb>=1.3,<2",
+  "pyarrow>=19,<22",
+]
+dev = [
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+  "pandas-stubs>=2.2,<3",
+  "mistune>=3.1,<4",
+  "PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+hyperlab = "hyperlab.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hyperlab"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["hyperlab"]
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+ignore_missing_imports = true

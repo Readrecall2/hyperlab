@@ -1,0 +1,753 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>HyperLab — Guide complet Windows 11 + Umbrel + Codex</title>
+<style>
+:root{--bg:#07101d;--paper:#0e1b2d;--paper2:#12243c;--text:#edf5ff;--muted:#9fb2ca;--line:#29445f;--accent:#60dfbf;--accent2:#86a9ff;--warn:#ffd070;--danger:#ff8f9d;--code:#06101e}
+*{box-sizing:border-box;scroll-behavior:smooth}
+html{scroll-padding-top:24px}
+body{margin:0;background:radial-gradient(circle at 25% 0,#1c4775 0,#07101d 35%,#050b14 100%);color:var(--text);font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;line-height:1.66}
+a{color:#8cc8ff;text-decoration:none}a:hover{text-decoration:underline}
+.layout{display:grid;grid-template-columns:310px minmax(0,1fr);max-width:1520px;margin:auto}
+aside{position:sticky;top:0;height:100vh;overflow:auto;padding:24px 18px;border-right:1px solid var(--line);background:rgba(5,12,22,.84);backdrop-filter:blur(18px)}
+.brand{padding:18px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#143154,#0b1728);margin-bottom:18px;box-shadow:0 20px 50px #0003}
+.brand strong{font-size:1.38rem;letter-spacing:-.03em}.brand span{display:block;color:var(--muted);font-size:.82rem;margin-top:4px}
+.brand .pill{display:inline-block;margin-top:12px;padding:4px 9px;border-radius:999px;border:1px solid #60dfbf66;background:#60dfbf14;color:#aaf4df;font-size:.72rem;font-weight:800;letter-spacing:.04em}
+nav a{display:block;padding:7px 9px;border-radius:9px;color:var(--muted);font-size:.85rem;line-height:1.3}nav a:hover{background:#ffffff0b;color:var(--text);text-decoration:none}nav .l1{color:var(--accent);font-weight:800;margin-top:10px}nav .l2{padding-left:16px}nav .l3{padding-left:28px;font-size:.79rem}
+main{min-width:0;padding:56px clamp(24px,5vw,78px) 100px}article{max-width:990px;margin:auto}
+article>h1:first-of-type{font-size:clamp(2.7rem,7vw,6.4rem);line-height:.98;letter-spacing:-.065em;margin:0 0 20px;background:linear-gradient(90deg,#fff,#9fe8da 55%,#a9bfff);-webkit-background-clip:text;color:transparent}
+h1{font-size:2.35rem;letter-spacing:-.04em;margin:72px 0 22px;padding-top:10px}h2{font-size:1.65rem;letter-spacing:-.025em;margin:46px 0 16px}h3{font-size:1.22rem;margin:30px 0 10px;color:#ddebff}
+.heading-link{opacity:0;margin-left:.45rem;font-size:.68em;color:var(--accent)}h1:hover .heading-link,h2:hover .heading-link,h3:hover .heading-link{opacity:.75;text-decoration:none}
+p,li{color:#d8e4f3}strong{color:#fff}em{color:#c9d9ec}
+article>p:first-of-type{font-size:1.07rem;color:var(--muted);padding:12px 0 4px}
+blockquote{margin:24px 0;padding:16px 20px;border-left:4px solid var(--warn);background:#ffd07010;border-radius:0 12px 12px 0;color:#f9e7b2}
+hr{border:0;border-top:1px solid var(--line);margin:58px 0}
+pre{position:relative;overflow:auto;background:var(--code);border:1px solid #203b58;border-radius:15px;padding:18px 20px;box-shadow:inset 0 1px 0 #ffffff08}code{font-family:"Cascadia Code",Consolas,ui-monospace,monospace;font-size:.9em}p code,li code{background:#152a43;border:1px solid #294867;padding:2px 6px;border-radius:6px;color:#dff8f2}
+table{border-collapse:separate;border-spacing:0;width:100%;display:block;overflow:auto;margin:24px 0;border:1px solid var(--line);border-radius:14px;background:#0c192a}thead{position:sticky;top:0}th,td{padding:12px 14px;border-bottom:1px solid var(--line);border-right:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#142b47;color:#fff}td{color:#d8e4f3}tr:last-child td{border-bottom:0}th:last-child,td:last-child{border-right:0}
+ul,ol{padding-left:24px}li{margin:5px 0}
+.backtop{position:fixed;right:22px;bottom:22px;width:46px;height:46px;display:grid;place-items:center;border-radius:50%;background:#173552;border:1px solid #3e6487;color:white;box-shadow:0 10px 30px #0008;text-decoration:none}
+.copy-button{position:absolute;right:10px;top:10px;border:1px solid #35516d;background:#10243a;color:#cfe4fb;border-radius:8px;padding:5px 9px;font-size:.72rem;cursor:pointer;opacity:.82}.copy-button:hover{opacity:1}
+footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:var(--muted);font-size:.85rem}
+@media(max-width:1050px){.layout{display:block}aside{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line)}nav{columns:2}main{padding-top:38px}}
+@media(max-width:650px){aside{display:none}main{padding:32px 18px 70px}article>h1:first-of-type{font-size:3rem}h1{font-size:1.9rem}nav{columns:1}.heading-link{display:none}}
+@media print{aside,.backtop,.copy-button{display:none}.layout{display:block}body{background:white;color:#111}main{padding:0}article{max-width:none}p,li,td{color:#222}h1,h2,h3,strong{color:#000}pre{white-space:pre-wrap;background:#f5f5f5;color:#111}a{color:#111}}
+</style>
+</head>
+<body id="top">
+<div class="layout">
+<aside>
+<div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.0 · 11 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
+<nav><a class="l2" href="#1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd&#x27;hui</a><a class="l3" href="#ce-qu-il-ne-fait-pas-encore">Ce qu&#x27;il ne fait pas encore</a><a class="l2" href="#2-architecture-retenue">2. Architecture retenue</a><a class="l3" href="#pourquoi-les-deux-machines">Pourquoi les deux machines</a><a class="l2" href="#3-les-sept-strategies">3. Les sept stratégies</a><a class="l3" href="#3-1-cash-and-carry">3.1 Cash-and-carry</a><a class="l3" href="#3-2-basket-de-funding">3.2 Basket de funding</a><a class="l3" href="#3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges</a><a class="l3" href="#3-4-pairs-trading">3.4 Pairs trading</a><a class="l3" href="#3-5-momentum-regime">3.5 Momentum/régime</a><a class="l3" href="#3-6-lead-lag">3.6 Lead-lag</a><a class="l3" href="#3-7-market-making">3.7 Market making</a><a class="l2" href="#4-philosophie-des-resultats">4. Philosophie des résultats</a><a class="l1" href="#partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11</a><a class="l2" href="#5-installer-les-outils">5. Installer les outils</a><a class="l2" href="#6-extraire-le-pack">6. Extraire le pack</a><a class="l2" href="#7-installer-l-environnement-python">7. Installer l&#x27;environnement Python</a><a class="l2" href="#8-afficher-les-strategies">8. Afficher les stratégies</a><a class="l2" href="#9-lancer-la-demonstration-complete">9. Lancer la démonstration complète</a><a class="l2" href="#10-tester-une-strategie-seule">10. Tester une stratégie seule</a><a class="l2" href="#11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid</a><a class="l2" href="#12-lancer-une-collecte-courte">12. Lancer une collecte courte</a><a class="l2" href="#13-dashboard-windows">13. Dashboard Windows</a><a class="l1" href="#partie-b-git-et-codex">PARTIE B — GIT ET CODEX</a><a class="l2" href="#14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git</a><a class="l2" href="#15-ouvrir-dans-codex">15. Ouvrir dans Codex</a><a class="l2" href="#16-premier-prompt-codex">16. Premier prompt Codex</a><a class="l2" href="#17-controler-les-changements">17. Contrôler les changements</a><a class="l2" href="#18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l&#x27;ordre</a><a class="l1" href="#partie-c-docker-local">PARTIE C — DOCKER LOCAL</a><a class="l2" href="#19-construire-l-image">19. Construire l&#x27;image</a><a class="l2" href="#20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard</a><a class="l1" href="#partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL</a><a class="l2" href="#21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry</a><a class="l2" href="#22-creer-un-depot-github">22. Créer un dépôt GitHub</a><a class="l2" href="#23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel</a><a class="l2" href="#24-publier-l-image">24. Publier l&#x27;image</a><a class="l2" href="#25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS</a><a class="l2" href="#26-verifier-umbrel">26. Vérifier Umbrel</a><a class="l2" href="#27-collecter-pendant-le-developpement">27. Collecter pendant le développement</a><a class="l1" href="#partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES</a><a class="l2" href="#28-donnees-lentes">28. Données lentes</a><a class="l2" href="#29-donnees-rapides">29. Données rapides</a><a class="l2" href="#30-qualite">30. Qualité</a><a class="l1" href="#partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST</a><a class="l2" href="#31-decoupage-temporel">31. Découpage temporel</a><a class="l2" href="#32-walk-forward">32. Walk-forward</a><a class="l2" href="#33-couts">33. Coûts</a><a class="l2" href="#34-trois-scenarios-minimum">34. Trois scénarios minimum</a><a class="l2" href="#35-rapport-obligatoire">35. Rapport obligatoire</a><a class="l2" href="#36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé</a><a class="l1" href="#partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES</a><a class="l2" href="#37-vague-1-defensive">37. Vague 1 : défensive</a><a class="l3" href="#cash-and-carry">Cash-and-carry</a><a class="l2" href="#38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif</a><a class="l3" href="#basket-funding">Basket funding</a><a class="l3" href="#funding-inter-exchanges">Funding inter-exchanges</a><a class="l2" href="#39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque</a><a class="l3" href="#pairs">Pairs</a><a class="l3" href="#momentum">Momentum</a><a class="l2" href="#40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence</a><a class="l3" href="#lead-lag">Lead-lag</a><a class="l3" href="#market-making">Market making</a><a class="l1" href="#partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT</a><a class="l2" href="#41-paper-live">41. Paper live</a><a class="l2" href="#42-testnet">42. Testnet</a><a class="l2" href="#43-micro-mainnet">43. Micro-mainnet</a><a class="l2" href="#44-augmentation">44. Augmentation</a><a class="l1" href="#partie-i-securite">PARTIE I — SÉCURITÉ</a><a class="l2" href="#45-secrets">45. Secrets</a><a class="l2" href="#46-umbrel">46. Umbrel</a><a class="l2" href="#47-separation-future">47. Séparation future</a><a class="l2" href="#48-kill-switches">48. Kill switches</a><a class="l1" href="#partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE</a><a class="l2" href="#49-cette-semaine">49. Cette semaine</a><a class="l2" href="#50-ensuite">50. Ensuite</a><a class="l2" href="#51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles</a><a class="l2" href="#52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie</a><a class="l1" href="#conclusion">Conclusion</a><a class="l1" href="#sources-officielles">Sources officielles</a></nav>
+</aside>
+<main><article><h1 id="hyperlab-guide-complet-windows-11-umbrel-codex">HyperLab — guide complet Windows 11 + Umbrel + Codex<a class="heading-link" href="#hyperlab-guide-complet-windows-11-umbrel-codex" aria-label="Lien vers cette section">#</a></h1>
+<p><strong>Version : 0.2.0 — 11 août 2026</strong></p>
+<p>Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un <strong>laboratoire multi-stratégies</strong> : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.</p>
+<hr />
+<h2 id="1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd'hui<a class="heading-link" href="#1-ce-que-le-pack-fait-aujourd-hui" aria-label="Lien vers cette section">#</a></h2>
+<p>Le dépôt livré contient :</p>
+<ul>
+<li>un moteur de backtest portefeuille causal ;</li>
+<li>des coûts configurables ;</li>
+<li>des limites d'exposition ;</li>
+<li>six baselines bar-level ;</li>
+<li>un simulateur simplifié de market making ;</li>
+<li>un générateur synthétique déterministe pour vérifier l'installation ;</li>
+<li>un lecteur public Hyperliquid spot/perp ;</li>
+<li>un stockage SQLite ;</li>
+<li>un dashboard local ;</li>
+<li>Docker et un package Community App Store Umbrel ;</li>
+<li>des tests ;</li>
+<li>une CI GitHub ;</li>
+<li>seize prompts Codex séquentiels ;</li>
+<li>des portes de validation jusqu'au futur micro-mainnet.</li>
+</ul>
+<h3 id="ce-qu-il-ne-fait-pas-encore">Ce qu'il ne fait pas encore<a class="heading-link" href="#ce-qu-il-ne-fait-pas-encore" aria-label="Lien vers cette section">#</a></h3>
+<ul>
+<li>aucun ordre ;</li>
+<li>aucune clé ;</li>
+<li>aucun wallet ;</li>
+<li>aucun paper engine événementiel complet ;</li>
+<li>aucun replay L2 réel ;</li>
+<li>aucune preuve qu'une stratégie est rentable ;</li>
+<li>aucun passage automatique vers testnet ou mainnet.</li>
+</ul>
+<p>C'est volontaire. La première version doit construire une base que l'on peut auditer, pas une boîte noire autorisée à risquer de l'argent.</p>
+<hr />
+<h2 id="2-architecture-retenue">2. Architecture retenue<a class="heading-link" href="#2-architecture-retenue" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-text">┌──────────────────────────────────────────────────────────────────┐
+│ WINDOWS 11                                                       │
+│                                                                  │
+│ Codex + Git + Python + tests + backtests + rapports + Docker     │
+│ Aucun secret                                                     │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ code revu / image versionnée
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ MINI-PC UMBREL 24/24                                             │
+│                                                                  │
+│ Collecteur public → SQLite/Parquet → dashboard local             │
+│ Aucun secret, aucun ordre                                        │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ export des données
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ RECHERCHE                                                        │
+│                                                                  │
+│ Backtests → stress tests → forward paper → testnet → micro-live  │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="pourquoi-les-deux-machines">Pourquoi les deux machines<a class="heading-link" href="#pourquoi-les-deux-machines" aria-label="Lien vers cette section">#</a></h3>
+<p><strong>Windows 11</strong> est plus confortable pour Codex, Git, les rapports, les notebooks et les backtests. Il évite aussi de développer directement sur un serveur qui héberge peut-être ton nœud Bitcoin.</p>
+<p><strong>Umbrel</strong> est idéal pour la collecte publique 24/24 et le paper trading lent. Il accumule les données pendant que le code évolue sur Windows.</p>
+<p>Pour une stratégie sub-seconde, le mini-PC domestique pourra servir de laboratoire, mais le live nécessitera probablement une machine dédiée et une meilleure latence.</p>
+<hr />
+<h2 id="3-les-sept-strategies">3. Les sept stratégies<a class="heading-link" href="#3-les-sept-strategies" aria-label="Lien vers cette section">#</a></h2>
+<table>
+<thead>
+<tr>
+  <th>Niveau</th>
+  <th>Stratégie</th>
+  <th>Exposition</th>
+  <th>Complexité</th>
+  <th>État du pack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td>Cash-and-carry spot/perp</td>
+  <td>Presque neutre</td>
+  <td>Moyenne</td>
+  <td>Baseline incluse</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td>Basket de funding</td>
+  <td>Long/short relatif</td>
+  <td>Moyenne</td>
+  <td>Baseline incluse</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td>Funding inter-exchanges</td>
+  <td>Même actif, deux venues</td>
+  <td>Élevée</td>
+  <td>Baseline incluse</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td>Pairs trading</td>
+  <td>Relative value</td>
+  <td>Élevée</td>
+  <td>Baseline incluse</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td>Momentum/régime</td>
+  <td>Directionnelle</td>
+  <td>Élevée</td>
+  <td>Baseline incluse</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td>Lead-lag</td>
+  <td>Très court terme</td>
+  <td>Très élevée</td>
+  <td>Prototype horaire seulement</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td>Market making</td>
+  <td>Inventaire + spread</td>
+  <td>Extrême</td>
+  <td>Simulateur jouet seulement</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3-1-cash-and-carry">3.1 Cash-and-carry<a class="heading-link" href="#3-1-cash-and-carry" aria-label="Lien vers cette section">#</a></h3>
+<p>Le bot achète le spot et shorte le perp du même actif. Il recherche le funding reçu par le short, diminué des frais, du slippage, du coût de couverture et du risque de basis.</p>
+<p>Le backtest doit calculer le rendement sur <strong>tout le capital immobilisé</strong>, pas uniquement sur la marge du short.</p>
+<h3 id="3-2-basket-de-funding">3.2 Basket de funding<a class="heading-link" href="#3-2-basket-de-funding" aria-label="Lien vers cette section">#</a></h3>
+<p>Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La version sérieuse ajoutera neutralité bêta, inverse-vol, covariance et pénalité de turnover.</p>
+<p>Ce n'est pas un arbitrage pur : deux actifs différents peuvent diverger violemment.</p>
+<h3 id="3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges<a class="heading-link" href="#3-3-arbitrage-de-funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
+<p>Même actif, deux plateformes : long sur la venue au funding inférieur et short sur celle au funding supérieur.</p>
+<p>Le risque principal vient de la marge séparée : le portefeuille global peut être neutre, mais une jambe locale peut être liquidée.</p>
+<h3 id="3-4-pairs-trading">3.4 Pairs trading<a class="heading-link" href="#3-4-pairs-trading" aria-label="Lien vers cette section">#</a></h3>
+<p>Le bot trade l'écart entre deux actifs corrélés. Il entre lorsque le spread est anormal, sort au retour à la moyenne et ferme également sur rupture ou délai maximal.</p>
+<p>Aucune martingale n'est permise.</p>
+<h3 id="3-5-momentum-regime">3.5 Momentum/régime<a class="heading-link" href="#3-5-momentum-regime" aria-label="Lien vers cette section">#</a></h3>
+<p>Le bot prend une exposition directionnelle quand la tendance dépasse le bruit, avec sizing par volatilité et pénalité si le funding coûte trop cher.</p>
+<p>Cette stratégie peut produire plus, mais son drawdown peut être nettement supérieur.</p>
+<h3 id="3-6-lead-lag">3.6 Lead-lag<a class="heading-link" href="#3-6-lead-lag" aria-label="Lien vers cette section">#</a></h3>
+<p>Une venue de référence bouge ; Hyperliquid réagit légèrement plus tard ; le bot tente d'exploiter ce délai.</p>
+<p>Le prototype inclus utilise des barres horaires uniquement pour exercer le moteur. Une conclusion réelle exige flux sub-seconde, horloges synchronisées, mesure de latence et replay du carnet.</p>
+<h3 id="3-7-market-making">3.7 Market making<a class="heading-link" href="#3-7-market-making" aria-label="Lien vers cette section">#</a></h3>
+<p>Le bot place bid et ask autour d'une fair value, réduit son risque selon l'inventaire et retire ses ordres quand le flux devient toxique.</p>
+<p>Un simple backtest OHLC est invalide ici. Il faut estimer la place dans la file, les fills, les cancel/replace et l'adverse selection.</p>
+<hr />
+<h2 id="4-philosophie-des-resultats">4. Philosophie des résultats<a class="heading-link" href="#4-philosophie-des-resultats" aria-label="Lien vers cette section">#</a></h2>
+<p>HyperLab ne contient aucun objectif du type « 1 % par mois ». Le backtest peut afficher :</p>
+<pre><code class="language-text">-20 %, +3 %, +40 %, +5 % par mois ou davantage
+</code></pre>
+<p>Le résultat n'est jamais plafonné. En revanche, le profil déployable impose des limites d'exposition. C'est la différence entre :</p>
+<ul>
+<li>falsifier un résultat ;</li>
+<li>mesurer une stratégie que l'on accepterait réellement de faire tourner.</li>
+</ul>
+<p>Un résultat exceptionnel déclenche davantage d'audits : frais oubliés, fills irréalistes, look-ahead, levier implicite, survivorship bias, sélection de paramètres ou régime exceptionnel.</p>
+<hr />
+<h1 id="partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11<a class="heading-link" href="#partie-a-installation-windows-11" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="5-installer-les-outils">5. Installer les outils<a class="heading-link" href="#5-installer-les-outils" aria-label="Lien vers cette section">#</a></h2>
+<p>Ouvre PowerShell normalement :</p>
+<pre><code class="language-powershell">winget install -e --id Python.Python.3.12
+winget install -e --id Git.Git
+winget install -e --id Docker.DockerDesktop
+</code></pre>
+<p>Redémarre PowerShell et vérifie :</p>
+<pre><code class="language-powershell">python --version
+git --version
+docker --version
+</code></pre>
+<p>Python 3.12 est recommandé. Python 3.11 et 3.13 sont également acceptés par le projet, mais la CI de référence utilise 3.12.</p>
+<h2 id="6-extraire-le-pack">6. Extraire le pack<a class="heading-link" href="#6-extraire-le-pack" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">New-Item -ItemType Directory -Force C:\Dev
+Expand-Archive `
+  -Path &quot;$HOME\Downloads\hyperlab-multistrategy-v0.2.0.zip&quot; `
+  -DestinationPath &quot;C:\Dev&quot; `
+  -Force
+</code></pre>
+<p>Entre dans le dossier qui contient <code>pyproject.toml</code> :</p>
+<pre><code class="language-powershell">cd C:\Dev\hyperlab-multistrategy
+</code></pre>
+<h2 id="7-installer-l-environnement-python">7. Installer l'environnement Python<a class="heading-link" href="#7-installer-l-environnement-python" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\bootstrap.ps1
+</code></pre>
+<p>Le script :</p>
+<ol>
+<li>crée <code>.venv</code> ;</li>
+<li>installe les dépendances ;</li>
+<li>installe HyperLab en mode éditable ;</li>
+<li>lance les tests ;</li>
+<li>lance le diagnostic.</li>
+</ol>
+<p>La sortie attendue contient :</p>
+<pre><code class="language-text">Exécuteur d'ordres  ABSENT — BLOQUÉ
+Installation saine
+</code></pre>
+<h2 id="8-afficher-les-strategies">8. Afficher les stratégies<a class="heading-link" href="#8-afficher-les-strategies" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab strategies
+</code></pre>
+<h2 id="9-lancer-la-demonstration-complete">9. Lancer la démonstration complète<a class="heading-link" href="#9-lancer-la-demonstration-complete" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab demo `
+  --strategy all `
+  --hours 1200 `
+  --output reports\demo
+</code></pre>
+<p>Ouvre le rapport :</p>
+<pre><code class="language-powershell">Start-Process .\reports\demo\comparison.html
+</code></pre>
+<p><strong>Attention :</strong> les données synthétiques ont volontairement des structures reconnaissables par plusieurs baselines. Un rendement élevé dans ce rapport ne signifie rien sur le vrai marché.</p>
+<h2 id="10-tester-une-strategie-seule">10. Tester une stratégie seule<a class="heading-link" href="#10-tester-une-strategie-seule" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab demo --strategy cash_and_carry
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy funding_basket
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy cross_exchange_funding
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy pairs_mean_reversion
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy momentum_regime
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy lead_lag
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy inventory_market_making
+</code></pre>
+<h2 id="11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid<a class="heading-link" href="#11-lire-les-donnees-publiques-hyperliquid" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab snapshot `
+  --network mainnet `
+  --save
+</code></pre>
+<p>Cette commande :</p>
+<ul>
+<li>utilise uniquement l'Info API ;</li>
+<li>ne demande pas d'adresse ;</li>
+<li>n'utilise pas de secret ;</li>
+<li>repère les actifs présents en spot USDC et perp ;</li>
+<li>stocke le résultat dans <code>data\hyperlab.sqlite3</code>.</li>
+</ul>
+<h2 id="12-lancer-une-collecte-courte">12. Lancer une collecte courte<a class="heading-link" href="#12-lancer-une-collecte-courte" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab collect `
+  --interval-seconds 60 `
+  --samples 10 `
+  --network mainnet
+</code></pre>
+<p>Vérifie :</p>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab status
+</code></pre>
+<h2 id="13-dashboard-windows">13. Dashboard Windows<a class="heading-link" href="#13-dashboard-windows" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab serve `
+  --host 127.0.0.1 `
+  --port 8000
+</code></pre>
+<p>Ouvre :</p>
+<pre><code class="language-text">http://127.0.0.1:8000
+</code></pre>
+<p>La bannière doit dire <code>READ-ONLY — ORDRES IMPOSSIBLES</code>.</p>
+<hr />
+<h1 id="partie-b-git-et-codex">PARTIE B — GIT ET CODEX<a class="heading-link" href="#partie-b-git-et-codex" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git<a class="heading-link" href="#14-creer-le-premier-checkpoint-git" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">git init
+git add .
+git commit -m &quot;chore: initial HyperLab multi-strategy lab&quot;
+</code></pre>
+<p>Crée une branche :</p>
+<pre><code class="language-powershell">git switch -c phase-00-audit
+</code></pre>
+<h2 id="15-ouvrir-dans-codex">15. Ouvrir dans Codex<a class="heading-link" href="#15-ouvrir-dans-codex" aria-label="Lien vers cette section">#</a></h2>
+<p>Ouvre le dossier <code>C:\Dev\hyperlab-multistrategy</code> dans Codex.</p>
+<p>Garde :</p>
+<ul>
+<li>sandbox workspace ;</li>
+<li>approbation à la demande ;</li>
+<li>accès réseau seulement si nécessaire ;</li>
+<li>aucun Full Access ;</li>
+<li>aucune connexion au wallet ou à Umbrel de production.</li>
+</ul>
+<h2 id="16-premier-prompt-codex">16. Premier prompt Codex<a class="heading-link" href="#16-premier-prompt-codex" aria-label="Lien vers cette section">#</a></h2>
+<p>Donne le contenu de <code>prompts/00_AUDIT_INITIAL.md</code>.</p>
+<p>L'audit doit arriver <strong>avant</strong> les modifications. Ensuite seulement, autorise les corrections confirmées.</p>
+<h2 id="17-controler-les-changements">17. Contrôler les changements<a class="heading-link" href="#17-controler-les-changements" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">git status
+git diff
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m hyperlab demo --strategy all --hours 1200
+</code></pre>
+<p>Puis :</p>
+<pre><code class="language-powershell">git add .
+git commit -m &quot;fix: harden initial read-only research lab&quot;
+</code></pre>
+<h2 id="18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l'ordre<a class="heading-link" href="#18-executer-les-phases-dans-l-ordre" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-text">00 audit
+01 modèle et qualité des données
+02 collecteur Hyperliquid public
+03 venues externes
+04 backtester réaliste
+05 cash-and-carry
+06 basket funding
+07 funding inter-exchanges
+08 pairs trading
+09 momentum
+10 lead-lag
+11 market making
+12 paper engine
+13 exécuteur testnet
+14 revue sécurité / micro-mainnet
+15 durcissement Umbrel
+</code></pre>
+<p>Les phases 13 et 14 ne sont ouvertes qu'après validation explicite. Elles ne doivent pas être fusionnées avec les phases de recherche.</p>
+<hr />
+<h1 id="partie-c-docker-local">PARTIE C — DOCKER LOCAL<a class="heading-link" href="#partie-c-docker-local" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="19-construire-l-image">19. Construire l'image<a class="heading-link" href="#19-construire-l-image" aria-label="Lien vers cette section">#</a></h2>
+<p>Lance Docker Desktop, puis :</p>
+<pre><code class="language-powershell">.\scripts\build_docker.ps1
+</code></pre>
+<h2 id="20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard<a class="heading-link" href="#20-demarrer-collecteur-et-dashboard" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">docker compose up -d
+docker compose ps
+</code></pre>
+<p>Logs :</p>
+<pre><code class="language-powershell">docker compose logs -f collector
+</code></pre>
+<p>Dashboard :</p>
+<pre><code class="language-text">http://127.0.0.1:8000
+</code></pre>
+<p>Arrêt :</p>
+<pre><code class="language-powershell">docker compose down
+</code></pre>
+<p>Les services sont non-root, read-only, sans capacités Linux et sans Docker socket.</p>
+<hr />
+<h1 id="partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL<a class="heading-link" href="#partie-d-installation-umbrel" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry<a class="heading-link" href="#21-pourquoi-passer-par-github-container-registry" aria-label="Lien vers cette section">#</a></h2>
+<p>Umbrel doit télécharger une image compatible avec l'architecture de ton mini-PC. Le workflow GitHub construit :</p>
+<pre><code class="language-text">linux/amd64
+linux/arm64
+</code></pre>
+<p>Il publie ensuite une image versionnée dans GHCR.</p>
+<h2 id="22-creer-un-depot-github">22. Créer un dépôt GitHub<a class="heading-link" href="#22-creer-un-depot-github" aria-label="Lien vers cette section">#</a></h2>
+<p>Crée un dépôt GitHub <strong>public</strong> nommé exactement <code>hyperlab</code>, sans secret. Le store et l’image read-only doivent être téléchargeables par Umbrel sans identifiants.</p>
+<pre><code class="language-powershell">git remote add origin https://github.com/VOTRE_NOM_GITHUB/hyperlab.git
+git branch -M main
+git push -u origin main
+</code></pre>
+<h2 id="23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel<a class="heading-link" href="#23-personnaliser-le-package-umbrel" aria-label="Lien vers cette section">#</a></h2>
+<p>Les fichiers <code>umbrel-app-store.yml</code> et <code>jjlab-hyperlab/</code> sont volontairement à la <strong>racine du dépôt</strong> : c'est la structure attendue par le template officiel Umbrel.</p>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB
+</code></pre>
+<p>Vérifie :</p>
+<pre><code class="language-powershell">Get-ChildItem .\jjlab-hyperlab -Recurse -File | Select-String &quot;REPLACE_WITH_&quot;
+</code></pre>
+<p>Aucun résultat attendu.</p>
+<p>Commit :</p>
+<pre><code class="language-powershell">git add umbrel-app-store.yml jjlab-hyperlab scripts\prepare_umbrel_store.py
+git commit -m &quot;chore: configure Umbrel community app store&quot;
+git push
+</code></pre>
+<h2 id="24-publier-l-image">24. Publier l'image<a class="heading-link" href="#24-publier-l-image" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">git tag v0.2.0
+git push origin v0.2.0
+</code></pre>
+<p>Dans GitHub, vérifie l'Action <code>Publish container</code> et le package <code>hyperlab:0.2.0</code>.</p>
+<p>Ouvre ensuite la page du package, puis <strong>Package settings → Change visibility → Public</strong>. Umbrel ne possède pas d'identifiants GHCR pour télécharger une image privée. La première version ne contient aucun secret ; le code et l'image peuvent donc être publics.</p>
+<h2 id="25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS<a class="heading-link" href="#25-ajouter-le-store-dans-umbrelos" aria-label="Lien vers cette section">#</a></h2>
+<p>Dans Umbrel :</p>
+<ol>
+<li>ouvre <strong>App Store</strong> ;</li>
+<li>clique sur les trois points en haut à droite ;</li>
+<li>clique sur <strong>Community App Stores</strong> ;</li>
+<li>colle l'URL du dépôt GitHub ;</li>
+<li>clique sur <strong>Add</strong> ;</li>
+<li>ouvre <code>Jj HyperLab</code> ;</li>
+<li>installe <code>HyperLab</code>.</li>
+</ol>
+<p>N'ajoute pas un store tiers inconnu : Umbrel ne vérifie pas les apps communautaires.</p>
+<h2 id="26-verifier-umbrel">26. Vérifier Umbrel<a class="heading-link" href="#26-verifier-umbrel" aria-label="Lien vers cette section">#</a></h2>
+<p>Ouvre HyperLab. Tu dois voir :</p>
+<pre><code class="language-text">READ-ONLY — ORDRES IMPOSSIBLES
+</code></pre>
+<p>Le compteur augmente progressivement. Vérifie aussi :</p>
+<pre><code class="language-text">/health
+/api/status
+</code></pre>
+<p>Le dashboard n'est pas un panneau d'administration de trading. Il ne possède aucun bouton d'ordre.</p>
+<h2 id="27-collecter-pendant-le-developpement">27. Collecter pendant le développement<a class="heading-link" href="#27-collecter-pendant-le-developpement" aria-label="Lien vers cette section">#</a></h2>
+<p>Laisse Umbrel tourner pendant que Codex implémente les phases 01 à 04. Cela crée un jeu de données forward jamais vu pendant la calibration.</p>
+<p>La collecte officielle historique est utile, mais sa publication peut être espacée. Notre propre flux réduit la dépendance à sa fraîcheur.</p>
+<hr />
+<h1 id="partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES<a class="heading-link" href="#partie-e-construction-des-donnees-reelles" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="28-donnees-lentes">28. Données lentes<a class="heading-link" href="#28-donnees-lentes" aria-label="Lien vers cette section">#</a></h2>
+<p>Pour carry, basket, inter-exchange, pairs et momentum :</p>
+<ul>
+<li>candles ;</li>
+<li>mark/oracle/mid ;</li>
+<li>funding ;</li>
+<li>OI ;</li>
+<li>volume ;</li>
+<li>BBO ;</li>
+<li>profondeur ;</li>
+<li>statut de marché ;</li>
+<li>listes historiques d'actifs.</li>
+</ul>
+<h2 id="29-donnees-rapides">29. Données rapides<a class="heading-link" href="#29-donnees-rapides" aria-label="Lien vers cette section">#</a></h2>
+<p>Pour lead-lag et market making :</p>
+<ul>
+<li>carnet L2 event-by-event ;</li>
+<li>trades ;</li>
+<li>BBO ;</li>
+<li>séquences ;</li>
+<li>timestamps source/réception ;</li>
+<li>reconnexions ;</li>
+<li>venue de référence ;</li>
+<li>latence.</li>
+</ul>
+<p>Ces datasets deviennent rapidement volumineux. Parquet + DuckDB sont préférables à une grosse table SQLite unique.</p>
+<h2 id="30-qualite">30. Qualité<a class="heading-link" href="#30-qualite" aria-label="Lien vers cette section">#</a></h2>
+<p>Chaque journée doit produire un manifeste :</p>
+<pre><code class="language-text">nombre de lignes
+premier/dernier timestamp
+trous
+messages hors ordre
+duplicats
+reconnexions
+hash des fichiers
+</code></pre>
+<p>Un trou ne doit jamais être masqué par un forward-fill silencieux.</p>
+<hr />
+<h1 id="partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST<a class="heading-link" href="#partie-f-protocole-de-backtest" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="31-decoupage-temporel">31. Découpage temporel<a class="heading-link" href="#31-decoupage-temporel" aria-label="Lien vers cette section">#</a></h2>
+<p>Point de départ :</p>
+<pre><code class="language-text">60 % train
+20 % validation
+20 % test final verrouillé
+</code></pre>
+<p>Le test final n'est regardé qu'après avoir figé la stratégie.</p>
+<h2 id="32-walk-forward">32. Walk-forward<a class="heading-link" href="#32-walk-forward" aria-label="Lien vers cette section">#</a></h2>
+<p>Pour chaque fenêtre :</p>
+<ol>
+<li>estimer les paramètres sur le passé ;</li>
+<li>les figer ;</li>
+<li>trader la fenêtre suivante ;</li>
+<li>avancer ;</li>
+<li>agréger les résultats hors échantillon.</li>
+</ol>
+<h2 id="33-couts">33. Coûts<a class="heading-link" href="#33-couts" aria-label="Lien vers cette section">#</a></h2>
+<p>Le backtest réaliste inclut :</p>
+<pre><code class="language-text">fees maker/taker
+spread
+slippage
+taille/profondeur
+fills partiels
+ordres manqués
+latence
+sorties d'urgence
+funding réel
+transferts inter-venues
+rendement passif abandonné
+</code></pre>
+<p>Les frais de <code>config/research.toml</code> sont des placeholders. La future phase paper doit récupérer les frais réels du compte.</p>
+<h2 id="34-trois-scenarios-minimum">34. Trois scénarios minimum<a class="heading-link" href="#34-trois-scenarios-minimum" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-text">informatif/optimiste
+réaliste
+défavorable : frais et slippage ×2
+</code></pre>
+<p>Ajouter ensuite :</p>
+<ul>
+<li>taux de fill maker réduit ;</li>
+<li>funding prévu réduit ;</li>
+<li>suppression des meilleurs trades ;</li>
+<li>choc de volatilité ;</li>
+<li>coupure d'une venue ;</li>
+<li>délai de couverture plus long.</li>
+</ul>
+<h2 id="35-rapport-obligatoire">35. Rapport obligatoire<a class="heading-link" href="#35-rapport-obligatoire" aria-label="Lien vers cette section">#</a></h2>
+<p>Pour chaque stratégie :</p>
+<ul>
+<li>rendement total ;</li>
+<li>rendement annualisé ;</li>
+<li>max drawdown ;</li>
+<li>pire jour/heure ;</li>
+<li>Sharpe et Calmar ;</li>
+<li>turnover ;</li>
+<li>temps investi ;</li>
+<li>exposition brute/net ;</li>
+<li>PnL par composante ;</li>
+<li>répartition par actif/mois/régime ;</li>
+<li>capacité ;</li>
+<li>comparaison au passif 4–5 %.</li>
+</ul>
+<h2 id="36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé<a class="heading-link" href="#36-interpreter-un-resultat-tres-eleve" aria-label="Lien vers cette section">#</a></h2>
+<p>Exemple : 5 % net par mois.</p>
+<p>On ne le réduit pas. On cherche d'abord :</p>
+<ul>
+<li>levier implicite ;</li>
+<li>PnL calculé sur la mauvaise base de capital ;</li>
+<li>look-ahead ;</li>
+<li>frais manquants ;</li>
+<li>fill maker automatique ;</li>
+<li>survivorship bias ;</li>
+<li>sélection excessive de paramètres ;</li>
+<li>période exceptionnellement favorable ;</li>
+<li>risque rare absent.</li>
+</ul>
+<hr />
+<h1 id="partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES<a class="heading-link" href="#partie-g-ordre-de-validation-des-strategies" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="37-vague-1-defensive">37. Vague 1 : défensive<a class="heading-link" href="#37-vague-1-defensive" aria-label="Lien vers cette section">#</a></h2>
+<h3 id="cash-and-carry">Cash-and-carry<a class="heading-link" href="#cash-and-carry" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : fiabiliser deux jambes, coûts et funding.</p>
+<p>Gate : rendement stressé supérieur au passif avec drawdown et marge raisonnables.</p>
+<h2 id="38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif<a class="heading-link" href="#38-vague-2-market-neutral-relatif" aria-label="Lien vers cette section">#</a></h2>
+<h3 id="basket-funding">Basket funding<a class="heading-link" href="#basket-funding" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : optimiser le portefeuille sans bêta caché.</p>
+<h3 id="funding-inter-exchanges">Funding inter-exchanges<a class="heading-link" href="#funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : même actif, neutralité de prix, gestion de marge séparée.</p>
+<h2 id="39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque<a class="heading-link" href="#39-vague-3-alpha-moyen-risque" aria-label="Lien vers cette section">#</a></h2>
+<h3 id="pairs">Pairs<a class="heading-link" href="#pairs" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : spread robuste, stop et time stop.</p>
+<h3 id="momentum">Momentum<a class="heading-link" href="#momentum" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : rendement directionnel contrôlé, régime explicite.</p>
+<h2 id="40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence<a class="heading-link" href="#40-vague-4-haute-performance-haute-exigence" aria-label="Lien vers cette section">#</a></h2>
+<h3 id="lead-lag">Lead-lag<a class="heading-link" href="#lead-lag" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : edge après latence et coûts réels.</p>
+<h3 id="market-making">Market making<a class="heading-link" href="#market-making" aria-label="Lien vers cette section">#</a></h3>
+<p>Objectif : spread net après markout adverse, queue et inventaire.</p>
+<p>Ces deux modules ne doivent pas retarder le déploiement du collecteur lent : leurs données sont collectées en parallèle.</p>
+<hr />
+<h1 id="partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT<a class="heading-link" href="#partie-h-paper-testnet-et-vrai-argent" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="41-paper-live">41. Paper live<a class="heading-link" href="#41-paper-live" aria-label="Lien vers cette section">#</a></h2>
+<p>Après backtest :</p>
+<ul>
+<li>stratégie figée ;</li>
+<li>décisions en temps réel ;</li>
+<li>ordres simulés ;</li>
+<li>modèle de fill réaliste ;</li>
+<li>aucun ajustement pendant la fenêtre de validation.</li>
+</ul>
+<p>Minimum recommandé :</p>
+<pre><code class="language-text">6 à 8 semaines
+30 à 50 cycles pour les stratégies lentes
+beaucoup plus pour les rapides
+14 jours sans incident critique
+</code></pre>
+<h2 id="42-testnet">42. Testnet<a class="heading-link" href="#42-testnet" aria-label="Lien vers cette section">#</a></h2>
+<p>Le futur exécuteur testnet doit vivre dans une branche/version séparée (<code>0.3.0-dev</code> ou service distinct). Le collecteur et le dashboard <code>0.2.x</code> restent read-only ; on ne leur ajoute jamais une clé « temporairement ».</p>
+<p>Le testnet valide :</p>
+<ul>
+<li>signature ;</li>
+<li>ordres post-only/IOC/reduce-only ;</li>
+<li>annulations ;</li>
+<li>CLOID ;</li>
+<li>fills partiels ;</li>
+<li>WebSocket coupé ;</li>
+<li>réponse perdue ;</li>
+<li>redémarrage ;</li>
+<li>réconciliation ;</li>
+<li>dead-man switch.</li>
+</ul>
+<p>Il ne valide pas parfaitement la rentabilité ou la liquidité.</p>
+<h2 id="43-micro-mainnet">43. Micro-mainnet<a class="heading-link" href="#43-micro-mainnet" aria-label="Lien vers cette section">#</a></h2>
+<p>Seulement après toutes les gates :</p>
+<pre><code class="language-text">100 à 300 USDC
+levier 1× maximum
+une stratégie
+une position
+validation humaine
+aucune hausse automatique
+</code></pre>
+<p>Le but est de mesurer :</p>
+<pre><code class="language-text">fill prévu vs réel
+slippage prévu vs réel
+fees prévus vs réels
+PnL paper vs PnL live
+</code></pre>
+<h2 id="44-augmentation">44. Augmentation<a class="heading-link" href="#44-augmentation" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-text">100–300 USDC : 4 à 8 semaines
+500–1 000 USDC : nouvelle période d’observation
+augmentation suivante : +50 à +100 % maximum
+puis nouvelle observation avant chaque palier
+</code></pre>
+<p>Aucune augmentation si le rendement additionnel ne justifie pas le risque par rapport au placement passif.</p>
+<hr />
+<h1 id="partie-i-securite">PARTIE I — SÉCURITÉ<a class="heading-link" href="#partie-i-securite" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="45-secrets">45. Secrets<a class="heading-link" href="#45-secrets" aria-label="Lien vers cette section">#</a></h2>
+<p>Ne donne jamais à ChatGPT ou Codex :</p>
+<ul>
+<li>seed ;</li>
+<li>clé principale ;</li>
+<li>fichier wallet ;</li>
+<li>keystore et mot de passe ensemble.</li>
+</ul>
+<p>La future clé API doit être dédiée, révocable et limitée au capital du sous-compte.</p>
+<h2 id="46-umbrel">46. Umbrel<a class="heading-link" href="#46-umbrel" aria-label="Lien vers cette section">#</a></h2>
+<p>Le package actuel :</p>
+<ul>
+<li>tourne en utilisateur 1000 ;</li>
+<li>filesystem read-only ;</li>
+<li><code>cap_drop: ALL</code> ;</li>
+<li><code>no-new-privileges</code> ;</li>
+<li>aucun Docker socket ;</li>
+<li>aucun port public direct ;</li>
+<li>aucun secret.</li>
+</ul>
+<h2 id="47-separation-future">47. Séparation future<a class="heading-link" href="#47-separation-future" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-text">collector : public
+research : sans clé
+dashboard : lecture seule
+paper : sans clé
+executor testnet : clé testnet
+executor mainnet : clé dédiée et service séparé
+</code></pre>
+<h2 id="48-kill-switches">48. Kill switches<a class="heading-link" href="#48-kill-switches" aria-label="Lien vers cette section">#</a></h2>
+<p>Le futur live doit avoir :</p>
+<ul>
+<li>données stale → aucune entrée ;</li>
+<li>erreurs répétées → pause ;</li>
+<li>position inconnue → revue manuelle ;</li>
+<li>perte journalière → arrêt ;</li>
+<li>drawdown → arrêt ;</li>
+<li>jambe non couverte → hedge/débouclement ;</li>
+<li>process mort → annulation programmée des ordres.</li>
+</ul>
+<hr />
+<h1 id="partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE<a class="heading-link" href="#partie-j-routine-pratique" aria-label="Lien vers cette section">#</a></h1>
+<h2 id="49-cette-semaine">49. Cette semaine<a class="heading-link" href="#49-cette-semaine" aria-label="Lien vers cette section">#</a></h2>
+<ol>
+<li>installe le pack sur Windows ;</li>
+<li>lance les tests et la démo ;</li>
+<li>initialise Git ;</li>
+<li>donne le prompt 00 à Codex ;</li>
+<li>crée le dépôt GitHub ;</li>
+<li>publie l'image ;</li>
+<li>installe l'app read-only sur Umbrel ;</li>
+<li>commence la collecte 24/24.</li>
+</ol>
+<h2 id="50-ensuite">50. Ensuite<a class="heading-link" href="#50-ensuite" aria-label="Lien vers cette section">#</a></h2>
+<p>Pendant qu'Umbrel collecte :</p>
+<ol>
+<li>phase 01 données ;</li>
+<li>phase 02 Hyperliquid ;</li>
+<li>phase 03 seconde venue ;</li>
+<li>phase 04 backtester ;</li>
+<li>validation des stratégies de niveau 1 et 2 ;</li>
+<li>recherche parallèle des niveaux 3 et 4.</li>
+</ol>
+<h2 id="51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles<a class="heading-link" href="#51-commandes-quotidiennes-utiles" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">git status
+git diff
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m hyperlab doctor
+.\.venv\Scripts\python.exe -m hyperlab status
+</code></pre>
+<p>Docker :</p>
+<pre><code class="language-powershell">docker compose ps
+docker compose logs --tail 100 collector
+</code></pre>
+<h2 id="52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie<a class="heading-link" href="#52-quand-abandonner-une-strategie" aria-label="Lien vers cette section">#</a></h2>
+<ul>
+<li>edge disparaît après coûts réalistes ;</li>
+<li>résultat dépend d'un seul mois ;</li>
+<li>stress test devient fortement négatif ;</li>
+<li>drawdown trop grand pour la surperformance ;</li>
+<li>capacité trop faible ;</li>
+<li>avantage absorbé par latence ;</li>
+<li>besoin d'un risque terminal caché ;</li>
+<li>rendement inférieur ou à peine supérieur au passif.</li>
+</ul>
+<p>Abandonner une mauvaise stratégie est un résultat positif du laboratoire.</p>
+<hr />
+<h1 id="conclusion">Conclusion<a class="heading-link" href="#conclusion" aria-label="Lien vers cette section">#</a></h1>
+<p>Le projet ne vise plus un unique bot de carry. Il construit une <strong>plateforme de recherche</strong> capable de comparer plusieurs sources de rendement : défensives, relatives, directionnelles et microstructurelles.</p>
+<p>L'ordre rationnel reste :</p>
+<pre><code class="language-text">infrastructure sûre
+→ collecte
+→ backtests non bridés
+→ stress tests
+→ forward paper
+→ testnet
+→ micro-mainnet
+</code></pre>
+<p>Umbrel commence à accumuler les données immédiatement, tandis que Windows et Codex développent et auditent les modèles. C'est la façon la plus rapide d'être ambitieux sans sacrifier la rigueur.</p>
+<hr />
+<h1 id="sources-officielles">Sources officielles<a class="heading-link" href="#sources-officielles" aria-label="Lien vers cette section">#</a></h1>
+<ul>
+<li>Hyperliquid API : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api">https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api</a></li>
+<li>Hyperliquid historical data : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data">https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data</a></li>
+<li>Hyperliquid WebSocket subscriptions : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions">https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions</a></li>
+<li>Hyperliquid funding : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding">https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding</a></li>
+<li>SDK Python officiel : <a href="https://github.com/hyperliquid-dex/hyperliquid-python-sdk">https://github.com/hyperliquid-dex/hyperliquid-python-sdk</a></li>
+<li>Umbrel Community App Store : <a href="https://umbrel.com/support/apps/how-to-add-a-community-app-store">https://umbrel.com/support/apps/how-to-add-a-community-app-store</a></li>
+<li>Template Community App Store : <a href="https://github.com/getumbrel/umbrel-community-app-store">https://github.com/getumbrel/umbrel-community-app-store</a></li>
+<li>Codex security and approvals : <a href="https://developers.openai.com/codex/agent-approvals-security">https://developers.openai.com/codex/agent-approvals-security</a></li>
+</ul>
+<p>Vérifie de nouveau ces pages avant toute phase testnet ou mainnet : les APIs, frais, limites et formats évoluent.</p>
+<footer>HyperLab 0.2.0 · Laboratoire de recherche multi-stratégies · aucune promesse de rendement.</footer></article></main>
+</div>
+<a class="backtop" href="#top" aria-label="Retour en haut">↑</a>
+<script>
+document.querySelectorAll('pre').forEach((pre) => {
+  const button = document.createElement('button');
+  button.className = 'copy-button';
+  button.type = 'button';
+  button.textContent = 'Copier';
+  button.addEventListener('click', async () => {
+    const code = pre.querySelector('code');
+    try {
+      await navigator.clipboard.writeText(code ? code.innerText : pre.innerText);
+      button.textContent = 'Copié';
+    } catch (_) {
+      button.textContent = 'Sélectionner';
+    }
+    setTimeout(() => button.textContent = 'Copier', 1500);
+  });
+  pre.appendChild(button);
+});
+</script>
+</body>
+</html>

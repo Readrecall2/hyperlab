@@ -1,0 +1,25 @@
+manifestVersion: 1
+id: jjlab-hyperlab
+name: HyperLab
+category: finance
+version: "0.2.0"
+tagline: Laboratoire Hyperliquid read-only et multi-stratégies
+icon: https://raw.githubusercontent.com/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY/main/jjlab-hyperlab/icon.svg
+port: 8000
+description: >-
+  HyperLab collecte des données publiques Hyperliquid 24/24, affiche un tableau de bord
+  local et fournit un laboratoire de recherche pour plusieurs familles de stratégies.
+  Cette version Umbrel est volontairement incapable de signer ou d'envoyer un ordre.
+developer: Jj
+website: https://github.com/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY
+submitter: Jj
+submission: https://github.com/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY
+repo: https://github.com/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY
+support: https://github.com/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY/issues
+gallery: []
+releaseNotes: >-
+  Première version multi-stratégies avec collecteur public, dashboard local et mode read-only.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""

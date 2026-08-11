@@ -1,0 +1,36 @@
+# HyperLab starts in read-only research mode. No private key is supported by this release.
+
+[app]
+network = "mainnet"
+data_dir = "data"
+request_timeout_seconds = 15.0
+mode = "readonly"
+
+[costs]
+# Research placeholders only. Before paper/live evaluation, fetch account-specific rates
+# via Hyperliquid userFees and calibrate slippage from real/replayed fills.
+spot_fee_bps = 4.0
+perp_fee_bps = 1.5
+external_perp_fee_bps = 2.0
+base_slippage_bps = 1.0
+stress_multiplier = 1.0
+
+[risk_profiles.defensive]
+max_gross_leverage = 0.75
+max_net_exposure = 0.05
+max_instrument_weight = 0.25
+
+[risk_profiles.balanced]
+max_gross_leverage = 1.00
+max_net_exposure = 0.10
+max_instrument_weight = 0.35
+
+[risk_profiles.offensive]
+max_gross_leverage = 1.00
+max_net_exposure = 1.00
+max_instrument_weight = 0.50
+
+[risk_profiles.aggressive_research_only]
+max_gross_leverage = 1.00
+max_net_exposure = 1.00
+max_instrument_weight = 0.60

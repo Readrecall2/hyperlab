@@ -5,7 +5,13 @@ from dataclasses import dataclass
 import pandas as pd
 
 from hyperlab.models import MarketPanel, StrategyOutput
-from hyperlab.strategies.helpers import asset_from, columns_by, empty_weights, rebalance_mask
+from hyperlab.strategies.helpers import (
+    asset_from,
+    columns_by,
+    empty_weights,
+    rebalance_mask,
+    scalar_float,
+)
 
 
 @dataclass(slots=True)
@@ -38,7 +44,9 @@ class CrossExchangeFundingStrategy:
                     external = f"{self.external_exchange.upper()}:{asset}:perp"
                     if external not in panel.prices.columns:
                         continue
-                    diff = float(funding_mean.at[timestamp, hl] - funding_mean.at[timestamp, external])
+                    hl_funding = scalar_float(funding_mean.at[timestamp, hl])
+                    external_funding = scalar_float(funding_mean.at[timestamp, external])
+                    diff = hl_funding - external_funding
                     if pd.isna(diff) or abs(diff) < self.min_abs_diff_hourly:
                         continue
                     candidates.append((abs(diff), hl, external, diff))

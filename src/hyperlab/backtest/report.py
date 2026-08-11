@@ -87,7 +87,7 @@ def write_comparison_report(
                 <div><span>Annualisé</span><strong>{_pct(m.annualized_return)}</strong></div>
                 <div><span>Sharpe</span><strong>{_num(m.sharpe)}</strong></div>
                 <div><span>Drawdown max</span><strong>{_pct(m.max_drawdown)}</strong></div>
-                <div><span>Exposition brute max</span><strong>{_num(m.max_gross_leverage)}×</strong></div>
+                <div><span>Exposition brute max</span><strong>{_num(m.max_gross_leverage)}&times;</strong></div>
               </div>
               <details><summary>Diagnostics</summary><code>{diagnostic_text}</code></details>
             </section>

@@ -34,8 +34,8 @@ class LeadLagStrategy:
             reference = f"{self.reference_exchange.upper()}:{asset}:perp"
             if reference not in panel.prices.columns:
                 continue
-            hl_return = panel.prices[hl].pct_change()
-            reference_return = panel.prices[reference].pct_change()
+            hl_return = panel.prices[hl].pct_change(fill_method=None)
+            reference_return = panel.prices[reference].pct_change(fill_method=None)
             lagged_reference = reference_return.shift(1)
             beta = (
                 hl_return.rolling(self.estimation_hours, min_periods=self.estimation_hours)

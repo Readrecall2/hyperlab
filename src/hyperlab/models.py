@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,15 @@ class RiskLimits:
     max_net_exposure: float = 1.0
     max_instrument_weight: float = 0.50
 
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_gross_leverage", self.max_gross_leverage),
+            ("max_net_exposure", self.max_net_exposure),
+            ("max_instrument_weight", self.max_instrument_weight),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
 
 @dataclass(frozen=True, slots=True)
 class CostModel:
@@ -29,6 +39,18 @@ class CostModel:
     external_perp_fee_bps: float = 2.0
     base_slippage_bps: float = 1.0
     stress_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("spot_fee_bps", self.spot_fee_bps),
+            ("perp_fee_bps", self.perp_fee_bps),
+            ("external_perp_fee_bps", self.external_perp_fee_bps),
+            ("base_slippage_bps", self.base_slippage_bps),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not math.isfinite(self.stress_multiplier) or self.stress_multiplier <= 0.0:
+            raise ValueError("stress_multiplier must be finite and positive")
 
     def one_way_bps(self, instrument: str) -> float:
         if instrument.endswith(":spot"):

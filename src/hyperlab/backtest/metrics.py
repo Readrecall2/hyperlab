@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import pandas as pd
 
 from hyperlab.models import BacktestMetrics
 
 
-def infer_periods_per_year(index: pd.DatetimeIndex) -> float:
-    if len(index) < 2:
+def infer_periods_per_year(index: pd.Index) -> float:
+    datetime_index = pd.DatetimeIndex(index)
+    if len(datetime_index) < 2:
         return 365.0
-    deltas = index.to_series().diff().dropna().dt.total_seconds()
+    deltas = datetime_index.to_series().diff().dropna().dt.total_seconds()
     median_seconds = float(deltas.median())
     if median_seconds <= 0:
         return 365.0
@@ -19,8 +19,18 @@ def infer_periods_per_year(index: pd.DatetimeIndex) -> float:
 
 
 def drawdown_series(equity: pd.Series) -> pd.Series:
-    running_max = equity.cummax()
+    """Compute drawdown against normalized initial capital as well as later peaks."""
+    running_max = equity.cummax().clip(lower=1.0)
     return equity / running_max - 1.0
+
+
+def _annualize(final_equity: float, exponent: float) -> float:
+    if final_equity <= 0.0:
+        return math.nan
+    try:
+        return math.expm1(math.log(final_equity) * exponent)
+    except OverflowError:
+        return math.inf
 
 
 def compute_metrics(
@@ -33,28 +43,24 @@ def compute_metrics(
     n_periods = max(len(net), 1)
     final_equity = float(equity.iloc[-1])
     total_return = final_equity - 1.0
-    if final_equity > 0:
-        annualized_return = final_equity ** (periods_per_year / n_periods) - 1.0
-    else:
-        annualized_return = -1.0
+    annualized_return = _annualize(final_equity, periods_per_year / n_periods)
 
     std = float(net.std(ddof=1)) if len(net) > 1 else 0.0
     annualized_volatility = std * math.sqrt(periods_per_year)
-    sharpe = (
-        float(net.mean()) / std * math.sqrt(periods_per_year)
-        if std > 1e-15
-        else 0.0
-    )
+    sharpe = float(net.mean()) / std * math.sqrt(periods_per_year) if std > 1e-15 else 0.0
 
     max_drawdown = float(drawdown_series(equity).min())
     calmar = annualized_return / abs(max_drawdown) if max_drawdown < -1e-12 else 0.0
 
     daily_equity = equity.resample("1D").last().dropna()
-    daily_returns = daily_equity.pct_change().dropna()
+    daily_returns = daily_equity.pct_change()
+    if not daily_returns.empty:
+        daily_returns.iloc[0] = float(daily_equity.iloc[0]) - 1.0
+    daily_returns = daily_returns.dropna()
     win_day_rate = float((daily_returns > 0).mean()) if not daily_returns.empty else 0.0
     worst_day = float(daily_returns.min()) if not daily_returns.empty else 0.0
 
-    turnover = float(weights.diff().abs().sum(axis=1).sum())
+    turnover = float(weights.diff().fillna(weights).abs().sum(axis=1).sum())
     gross = weights.abs().sum(axis=1)
     net_exposure = weights.sum(axis=1).abs()
     time_in_market = float((gross > 1e-12).mean())

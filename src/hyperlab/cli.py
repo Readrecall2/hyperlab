@@ -5,6 +5,7 @@ import os
 import platform
 import sys
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -30,6 +31,13 @@ app = typer.Typer(
 )
 console = Console()
 CONFIG = Path("config/research.toml")
+SECRET_ENV_MARKERS = (
+    "PRIVATE_KEY",
+    "SEED_PHRASE",
+    "MNEMONIC",
+    "WALLET_KEY",
+    "API_KEY",
+)
 
 
 def _settings() -> Settings:
@@ -49,13 +57,17 @@ def _profile_for(name: str) -> str:
     }[name]
 
 
+def _secret_like_environment_variables(environment: Mapping[str, str]) -> list[str]:
+    return sorted(
+        key for key in environment if any(marker in key.upper() for marker in SECRET_ENV_MARKERS)
+    )
+
+
 @app.command()
 def doctor() -> None:
     """Vérifie l'installation et confirme l'absence d'exécution réelle."""
     settings = _settings()
-    secret_like = sorted(
-        key for key in os.environ if any(token in key.upper() for token in ("PRIVATE_KEY", "SEED_PHRASE"))
-    )
+    secret_like = _secret_like_environment_variables(os.environ)
     table = Table(title="Diagnostic HyperLab")
     table.add_column("Contrôle")
     table.add_column("Résultat")

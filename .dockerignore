@@ -4,6 +4,16 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .mypy_cache
+.env
+.env.*
+**/.env
+**/.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*keystore*
 data
 reports
 *.zip

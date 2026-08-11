@@ -39,9 +39,11 @@ def load_settings(path: Path = Path("config/research.toml")) -> Settings:
     cost_data = _section(data, "costs")
     profiles_data = _section(data, "risk_profiles")
     data_dir = Path(os.getenv("HYPERLAB_DATA_DIR", str(app_data.get("data_dir", "data"))))
-    mode = os.getenv("HYPERLAB_MODE", str(app_data.get("mode", "readonly"))).lower()
-    if mode not in {"readonly", "research", "paper", "testnet", "mainnet"}:
-        raise ValueError(f"unsupported HYPERLAB_MODE: {mode}")
+    mode = os.getenv("HYPERLAB_MODE", str(app_data.get("mode", "readonly"))).strip().lower()
+    if mode not in {"readonly", "research"}:
+        raise ValueError(
+            f"unsupported HYPERLAB_MODE: {mode}; HyperLab 0.2.x only allows readonly/research"
+        )
 
     settings = AppSettings(
         network=str(app_data.get("network", "mainnet")),

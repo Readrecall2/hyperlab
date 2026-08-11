@@ -5,6 +5,27 @@ from pathlib import Path
 import yaml
 
 
+def test_docker_context_excludes_secret_files() -> None:
+    root = Path(__file__).resolve().parents[1]
+    patterns = {
+        line.strip()
+        for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    required = {
+        ".env",
+        ".env.*",
+        "*.key",
+        "*.pem",
+        "*.p12",
+        "*.pfx",
+        "*.keystore",
+        "*keystore*",
+    }
+
+    assert required <= patterns
+
+
 def test_umbrel_package_is_rooted_and_hardened() -> None:
     root = Path(__file__).resolve().parents[1]
     store_path = root / "umbrel-app-store.yml"

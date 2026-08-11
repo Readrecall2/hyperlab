@@ -48,14 +48,15 @@ class PairsMeanReversionStrategy:
             b = float(beta.loc[timestamp])
             if pd.isna(z) or pd.isna(b):
                 continue
-            if state == 0:
+            if abs(z) >= self.stop_z:
+                state = 0
+            elif state == 0:
                 if z >= self.enter_z:
                     state = -1
                 elif z <= -self.enter_z:
                     state = 1
-            else:
-                if abs(z) <= self.exit_z or abs(z) >= self.stop_z:
-                    state = 0
+            elif abs(z) <= self.exit_z:
+                state = 0
 
             if state != 0:
                 gross = 1.0 + abs(b)

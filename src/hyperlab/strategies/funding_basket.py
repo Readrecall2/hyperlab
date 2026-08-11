@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from hyperlab.models import MarketPanel, StrategyOutput
-from hyperlab.strategies.helpers import columns_by, empty_weights, rebalance_mask
+from hyperlab.strategies.helpers import columns_by, empty_weights, rebalance_mask, scalar_float
 
 
 @dataclass(slots=True)
@@ -28,7 +28,7 @@ class FundingBasketStrategy:
             self.lookback_hours,
             min_periods=self.lookback_hours,
         ).mean()
-        momentum = panel.prices[perps].pct_change(self.momentum_hours)
+        momentum = panel.prices[perps].pct_change(self.momentum_hours, fill_method=None)
         rebalance = rebalance_mask(panel.prices.index, self.rebalance_hours)
         current = pd.Series(0.0, index=panel.prices.columns)
 
@@ -42,7 +42,7 @@ class FundingBasketStrategy:
                     shorts = [
                         column
                         for column in short_candidates
-                        if float(momentum.at[timestamp, column]) <= self.squeeze_guard_return
+                        if scalar_float(momentum.at[timestamp, column]) <= self.squeeze_guard_return
                     ][: self.legs_per_side]
                     if len(shorts) == self.legs_per_side:
                         spread = float(row[shorts].mean() - row[longs].mean())

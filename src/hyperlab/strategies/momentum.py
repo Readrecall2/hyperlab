@@ -25,15 +25,15 @@ class MomentumRegimeStrategy:
     def generate(self, panel: MarketPanel) -> StrategyOutput:
         weights = empty_weights(panel)
         perps = columns_by(panel, exchange="HL", kind="perp")
-        returns = panel.prices[perps].pct_change()
-        momentum = panel.prices[perps].pct_change(self.lookback_hours)
+        returns = panel.prices[perps].pct_change(fill_method=None)
+        momentum = panel.prices[perps].pct_change(self.lookback_hours, fill_method=None)
         volatility = returns.rolling(
             self.volatility_hours,
             min_periods=self.volatility_hours,
         ).std().replace(0.0, np.nan)
         funding_mean = panel.funding[perps].rolling(24, min_periods=24).mean()
         raw_score = momentum / (volatility * np.sqrt(self.lookback_hours))
-        score = raw_score - np.sign(raw_score) * funding_mean * self.funding_penalty
+        score = raw_score - funding_mean * self.funding_penalty
         rebalance = rebalance_mask(panel.prices.index, self.rebalance_hours)
         current = pd.Series(0.0, index=panel.prices.columns)
 

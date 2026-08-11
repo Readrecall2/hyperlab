@@ -5,7 +5,13 @@ from dataclasses import dataclass
 import pandas as pd
 
 from hyperlab.models import MarketPanel, StrategyOutput
-from hyperlab.strategies.helpers import asset_from, columns_by, empty_weights, rebalance_mask
+from hyperlab.strategies.helpers import (
+    asset_from,
+    columns_by,
+    empty_weights,
+    rebalance_mask,
+    scalar_float,
+)
 
 
 @dataclass(slots=True)
@@ -41,13 +47,13 @@ class CashAndCarryStrategy:
                     spot = f"HL:{asset}:spot"
                     if spot not in panel.prices.columns:
                         continue
-                    spot_px = float(panel.prices.at[timestamp, spot])
-                    perp_px = float(panel.prices.at[timestamp, perp])
+                    spot_px = scalar_float(panel.prices.at[timestamp, spot])
+                    perp_px = scalar_float(panel.prices.at[timestamp, perp])
                     if spot_px <= 0 or perp_px <= 0:
                         continue
                     basis_bps = (perp_px / spot_px - 1.0) * 10_000.0
-                    mean_funding = float(funding_mean.at[timestamp, perp])
-                    share = float(positive_share.at[timestamp, perp])
+                    mean_funding = scalar_float(funding_mean.at[timestamp, perp])
+                    share = scalar_float(positive_share.at[timestamp, perp])
                     if pd.isna(mean_funding) or pd.isna(share):
                         continue
                     if mean_funding < self.min_mean_funding_hourly:

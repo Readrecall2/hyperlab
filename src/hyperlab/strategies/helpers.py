@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import SupportsFloat, cast
+
 import pandas as pd
 
 from hyperlab.models import MarketPanel
@@ -28,8 +30,14 @@ def asset_from(column: str) -> str:
     return column.split(":")[1]
 
 
-def rebalance_mask(index: pd.DatetimeIndex, every_hours: int) -> pd.Series:
+def scalar_float(value: object) -> float:
+    """Normalize a pandas scalar at the boundary of numeric strategy logic."""
+    return float(cast(SupportsFloat, value))
+
+
+def rebalance_mask(index: pd.Index, every_hours: int) -> pd.Series:
     if every_hours <= 0:
         raise ValueError("every_hours must be positive")
-    elapsed = (index - index[0]).total_seconds() / 3600.0
-    return pd.Series((elapsed.astype(int) % every_hours) == 0, index=index)
+    datetime_index = pd.DatetimeIndex(index)
+    elapsed = (datetime_index - datetime_index[0]).total_seconds() / 3600.0
+    return pd.Series((elapsed.astype(int) % every_hours) == 0, index=datetime_index)

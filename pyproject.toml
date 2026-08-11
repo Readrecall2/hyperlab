@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Jj" }]
 dependencies = [
   "hyperliquid-python-sdk==0.24.0",
-  "numpy>=2.0,<3",
+  "numpy>=2.0,<2.5",
   "pandas>=2.2,<3",
   "rich>=13.9,<15",
   "typer>=0.15,<1",
@@ -30,6 +30,7 @@ dev = [
   "mypy>=1.14,<2",
   "pytest>=8.3,<10",
   "pytest-cov>=6,<8",
+  "httpx2>=2,<3",
   "ruff>=0.9,<1",
   "pandas-stubs>=2.2,<3",
   "mistune>=3.1,<4",

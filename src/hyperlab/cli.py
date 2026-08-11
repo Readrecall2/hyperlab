@@ -17,6 +17,7 @@ from rich.table import Table
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.report import write_comparison_report
 from hyperlab.config import Settings, load_settings
+from hyperlab.data.cli import data_app
 from hyperlab.data.io import load_panel_csv, save_panel_csv
 from hyperlab.data.synthetic import generate_demo_panel, generate_microstructure_demo
 from hyperlab.models import BacktestResult
@@ -38,6 +39,8 @@ SECRET_ENV_MARKERS = (
     "WALLET_KEY",
     "API_KEY",
 )
+
+app.add_typer(data_app, name="data")
 
 
 def _settings() -> Settings:

@@ -17,6 +17,20 @@ def test_synthetic_panel_is_aligned() -> None:
     assert list(panel.prices.columns) == list(panel.spreads_bps.columns)
 
 
+def test_market_panel_rejects_naive_timestamps() -> None:
+    index = pd.date_range("2026-01-01", periods=2, freq="1h")
+    prices = pd.DataFrame({"HL:BTC:perp": [100.0, 101.0]}, index=index)
+    zero = pd.DataFrame(0.0, index=index, columns=prices.columns)
+    panel = generate_demo_panel(hours=800, seed=1)
+    panel.prices = prices
+    panel.funding = zero.copy()
+    panel.spreads_bps = zero.copy()
+    panel.volume_usd = zero.copy()
+
+    with pytest.raises(ValueError, match="UTC"):
+        panel.validate()
+
+
 def test_risk_limits_do_not_create_new_positions() -> None:
     index = pd.date_range("2026-01-01", periods=2, freq="1h", tz="UTC")
     weights = pd.DataFrame({"A": [0.8, 0.0], "B": [0.0, -0.8], "C": [0.0, 0.0]}, index=index)

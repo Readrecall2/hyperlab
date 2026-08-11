@@ -81,6 +81,11 @@ class MarketPanel:
             raise ValueError("prices cannot be empty")
         if not isinstance(self.prices.index, pd.DatetimeIndex):
             raise TypeError("prices index must be a DatetimeIndex")
+        if self.prices.index.tz is None or str(self.prices.index.tz).upper() not in {
+            "UTC",
+            "UTC+00:00",
+        }:
+            raise ValueError("panel timestamps must use UTC")
         if not self.prices.index.is_monotonic_increasing:
             raise ValueError("panel index must be sorted")
         if self.prices.index.has_duplicates:

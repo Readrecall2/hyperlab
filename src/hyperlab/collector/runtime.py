@@ -27,6 +27,7 @@ from hyperlab.collector.models import (
     CollectorState,
     ParsedMessage,
     ParsedRecord,
+    PublicSubscription,
     WireEnvelope,
 )
 from hyperlab.collector.parser import parse_websocket_message
@@ -127,6 +128,17 @@ class PublicCollector:
         connection_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
         self.config = config
+        subscriptions = config.subscriptions()
+        self._critical_stream_keys = frozenset(
+            subscription.key
+            for subscription in subscriptions
+            if subscription.channel in {"activeAssetCtx", "l2Book"}
+        )
+        self._candle_intervals_by_stream_key = {
+            subscription.key: subscription.interval
+            for subscription in subscriptions
+            if subscription.channel == "candle" and subscription.interval is not None
+        }
         self.rest = rest
         self.socket_factory = socket_factory
         self.sink = sink
@@ -418,7 +430,7 @@ class PublicCollector:
                     critical_stale = tuple(
                         key
                         for key in self.metrics.stale_channels
-                        if key.startswith(("activeAssetCtx:", "l2Book:"))
+                        if key in self._critical_stream_keys
                     )
                     if live and critical_stale:
                         raise TimeoutError(f"stale critical public streams: {list(critical_stale)}")
@@ -532,11 +544,7 @@ class PublicCollector:
 
     @staticmethod
     def _subscription_key(subscription: Mapping[str, Any]) -> str:
-        channel = str(subscription.get("type", ""))
-        coin = str(subscription.get("coin", ""))
-        interval = subscription.get("interval")
-        suffix = f":{interval}" if interval is not None else ""
-        return f"{channel}:{coin}{suffix}"
+        return PublicSubscription.from_payload(subscription).key
 
     def _handle_message(
         self,
@@ -561,19 +569,23 @@ class PublicCollector:
         if parsed.is_pong:
             self.metrics.last_pong_at = observed_at
         if parsed.channel is not None:
-            self.metrics.last_event_by_channel[parsed.channel] = observed_at
             assets = {
                 record.asset for record in parsed.records if record.record_type != RecordType.WIRE_MESSAGE
             }
             for asset in assets:
                 channel = "activeAssetCtx" if parsed.channel == "activeSpotAssetCtx" else parsed.channel
-                metric_keys = [f"{channel}:{asset}"]
                 if channel == "candle":
-                    metric_keys.extend(
-                        f"{channel}:{asset}:{record.row['interval']}"
+                    metric_keys = {
+                        PublicSubscription(
+                            channel=channel,
+                            coin=asset,
+                            interval=str(record.row["interval"]),
+                        ).key
                         for record in parsed.records
                         if record.asset == asset and record.record_type == RecordType.CANDLE
-                    )
+                    }
+                else:
+                    metric_keys = {PublicSubscription(channel=channel, coin=asset).key}
                 for metric_key in metric_keys:
                     self.metrics.last_event_by_channel[metric_key] = observed_at
                 latest: datetime | None = None
@@ -624,11 +636,11 @@ class PublicCollector:
         stale: list[str] = []
         for key, observed_at in self.metrics.last_event_by_channel.items():
             age = (now - observed_at).total_seconds()
-            if key.startswith(("activeAssetCtx:", "l2Book:")):
+            if key in self._critical_stream_keys:
                 if age > self.config.stale_after_seconds:
                     stale.append(key)
-            elif key.startswith("candle:"):
-                interval = key.rsplit(":", 1)[-1]
+            elif key in self._candle_intervals_by_stream_key:
+                interval = self._candle_intervals_by_stream_key[key]
                 if age > _candle_interval_seconds(interval) + self.config.stale_after_seconds:
                     stale.append(key)
         expected_funding = (now - timedelta(seconds=self.config.funding_grace_seconds)).replace(

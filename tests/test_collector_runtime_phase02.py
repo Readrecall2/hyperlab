@@ -12,7 +12,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from hyperlab.api.public import PublicBootstrap
-from hyperlab.collector.models import CollectorConfig, CollectorState, ParsedRecord, WireEnvelope
+from hyperlab.collector.models import (
+    CollectorConfig,
+    CollectorState,
+    ParsedRecord,
+    PublicSubscription,
+    WireEnvelope,
+)
 from hyperlab.collector.parser import parse_websocket_message
 from hyperlab.collector.runtime import PublicCollector
 from hyperlab.collector.storage import BatchingLakeSink, FlushResult
@@ -201,6 +207,29 @@ def _ack_messages(config: CollectorConfig) -> list[SocketItem]:
         )
         for subscription in config.subscriptions()
     ]
+
+
+def _candle_message(asset: str, interval: str, *, close_offset_seconds: int = 0) -> str:
+    close_time_ms = int((BASE_TIME + timedelta(seconds=close_offset_seconds)).timestamp() * 1_000)
+    interval_seconds = {"1m": 60, "5m": 300}[interval]
+    return json.dumps(
+        {
+            "channel": "candle",
+            "data": {
+                "t": close_time_ms - interval_seconds * 1_000 + 1,
+                "T": close_time_ms,
+                "s": asset,
+                "i": interval,
+                "o": "50000",
+                "c": "50001",
+                "h": "50002",
+                "l": "49999",
+                "v": "1.5",
+                "n": 3,
+            },
+        },
+        separators=(",", ":"),
+    )
 
 
 def _config(**overrides: Any) -> CollectorConfig:
@@ -700,3 +729,113 @@ def test_close_does_not_retry_flush_interrupted_while_applying_rest_future(
     collector.close()
     assert flush_calls == 1
     assert rest.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("asset", "interval", "expected_key"),
+    [
+        ("BTC", "1m", "candle:BTC:1m"),
+        ("ETH", "1m", "candle:ETH:1m"),
+        ("BTC", "5m", "candle:BTC:5m"),
+        ("ETH", "5m", "candle:ETH:5m"),
+    ],
+)
+def test_candle_subscription_key_is_canonical(
+    asset: str,
+    interval: str,
+    expected_key: str,
+) -> None:
+    subscription = PublicSubscription(channel="candle", coin=asset, interval=interval)
+
+    assert subscription.key == expected_key
+    assert PublicCollector._subscription_key(subscription.payload()) == expected_key
+
+
+
+def test_subscription_key_rejects_ambiguous_components() -> None:
+    with pytest.raises(ValueError, match="stream key separator"):
+        PublicSubscription(channel="candle", coin="BTC:1m", interval="1m")
+
+    with pytest.raises(ValueError, match="unsupported candle interval"):
+        PublicSubscription(channel="candle", coin="BTC", interval="1m:BTC")
+
+
+def test_multi_asset_multi_interval_candle_staleness_uses_canonical_keys(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    config = _config(assets=("BTC", "ETH"), candle_intervals=("1m", "5m"))
+    collector, _rest, _factory, _sink = _collector(tmp_path, config, timer, [])
+    expected_keys = {
+        "candle:BTC:1m",
+        "candle:BTC:5m",
+        "candle:ETH:1m",
+        "candle:ETH:5m",
+    }
+
+    try:
+        sequence = 0
+        for asset in config.assets:
+            for interval in config.candle_intervals:
+                sequence += 1
+                collector._handle_message(
+                    _candle_message(asset, interval),
+                    timer.now(),
+                    "canonical-candles",
+                    1,
+                    sequence,
+                )
+        collector.metrics.last_funding_by_asset = {asset: timer.now() for asset in config.assets}
+
+        assert set(collector.metrics.last_event_by_channel) == expected_keys
+
+        collector._update_staleness(timer.now() + timedelta(seconds=81))
+
+        assert collector.metrics.stale_channels == ("candle:BTC:1m", "candle:ETH:1m")
+    finally:
+        collector.metrics.last_event_by_channel = {
+            key: value
+            for key, value in collector.metrics.last_event_by_channel.items()
+            if key in expected_keys
+        }
+        collector.close()
+
+
+def test_duration_stop_and_cleanup_are_normal_with_multiple_candle_streams(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    config = _config(
+        assets=("BTC", "ETH"),
+        candle_intervals=("1m", "5m"),
+        heartbeat_interval_seconds=100.0,
+        pong_timeout_seconds=200.0,
+        stale_after_seconds=20.0,
+    )
+    messages = [
+        *_ack_messages(config),
+        *[
+            (_candle_message(asset, interval), 0.0)
+            for asset in config.assets
+            for interval in config.candle_intervals
+        ],
+        (None, 3.0),
+    ]
+    socket = FakeSocket(timer, messages)
+    collector, rest, _factory, sink = _collector(tmp_path, config, timer, [socket])
+
+    try:
+        metrics = collector.run(duration_seconds=2.5)
+
+        assert metrics.state == CollectorState.STOPPED
+        assert metrics.messages_received == config.subscription_count + 4
+        assert metrics.stale_channels == ()
+        assert socket.closed is True
+        collector.close()
+        collector.close()
+        assert sink._closed is True
+        assert rest.close_calls == 1
+    finally:
+        if not collector._closed:
+            collector.metrics.last_event_by_channel = {
+                key: value
+                for key, value in collector.metrics.last_event_by_channel.items()
+                if not key.startswith("candle:") or key.count(":") == 2
+            }
+            collector.close()

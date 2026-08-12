@@ -87,10 +87,23 @@ class PublicSubscription:
             raise ValueError(f"unsupported public channel: {self.channel}")
         if not self.coin or any(key in self.coin.lower() for key in ("0x", "user", "wallet")):
             raise ValueError("coin must be a public market symbol")
+        if ":" in self.coin:
+            raise ValueError("coin must not contain the stream key separator ':'")
         if self.channel == "candle" and not self.interval:
             raise ValueError("candle subscription requires an interval")
         if self.channel != "candle" and self.interval is not None:
             raise ValueError("interval is only valid for candle subscriptions")
+        if self.interval is not None and self.interval not in VALID_CANDLE_INTERVALS:
+            raise ValueError(f"unsupported candle interval: {self.interval}")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> PublicSubscription:
+        interval = payload.get("interval")
+        return cls(
+            channel=str(payload.get("type", "")),
+            coin=str(payload.get("coin", "")),
+            interval=None if interval is None else str(interval),
+        )
 
     @property
     def key(self) -> str:

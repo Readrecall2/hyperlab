@@ -521,8 +521,8 @@ def test_cost_components_reconcile_and_adverse_cost_stress_does_not_improve_reba
         "hedge_return",
     ]
     assert base.returns["net_return"].equals(base.returns[additive].sum(axis=1))
-    base_cost_pnl = float(base.attribution[["spread_pnl", "fee_pnl", "slippage_pnl"]].sum(axis=None))
-    stressed_cost_pnl = float(stressed.attribution[["spread_pnl", "fee_pnl", "slippage_pnl"]].sum(axis=None))
+    base_cost_pnl = float(base.attribution[["spread_pnl", "fee_pnl", "slippage_pnl"]].sum().sum())
+    stressed_cost_pnl = float(stressed.attribution[["spread_pnl", "fee_pnl", "slippage_pnl"]].sum().sum())
     assert stressed_cost_pnl == pytest.approx(2.0 * base_cost_pnl)
 
     maker = StrategyOutput(

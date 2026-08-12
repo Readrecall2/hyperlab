@@ -148,3 +148,54 @@ explicite et le test de non-régression exige des poids finaux exactement nuls.
 
 Cette démo valide le câblage Cash & Carry de bout en bout, pas la stratégie sur le
 marché réel. Le verdict économique reste `BLOCKED_INSUFFICIENT_REAL_DATA`.
+
+---
+
+# Validation — Phase 06, basket de funding Hyperliquid
+
+Date d'audit : 12 août 2026
+
+Checkpoint antérieur aux travaux : `3fd7dae`
+
+Branche : `phase-06-funding-basket`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (62 fichiers) et les
+491 tests `pytest` passent. La démo synthétique 1 200 h/seed 42 ouvre trois
+positions, produit 207 ordres simulés et exerce funding comme coûts. Le manifeste
+de livraison contient 186 entrées et se revérifie sans mismatch après
+normalisation canonique CRLF vers LF.
+
+## Verdict Phase 06
+
+Le modèle causal et le validateur logiciel sont implémentés. Aucune promotion
+économique n'est possible avec le lake local : il ne contient pas 90 jours de
+funding Hyperliquid horaire, une cross-section d'au moins six perps avec profondeur
+point-in-time et un univers lifecycle incluant des marchés délistés. Le statut réel
+reste `BLOCKED_INSUFFICIENT_REAL_DATA`; aucun rendement réel n'est fabriqué.
+
+La baseline classe les fundings persistants et répartit chaque côté en inverse-vol.
+L'optimiseur projette le problème risque/carry/turnover dans le noyau des contraintes
+de neutralité dollar, bêta BTC et bêta ETH. La covariance échantillonnale est
+shrinkée vers sa diagonale. Une mise à l'échelle commune respecte levier brut et
+poids maximum sans casser les neutralités au moment du rebalance.
+
+Les filtres d'âge, volume, profondeur, finalité, disponibilité et tradabilité sont
+causaux. Un momentum de squeeze interdit un short et force un rebalance de risque ;
+le système ne consulte pas le futur pour anticiper une délisting.
+
+La matrice Phase 06 enregistre ranking et optimisation, attribue séparément funding
+et performance relative, puis exécute coûts ×2, fills maker dégradés, latence,
+corrélation cassée, squeeze simultané des shorts et suppression des meilleurs
+trades. Le leave-one-out recalcule l'optimisation après exclusion de chaque actif.
+L'audit bloque explicitement un panel sans marché ancien délisté, protection contre
+le biais de survivants.
+
+Les tests dédiés couvrent causalité des features, filtres de données, covariance
+symétrique positive semi-définie, trois neutralités, poids maximum, effet de la
+pénalité de turnover, filtre de squeeze, transformations réelles des stress,
+attribution du PnL, leave-one-out et rapport JSON/HTML reproductible.
+
+Les neutralités bêta sont exactes aux décisions de rebalance et peuvent dériver
+entre deux décisions quand les estimations changent. Les chocs de corrélation et de
+squeeze sont contrefactuels et visibles comme tels ; ils mesurent une sensibilité,
+pas une probabilité de crise. La Phase 06 ne crée aucune route d'ordre réel.

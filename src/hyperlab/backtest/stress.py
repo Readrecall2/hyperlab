@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from hyperlab.backtest.attribution import aggregate_pnl
@@ -23,6 +24,8 @@ class StressScenario:
     added_latency_bars: int = 0
     remove_best_trade_fraction: float = 0.0
     funding_multiplier: float = 1.0
+    correlation_break_strength: float = 0.0
+    simultaneous_short_squeeze_return: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -35,6 +38,16 @@ class StressScenario:
                 raise ValueError(f"{name} must be finite and positive")
         if not math.isfinite(self.funding_multiplier):
             raise ValueError("funding_multiplier must be finite")
+        if (
+            not math.isfinite(self.correlation_break_strength)
+            or self.correlation_break_strength < 0.0
+        ):
+            raise ValueError("correlation_break_strength must be finite and non-negative")
+        if (
+            not math.isfinite(self.simultaneous_short_squeeze_return)
+            or self.simultaneous_short_squeeze_return < 0.0
+        ):
+            raise ValueError("simultaneous_short_squeeze_return must be finite and non-negative")
         if (
             not isinstance(self.added_latency_bars, int)
             or isinstance(self.added_latency_bars, bool)
@@ -57,6 +70,99 @@ def execution_for_scenario(
         cost_multiplier=base.cost_multiplier * scenario.cost_multiplier,
         maker_fill_multiplier=base.maker_fill_multiplier * scenario.maker_fill_multiplier,
         base_latency_bars=base.base_latency_bars + scenario.added_latency_bars,
+    )
+
+
+def _break_correlations(
+    panel: MarketPanel,
+    *,
+    strength: float,
+) -> MarketPanel:
+    if strength == 0.0:
+        return panel
+    prices = panel.prices.copy(deep=True)
+    returns = prices.pct_change(fill_method=None)
+    reference_columns = [
+        column for column in ("HL:BTC:perp", "HL:ETH:perp") if column in returns.columns
+    ]
+    if not reference_columns:
+        raise ValueError("correlation break requires a BTC or ETH Hyperliquid perp reference")
+    common = returns[reference_columns].mean(axis=1)
+    for position, column in enumerate(prices.columns):
+        if column in reference_columns or not str(column).endswith(":perp"):
+            continue
+        direction = -1.0 if position % 2 else 1.0
+        stressed_returns = returns[column] + direction * strength * common
+        valid = prices[column].notna()
+        if not bool(valid.any()):
+            continue
+        first = prices.index[valid][0]
+        reconstructed = (1.0 + stressed_returns.loc[first:].fillna(0.0)).cumprod()
+        reconstructed *= float(cast(Any, prices.at[first, column]))
+        prices.loc[first:, column] = reconstructed.where(valid.loc[first:])
+    return replace(
+        panel,
+        prices=prices,
+        metadata={
+            **panel.metadata,
+            "correlation_break_strength": strength,
+            "stress_parent_calibration_status": panel.metadata.get("calibration_status"),
+            "calibration_status": "SYNTHETIC",
+            "stress_data_warning": "deterministic counterfactual price path",
+        },
+    )
+
+
+def _squeeze_simultaneous_shorts(
+    panel: MarketPanel,
+    output: StrategyOutput,
+    *,
+    shock_return: float,
+) -> MarketPanel:
+    if shock_return == 0.0:
+        return panel
+    negative_gross = output.weights.clip(upper=0.0).abs().sum(axis=1)
+    if not bool(negative_gross.gt(0.0).any()):
+        return replace(
+            panel,
+            metadata={
+                **panel.metadata,
+                "simultaneous_short_squeeze_return": shock_return,
+                "squeezed_instruments": [],
+                "stress_parent_calibration_status": panel.metadata.get("calibration_status"),
+                "calibration_status": "SYNTHETIC",
+                "stress_data_warning": "deterministic counterfactual price path",
+            },
+        )
+    decision_time = cast(pd.Timestamp, negative_gross.idxmax())
+    raw_position = panel.prices.index.get_loc(decision_time)
+    if isinstance(raw_position, (slice, np.ndarray)):
+        raise ValueError("squeeze stress requires a unique timestamp index")
+    decision_position = int(raw_position)
+    if decision_position >= len(panel.prices.index) - 1:
+        decision_position -= 1
+        decision_time = panel.prices.index[decision_position]
+    shock_time = panel.prices.index[decision_position + 1]
+    squeezed = [
+        str(column)
+        for column in output.weights.columns
+        if float(cast(Any, output.weights.at[decision_time, column])) < 0.0
+    ]
+    prices = panel.prices.copy(deep=True)
+    if squeezed:
+        prices.loc[shock_time:, squeezed] *= 1.0 + shock_return
+    return replace(
+        panel,
+        prices=prices,
+        metadata={
+            **panel.metadata,
+            "simultaneous_short_squeeze_return": shock_return,
+            "squeezed_instruments": squeezed,
+            "squeeze_timestamp": shock_time.isoformat(),
+            "stress_parent_calibration_status": panel.metadata.get("calibration_status"),
+            "calibration_status": "SYNTHETIC",
+            "stress_data_warning": "deterministic counterfactual price path",
+        },
     )
 
 
@@ -312,6 +418,15 @@ def run_stress_matrix(
                     "funding_stress_multiplier": scenario.funding_multiplier,
                 },
             )
+        stressed_panel = _break_correlations(
+            stressed_panel,
+            strength=scenario.correlation_break_strength,
+        )
+        stressed_panel = _squeeze_simultaneous_shorts(
+            stressed_panel,
+            output,
+            shock_return=scenario.simultaneous_short_squeeze_return,
+        )
         engine = PanelBacktester(
             costs=costs,
             risk_limits=risk_limits,

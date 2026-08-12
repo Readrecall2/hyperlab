@@ -39,7 +39,12 @@ conservatrice et refuse la promotion si le pire stress ne bat pas le passif. Voi
 
 **Risques :** actifs différents, bêta BTC résiduel, squeeze des shorts, rotation coûteuse.
 
-**Améliorations à coder :** neutralité dollar et bêta, inverse-vol, covariance shrinkée, pénalité de turnover.
+**Validation Phase 06 :** score de funding persistant, âge et liquidité minimum,
+ranking inverse-vol comparé à une optimisation dollar et bêta BTC/ETH neutre,
+covariance shrinkée, limite par actif, pénalité de turnover et filtre de squeeze.
+Le rapport sépare funding et performance relative, choque corrélations et shorts,
+exclut chaque actif et exige un univers lifecycle contenant les marchés délistés.
+Voir [`FUNDING_BASKET_PHASE06.md`](FUNDING_BASKET_PHASE06.md).
 
 ## Niveau 2 — arbitrage de funding inter-exchanges
 

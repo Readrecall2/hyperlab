@@ -104,9 +104,16 @@ coût d'opportunité et capacité. Voir
 
 ### 3.2 Basket de funding
 
-Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La version sérieuse ajoutera neutralité bêta, inverse-vol, covariance et pénalité de turnover.
+Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La Phase 06 compare ce ranking inverse-vol à une optimisation sous neutralité dollar et bêta BTC/ETH, covariance shrinkée, limites par actif et pénalité de turnover. Un filtre de momentum retire les shorts exposés à un squeeze.
 
 Ce n'est pas un arbitrage pur : deux actifs différents peuvent diverger violemment.
+
+Le validateur sépare funding et performance relative, casse les corrélations,
+applique un squeeze simultané, exclut chaque actif tour à tour et refuse un univers
+qui omet les marchés délistés. Voir
+[`FUNDING_BASKET_PHASE06.md`](FUNDING_BASKET_PHASE06.md). Le lake local ne fournit
+pas encore les 90 jours d'univers Hyperliquid point-in-time calibré exigés : statut
+`BLOCKED_INSUFFICIENT_REAL_DATA`.
 
 ### 3.3 Arbitrage de funding inter-exchanges
 
@@ -762,6 +769,11 @@ y compris l'inversion du funding. Elle ne crée jamais d'autorisation de trading
 ### Basket funding
 
 Objectif : optimiser le portefeuille sans bêta caché.
+
+La Phase 06 impose la neutralité aux instants de rebalance et préenregistre les
+stress de corrélation cassée et squeeze simultané. Sa gate exige aussi au moins un
+marché délisté dans l'univers historique afin de ne pas valider uniquement les
+survivants actuels.
 
 ### Funding inter-exchanges
 

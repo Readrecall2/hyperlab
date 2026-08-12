@@ -179,8 +179,14 @@ coût d'opportunité et capacité. Voir
 24 h de données réelles locales au 12 août 2026, son statut reste
 <code>BLOCKED_INSUFFICIENT_REAL_DATA</code> ; aucun rendement réel n'est revendiqué.</p>
 <h3 id="3-2-basket-de-funding">3.2 Basket de funding<a class="heading-link" href="#3-2-basket-de-funding" aria-label="Lien vers cette section">#</a></h3>
-<p>Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La version sérieuse ajoutera neutralité bêta, inverse-vol, covariance et pénalité de turnover.</p>
+<p>Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La Phase 06 compare ce ranking inverse-vol à une optimisation sous neutralité dollar et bêta BTC/ETH, covariance shrinkée, limites par actif et pénalité de turnover. Un filtre de momentum retire les shorts exposés à un squeeze.</p>
 <p>Ce n'est pas un arbitrage pur : deux actifs différents peuvent diverger violemment.</p>
+<p>Le validateur sépare funding et performance relative, casse les corrélations,
+applique un squeeze simultané, exclut chaque actif tour à tour et refuse un univers
+qui omet les marchés délistés. Voir
+<a href="FUNDING_BASKET_PHASE06.md"><code>FUNDING_BASKET_PHASE06.md</code></a>. Le lake local ne fournit
+pas encore les 90 jours d'univers Hyperliquid point-in-time calibré exigés : statut
+<code>BLOCKED_INSUFFICIENT_REAL_DATA</code>.</p>
 <h3 id="3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges<a class="heading-link" href="#3-3-arbitrage-de-funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
 <p>Même actif, deux plateformes : long sur la venue au funding inférieur et short sur celle au funding supérieur.</p>
 <p>Le risque principal vient de la marge séparée : le portefeuille global peut être neutre, mais une jambe locale peut être liquidée.</p>
@@ -628,6 +634,10 @@ y compris l'inversion du funding. Elle ne crée jamais d'autorisation de trading
 <h2 id="38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif<a class="heading-link" href="#38-vague-2-market-neutral-relatif" aria-label="Lien vers cette section">#</a></h2>
 <h3 id="basket-funding">Basket funding<a class="heading-link" href="#basket-funding" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : optimiser le portefeuille sans bêta caché.</p>
+<p>La Phase 06 impose la neutralité aux instants de rebalance et préenregistre les
+stress de corrélation cassée et squeeze simultané. Sa gate exige aussi au moins un
+marché délisté dans l'univers historique afin de ne pas valider uniquement les
+survivants actuels.</p>
 <h3 id="funding-inter-exchanges">Funding inter-exchanges<a class="heading-link" href="#funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : même actif, neutralité de prix, gestion de marge séparée.</p>
 <h2 id="39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque<a class="heading-link" href="#39-vague-3-alpha-moyen-risque" aria-label="Lien vers cette section">#</a></h2>

@@ -14,7 +14,7 @@ Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher et backt
 6. lead-lag multi-exchange, baseline bar-level ;
 7. market making avec inventaire, simulateur microstructurel simplifié.
 
-Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité.
+Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité. Le basket Phase 06 compare ranking inverse-vol et optimisation dollar/bêta BTC/ETH neutre, avec covariance shrinkée, pénalité de turnover et stress dédiés ; ses scénarios synthétiques ne valident pas davantage une rentabilité.
 
 ## Windows 11
 
@@ -94,3 +94,8 @@ d'inversion du funding et sa gate face au benchmark passif sont documentés dans
 [`docs/CASH_AND_CARRY_PHASE05.md`](docs/CASH_AND_CARRY_PHASE05.md). Le lake local
 reste insuffisant pour une validation économique : le statut actuel est
 `BLOCKED_INSUFFICIENT_REAL_DATA`.
+
+Le basket de funding Phase 06, son filtre de squeeze, sa neutralisation, ses stress
+de corrélation/squeeze et sa validation leave-one-out avec marchés délistés sont
+décrits dans [`docs/FUNDING_BASKET_PHASE06.md`](docs/FUNDING_BASKET_PHASE06.md).
+La gate reste fermée sans 90 jours d'univers Hyperliquid point-in-time calibré.

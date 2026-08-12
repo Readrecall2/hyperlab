@@ -40,9 +40,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "funding_basket": {
         "label": "Basket de funding",
         "tier": "Niveau 2 — équilibré",
-        "status": "Backtester de base inclus",
-        "data": "Perps HL, funding, volatilité, bêta",
-        "summary": "Long des fundings faibles, short des fundings élevés, avec neutralisation.",
+        "status": "Validateur Phase 06 inclus — gate fermée sans univers historique calibré",
+        "data": "Perps HL, funding, profondeur, lifecycle, volatilité et bêta BTC/ETH",
+        "summary": "Ranking inverse-vol comparé à une optimisation dollar/bêta neutre et stressée.",
     },
     "cross_exchange_funding": {
         "label": "Arbitrage de funding inter-venues",

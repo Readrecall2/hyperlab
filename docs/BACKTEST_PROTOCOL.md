@@ -233,6 +233,9 @@ Les rapports réconcilient le PnL par :
 La suppression regroupe les jambes d'un même hedge en un trade, tranche les ties de
 façon déterministe, ne refit aucun paramètre et enregistre les identifiants retirés.
 Le cash-and-carry ajoute un scénario propre d'inversion du funding (`× -1`). Les
+stress Phase 06 du basket ajoutent une rupture déterministe des corrélations et un
+squeeze simultané de tous les perps détenus short, sans recalculer les poids après
+observation du choc. Ils sont préenregistrés avant révélation du test final. Les
 scénarios de volatilité et panne de venue restent à ajouter au niveau de chaque
 stratégie lorsqu'un dataset réel suffisant existe.
 

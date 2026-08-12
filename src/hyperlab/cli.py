@@ -24,14 +24,21 @@ from hyperlab.backtest.carry import (
     write_carry_report,
 )
 from hyperlab.backtest.engine import PanelBacktester
+from hyperlab.backtest.funding_basket import (
+    FundingBasketValidation,
+    audit_funding_basket_panel,
+    funding_basket_stress_scenarios,
+    write_funding_basket_report,
+)
 from hyperlab.backtest.report import write_comparison_report
 from hyperlab.backtest.workflow import ResearchWorkflowSpec, run_research_workflow
 from hyperlab.config import Settings, load_settings
 from hyperlab.data.cli import data_app
 from hyperlab.data.io import load_panel_csv, save_panel_csv
 from hyperlab.data.synthetic import generate_demo_panel, generate_microstructure_demo
-from hyperlab.models import BacktestResult
+from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
+from hyperlab.strategies.funding_basket import FundingBasketStrategy
 from hyperlab.strategies.market_making import InventoryAwareMarketMaker
 from hyperlab.strategies.registry import STRATEGY_CATALOG, STRATEGY_FACTORIES, create_strategy
 
@@ -294,7 +301,12 @@ def backtest(
         )
     parameters = asdict(selected) if is_dataclass(selected) else {"factory": strategy}
     research = settings.research
-    stress_scenarios = carry_stress_scenarios() if strategy == "cash_and_carry" else None
+    if strategy == "cash_and_carry":
+        stress_scenarios = carry_stress_scenarios()
+    elif strategy == "funding_basket":
+        stress_scenarios = funding_basket_stress_scenarios()
+    else:
+        stress_scenarios = None
 
     def phase05_reporter(
         base_result: BacktestResult,
@@ -311,6 +323,91 @@ def backtest(
             output_dir=directory,
             perp_margin_fraction=float(parameters.get("perp_margin_fraction", 1.0)),
         )
+
+    def phase06_reporter(
+        base_result: BacktestResult,
+        stress_results: dict[str, BacktestResult],
+        directory: Path,
+    ) -> Path:
+        if not isinstance(selected, FundingBasketStrategy):
+            raise TypeError("Phase-06 reporter requires FundingBasketStrategy")
+        final_index = base_result.weights.index
+        final_panel = MarketPanel(
+            prices=panel.prices.loc[final_index].copy(),
+            funding=panel.funding.loc[final_index].copy(),
+            spreads_bps=panel.spreads_bps.loc[final_index].copy(),
+            volume_usd=panel.volume_usd.loc[final_index].copy(),
+            metadata={**panel.metadata, "evaluation_split": "final_test"},
+            depth_usd=panel.depth_usd.loc[final_index].copy() if panel.depth_usd is not None else None,
+            open_interest_usd=(
+                panel.open_interest_usd.loc[final_index].copy()
+                if panel.open_interest_usd is not None
+                else None
+            ),
+            available_at=(
+                panel.available_at.loc[final_index].copy()
+                if panel.available_at is not None
+                else None
+            ),
+            finality=panel.finality.loc[final_index].copy() if panel.finality is not None else None,
+            tradable=panel.tradable.loc[final_index].copy() if panel.tradable is not None else None,
+            regimes=panel.regimes.loc[final_index].copy() if panel.regimes is not None else None,
+        )
+        sensitivity_engine = PanelBacktester(
+            costs=settings.cost_schedule,
+            risk_limits=settings.risk_profiles[_profile_for(strategy)],
+            execution=replace(
+                settings.execution,
+                cost_multiplier=settings.execution.cost_multiplier * stress_multiplier,
+                require_depth=True,
+                require_point_in_time=True,
+            ),
+            benchmark=research.benchmark,
+        )
+
+        def final_output(candidate: FundingBasketStrategy) -> StrategyOutput:
+            generated = candidate.generate(panel)
+            candidate_weights = generated.weights.loc[final_index].copy()
+            candidate_weights.iloc[-min(3, len(candidate_weights)) :] = 0.0
+            return StrategyOutput(
+                name=generated.name,
+                risk_tier=generated.risk_tier,
+                weights=candidate_weights,
+                diagnostics=generated.diagnostics,
+            )
+
+        ranking = sensitivity_engine.run(final_panel, final_output(replace(selected, mode="ranking")))
+        audit = audit_funding_basket_panel(panel)
+        leave_one_out: dict[str, BacktestResult] = {}
+        for asset in audit.assets:
+            excluded = tuple(sorted({*selected.excluded_assets, asset}))
+            candidate = replace(selected, mode="optimized", excluded_assets=excluded)
+            leave_one_out[asset] = sensitivity_engine.run(final_panel, final_output(candidate))
+        if not audit.checks.get("minimum_history", False):
+            status = "BLOCKED_INSUFFICIENT_REAL_DATA"
+        elif not audit.passed:
+            status = "BLOCKED_UNCALIBRATED_OR_SURVIVORSHIP_BIAS"
+        elif any(
+            result.diagnostics.get("audit_status") != "CALIBRATED"
+            for result in (base_result, ranking)
+        ):
+            status = "BLOCKED_UNCALIBRATED_EXECUTION_MODEL"
+        else:
+            status = "VALIDATED_RESEARCH_ONLY"
+        validation = FundingBasketValidation(
+            audit=audit,
+            comparison={"ranking": ranking, "optimized": base_result},
+            stresses={"base": base_result, **stress_results},
+            leave_one_out=leave_one_out,
+            status=status,
+        )
+        return write_funding_basket_report(validation, output_dir=directory)
+
+    final_reporter = None
+    if strategy == "cash_and_carry":
+        final_reporter = phase05_reporter
+    elif strategy == "funding_basket":
+        final_reporter = phase06_reporter
 
     artifacts = run_research_workflow(
         panel,
@@ -337,12 +434,12 @@ def backtest(
             bootstrap_confidence_level=research.bootstrap_confidence_level,
             bootstrap_seed=research.bootstrap_seed,
             reveal_final=reveal_final,
-            final_liquidation_bars=2 if strategy == "cash_and_carry" else 0,
+            final_liquidation_bars=2 if strategy in {"cash_and_carry", "funding_basket"} else 0,
         ),
         output_dir=output,
         registry_path=research.registry_path,
         stress_scenarios=stress_scenarios,
-        final_reporter=phase05_reporter if strategy == "cash_and_carry" else None,
+        final_reporter=final_reporter,
     )
     console.print(f"Plan verrouillé : {artifacts.split_plan_path.resolve()}")
     console.print(f"Registre vérifiable : {artifacts.registry_path.resolve()}")
@@ -355,7 +452,7 @@ def backtest(
     else:
         console.print(f"Rapport final et stress : {artifacts.report_path.resolve()}")
     if artifacts.supplemental_report_path is not None:
-        console.print(f"Rapport et gate Phase 05 : {artifacts.supplemental_report_path.resolve()}")
+        console.print(f"Rapport dédié de stratégie : {artifacts.supplemental_report_path.resolve()}")
 
 
 @app.command("carry-audit")
@@ -384,6 +481,42 @@ def carry_audit(
     temporary.replace(output)
     console.print_json(json.dumps(payload, ensure_ascii=False))
     console.print(f"Rapport Gate B : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
+
+
+@app.command("funding-basket-audit")
+def funding_basket_audit(
+    data: Annotated[
+        Path,
+        typer.Option(help="Export panel point-in-time avec perps, profondeur et lifecycle"),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de préparation Phase 06"),
+    ] = Path("reports/funding-basket-readiness.json"),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 90 * 24,
+    minimum_assets: Annotated[int, typer.Option(min=4)] = 6,
+) -> None:
+    """Audite l'univers Phase 06, marchés délistés inclus, sans simuler d'ordre."""
+
+    panel = load_panel_csv(data)
+    audit = audit_funding_basket_panel(
+        panel,
+        minimum_history_hours=minimum_history_hours,
+        minimum_assets=minimum_assets,
+    )
+    payload = asdict(audit)
+    payload["passed"] = audit.passed
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Phase 06 : {output.resolve()}")
     if not audit.passed:
         raise typer.Exit(2)
 

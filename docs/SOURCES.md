@@ -29,6 +29,14 @@ Dernière vérification documentaire : 12 août 2026.
 - Template officiel : https://github.com/getumbrel/umbrel-community-app-store
 - Paquets App Store : https://github.com/getumbrel/umbrel-apps
 
+## Binance USDⓈ-M Futures
+
+- Catalogue REST : https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api
+- Market streams : https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams
+- Introduction et changements API : https://developers.binance.com/en/docs/introduction
+- Conditions d'utilisation : https://www.binance.com/en/terms
+- Archives de données publiques : https://data.binance.vision/
+
 ## OpenAI Codex
 
 - Documentation Codex : https://developers.openai.com/codex/

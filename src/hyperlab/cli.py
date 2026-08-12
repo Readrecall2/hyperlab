@@ -333,6 +333,51 @@ def collect(
     console.print_json(json.dumps(collector.metrics.as_dict(datetime.now(tz=UTC))))
 
 
+@app.command("collect-reference")
+def collect_reference(
+    assets: Annotated[str, typer.Option(help="Actifs de base séparés par des virgules")] = "BTC,ETH",
+    candle_intervals: Annotated[
+        str, typer.Option(help="Intervalles candle séparés par des virgules")
+    ] = "1m",
+    duration_seconds: Annotated[float, typer.Option(min=0.0, help="0 = boucle continue")] = 0.0,
+    max_messages: Annotated[int, typer.Option(min=0, help="0 = aucune limite")] = 0,
+    batch_size: Annotated[int, typer.Option(min=1, max=10_000)] = 500,
+    history_lookback_hours: Annotated[int, typer.Option(min=1, max=168)] = 24,
+) -> None:
+    """Collecte Binance USD-M publique et sans clé; aucune API de trading."""
+    from hyperlab.venues.runtime import BinanceReferenceCollector, ReferenceCollectorConfig
+
+    settings = _settings()
+    if settings.app.mode not in {"readonly", "research"}:
+        raise typer.BadParameter("Le collecteur de référence refuse tout mode non readonly/research")
+    try:
+        config = ReferenceCollectorConfig(
+            assets=tuple(value.upper() for value in _csv_values(assets, label="assets")),
+            candle_intervals=_csv_values(candle_intervals, label="candle-intervals"),
+            batch_size=batch_size,
+            history_lookback_hours=history_lookback_hours,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    collector = BinanceReferenceCollector.create_default(
+        config,
+        data_dir=settings.app.data_dir,
+        request_timeout_seconds=settings.app.request_timeout_seconds,
+    )
+    try:
+        with _cooperative_signal_handlers(collector.stop):
+            collector.run(
+                duration_seconds=None if duration_seconds == 0 else duration_seconds,
+                max_messages=None if max_messages == 0 else max_messages,
+            )
+    except KeyboardInterrupt:
+        collector.stop()
+        console.print("Arrêt demandé; fermeture du collecteur de référence.")
+    finally:
+        _close_preserving_active_exception(collector.close)
+    console.print_json(json.dumps(collector.metrics))
+
+
 @app.command()
 def replay(
     fixture_dir: Annotated[
@@ -385,6 +430,17 @@ def status() -> None:
             payload["runtime"] = json.loads(runtime_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             payload["runtime"] = {"ok": False, "error": "runtime_status.json illisible"}
+    reference_runtime_path = settings.app.data_dir / "runtime_status_binance_usdm.json"
+    if reference_runtime_path.exists():
+        try:
+            payload["reference_runtime"] = json.loads(
+                reference_runtime_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            payload["reference_runtime"] = {
+                "ok": False,
+                "error": "runtime_status_binance_usdm.json illisible",
+            }
     console.print_json(json.dumps(payload))
 
 

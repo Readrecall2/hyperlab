@@ -47,6 +47,7 @@ def test_registry_contains_every_phase_02_record_type() -> None:
         "fee",
         "connection_event",
         "instrument_lifecycle",
+        "clock_sync",
     }
 
 

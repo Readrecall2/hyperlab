@@ -59,7 +59,7 @@ class WebsocketClientSocket:
         self._connection.settimeout(1.0)
         self._reader = threading.Thread(
             target=self._read_forever,
-            name="hyperliquid-public-ws-reader",
+            name="public-market-data-ws-reader",
             daemon=True,
         )
         self._reader.start()
@@ -156,6 +156,41 @@ class WebsocketClientFactory:
             raise ValueError(f"unsupported network: {network}")
         connection = websocket.create_connection(
             url,
+            timeout=timeout_seconds,
+            enable_multithread=True,
+        )
+        return WebsocketClientSocket(
+            connection,
+            queue_capacity=self.queue_capacity,
+            clock=self._clock,
+        )
+
+
+class UrlWebsocketClientFactory:
+    """Public transport for a connector-owned market-data URL."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        queue_capacity: int = 10_000,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> None:
+        if not url.startswith("wss://"):
+            raise ValueError("public websocket URL must use wss")
+        if queue_capacity <= 0:
+            raise ValueError("queue_capacity must be positive")
+        self.url = url
+        self.queue_capacity = queue_capacity
+        self._clock = clock
+
+    def connect(self, network: str, timeout_seconds: float) -> WebsocketClientSocket:
+        import websocket
+
+        if network != "public":
+            raise ValueError("URL websocket factory only supports the public network label")
+        connection = websocket.create_connection(
+            self.url,
             timeout=timeout_seconds,
             enable_multithread=True,
         )

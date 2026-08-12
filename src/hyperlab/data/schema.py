@@ -27,6 +27,7 @@ class RecordType(StrEnum):
     FEE = "fee"
     CONNECTION_EVENT = "connection_event"
     INSTRUMENT_LIFECYCLE = "instrument_lifecycle"
+    CLOCK_SYNC = "clock_sync"
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +330,20 @@ _V1_SPECS = (
         ],
         primary_key=("venue", "asset", "source_symbol", "valid_from"),
         order_key=("event_time", "received_time", "source_sequence", "valid_from"),
+    ),
+    _make_spec(
+        RecordType.CLOCK_SYNC,
+        [
+            _field("request_sent_time", UTC_TIMESTAMP),
+            _field("response_received_time", UTC_TIMESTAMP),
+            _field("server_time", UTC_TIMESTAMP),
+            _field("round_trip_latency_ms", MARKET_DECIMAL),
+            _field("estimated_clock_drift_ms", MARKET_DECIMAL),
+            _field("drift_uncertainty_ms", MARKET_DECIMAL),
+            _field("observation_id", pa.string()),
+        ],
+        primary_key=("venue", "observation_id"),
+        order_key=("event_time", "received_time", "observation_id"),
     ),
 )
 

@@ -316,6 +316,25 @@ les lignes Parquet du collecteur Phase 02.
 
 La bannière doit dire `READ-ONLY — ORDRES IMPOSSIBLES`.
 
+## 13 bis. Venue de référence publique
+
+La Phase 03 ajoute Binance USDⓈ-M Futures comme référence externe, uniquement
+pour ses données publiques et sans clé :
+
+```powershell
+.\.venv\Scripts\python.exe -m hyperlab collect-reference `
+  --assets BTC,ETH `
+  --candle-intervals 1m `
+  --duration-seconds 600
+```
+
+Le connecteur collecte BBO, trades agrégés, funding et candles, conserve les
+temps source et réception, mesure le drift d'horloge par midpoint du RTT, et
+écrit sous `venue=binance_usdm`. Il refuse les contrats dont l'identité linéaire
+`BASEUSDT` n'est pas explicite. Le mark Binance n'est jamais assimilé à l'oracle
+Hyperliquid. Voir [`EXTERNAL_VENUES.md`](EXTERNAL_VENUES.md) pour les limites,
+conditions d'utilisation et règles du replay multi-venue.
+
 ---
 
 # PARTIE B — GIT ET CODEX

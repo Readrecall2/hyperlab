@@ -33,6 +33,19 @@ Ouvrez ensuite `reports\demo\comparison.html`.
 .\.venv\Scripts\python.exe -m hyperlab collect --assets BTC,ETH --duration-seconds 600
 ```
 
+## Venue de référence publique
+
+```powershell
+.\.venv\Scripts\python.exe -m hyperlab collect-reference `
+  --assets BTC,ETH `
+  --duration-seconds 600
+```
+
+Cette commande collecte uniquement les données publiques Binance USDⓈ-M
+(BBO, trades agrégés, funding et candles), sans clé et sans route de trading.
+Les différences de contrat, mark et index restent explicites. Voir
+[`docs/EXTERNAL_VENUES.md`](docs/EXTERNAL_VENUES.md).
+
 ## Docker local
 
 ```powershell

@@ -935,6 +935,23 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
         ):
             if end is not None and start > end:
                 raise PartitionValidationError("valid_from must not be after valid_to")
+    elif record_type == RecordType.CLOCK_SYNC:
+        _require_non_negative(
+            table,
+            "round_trip_latency_ms",
+            "drift_uncertainty_ms",
+        )
+        for sent, received, uncertainty, round_trip in zip(
+            table.column("request_sent_time").to_pylist(),
+            table.column("response_received_time").to_pylist(),
+            table.column("drift_uncertainty_ms").to_pylist(),
+            table.column("round_trip_latency_ms").to_pylist(),
+            strict=True,
+        ):
+            if sent > received:
+                raise PartitionValidationError("clock sync request must be sent before its response")
+            if uncertainty * 2 != round_trip:
+                raise PartitionValidationError("clock drift uncertainty must equal half the round trip")
 
 
 def _analyze_table(

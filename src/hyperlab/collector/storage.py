@@ -33,7 +33,7 @@ class FlushResult:
     duplicate_count: int
 
 
-_GroupKey = tuple[RecordType, str, str, str]
+_GroupKey = tuple[str, RecordType, str, str, str]
 _ObservationSignature = tuple[str, str, str]
 _ObservationHeadKey = tuple[str, str]
 _StablePrimaryKey = tuple[str, str]
@@ -491,9 +491,9 @@ class BatchingLakeSink:
         written = 0
         for group_key in sorted(
             self._groups,
-            key=lambda item: (item[2], item[1], item[0].value, item[3]),
+            key=lambda item: (item[3], item[2], item[0], item[1].value, item[4]),
         ):
-            record_type, asset, day, _stream = group_key
+            venue, record_type, asset, day, _stream = group_key
             spec = latest_schema_for(record_type)
             rows = list(self._groups[group_key].values())
             rows.sort(key=lambda row: self._order_key(spec, row))
@@ -501,7 +501,7 @@ class BatchingLakeSink:
             manifest = write_partition(
                 self.root,
                 PartitionKey(
-                    venue="hyperliquid",
+                    venue=venue,
                     date=day,
                     asset=asset,
                     record_type=record_type,
@@ -555,6 +555,9 @@ class BatchingLakeSink:
         asset: str,
         row: dict[str, object],
     ) -> _GroupKey:
+        venue = row.get("venue")
+        if not isinstance(venue, str) or not venue:
+            raise ValueError("record venue must be a non-empty string")
         event_time = row.get("event_time")
         if not isinstance(event_time, datetime):
             raise ValueError("record event_time must be a datetime")
@@ -565,4 +568,4 @@ class BatchingLakeSink:
             stream = f"kind={row.get('rate_kind')};seconds={row.get('funding_interval_seconds')}"
         else:
             stream = "default"
-        return record_type, asset, day, stream
+        return venue, record_type, asset, day, stream

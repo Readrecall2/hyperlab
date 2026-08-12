@@ -30,7 +30,7 @@ Ouvrez ensuite `reports\demo\comparison.html`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab snapshot --save
-.\.venv\Scripts\python.exe -m hyperlab collect --interval-seconds 60 --samples 10
+.\.venv\Scripts\python.exe -m hyperlab collect --assets BTC,ETH --duration-seconds 600
 ```
 
 ## Docker local
@@ -56,4 +56,7 @@ Le workflow GitHub publie une image `amd64`/`arm64`. Le guide explique ensuite c
 
 ## Documentation
 
-Commencez par [`docs/GUIDE_COMPLET_FR.md`](docs/GUIDE_COMPLET_FR.md), puis suivez les prompts Codex dans `prompts/` dans l'ordre.
+Commencez par [`docs/GUIDE_COMPLET_FR.md`](docs/GUIDE_COMPLET_FR.md).
+Le contrat détaillé du collecteur public, ses limites de reprise et le protocole
+soak non encore certifié sont dans
+[`docs/HYPERLIQUID_COLLECTOR.md`](docs/HYPERLIQUID_COLLECTOR.md). Suivez ensuite les prompts Codex dans `prompts/` dans l'ordre.

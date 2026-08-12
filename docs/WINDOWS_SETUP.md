@@ -56,9 +56,10 @@ Aucun wallet n'est requis.
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect `
-  --interval-seconds 60 `
-  --samples 10 `
-  --network mainnet
+  --network mainnet `
+  --assets BTC,ETH `
+  --candle-intervals 1m `
+  --duration-seconds 600
 ```
 
 ## 7. Dashboard local

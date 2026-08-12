@@ -276,13 +276,27 @@ Installation saine
 </ul>
 <h2 id="12-lancer-une-collecte-courte">12. Lancer une collecte courte<a class="heading-link" href="#12-lancer-une-collecte-courte" aria-label="Lien vers cette section">#</a></h2>
 <pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab collect `
-  --interval-seconds 60 `
-  --samples 10 `
-  --network mainnet
+  --network mainnet `
+  --assets BTC,ETH `
+  --candle-intervals 1m `
+  --duration-seconds 600
 </code></pre>
+<p>Le contrat technique complet est documenté dans
+<a href="HYPERLIQUID_COLLECTOR.md"><code>HYPERLIQUID_COLLECTOR.md</code></a>. Le premier bootstrap REST
+et toute resynchronisation après coupure ont lieu avant l’ouverture du socket ;
+le collecteur passe ensuite de <code>SUBSCRIBING</code> à <code>LIVE</code> seulement après tous les
+acquittements. Une fois <code>LIVE</code>, le refresh REST périodique s’exécute dans un
+worker pendant que la lecture WebSocket continue.</p>
+<p>Les révisions d’une candle restent des observations immuables : aucune horloge
+locale ne les marque finales. L’intervalle calendaire <code>1M</code> est volontairement
+refusé ; utilise un intervalle fixe tel que <code>1m</code>, <code>1h</code>, <code>1d</code> ou <code>1w</code>.</p>
+<p>Cette collecte courte est un smoke test, pas la certification soak de 24 heures,
+qui reste explicitement en attente.</p>
 <p>Vérifie :</p>
 <pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab status
 </code></pre>
+<p>Le statut runtime expose notamment l’état, les connexions/reconnexions, les gaps
+visibles et les flux stale.</p>
 <h2 id="13-dashboard-windows">13. Dashboard Windows<a class="heading-link" href="#13-dashboard-windows" aria-label="Lien vers cette section">#</a></h2>
 <pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab serve `
   --host 127.0.0.1 `
@@ -291,6 +305,10 @@ Installation saine
 <p>Ouvre :</p>
 <pre><code class="language-text">http://127.0.0.1:8000
 </code></pre>
+<p>La page « Santé du collecteur public » lit <code>data/runtime_status.json</code> et affiche
+les connexions, gaps et flux stale. Le compteur SQLite est conservé uniquement
+comme indicateur <strong>legacy</strong> de la commande <code>snapshot --save</code>; il ne compte pas
+les lignes Parquet du collecteur Phase 02.</p>
 <p>La bannière doit dire <code>READ-ONLY — ORDRES IMPOSSIBLES</code>.</p>
 <hr />
 <h1 id="partie-b-git-et-codex">PARTIE B — GIT ET CODEX<a class="heading-link" href="#partie-b-git-et-codex" aria-label="Lien vers cette section">#</a></h1>
@@ -363,6 +381,9 @@ docker compose ps
 <p>Arrêt :</p>
 <pre><code class="language-powershell">docker compose down
 </code></pre>
+<p>Le collecteur reçoit <code>SIGINT</code>/<code>SIGTERM</code> de façon coopérative. Les compositions
+locale et Umbrel lui accordent 30 secondes pour fermer le socket, publier le
+dernier statut et flusher le dernier batch avant un éventuel arrêt forcé.</p>
 <p>Les services sont non-root, read-only, sans capacités Linux et sans Docker socket.</p>
 <hr />
 <h1 id="partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL<a class="heading-link" href="#partie-d-installation-umbrel" aria-label="Lien vers cette section">#</a></h1>
@@ -413,7 +434,9 @@ git push origin v0.2.0
 <p>Ouvre HyperLab. Tu dois voir :</p>
 <pre><code class="language-text">READ-ONLY — ORDRES IMPOSSIBLES
 </code></pre>
-<p>Le compteur augmente progressivement. Vérifie aussi :</p>
+<p>La section runtime doit indiquer l’état du collecteur, ses connexions, ses gaps
+et ses flux stale. Le compteur « legacy SQLite » peut rester à zéro lorsque seul
+le collecteur Parquet Phase 02 tourne. Vérifie aussi :</p>
 <pre><code class="language-text">/health
 /api/status
 </code></pre>

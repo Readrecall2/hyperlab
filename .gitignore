@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.test-output/
 .coverage
 htmlcov/
 data/*
@@ -17,3 +18,5 @@ reports/*
 *.sqlite3
 jjlab-hyperlab/data/*
 !jjlab-hyperlab/data/.gitkeep
+
+.pytest_tmp/

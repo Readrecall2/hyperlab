@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -13,6 +14,7 @@ from hyperlab.data.lake import (
     PartitionKey,
     PartitionValidationError,
     inventory_partitions,
+    read_hashed_table,
     validate_partition,
     write_partition,
 )
@@ -25,6 +27,10 @@ from hyperlab.data.schema import (
 
 DAY = date(2026, 8, 11)
 NOW = datetime(2026, 8, 11, 12, tzinfo=UTC)
+METADATA_JSON = '{"name":"BTC","szDecimals":5}'
+METADATA_SHA256 = hashlib.sha256(METADATA_JSON.encode()).hexdigest()
+WIRE_RAW = '{"channel":"pong"}'
+WIRE_SHA256 = hashlib.sha256(WIRE_RAW.encode()).hexdigest()
 
 
 def _common(record_type: RecordType) -> dict[str, object]:
@@ -44,6 +50,47 @@ def _common(record_type: RecordType) -> dict[str, object]:
 def _valid_row(record_type: RecordType) -> dict[str, object]:
     row = _common(record_type)
     values: dict[RecordType, dict[str, object]] = {
+        RecordType.INSTRUMENT_METADATA: {
+            "instrument_kind": "perp",
+            "instrument_id": "hyperliquid:BTC:perp",
+            "source_symbol": "BTC",
+            "source_index": 0,
+            "base_token": "BTC",
+            "quote_token": "USDC",
+            "sz_decimals": 5,
+            "wei_decimals": None,
+            "max_leverage": 50,
+            "margin_table_id": 20,
+            "is_canonical": True,
+            "full_name": "Bitcoin",
+            "metadata_sha256": METADATA_SHA256,
+            "metadata_json": METADATA_JSON,
+        },
+        RecordType.MARKET_CONTEXT: {
+            "instrument_kind": "perp",
+            "instrument_id": "hyperliquid:BTC:perp",
+            "mark_price": Decimal("100"),
+            "oracle_price": Decimal("99"),
+            "mid_price": Decimal("99.5"),
+            "current_funding_rate": Decimal("-0.0001"),
+            "open_interest_quantity": Decimal("10"),
+            "open_interest_notional": Decimal("1000"),
+            "base_volume_24h": Decimal("20"),
+            "notional_volume_24h": Decimal("2000"),
+            "previous_day_price": Decimal("98"),
+            "circulating_supply": None,
+            "observation_id": "connection-1:1:100",
+        },
+        RecordType.WIRE_MESSAGE: {
+            "source_sequence": None,
+            "connection_epoch": 1,
+            "arrival_sequence": 1,
+            "channel": "pong",
+            "message_asset": None,
+            "raw_message": WIRE_RAW,
+            "is_json": True,
+            "payload_sha256": WIRE_SHA256,
+        },
         RecordType.CANDLE: {
             "interval": "1h",
             "open_time": NOW - timedelta(hours=1),
@@ -144,8 +191,73 @@ def _table(record_type: RecordType, **changes: object) -> pa.Table:
 
 
 @pytest.mark.parametrize(
+    "record_type",
+    [
+        RecordType.INSTRUMENT_METADATA,
+        RecordType.MARKET_CONTEXT,
+        RecordType.WIRE_MESSAGE,
+    ],
+)
+def test_write_accepts_valid_phase_02_records(
+    tmp_path: Path,
+    record_type: RecordType,
+) -> None:
+    manifest = write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "BTC", record_type),
+        _table(record_type),
+    )
+
+    assert manifest.row_count == 1
+    assert manifest.quality == "ok"
+
+
+def test_wire_message_preserves_exact_non_json_text(tmp_path: Path) -> None:
+    raw_message = "Websocket connection established."
+    payload_sha256 = hashlib.sha256(raw_message.encode()).hexdigest()
+    table = _table(
+        RecordType.WIRE_MESSAGE,
+        asset="GLOBAL",
+        channel=None,
+        raw_message=raw_message,
+        is_json=False,
+        payload_sha256=payload_sha256,
+    )
+    manifest = write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "GLOBAL", RecordType.WIRE_MESSAGE),
+        table,
+    )
+
+    decoded = read_hashed_table(tmp_path, manifest)
+    assert decoded.column("raw_message")[0].as_py() == raw_message
+    assert decoded.column("source_sequence")[0].as_py() is None
+
+
+@pytest.mark.parametrize(
     ("record_type", "changes", "message"),
     [
+        (
+            RecordType.INSTRUMENT_METADATA,
+            {"max_leverage": 0},
+            "max_leverage.*positive",
+        ),
+        (RecordType.MARKET_CONTEXT, {"mark_price": Decimal("0")}, "positive price"),
+        (RecordType.MARKET_CONTEXT, {"oracle_price": Decimal("0")}, "positive price"),
+        (RecordType.MARKET_CONTEXT, {"mid_price": Decimal("0")}, "positive price"),
+        (RecordType.MARKET_CONTEXT, {"previous_day_price": Decimal("-1")}, "non-negative"),
+        (
+            RecordType.MARKET_CONTEXT,
+            {"base_volume_24h": Decimal("-1")},
+            "non-negative",
+        ),
+        (RecordType.WIRE_MESSAGE, {"source_sequence": 1}, "must remain null"),
+        (RecordType.WIRE_MESSAGE, {"is_json": False}, "is_json"),
+        (
+            RecordType.WIRE_MESSAGE,
+            {"payload_sha256": "0" * 64},
+            "does not match",
+        ),
         (RecordType.CANDLE, {"open": Decimal("0")}, "positive price"),
         (RecordType.CANDLE, {"base_volume": Decimal("-1")}, "non-negative"),
         (RecordType.CANDLE, {"high": Decimal("100")}, "OHLC"),
@@ -189,9 +301,51 @@ def test_write_rejects_invalid_market_semantics(
         )
 
 
+@pytest.mark.parametrize("previous_day_price", [Decimal("0"), None])
+def test_market_context_accepts_unavailable_previous_day_reference(
+    tmp_path: Path,
+    previous_day_price: Decimal | None,
+) -> None:
+    manifest = write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "@189", RecordType.MARKET_CONTEXT),
+        _table(
+            RecordType.MARKET_CONTEXT,
+            asset="@189",
+            instrument_kind="spot",
+            instrument_id="hyperliquid:@189:spot",
+            mark_price=Decimal("620"),
+            oracle_price=None,
+            mid_price=None,
+            previous_day_price=previous_day_price,
+        ),
+    )
+    assert read_hashed_table(tmp_path, manifest).column("previous_day_price")[0].as_py() == previous_day_price
+
+
+def test_instrument_metadata_requires_valid_json_even_when_hash_matches(
+    tmp_path: Path,
+) -> None:
+    invalid_json = "{"
+    matching_hash = hashlib.sha256(invalid_json.encode()).hexdigest()
+
+    with pytest.raises(PartitionValidationError, match=r"metadata_json.*valid JSON"):
+        write_partition(
+            tmp_path,
+            PartitionKey("hyperliquid", DAY, "BTC", RecordType.INSTRUMENT_METADATA),
+            _table(
+                RecordType.INSTRUMENT_METADATA,
+                metadata_json=invalid_json,
+                metadata_sha256=matching_hash,
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("record_type", "field", "value"),
     [
+        (RecordType.INSTRUMENT_METADATA, "instrument_kind", "future"),
+        (RecordType.MARKET_CONTEXT, "instrument_kind", "future"),
         (RecordType.L2_SNAPSHOT, "side", "middle"),
         (RecordType.L2_DELTA, "side", "middle"),
         (RecordType.L2_DELTA, "action", "append"),
@@ -220,6 +374,9 @@ def test_write_rejects_unknown_closed_vocabulary(
     ("record_type", "field"),
     [
         (RecordType.FUNDING, "rate_kind"),
+        (RecordType.INSTRUMENT_METADATA, "source_symbol"),
+        (RecordType.MARKET_CONTEXT, "instrument_id"),
+        (RecordType.WIRE_MESSAGE, "channel"),
         (RecordType.FEE, "scope"),
     ],
 )

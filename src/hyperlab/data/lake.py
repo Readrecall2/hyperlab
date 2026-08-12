@@ -11,6 +11,7 @@ from datetime import date as Date
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -26,10 +27,13 @@ from hyperlab.data.schema import (
 
 MANIFEST_FORMAT_VERSION = 1
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ASSET = re.compile(r"^[A-Za-z0-9@%][A-Za-z0-9@%._/+:-]{0,127}$")
 _CANDLE_INTERVAL = re.compile(r"^([1-9][0-9]*)(s|m|h|d|w)$")
 _PARQUET_FILE = re.compile(r"^part-[0-9a-f]{64}\.parquet$")
 _MANIFEST_FILE = re.compile(r"^part-[0-9a-f]{64}\.manifest\.json$")
 _SCHEMA_VERSION_VALUE = re.compile(rb"^[1-9][0-9]*$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_FUNDING_BUCKET_TOLERANCE_NS = 60 * 1_000_000_000
 _TIMESTAMP_COLUMNS = ("event_time", "exchange_time", "received_time")
 _INTERVAL_UNIT_NS = {
     "s": 1_000_000_000,
@@ -89,9 +93,10 @@ class PartitionKey:
     record_type: RecordType | str
 
     def __post_init__(self) -> None:
-        for name, value in (("venue", self.venue), ("asset", self.asset)):
-            if not _SLUG.fullmatch(value):
-                raise ValueError(f"invalid {name} partition slug: {value!r}")
+        if not _SLUG.fullmatch(self.venue):
+            raise ValueError(f"invalid venue partition slug: {self.venue!r}")
+        if not _ASSET.fullmatch(self.asset):
+            raise ValueError(f"invalid asset partition value: {self.asset!r}")
         parsed_date: Date
         if isinstance(self.date, str):
             try:
@@ -102,9 +107,7 @@ class PartitionKey:
             parsed_date = self.date
         try:
             parsed_type = (
-                self.record_type
-                if isinstance(self.record_type, RecordType)
-                else RecordType(self.record_type)
+                self.record_type if isinstance(self.record_type, RecordType) else RecordType(self.record_type)
             )
         except ValueError:
             raise ValueError(f"invalid record type partition: {self.record_type!r}") from None
@@ -121,7 +124,7 @@ class PartitionKey:
         return Path(
             f"venue={self.venue}",
             f"date={partition_date.isoformat()}",
-            f"asset={self.asset}",
+            f"asset={quote(self.asset, safe='-._~')}",
             f"type={record_type}",
         )
 
@@ -158,6 +161,10 @@ class PartitionKey:
                     "venue=<venue>/date=YYYY-MM-DD/asset=<asset>/type=<record-type>"
                 )
             values[label] = directory.name[len(prefix) :]
+        encoded_asset = values["asset"]
+        values["asset"] = unquote(encoded_asset)
+        if quote(values["asset"], safe="-._~") != encoded_asset:
+            raise PartitionValidationError("asset partition encoding is not canonical")
         try:
             return cls(
                 venue=values["venue"],
@@ -193,9 +200,7 @@ class Gap:
             start=str(payload["start"]),
             end=str(payload["end"]),
             missing_count=int(str(payload["missing_count"])),
-            connection_id=(
-                None if payload.get("connection_id") is None else str(payload["connection_id"])
-            ),
+            connection_id=(None if payload.get("connection_id") is None else str(payload["connection_id"])),
         )
 
 
@@ -263,9 +268,7 @@ class PartitionManifest:
         try:
             format_version = int(str(payload["format_version"]))
             if format_version != MANIFEST_FORMAT_VERSION:
-                raise PartitionValidationError(
-                    f"unsupported manifest format version: {format_version}"
-                )
+                raise PartitionValidationError(f"unsupported manifest format version: {format_version}")
             partition_payload = payload["partition"]
             bounds_payload = payload["timestamp_bounds"]
             gaps_payload = payload["gaps"]
@@ -286,11 +289,7 @@ class PartitionManifest:
                     "min": None if value.get("min") is None else str(value["min"]),
                     "max": None if value.get("max") is None else str(value["max"]),
                 }
-            gaps = tuple(
-                Gap.from_dict(value)
-                for value in gaps_payload
-                if isinstance(value, dict)
-            )
+            gaps = tuple(Gap.from_dict(value) for value in gaps_payload if isinstance(value, dict))
             if len(gaps) != len(gaps_payload):
                 raise TypeError("every gap must be an object")
             expected_interval_ns = (
@@ -312,23 +311,13 @@ class PartitionManifest:
                 schema_version=int(str(payload["schema_version"])),
                 schema_fingerprint=str(payload["schema_fingerprint"]),
                 stream_key=str(payload["stream_key"]),
-                sequence_min=(
-                    None
-                    if payload["sequence_min"] is None
-                    else int(str(payload["sequence_min"]))
-                ),
-                sequence_max=(
-                    None
-                    if payload["sequence_max"] is None
-                    else int(str(payload["sequence_max"]))
-                ),
+                sequence_min=(None if payload["sequence_min"] is None else int(str(payload["sequence_min"]))),
+                sequence_max=(None if payload["sequence_max"] is None else int(str(payload["sequence_max"]))),
                 duplicates=int(str(payload["duplicates"])),
                 out_of_order=int(str(payload["out_of_order"])),
                 gaps=gaps,
                 gap_detection=str(payload["gap_detection"]),
-                null_counts={
-                    str(name): int(str(value)) for name, value in nulls_payload.items()
-                },
+                null_counts={str(name): int(str(value)) for name, value in nulls_payload.items()},
                 quality=str(payload["quality"]),
                 expected_interval_ns=expected_interval_ns,
             )
@@ -361,8 +350,7 @@ class InventoryReport:
             "dates": list(self.dates),
             "delisted_assets": list(self.delisted_assets),
             "cross_segment_gaps": [
-                {"partition": key.as_dict(), **gap.as_dict()}
-                for key, gap in self.cross_segment_gaps
+                {"partition": key.as_dict(), **gap.as_dict()} for key, gap in self.cross_segment_gaps
             ],
             "partitions": [manifest.as_dict() for manifest in self.partitions],
         }
@@ -394,9 +382,7 @@ def _require_under_root(canonical_root: Path, path: Path, *, label: str) -> Path
     try:
         resolved.relative_to(canonical_root)
     except ValueError:
-        raise PartitionValidationError(
-            f"{label} resolves outside data lake root: {resolved}"
-        ) from None
+        raise PartitionValidationError(f"{label} resolves outside data lake root: {resolved}") from None
     return resolved
 
 
@@ -443,9 +429,7 @@ def _read_hashed_path(
     try:
         return pq.ParquetFile(pa.BufferReader(payload)).read(columns=columns)
     except Exception as exc:
-        raise PartitionValidationError(
-            f"invalid Parquet file {data_path.name}: {exc}"
-        ) from None
+        raise PartitionValidationError(f"invalid Parquet file {data_path.name}: {exc}") from None
 
 
 def read_hashed_table(
@@ -504,9 +488,7 @@ def _interval_ns(expected_interval: timedelta | None) -> int | None:
 def _declared_candle_interval_ns(table: pa.Table) -> int:
     intervals = set(table.column("interval").to_pylist())
     if len(intervals) != 1:
-        raise PartitionValidationError(
-            "one candle interval is required per immutable Parquet file"
-        )
+        raise PartitionValidationError("one candle interval is required per immutable Parquet file")
     interval = str(next(iter(intervals)))
     match = _CANDLE_INTERVAL.fullmatch(interval)
     if match is None:
@@ -522,9 +504,7 @@ def _stream_definition(
     if key.record_type == RecordType.CANDLE:
         declared_interval_ns = _declared_candle_interval_ns(table)
         if requested_interval_ns is not None and requested_interval_ns != declared_interval_ns:
-            raise PartitionValidationError(
-                "expected_interval does not match the declared candle interval"
-            )
+            raise PartitionValidationError("expected_interval does not match the declared candle interval")
         interval = str(table.column("interval")[0].as_py())
         return declared_interval_ns, f"candle:{interval}"
     if key.record_type == RecordType.FUNDING:
@@ -546,9 +526,7 @@ def _stream_definition(
             raise PartitionValidationError("declared funding interval must be positive")
         declared_interval_ns = interval_seconds * 1_000_000_000
         if requested_interval_ns is not None and requested_interval_ns != declared_interval_ns:
-            raise PartitionValidationError(
-                "expected_interval does not match the declared funding interval"
-            )
+            raise PartitionValidationError("expected_interval does not match the declared funding interval")
         stream_key = json.dumps(
             {
                 "funding_interval_seconds": interval_seconds,
@@ -597,13 +575,44 @@ def _sequence_gaps(table: pa.Table) -> list[Gap]:
     return gaps
 
 
-def _time_gaps(table: pa.Table, expected_interval_ns: int | None) -> list[Gap]:
+def _funding_bucket(epoch_ns: int, interval_ns: int) -> int:
+    tolerance_ns = min(
+        _FUNDING_BUCKET_TOLERANCE_NS,
+        max(interval_ns // 2 - 1, 0),
+    )
+    return (epoch_ns + tolerance_ns) // interval_ns
+
+
+def _time_gaps(
+    table: pa.Table,
+    record_type: RecordType | str,
+    expected_interval_ns: int | None,
+) -> list[Gap]:
     if expected_interval_ns is None:
         return []
-    raw_times = pc.cast(table.column("event_time").combine_chunks(), pa.int64()).to_pylist()
+    is_funding = record_type == RecordType.FUNDING
+    timestamp_name = "funding_time" if is_funding else "event_time"
+    raw_times = pc.cast(
+        table.column(timestamp_name).combine_chunks(),
+        pa.int64(),
+    ).to_pylist()
     times = list(dict.fromkeys(int(value) for value in raw_times if value is not None))
     gaps: list[Gap] = []
     for previous, current in pairwise(times):
+        if is_funding:
+            previous_bucket = _funding_bucket(previous, expected_interval_ns)
+            current_bucket = _funding_bucket(current, expected_interval_ns)
+            difference = current_bucket - previous_bucket
+            if difference > 1:
+                gaps.append(
+                    Gap(
+                        kind="funding_bucket",
+                        start=_timestamp_iso(previous),
+                        end=_timestamp_iso(current),
+                        missing_count=difference - 1,
+                    )
+                )
+            continue
         difference = current - previous
         if difference > expected_interval_ns:
             gaps.append(
@@ -614,6 +623,47 @@ def _time_gaps(table: pa.Table, expected_interval_ns: int | None) -> list[Gap]:
                     missing_count=max(difference // expected_interval_ns - 1, 1),
                 )
             )
+    return gaps
+
+
+def _arrival_sequence_gaps(table: pa.Table) -> list[Gap]:
+    connections = table.column("connection_id").to_pylist()
+    epochs = table.column("connection_epoch").to_pylist()
+    sequences = table.column("arrival_sequence").to_pylist()
+    previous: dict[tuple[str, int], int] = {}
+    gaps: list[Gap] = []
+    for raw_connection, raw_epoch, raw_sequence in zip(
+        connections,
+        epochs,
+        sequences,
+        strict=True,
+    ):
+        connection = str(raw_connection)
+        key = (connection, int(raw_epoch))
+        sequence = int(raw_sequence)
+        prior = previous.get(key)
+        if prior is not None and sequence > prior + 1:
+            gaps.append(
+                Gap(
+                    kind="arrival_sequence",
+                    start=str(prior),
+                    end=str(sequence),
+                    missing_count=sequence - prior - 1,
+                    connection_id=connection,
+                )
+            )
+        elif prior is not None and sequence < prior:
+            gaps.append(
+                Gap(
+                    kind="arrival_sequence_regression",
+                    start=str(prior),
+                    end=str(sequence),
+                    missing_count=0,
+                    connection_id=connection,
+                )
+            )
+        if prior != sequence:
+            previous[key] = sequence
     return gaps
 
 
@@ -638,10 +688,7 @@ def _duplicate_primary_keys(table: pa.Table, spec: SchemaSpec) -> int:
 
 def _out_of_order_rows(table: pa.Table, spec: SchemaSpec) -> int:
     order_rows = [_normalized_row(row) for row in _rows_for(table, spec.order_key)]
-    return sum(
-        current < previous
-        for previous, current in pairwise(order_rows)
-    )
+    return sum(current < previous for previous, current in pairwise(order_rows))
 
 
 def _require_positive_prices(table: pa.Table, *names: str) -> None:
@@ -660,15 +707,56 @@ def _require_closed_vocabulary(table: pa.Table, name: str, allowed: frozenset[st
     observed = {str(value) for value in table.column(name).to_pylist()}
     invalid = sorted(observed - allowed)
     if invalid:
-        raise PartitionValidationError(
-            f"{name} contains unsupported values: {', '.join(invalid)}"
-        )
+        raise PartitionValidationError(f"{name} contains unsupported values: {', '.join(invalid)}")
 
 
 def _require_non_empty_strings(table: pa.Table, *names: str) -> None:
     for name in names:
-        if any(not str(value).strip() for value in table.column(name).to_pylist()):
+        if any(value is None or not str(value).strip() for value in table.column(name).to_pylist()):
             raise PartitionValidationError(f"{name} must be non-empty")
+
+
+def _require_optional_non_empty_strings(table: pa.Table, *names: str) -> None:
+    for name in names:
+        if any(value is not None and not str(value).strip() for value in table.column(name).to_pylist()):
+            raise PartitionValidationError(f"{name} must be non-empty when present")
+
+
+def _validate_text_hash(table: pa.Table, text_name: str, hash_name: str) -> None:
+    for raw_text, raw_hash in zip(
+        table.column(text_name).to_pylist(),
+        table.column(hash_name).to_pylist(),
+        strict=True,
+    ):
+        declared_hash = str(raw_hash)
+        if _SHA256_HEX.fullmatch(declared_hash) is None:
+            raise PartitionValidationError(f"{hash_name} must be lowercase SHA-256 hex")
+        actual_hash = hashlib.sha256(str(raw_text).encode("utf-8")).hexdigest()
+        if actual_hash != declared_hash:
+            raise PartitionValidationError(f"{hash_name} does not match the exact UTF-8 {text_name}")
+
+
+def _require_valid_json(table: pa.Table, name: str) -> None:
+    for raw_value in table.column(name).to_pylist():
+        try:
+            json.loads(str(raw_value))
+        except json.JSONDecodeError:
+            raise PartitionValidationError(f"{name} must contain valid JSON") from None
+
+
+def _validate_wire_json_flags(table: pa.Table) -> None:
+    for raw_message, declared_is_json in zip(
+        table.column("raw_message").to_pylist(),
+        table.column("is_json").to_pylist(),
+        strict=True,
+    ):
+        try:
+            json.loads(str(raw_message))
+            actual_is_json = True
+        except json.JSONDecodeError:
+            actual_is_json = False
+        if bool(declared_is_json) != actual_is_json:
+            raise PartitionValidationError("is_json must describe whether raw_message is valid JSON")
 
 
 def _validate_l2_metadata(table: pa.Table, key: PartitionKey) -> None:
@@ -685,14 +773,72 @@ def _validate_l2_metadata(table: pa.Table, key: PartitionKey) -> None:
         previous = expected_by_identifier.setdefault(normalized_identifier, observed_metadata)
         if previous != observed_metadata:
             raise PartitionValidationError(
-                f"inconsistent L2 {label} metadata for "
-                f"{identifier_name} {normalized_identifier!r}"
+                f"inconsistent L2 {label} metadata for {identifier_name} {normalized_identifier!r}"
             )
 
 
 def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
     record_type = key.record_type
-    if record_type == RecordType.CANDLE:
+    if record_type == RecordType.INSTRUMENT_METADATA:
+        _require_closed_vocabulary(
+            table,
+            "instrument_kind",
+            frozenset({"spot", "perp"}),
+        )
+        _require_non_empty_strings(
+            table,
+            "instrument_id",
+            "source_symbol",
+            "metadata_sha256",
+            "metadata_json",
+        )
+        _require_optional_non_empty_strings(
+            table,
+            "base_token",
+            "quote_token",
+            "full_name",
+        )
+        if any(value is not None and value <= 0 for value in table.column("max_leverage").to_pylist()):
+            raise PartitionValidationError("max_leverage must be positive when present")
+        _validate_text_hash(table, "metadata_json", "metadata_sha256")
+        _require_valid_json(table, "metadata_json")
+    elif record_type == RecordType.MARKET_CONTEXT:
+        _require_closed_vocabulary(
+            table,
+            "instrument_kind",
+            frozenset({"spot", "perp"}),
+        )
+        _require_non_empty_strings(table, "instrument_id")
+        _require_positive_prices(
+            table,
+            "mark_price",
+            "oracle_price",
+            "mid_price",
+        )
+        _require_non_negative(
+            table,
+            "previous_day_price",
+            "open_interest_quantity",
+            "open_interest_notional",
+            "base_volume_24h",
+            "notional_volume_24h",
+            "circulating_supply",
+        )
+    elif record_type == RecordType.WIRE_MESSAGE:
+        _require_non_empty_strings(
+            table,
+            "connection_id",
+            "raw_message",
+            "payload_sha256",
+        )
+        _require_optional_non_empty_strings(table, "channel")
+        if table.column("source_sequence").null_count != table.num_rows:
+            raise PartitionValidationError(
+                "wire_message source_sequence must remain null; use arrival_sequence"
+            )
+        _validate_text_hash(table, "raw_message", "payload_sha256")
+        _validate_wire_json_flags(table)
+    elif record_type == RecordType.CANDLE:
         _require_positive_prices(table, "open", "high", "low", "close")
         _require_non_negative(table, "base_volume", "quote_volume")
         for open_time, close_time, open_price, high, low, close in zip(
@@ -713,15 +859,19 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
     elif record_type == RecordType.BBO:
         _require_positive_prices(table, "bid_price", "ask_price")
         _require_non_negative(table, "bid_quantity", "ask_quantity")
-        if any(
-            bid > ask
-            for bid, ask in zip(
-                table.column("bid_price").to_pylist(),
-                table.column("ask_price").to_pylist(),
-                strict=True,
-            )
+        for bid_price, bid_quantity, ask_price, ask_quantity in zip(
+            table.column("bid_price").to_pylist(),
+            table.column("bid_quantity").to_pylist(),
+            table.column("ask_price").to_pylist(),
+            table.column("ask_quantity").to_pylist(),
+            strict=True,
         ):
-            raise PartitionValidationError("bid_price must not exceed ask_price")
+            if (bid_price is None) != (bid_quantity is None):
+                raise PartitionValidationError("BBO bid price and quantity must be present together")
+            if (ask_price is None) != (ask_quantity is None):
+                raise PartitionValidationError("BBO ask price and quantity must be present together")
+            if bid_price is not None and ask_price is not None and bid_price > ask_price:
+                raise PartitionValidationError("bid_price must not exceed ask_price")
     elif record_type in {RecordType.L2_SNAPSHOT, RecordType.L2_DELTA}:
         _require_closed_vocabulary(table, "side", frozenset({"bid", "ask"}))
         _require_positive_prices(table, "price")
@@ -734,9 +884,7 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
                 strict=True,
             ):
                 if first is not None and last is not None and first > last:
-                    raise PartitionValidationError(
-                        "first_sequence must not exceed last_sequence"
-                    )
+                    raise PartitionValidationError("first_sequence must not exceed last_sequence")
     elif record_type == RecordType.TRADE:
         _require_closed_vocabulary(
             table,
@@ -766,16 +914,12 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
             strict=True,
         ):
             if end is not None and start > end:
-                raise PartitionValidationError(
-                    "effective_from must not be after effective_to"
-                )
+                raise PartitionValidationError("effective_from must not be after effective_to")
     elif record_type == RecordType.CONNECTION_EVENT:
         _require_closed_vocabulary(
             table,
             "event_kind",
-            frozenset(
-                {"connect", "disconnect", "gap", "resync_start", "resync_complete"}
-            ),
+            frozenset({"connect", "disconnect", "gap", "resync_start", "resync_complete"}),
         )
     elif record_type == RecordType.INSTRUMENT_LIFECYCLE:
         _require_closed_vocabulary(table, "instrument_kind", frozenset({"spot", "perp"}))
@@ -812,9 +956,7 @@ def _analyze_table(
         field.name for field in spec.schema if not field.nullable and null_counts[field.name] > 0
     ]
     if required_nulls:
-        raise PartitionValidationError(
-            f"non-nullable columns contain nulls: {', '.join(required_nulls)}"
-        )
+        raise PartitionValidationError(f"non-nullable columns contain nulls: {', '.join(required_nulls)}")
 
     _require_partition_value(table, "schema_version", spec.version)
     _require_partition_value(table, "record_type", _record_type_value(key.record_type))
@@ -824,9 +966,7 @@ def _analyze_table(
     _validate_l2_metadata(table, key)
 
     event_dates = {
-        value.date().isoformat()
-        for value in table.column("event_time").to_pylist()
-        if value is not None
+        value.date().isoformat() for value in table.column("event_time").to_pylist() if value is not None
     }
     expected_date = _date_value(key.date).isoformat()
     if event_dates != {expected_date}:
@@ -843,19 +983,29 @@ def _analyze_table(
         raise PartitionValidationError(f"out-of-order rows: {out_of_order}")
 
     raw_sequences = table.column("source_sequence").to_pylist()
-    sequence_values = [
-        int(value)
-        for value in raw_sequences
-        if value is not None
+    sequence_values = [int(value) for value in raw_sequences if value is not None]
+    gap_sources = [
+        *_sequence_gaps(table),
+        *_time_gaps(
+            table,
+            key.record_type,
+            expected_interval_ns,
+        ),
     ]
+    if key.record_type == RecordType.WIRE_MESSAGE:
+        gap_sources.extend(_arrival_sequence_gaps(table))
     gaps = tuple(
         sorted(
-            [*_sequence_gaps(table), *_time_gaps(table, expected_interval_ns)],
+            gap_sources,
             key=lambda item: (item.kind, item.connection_id or "", item.start, item.end),
         )
     )
     complete_sequence = len(sequence_values) == table.num_rows
-    if expected_interval_ns is not None and complete_sequence:
+    if key.record_type == RecordType.WIRE_MESSAGE:
+        gap_detection = "arrival_sequence"
+    elif key.record_type == RecordType.FUNDING and expected_interval_ns is not None:
+        gap_detection = "funding_bucket_and_sequence" if complete_sequence else "funding_bucket"
+    elif expected_interval_ns is not None and complete_sequence:
         gap_detection = "cadence_and_sequence"
     elif expected_interval_ns is not None:
         gap_detection = "cadence"
@@ -872,13 +1022,7 @@ def _analyze_table(
         gaps=gaps,
         gap_detection=gap_detection,
         null_counts=null_counts,
-        quality=(
-            "degraded"
-            if gaps
-            else "unobservable"
-            if gap_detection == "not_observable"
-            else "ok"
-        ),
+        quality=("degraded" if gaps else "unobservable" if gap_detection == "not_observable" else "ok"),
     )
 
 
@@ -936,15 +1080,11 @@ def _schema_spec_for_write(key: PartitionKey, table: pa.Table) -> SchemaSpec:
     if raw_version is None:
         raise PartitionValidationError("missing hyperlab.schema_version metadata")
     if _SCHEMA_VERSION_VALUE.fullmatch(raw_version) is None:
-        raise PartitionValidationError(
-            f"invalid hyperlab.schema_version metadata: {raw_version!r}"
-        )
+        raise PartitionValidationError(f"invalid hyperlab.schema_version metadata: {raw_version!r}")
     try:
         version = int(raw_version)
     except ValueError:
-        raise PartitionValidationError(
-            f"invalid hyperlab.schema_version metadata: {raw_version!r}"
-        ) from None
+        raise PartitionValidationError(f"invalid hyperlab.schema_version metadata: {raw_version!r}") from None
     try:
         return schema_for(key.record_type, version)
     except ValueError as exc:
@@ -1030,6 +1170,69 @@ def write_partition(
     return validate_partition(manifest_path)
 
 
+def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest:
+    """Rebuild and atomically publish the manifest for one valid orphan Parquet."""
+
+    canonical_root = root.resolve()
+    resolved_data_path = _require_under_root(
+        canonical_root,
+        data_path,
+        label="orphan partition data",
+    )
+    if not resolved_data_path.is_file() or _PARQUET_FILE.fullmatch(resolved_data_path.name) is None:
+        raise PartitionValidationError(f"invalid orphan Parquet path: {data_path.name}")
+    manifest_path = resolved_data_path.with_name(f"{resolved_data_path.stem}.manifest.json")
+    if manifest_path.exists():
+        return validate_partition(manifest_path)
+
+    payload = resolved_data_path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    expected_data_file = f"part-{digest}.parquet"
+    if resolved_data_path.name != expected_data_file:
+        raise PartitionValidationError(
+            f"orphan Parquet content-address mismatch: expected {expected_data_file}"
+        )
+    try:
+        table = pq.ParquetFile(pa.BufferReader(payload)).read()
+    except Exception as exc:
+        raise PartitionValidationError(
+            f"invalid orphan Parquet file {resolved_data_path.name}: {exc}"
+        ) from None
+
+    key = PartitionKey.from_leaf(resolved_data_path.parent)
+    spec = _schema_spec_for_write(key, table)
+    expected_interval_ns, stream_key = _stream_definition(table, key, None)
+    analysis = _analyze_table(
+        table,
+        key,
+        spec,
+        expected_interval_ns=expected_interval_ns,
+    )
+    manifest = _manifest_for(
+        key,
+        spec,
+        analysis,
+        data_file=resolved_data_path.name,
+        sha256=digest,
+        size_bytes=len(payload),
+        row_count=table.num_rows,
+        expected_interval_ns=expected_interval_ns,
+        stream_key=stream_key,
+    )
+    manifest_bytes = _canonical_json(manifest.as_dict())
+    temporary = resolved_data_path.parent / f".{uuid.uuid4().hex}.manifest.tmp"
+    _require_under_root(canonical_root, temporary, label="temporary recovery manifest")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(manifest_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _publish_exclusive(temporary, manifest_path, expected_bytes=manifest_bytes)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return validate_partition(manifest_path)
+
+
 def _paths_for_validation(path: Path) -> tuple[Path, Path]:
     if path.name.endswith(".manifest.json"):
         manifest_path = path
@@ -1063,9 +1266,7 @@ def validate_partition(path: Path) -> PartitionManifest:
     if manifest_path.read_bytes() != _canonical_json(manifest.as_dict()):
         raise PartitionValidationError(f"manifest is not canonical: {manifest_path.name}")
     if manifest_path.name != manifest.manifest_file:
-        raise PartitionValidationError(
-            f"manifest file name mismatch: expected {manifest.manifest_file}"
-        )
+        raise PartitionValidationError(f"manifest file name mismatch: expected {manifest.manifest_file}")
     actual_key = PartitionKey.from_leaf(data_path.parent)
     if actual_key != manifest.partition:
         raise PartitionValidationError(
@@ -1075,9 +1276,7 @@ def validate_partition(path: Path) -> PartitionManifest:
         raise PartitionValidationError(f"manifest data_file mismatch for {data_path.name}")
     expected_data_file = f"part-{manifest.sha256}.parquet"
     if manifest.data_file != expected_data_file:
-        raise PartitionValidationError(
-            f"content-addressed file name mismatch: expected {expected_data_file}"
-        )
+        raise PartitionValidationError(f"content-addressed file name mismatch: expected {expected_data_file}")
     if not data_path.is_file():
         raise PartitionValidationError(f"partition data file not found: {data_path.name}")
 
@@ -1118,9 +1317,7 @@ def validate_partition(path: Path) -> PartitionManifest:
     observed = candidate.as_dict()
     for field in sorted(expected):
         if expected[field] != observed[field]:
-            raise PartitionValidationError(
-                f"manifest statistics mismatch for {data_path.name}: {field}"
-            )
+            raise PartitionValidationError(f"manifest statistics mismatch for {data_path.name}: {field}")
     return manifest
 
 
@@ -1162,9 +1359,7 @@ def discover_partitions(
         return cutoff is None or physical_date is None or physical_date <= cutoff
 
     parquet_files = tuple(
-        path
-        for path in sorted(root.rglob("*.parquet"), key=lambda path: path.as_posix())
-        if selected(path)
+        path for path in sorted(root.rglob("*.parquet"), key=lambda path: path.as_posix()) if selected(path)
     )
     noncanonical = [path for path in parquet_files if _PARQUET_FILE.fullmatch(path.name) is None]
     if noncanonical:
@@ -1176,9 +1371,7 @@ def discover_partitions(
         if selected(path)
     )
     noncanonical_manifests = [
-        path
-        for path in manifest_candidates
-        if _MANIFEST_FILE.fullmatch(path.name) is None
+        path for path in manifest_candidates if _MANIFEST_FILE.fullmatch(path.name) is None
     ]
     if noncanonical_manifests:
         relative = noncanonical_manifests[0].relative_to(root).as_posix()
@@ -1186,9 +1379,7 @@ def discover_partitions(
     manifests = manifest_candidates
     manifest_set = set(manifests)
     orphaned = [
-        path
-        for path in parquet_files
-        if path.with_name(f"{path.stem}.manifest.json") not in manifest_set
+        path for path in parquet_files if path.with_name(f"{path.stem}.manifest.json") not in manifest_set
     ]
     if orphaned:
         relative = orphaned[0].relative_to(root).as_posix()
@@ -1202,11 +1393,7 @@ def _delisted_assets(
     *,
     as_of: Date | None = None,
 ) -> tuple[str, ...]:
-    start_of_day = (
-        None
-        if as_of is None
-        else datetime(as_of.year, as_of.month, as_of.day, tzinfo=UTC)
-    )
+    start_of_day = None if as_of is None else datetime(as_of.year, as_of.month, as_of.day, tzinfo=UTC)
     cutoff_ns = (
         None
         if start_of_day is None
@@ -1240,11 +1427,7 @@ def _delisted_assets(
                 latest[key] = candidate
     return tuple(
         sorted(
-            {
-                f"{venue}:{asset}"
-                for (venue, asset, _), (_, status) in latest.items()
-                if status == "delisted"
-            }
+            {f"{venue}:{asset}" for (venue, asset, _), (_, status) in latest.items() if status == "delisted"}
         )
     )
 
@@ -1275,7 +1458,7 @@ def _resync_events(
                 "book_epoch_id",
                 "event_kind",
                 "event_time",
-            ]
+            ],
         )
         timestamps = pc.cast(table.column("event_time"), pa.int64()).to_pylist()
         for venue, asset, connection, epoch, kind, timestamp in zip(
@@ -1311,7 +1494,7 @@ def _has_completed_resync(
     starts = matching.get("resync_start", [])
     completes = matching.get("resync_complete", [])
     return any(
-        after_ns < start <= complete <= before_ns
+        after_ns < start <= complete <= before_ns or after_ns < start <= before_ns <= complete
         for start in starts
         for complete in completes
     )
@@ -1380,21 +1563,19 @@ def _cross_segment_gaps(
         )
         seen_primary_keys = primary_keys_by_dataset.setdefault(dataset_key, set())
         previous_order: tuple[tuple[int, object], ...] | None = None
-        previous_event_ns: int | None = None
+        previous_cadence_value: int | None = None
+        previous_cadence_time_ns: int | None = None
         previous_sequences: dict[str | None, int] = {}
+        previous_arrival_sequences: dict[tuple[str, int], int] = {}
         previous_l2: tuple[str, str | None, str | None, int | None, int] | None = None
 
         for manifest in sorted(group, key=_stream_sort_key):
             table = read_hashed_table(root, manifest)
-            l2_definition = _L2_METADATA_DEFINITIONS.get(
-                RecordType(_record_type_value(sample.record_type))
-            )
+            l2_definition = _L2_METADATA_DEFINITIONS.get(RecordType(_record_type_value(sample.record_type)))
             if l2_definition is not None:
                 identifier_name, metadata_names, label = l2_definition
                 identifiers = table.column(identifier_name).to_pylist()
-                metadata_columns = [
-                    table.column(name).to_pylist() for name in metadata_names
-                ]
+                metadata_columns = [table.column(name).to_pylist() for name in metadata_names]
                 for identifier, *metadata in zip(
                     identifiers,
                     *metadata_columns,
@@ -1415,29 +1596,40 @@ def _cross_segment_gaps(
             primary_rows = _rows_for(table, spec.primary_key)
             order_rows = _rows_for(table, spec.order_key)
             event_ns = pc.cast(table.column("event_time"), pa.int64()).to_pylist()
+            cadence_ns = (
+                pc.cast(table.column("funding_time"), pa.int64()).to_pylist()
+                if sample.record_type == RecordType.FUNDING
+                else event_ns
+            )
             sequences = table.column("source_sequence").to_pylist()
             connections = table.column("connection_id").to_pylist()
-            l2_updates = (
-                table.column("update_id").to_pylist()
-                if sample.record_type == RecordType.L2_DELTA
+            wire_epochs = (
+                table.column("connection_epoch").to_pylist()
+                if sample.record_type == RecordType.WIRE_MESSAGE
                 else [None] * table.num_rows
             )
-            l2_epochs = (
-                table.column("book_epoch_id").to_pylist()
-                if sample.record_type == RecordType.L2_DELTA
+            wire_arrivals = (
+                table.column("arrival_sequence").to_pylist()
+                if sample.record_type == RecordType.WIRE_MESSAGE
                 else [None] * table.num_rows
             )
+            is_l2 = sample.record_type in {
+                RecordType.L2_SNAPSHOT,
+                RecordType.L2_DELTA,
+            }
+            l2_identifier_name = "update_id" if sample.record_type == RecordType.L2_DELTA else "snapshot_id"
+            l2_identifiers = (
+                table.column(l2_identifier_name).to_pylist() if is_l2 else [None] * table.num_rows
+            )
+            l2_epochs = table.column("book_epoch_id").to_pylist() if is_l2 else [None] * table.num_rows
             l2_first = (
                 table.column("first_sequence").to_pylist()
                 if sample.record_type == RecordType.L2_DELTA
                 else [None] * table.num_rows
             )
-            l2_last = (
-                table.column("last_sequence").to_pylist()
-                if sample.record_type == RecordType.L2_DELTA
-                else [None] * table.num_rows
-            )
+            l2_last = table.column("last_sequence").to_pylist() if is_l2 else [None] * table.num_rows
 
+            wire_keys_seen_in_manifest: set[tuple[str, int]] = set()
             for index in range(table.num_rows):
                 primary_key = primary_rows[index]
                 if primary_key in seen_primary_keys:
@@ -1450,27 +1642,47 @@ def _cross_segment_gaps(
                 previous_order = order_key
 
                 current_event_ns = int(event_ns[index])
+                current_cadence_time_ns = int(cadence_ns[index])
+                if expected_interval_ns is None:
+                    current_cadence_value = current_cadence_time_ns
+                    cadence_step: int | None = None
+                elif sample.record_type == RecordType.FUNDING:
+                    current_cadence_value = _funding_bucket(
+                        current_cadence_time_ns,
+                        expected_interval_ns,
+                    )
+                    cadence_step = 1
+                else:
+                    current_cadence_value = current_cadence_time_ns
+                    cadence_step = expected_interval_ns
                 if (
-                    previous_event_ns is not None
-                    and current_event_ns != previous_event_ns
-                    and expected_interval_ns is not None
-                    and current_event_ns - previous_event_ns > expected_interval_ns
+                    previous_cadence_value is not None
+                    and current_cadence_value != previous_cadence_value
+                    and cadence_step is not None
                     and index == 0
                 ):
-                    difference = current_event_ns - previous_event_ns
-                    result.append(
-                        (
-                            manifest.partition,
-                            Gap(
-                                kind="time",
-                                start=_timestamp_iso(previous_event_ns),
-                                end=_timestamp_iso(current_event_ns),
-                                missing_count=max(difference // expected_interval_ns - 1, 1),
-                            ),
+                    assert previous_cadence_time_ns is not None
+                    difference = current_cadence_value - previous_cadence_value
+                    if difference > cadence_step:
+                        is_funding = sample.record_type == RecordType.FUNDING
+                        result.append(
+                            (
+                                manifest.partition,
+                                Gap(
+                                    kind="funding_bucket" if is_funding else "time",
+                                    start=_timestamp_iso(previous_cadence_time_ns),
+                                    end=_timestamp_iso(current_cadence_time_ns),
+                                    missing_count=(
+                                        difference - 1
+                                        if is_funding
+                                        else max(difference // cadence_step - 1, 1)
+                                    ),
+                                ),
+                            )
                         )
-                    )
-                if current_event_ns != previous_event_ns:
-                    previous_event_ns = current_event_ns
+                if current_cadence_value != previous_cadence_value:
+                    previous_cadence_value = current_cadence_value
+                    previous_cadence_time_ns = current_cadence_time_ns
 
                 connection = None if connections[index] is None else str(connections[index])
                 raw_sequence = sequences[index]
@@ -1507,32 +1719,70 @@ def _cross_segment_gaps(
                     if prior_sequence != sequence:
                         previous_sequences[connection] = sequence
 
-                if sample.record_type != RecordType.L2_DELTA:
+                if sample.record_type == RecordType.WIRE_MESSAGE:
+                    wire_connection = str(connections[index])
+                    raw_wire_epoch = wire_epochs[index]
+                    raw_arrival_sequence = wire_arrivals[index]
+                    assert raw_wire_epoch is not None
+                    assert raw_arrival_sequence is not None
+                    wire_epoch = int(raw_wire_epoch)
+                    arrival_sequence = int(raw_arrival_sequence)
+                    arrival_key = (wire_connection, wire_epoch)
+                    prior_arrival = previous_arrival_sequences.get(arrival_key)
+                    if prior_arrival is not None and arrival_key not in wire_keys_seen_in_manifest:
+                        if arrival_sequence > prior_arrival + 1:
+                            result.append(
+                                (
+                                    manifest.partition,
+                                    Gap(
+                                        kind="arrival_sequence",
+                                        start=str(prior_arrival),
+                                        end=str(arrival_sequence),
+                                        missing_count=arrival_sequence - prior_arrival - 1,
+                                        connection_id=wire_connection,
+                                    ),
+                                )
+                            )
+                        elif arrival_sequence < prior_arrival:
+                            result.append(
+                                (
+                                    manifest.partition,
+                                    Gap(
+                                        kind="arrival_sequence_regression",
+                                        start=str(prior_arrival),
+                                        end=str(arrival_sequence),
+                                        missing_count=0,
+                                        connection_id=wire_connection,
+                                    ),
+                                )
+                            )
+                    wire_keys_seen_in_manifest.add(arrival_key)
+                    if prior_arrival != arrival_sequence:
+                        previous_arrival_sequences[arrival_key] = arrival_sequence
+
+                if not is_l2:
                     continue
-                update = str(l2_updates[index])
+                identifier = str(l2_identifiers[index])
                 epoch = None if l2_epochs[index] is None else str(l2_epochs[index])
                 raw_first_sequence = l2_first[index]
                 raw_last_sequence = l2_last[index]
-                first_sequence = (
-                    None
-                    if raw_first_sequence is None
-                    else int(str(raw_first_sequence))
-                )
-                last_sequence = (
-                    None
-                    if raw_last_sequence is None
-                    else int(str(raw_last_sequence))
-                )
-                if previous_l2 is not None and update != previous_l2[0]:
-                    _, prior_epoch, prior_connection, prior_last, prior_event_ns = previous_l2
+                first_sequence = None if raw_first_sequence is None else int(str(raw_first_sequence))
+                last_sequence = None if raw_last_sequence is None else int(str(raw_last_sequence))
+                if previous_l2 is not None and identifier != previous_l2[0]:
+                    (
+                        prior_identifier,
+                        prior_epoch,
+                        prior_connection,
+                        prior_last,
+                        prior_event_ns,
+                    ) = previous_l2
                     reset = (
-                        first_sequence is not None
+                        sample.record_type == RecordType.L2_DELTA
+                        and first_sequence is not None
                         and prior_last is not None
                         and first_sequence <= prior_last
                     )
-                    transitioned = (
-                        epoch != prior_epoch or connection != prior_connection or reset
-                    )
+                    transitioned = epoch != prior_epoch or connection != prior_connection or reset
                     resync_key = (sample.venue, sample.asset, epoch, connection)
                     if transitioned and not _has_completed_resync(
                         resyncs,
@@ -1540,26 +1790,28 @@ def _cross_segment_gaps(
                         after_ns=prior_event_ns,
                         before_ns=current_event_ns,
                     ):
+                        if sample.record_type == RecordType.L2_SNAPSHOT:
+                            prior_cursor = f"snapshot={prior_identifier}"
+                            current_cursor = f"snapshot={identifier}"
+                        else:
+                            prior_cursor = f"sequence={prior_last}"
+                            current_cursor = f"sequence={first_sequence}"
                         result.append(
                             (
                                 manifest.partition,
                                 Gap(
                                     kind="l2_resync_missing",
                                     start=(
-                                        f"epoch={prior_epoch},connection={prior_connection},"
-                                        f"sequence={prior_last}"
+                                        f"epoch={prior_epoch},connection={prior_connection},{prior_cursor}"
                                     ),
-                                    end=(
-                                        f"epoch={epoch},connection={connection},"
-                                        f"sequence={first_sequence}"
-                                    ),
+                                    end=(f"epoch={epoch},connection={connection},{current_cursor}"),
                                     missing_count=0,
                                     connection_id=connection,
                                 ),
                             )
                         )
                 previous_l2 = (
-                    update,
+                    identifier,
                     epoch,
                     connection,
                     last_sequence,
@@ -1597,8 +1849,7 @@ def inventory_partitions(
         expected_path = (canonical_root / manifest.relative_manifest_path).resolve()
         if path.resolve() != expected_path:
             raise PartitionValidationError(
-                "manifest is outside canonical root layout: "
-                f"{path.relative_to(root).as_posix()}"
+                f"manifest is outside canonical root layout: {path.relative_to(root).as_posix()}"
             )
         validated.append((manifest, path))
     manifests = tuple(

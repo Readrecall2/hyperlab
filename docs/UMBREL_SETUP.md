@@ -93,7 +93,11 @@ Ouvrez l'icône HyperLab. La bannière doit afficher :
 READ-ONLY — ORDRES IMPOSSIBLES
 ```
 
-Après quelques minutes, le compteur de snapshots doit augmenter.
+Après quelques minutes, la section runtime doit afficher l’état du collecteur,
+ses connexions, ses gaps visibles et ses flux stale. Le compteur
+« legacy SQLite » correspond uniquement à l’ancienne commande
+`snapshot --save` et peut rester à zéro lorsque le collecteur Parquet Phase 02
+tourne normalement.
 
 Tests supplémentaires depuis le navigateur :
 
@@ -102,11 +106,20 @@ Tests supplémentaires depuis le navigateur :
 /api/status
 ```
 
-Le JSON doit contenir :
+`/health` doit contenir :
 
 ```json
 {"ok": true, "mode": "readonly", "orders_enabled": false}
 ```
+`/api/status` doit conserver `"mode": "readonly"` et
+`"orders_enabled": false`, puis exposer le document
+`runtime_status.json` sous la clé `runtime`. Le contrat complet et le gate soak
+24 heures non encore certifié sont décrits dans
+[`HYPERLIQUID_COLLECTOR.md`](HYPERLIQUID_COLLECTOR.md).
+
+Le service collecteur intercepte `SIGINT`/`SIGTERM` et dispose d’un
+`stop_grace_period` de 30 secondes pour fermer le socket, flusher et publier
+son statut final avant un éventuel arrêt forcé.
 
 ## 6. Mise à jour
 

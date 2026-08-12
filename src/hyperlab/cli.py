@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import signal
 import sys
-import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from types import FrameType
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -21,7 +23,7 @@ from hyperlab.data.cli import data_app
 from hyperlab.data.io import load_panel_csv, save_panel_csv
 from hyperlab.data.synthetic import generate_demo_panel, generate_microstructure_demo
 from hyperlab.models import BacktestResult
-from hyperlab.storage.sqlite import database_status, save_carry_snapshots, write_runtime_status
+from hyperlab.storage.sqlite import database_status, save_carry_snapshots
 from hyperlab.strategies.market_making import InventoryAwareMarketMaker
 from hyperlab.strategies.registry import STRATEGY_CATALOG, STRATEGY_FACTORIES, create_strategy
 
@@ -49,6 +51,53 @@ def _settings() -> Settings:
     return load_settings(CONFIG)
 
 
+def _csv_values(value: str, *, label: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not values:
+        raise typer.BadParameter(f"{label} ne peut pas être vide")
+    if len(values) != len(set(values)):
+        raise typer.BadParameter(f"{label} contient des doublons")
+    return values
+
+
+@contextmanager
+def _cooperative_signal_handlers(stop: Callable[[], None]) -> Iterator[None]:
+    """Ask the collector to stop, then restore the process signal handlers."""
+
+    managed_signals = tuple(
+        dict.fromkeys(
+            int(signum)
+            for name in ("SIGTERM", "SIGINT")
+            if isinstance(signum := getattr(signal, name, None), int)
+        )
+    )
+    previous: dict[int, Any] = {}
+
+    def request_stop(_signum: int, _frame: FrameType | None) -> None:
+        stop()
+
+    try:
+        for signum in managed_signals:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+        yield
+    finally:
+        for signum, handler in reversed(previous.items()):
+            signal.signal(signum, handler)
+
+
+def _close_preserving_active_exception(close: Callable[[], None]) -> None:
+    """Close resources without replacing an exception already in flight."""
+
+    primary_error = sys.exception()
+    try:
+        close()
+    except BaseException as cleanup_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(f"cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+
+
 def _profile_for(name: str) -> str:
     return {
         "cash_and_carry": "defensive",
@@ -61,9 +110,7 @@ def _profile_for(name: str) -> str:
 
 
 def _secret_like_environment_variables(environment: Mapping[str, str]) -> list[str]:
-    return sorted(
-        key for key in environment if any(marker in key.upper() for marker in SECRET_ENV_MARKERS)
-    )
+    return sorted(key for key in environment if any(marker in key.upper() for marker in SECRET_ENV_MARKERS))
 
 
 @app.command()
@@ -154,7 +201,9 @@ def demo(
         )
     console.print(table)
     console.print(f"[bold green]Rapport : {report.resolve()}[/bold green]")
-    console.print("[yellow]Ces résultats synthétiques valident l'installation, jamais une rentabilité.[/yellow]")
+    console.print(
+        "[yellow]Ces résultats synthétiques valident l'installation, jamais une rentabilité.[/yellow]"
+    )
 
 
 @app.command("demo-data")
@@ -212,8 +261,10 @@ def snapshot(
     from hyperlab.api.public import HyperliquidPublicClient
 
     settings = _settings()
-    client = HyperliquidPublicClient(network=network, timeout_seconds=settings.app.request_timeout_seconds)
-    snapshots = client.carry_snapshot()
+    with HyperliquidPublicClient(
+        network=network, timeout_seconds=settings.app.request_timeout_seconds
+    ) as client:
+        snapshots = client.carry_snapshot()
     table = Table(title=f"Snapshot public Hyperliquid — {network}")
     for heading in ("Actif", "Spot", "Perp", "Funding/h", "Basis bps", "Volume perp 24h"):
         table.add_column(heading, justify="right" if heading != "Actif" else "left")
@@ -235,56 +286,105 @@ def snapshot(
 
 @app.command()
 def collect(
-    interval_seconds: Annotated[int, typer.Option(min=15, max=86_400)] = 60,
-    samples: Annotated[int, typer.Option(min=0, help="0 = boucle continue")] = 0,
-    network: Annotated[str, typer.Option()] = "mainnet",
+    network: Annotated[str, typer.Option(help="mainnet ou testnet")] = "mainnet",
+    assets: Annotated[str, typer.Option(help="Coins API séparés par des virgules")] = "BTC,ETH",
+    candle_intervals: Annotated[str, typer.Option(help="Intervalles candle séparés par des virgules")] = "1m",
+    duration_seconds: Annotated[float, typer.Option(min=0.0, help="0 = boucle continue")] = 0.0,
+    max_messages: Annotated[int, typer.Option(min=0, help="0 = aucune limite de messages")] = 0,
+    batch_size: Annotated[int, typer.Option(min=1, max=10_000)] = 500,
+    history_lookback_hours: Annotated[int, typer.Option(min=1, max=24)] = 24,
 ) -> None:
-    """Collecte publique continue pour Windows, Docker ou Umbrel."""
-    from hyperlab.api.public import HyperliquidPublicClient
+    """Collecte REST+WebSocket publique, sans adresse ni secret."""
+    from hyperlab.collector.models import CollectorConfig
+    from hyperlab.collector.runtime import PublicCollector
+    from hyperlab.collector.websocket import WebsocketClientFactory
 
     settings = _settings()
     if settings.app.mode not in {"readonly", "research"}:
         raise typer.BadParameter("Le collecteur 0.2.0 refuse tout mode autre que readonly/research")
-    database = settings.app.data_dir / "hyperlab.sqlite3"
-    runtime = settings.app.data_dir / "runtime_status.json"
-    client = HyperliquidPublicClient(network=network, timeout_seconds=settings.app.request_timeout_seconds)
-    iteration = 0
-    while samples == 0 or iteration < samples:
-        iteration += 1
-        started = datetime.now(tz=UTC)
-        status_payload: dict[str, object]
-        try:
-            batch = client.carry_snapshot()
-            saved = save_carry_snapshots(database, batch)
-            status_payload = {
-                "ok": True,
-                "mode": "readonly",
-                "network": network,
-                "last_success": started.isoformat(),
-                "rows_last_batch": saved,
-                **database_status(database),
-            }
-            write_runtime_status(runtime, status_payload)
-            console.print(f"[{started.isoformat()}] {saved} snapshots publics")
-        except Exception as exc:  # collector must record and continue; no orders exist
-            status_payload = {
-                "ok": False,
-                "mode": "readonly",
-                "network": network,
-                "last_error": started.isoformat(),
-                "error": f"{type(exc).__name__}: {exc}",
-                **database_status(database),
-            }
-            write_runtime_status(runtime, status_payload)
-            console.print(f"[red]{status_payload['error']}[/red]")
-        if samples == 0 or iteration < samples:
-            time.sleep(interval_seconds)
+    try:
+        config = CollectorConfig(
+            network=network,
+            assets=_csv_values(assets, label="assets"),
+            candle_intervals=_csv_values(candle_intervals, label="candle-intervals"),
+            batch_size=batch_size,
+            history_lookback_hours=history_lookback_hours,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    socket_factory = WebsocketClientFactory(queue_capacity=config.queue_capacity)
+    collector = PublicCollector.create_default(
+        config,
+        data_dir=settings.app.data_dir,
+        request_timeout_seconds=settings.app.request_timeout_seconds,
+        socket_factory=socket_factory,
+    )
+    try:
+        with _cooperative_signal_handlers(collector.stop):
+            collector.run(
+                max_messages=max_messages,
+                duration_seconds=None if duration_seconds == 0 else duration_seconds,
+            )
+    except KeyboardInterrupt:
+        collector.stop()
+        console.print("Arrêt demandé; fermeture et publication du dernier batch.")
+    finally:
+        _close_preserving_active_exception(collector.close)
+    console.print_json(json.dumps(collector.metrics.as_dict(datetime.now(tz=UTC))))
+
+
+@app.command()
+def replay(
+    fixture_dir: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
+    ],
+    output: Annotated[Path, typer.Option(help="Racine du lake replay")] = Path("data/replay-lake"),
+    received_at: Annotated[
+        str, typer.Option(help="Horloge UTC logique et déterministe")
+    ] = "2026-08-11T23:21:00+00:00",
+) -> None:
+    """Rejoue des fixtures publiques sans construire de client réseau."""
+    from hyperlab.collector.models import ParsedRecord
+    from hyperlab.collector.replay import replay_fixture
+    from hyperlab.collector.storage import BatchingLakeSink
+
+    try:
+        logical_time = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise typer.BadParameter("received-at must be a valid ISO 8601 timestamp") from None
+    if logical_time.tzinfo is None or logical_time.utcoffset() != UTC.utcoffset(logical_time):
+        raise typer.BadParameter("received-at doit être un horodatage UTC explicite")
+    logical_time = logical_time.astimezone(UTC)
+    sink = BatchingLakeSink(output, batch_size=500, queue_capacity=10_000, persistent_dedup=False)
+    rows_written = 0
+
+    def add_and_flush(record: ParsedRecord) -> bool:
+        nonlocal rows_written
+        added = sink.add(record)
+        if sink.should_flush:
+            rows_written += sink.flush().row_count
+        return added
+
+    try:
+        summary = replay_fixture(fixture_dir, add_and_flush, lambda: logical_time)
+        rows_written += sink.flush().row_count
+    finally:
+        _close_preserving_active_exception(sink.close)
+    summary.update({"network_enabled": False, "rows_written": rows_written})
+    console.print_json(json.dumps(summary))
 
 
 @app.command()
 def status() -> None:
     settings = _settings()
-    payload = database_status(settings.app.data_dir / "hyperlab.sqlite3")
+    payload: dict[str, object] = dict(database_status(settings.app.data_dir / "hyperlab.sqlite3"))
+    runtime_path = settings.app.data_dir / "runtime_status.json"
+    if runtime_path.exists():
+        try:
+            payload["runtime"] = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload["runtime"] = {"ok": False, "error": "runtime_status.json illisible"}
     console.print_json(json.dumps(payload))
 
 

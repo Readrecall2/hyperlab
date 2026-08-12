@@ -263,16 +263,34 @@ Cette commande :
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect `
-  --interval-seconds 60 `
-  --samples 10 `
-  --network mainnet
+  --network mainnet `
+  --assets BTC,ETH `
+  --candle-intervals 1m `
+  --duration-seconds 600
 ```
+
+Le contrat technique complet est documenté dans
+[`HYPERLIQUID_COLLECTOR.md`](HYPERLIQUID_COLLECTOR.md). Le premier bootstrap REST
+et toute resynchronisation après coupure ont lieu avant l’ouverture du socket ;
+le collecteur passe ensuite de `SUBSCRIBING` à `LIVE` seulement après tous les
+acquittements. Une fois `LIVE`, le refresh REST périodique s’exécute dans un
+worker pendant que la lecture WebSocket continue.
+
+Les révisions d’une candle restent des observations immuables : aucune horloge
+locale ne les marque finales. L’intervalle calendaire `1M` est volontairement
+refusé ; utilise un intervalle fixe tel que `1m`, `1h`, `1d` ou `1w`.
+
+Cette collecte courte est un smoke test, pas la certification soak de 24 heures,
+qui reste explicitement en attente.
 
 Vérifie :
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab status
 ```
+
+Le statut runtime expose notamment l’état, les connexions/reconnexions, les gaps
+visibles et les flux stale.
 
 ## 13. Dashboard Windows
 
@@ -287,6 +305,11 @@ Ouvre :
 ```text
 http://127.0.0.1:8000
 ```
+
+La page « Santé du collecteur public » lit `data/runtime_status.json` et affiche
+les connexions, gaps et flux stale. Le compteur SQLite est conservé uniquement
+comme indicateur **legacy** de la commande `snapshot --save`; il ne compte pas
+les lignes Parquet du collecteur Phase 02.
 
 La bannière doit dire `READ-ONLY — ORDRES IMPOSSIBLES`.
 
@@ -402,6 +425,10 @@ Arrêt :
 docker compose down
 ```
 
+Le collecteur reçoit `SIGINT`/`SIGTERM` de façon coopérative. Les compositions
+locale et Umbrel lui accordent 30 secondes pour fermer le socket, publier le
+dernier statut et flusher le dernier batch avant un éventuel arrêt forcé.
+
 Les services sont non-root, read-only, sans capacités Linux et sans Docker socket.
 
 ---
@@ -487,7 +514,9 @@ Ouvre HyperLab. Tu dois voir :
 READ-ONLY — ORDRES IMPOSSIBLES
 ```
 
-Le compteur augmente progressivement. Vérifie aussi :
+La section runtime doit indiquer l’état du collecteur, ses connexions, ses gaps
+et ses flux stale. Le compteur « legacy SQLite » peut rester à zéro lorsque seul
+le collecteur Parquet Phase 02 tourne. Vérifie aussi :
 
 ```text
 /health

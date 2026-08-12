@@ -49,7 +49,7 @@ Puis relancez. Un endpoint ou un format peut avoir changé : comparez avec le SD
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab status
-.\.venv\Scripts\python.exe -m hyperlab collect --interval-seconds 60 --samples 2
+.\.venv\Scripts\python.exe -m hyperlab collect --assets BTC --duration-seconds 120
 ```
 
 Le dashboard ne fabrique pas de données ; le collecteur doit avoir réussi au moins une fois.

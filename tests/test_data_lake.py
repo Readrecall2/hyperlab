@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -176,6 +177,40 @@ def _trade_table(
     )
 
 
+def _wire_table(
+    observations: tuple[tuple[datetime, int, int], ...],
+    *,
+    connection_id: str = "connection-1",
+) -> pa.Table:
+    spec = schema_for("wire_message")
+    rows = []
+    for event_time, connection_epoch, arrival_sequence in observations:
+        raw_message = json.dumps(
+            {"channel": "pong", "arrival": arrival_sequence},
+            separators=(",", ":"),
+        )
+        rows.append(
+            {
+                "schema_version": 1,
+                "record_type": "wire_message",
+                "venue": "hyperliquid",
+                "asset": "CONNECTION",
+                "event_time": event_time,
+                "exchange_time": None,
+                "received_time": event_time,
+                "source_sequence": None,
+                "connection_id": connection_id,
+                "connection_epoch": connection_epoch,
+                "arrival_sequence": arrival_sequence,
+                "channel": "pong",
+                "raw_message": raw_message,
+                "is_json": True,
+                "payload_sha256": hashlib.sha256(raw_message.encode()).hexdigest(),
+            }
+        )
+    return pa.Table.from_pylist(rows, schema=spec.schema)
+
+
 def _resync_events_table() -> pa.Table:
     spec = schema_for("connection_event")
     rows = []
@@ -231,6 +266,38 @@ def _l2_delta_transition_table() -> pa.Table:
                 "price": Decimal("50000"),
                 "quantity": Decimal("1"),
                 "action": "set",
+            }
+        )
+    return pa.Table.from_pylist(rows, schema=spec.schema)
+
+
+def _l2_snapshot_transition_table() -> pa.Table:
+    spec = schema_for("l2_snapshot")
+    rows = []
+    for hour, epoch, connection, snapshot_id in (
+        (0, "epoch-1", "connection-1", "snapshot-1"),
+        (1, "epoch-2", "connection-2", "snapshot-2"),
+    ):
+        event_time = _utc(hour)
+        rows.append(
+            {
+                "schema_version": 1,
+                "record_type": "l2_snapshot",
+                "venue": "hyperliquid",
+                "asset": "BTC",
+                "event_time": event_time,
+                "exchange_time": event_time,
+                "received_time": event_time + timedelta(milliseconds=1),
+                "source_sequence": None,
+                "connection_id": connection,
+                "snapshot_id": snapshot_id,
+                "book_epoch_id": epoch,
+                "last_sequence": None,
+                "side": "bid",
+                "level": 0,
+                "price": Decimal("50000"),
+                "quantity": Decimal("1"),
+                "order_count": 1,
             }
         )
     return pa.Table.from_pylist(rows, schema=spec.schema)
@@ -299,8 +366,10 @@ def _funding_table(
 def test_partition_key_rejects_ambiguous_or_unsafe_layout_values() -> None:
     with pytest.raises(ValueError, match="venue"):
         PartitionKey("../venue", DAY, "BTC", "candle")
+    pair = PartitionKey("hyperliquid", DAY, "BTC/USDC", "candle")
+    assert "asset=BTC%2FUSDC" in pair.relative_path.as_posix()
     with pytest.raises(ValueError, match="asset"):
-        PartitionKey("hyperliquid", DAY, "BTC/USDC", "candle")
+        PartitionKey("hyperliquid", DAY, "../BTC", "candle")
     with pytest.raises(ValueError, match="record type"):
         PartitionKey("hyperliquid", DAY, "BTC", "l2")
 
@@ -365,9 +434,7 @@ def test_validation_hashes_before_attempting_to_read_corrupted_parquet(tmp_path:
         (_candle_table(times=(_utc(0), datetime(2026, 8, 12, tzinfo=UTC))), "date"),
     ],
 )
-def test_write_rejects_invalid_partition_content(
-    tmp_path: Path, table: pa.Table, message: str
-) -> None:
+def test_write_rejects_invalid_partition_content(tmp_path: Path, table: pa.Table, message: str) -> None:
     key = PartitionKey("hyperliquid", DAY, "BTC", "candle")
     with pytest.raises(PartitionValidationError, match=message):
         write_partition(tmp_path, key, table)
@@ -641,10 +708,7 @@ def test_cross_date_gaps_are_attributed_to_the_day_of_the_current_row(tmp_path: 
     previous_report = daily_quality_report(tmp_path, DAY)
     current_report = daily_quality_report(tmp_path, next_day)
     assert previous_report["gap_count"] == 0
-    assert {
-        (gap["kind"], gap["missing_count"], gap["partition"])
-        for gap in current_report["gaps"]
-    } == {
+    assert {(gap["kind"], gap["missing_count"], gap["partition"]) for gap in current_report["gaps"]} == {
         (
             "sequence",
             1,
@@ -715,6 +779,62 @@ def test_manifest_rejects_a_non_positive_expected_interval(tmp_path: Path) -> No
         validate_partition(manifest_path)
 
 
+@pytest.mark.parametrize(
+    ("arrivals", "expected_kind", "missing_count"),
+    [
+        ((1, 3), "arrival_sequence", 1),
+        ((3, 1), "arrival_sequence_regression", 0),
+    ],
+)
+def test_wire_arrival_sequence_quality_is_distinct_from_source_sequence(
+    tmp_path: Path,
+    arrivals: tuple[int, int],
+    expected_kind: str,
+    missing_count: int,
+) -> None:
+    manifest = write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "CONNECTION", "wire_message"),
+        _wire_table(
+            (
+                (_utc(0), 1, arrivals[0]),
+                (_utc(1), 1, arrivals[1]),
+            )
+        ),
+    )
+
+    assert manifest.sequence_min is None
+    assert manifest.sequence_max is None
+    assert manifest.gap_detection == "arrival_sequence"
+    assert [(gap.kind, gap.missing_count) for gap in manifest.gaps] == [(expected_kind, missing_count)]
+
+
+def test_wire_arrival_sequence_may_restart_in_a_new_connection_epoch(
+    tmp_path: Path,
+) -> None:
+    manifest = write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "CONNECTION", "wire_message"),
+        _wire_table(
+            (
+                (_utc(0), 1, 3),
+                (_utc(1), 2, 1),
+            )
+        ),
+    )
+
+    assert manifest.gaps == ()
+
+
+def test_wire_arrival_gap_is_detected_across_parquet_segments(tmp_path: Path) -> None:
+    key = PartitionKey("hyperliquid", DAY, "CONNECTION", "wire_message")
+    write_partition(tmp_path, key, _wire_table(((_utc(0), 1, 1),)))
+    write_partition(tmp_path, key, _wire_table(((_utc(1), 1, 3),)))
+
+    gaps = inventory_partitions(tmp_path).cross_segment_gaps
+    assert [(gap.kind, gap.missing_count) for _, gap in gaps] == [("arrival_sequence", 1)]
+
+
 def test_daily_report_makes_l2_resynchronization_events_visible(tmp_path: Path) -> None:
     write_partition(
         tmp_path,
@@ -783,6 +903,47 @@ def test_delisted_assets_are_deduplicated_across_instrument_ids(tmp_path: Path) 
 
     assert inventory_partitions(tmp_path).delisted_assets == ("hyperliquid:OLD",)
     assert daily_quality_report(tmp_path, DAY)["delisted_assets"] == ["hyperliquid:OLD"]
+
+
+def test_l2_snapshot_epoch_transition_without_resync_is_visible_without_sequence(
+    tmp_path: Path,
+) -> None:
+    write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "BTC", "l2_snapshot"),
+        _l2_snapshot_transition_table(),
+    )
+
+    report = daily_quality_report(tmp_path, DAY)
+    assert report["quality"] == "degraded"
+    assert len(report["gaps"]) == 1
+    gap = report["gaps"][0]
+    assert gap["kind"] == "l2_resync_missing"
+    assert "snapshot=snapshot-1" in gap["start"]
+    assert "snapshot=snapshot-2" in gap["end"]
+    assert "sequence=" not in gap["start"] + gap["end"]
+
+
+def test_l2_snapshot_epoch_transition_with_explicit_resync_is_accepted(
+    tmp_path: Path,
+) -> None:
+    write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "BTC", "l2_snapshot"),
+        _l2_snapshot_transition_table(),
+    )
+    write_partition(
+        tmp_path,
+        PartitionKey("hyperliquid", DAY, "BTC", "connection_event"),
+        _epoch_two_resync_events_table(),
+    )
+
+    report = daily_quality_report(tmp_path, DAY)
+    assert report["gap_count"] == 0
+    assert report["connection_events"] == {
+        "resync_complete": 1,
+        "resync_start": 1,
+    }
 
 
 def test_l2_epoch_transition_without_explicit_resync_is_degraded(tmp_path: Path) -> None:
@@ -940,6 +1101,88 @@ def test_funding_kinds_and_cadences_are_distinct_logical_streams(tmp_path: Path)
             ),
             expected_interval=timedelta(hours=8),
         )
+
+
+def test_funding_hour_buckets_tolerate_millisecond_jitter(tmp_path: Path) -> None:
+    key = PartitionKey("hyperliquid", DAY, "BTC", "funding")
+    manifest = write_partition(
+        tmp_path,
+        key,
+        _funding_table(
+            times=(
+                _utc(0) + timedelta(milliseconds=76),
+                _utc(1) + timedelta(milliseconds=123),
+            ),
+            sequences=(10, 11),
+            rate_kind="settled",
+            interval_seconds=3_600,
+        ),
+    )
+
+    assert manifest.gaps == ()
+    assert manifest.gap_detection == "funding_bucket_and_sequence"
+
+
+def test_funding_hour_buckets_still_report_a_missing_hour(tmp_path: Path) -> None:
+    key = PartitionKey("hyperliquid", DAY, "BTC", "funding")
+    manifest = write_partition(
+        tmp_path,
+        key,
+        _funding_table(
+            times=(
+                _utc(0) + timedelta(milliseconds=76),
+                _utc(2) + timedelta(milliseconds=123),
+            ),
+            sequences=(10, 11),
+            rate_kind="settled",
+            interval_seconds=3_600,
+        ),
+    )
+
+    assert [(gap.kind, gap.missing_count) for gap in manifest.gaps] == [("funding_bucket", 1)]
+
+
+def test_funding_tolerance_assigns_just_before_hour_to_next_bucket(
+    tmp_path: Path,
+) -> None:
+    key = PartitionKey("hyperliquid", DAY, "BTC", "funding")
+    manifest = write_partition(
+        tmp_path,
+        key,
+        _funding_table(
+            times=(
+                _utc(1) - timedelta(milliseconds=50),
+                _utc(2) - timedelta(milliseconds=25),
+            ),
+            sequences=(10, 11),
+            rate_kind="settled",
+            interval_seconds=3_600,
+        ),
+    )
+
+    assert manifest.gaps == ()
+
+
+def test_funding_bucket_tolerance_is_used_across_parquet_segments(
+    tmp_path: Path,
+) -> None:
+    key = PartitionKey("hyperliquid", DAY, "BTC", "funding")
+    for event_time, sequence in (
+        (_utc(0) + timedelta(milliseconds=76), 10),
+        (_utc(1) + timedelta(milliseconds=123), 11),
+    ):
+        write_partition(
+            tmp_path,
+            key,
+            _funding_table(
+                times=(event_time,),
+                sequences=(sequence,),
+                rate_kind="settled",
+                interval_seconds=3_600,
+            ),
+        )
+
+    assert inventory_partitions(tmp_path).cross_segment_gaps == ()
 
 
 def test_funding_primary_keys_remain_unique_across_historical_cadences(

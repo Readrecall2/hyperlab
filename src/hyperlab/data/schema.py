@@ -13,8 +13,12 @@ SCHEMA_VERSION_METADATA = b"hyperlab.schema_version"
 
 
 class RecordType(StrEnum):
+    INSTRUMENT_METADATA = "instrument_metadata"
+    MARKET_CONTEXT = "market_context"
+    WIRE_MESSAGE = "wire_message"
     CANDLE = "candle"
     BBO = "bbo"
+    L2_BOOK_STATE = "l2_book_state"
     L2_SNAPSHOT = "l2_snapshot"
     L2_DELTA = "l2_delta"
     TRADE = "trade"
@@ -94,6 +98,71 @@ def _make_spec(
 
 _V1_SPECS = (
     _make_spec(
+        RecordType.INSTRUMENT_METADATA,
+        [
+            _field("instrument_kind", pa.string()),
+            _field("instrument_id", pa.string()),
+            _field("source_symbol", pa.string()),
+            _field("source_index", pa.uint32(), nullable=True),
+            _field("base_token", pa.string(), nullable=True),
+            _field("quote_token", pa.string(), nullable=True),
+            _field("sz_decimals", pa.uint8(), nullable=True),
+            _field("wei_decimals", pa.uint8(), nullable=True),
+            _field("max_leverage", pa.uint32(), nullable=True),
+            _field("margin_table_id", pa.uint32(), nullable=True),
+            _field("is_canonical", pa.bool_(), nullable=True),
+            _field("full_name", pa.string(), nullable=True),
+            _field("metadata_sha256", pa.string()),
+            _field("metadata_json", pa.string()),
+        ],
+        primary_key=("venue", "instrument_id", "event_time", "metadata_sha256"),
+        order_key=("event_time", "received_time", "instrument_id", "metadata_sha256"),
+    ),
+    _make_spec(
+        RecordType.MARKET_CONTEXT,
+        [
+            _field("instrument_kind", pa.string()),
+            _field("instrument_id", pa.string()),
+            _field("mark_price", MARKET_DECIMAL, nullable=True),
+            _field("oracle_price", MARKET_DECIMAL, nullable=True),
+            _field("mid_price", MARKET_DECIMAL, nullable=True),
+            _field("current_funding_rate", MARKET_DECIMAL, nullable=True),
+            _field("open_interest_quantity", MARKET_DECIMAL, nullable=True),
+            _field("open_interest_notional", MARKET_DECIMAL, nullable=True),
+            _field("base_volume_24h", MARKET_DECIMAL, nullable=True),
+            _field("notional_volume_24h", MARKET_DECIMAL, nullable=True),
+            _field("previous_day_price", MARKET_DECIMAL, nullable=True),
+            _field("circulating_supply", MARKET_DECIMAL, nullable=True),
+            _field("observation_id", pa.string()),
+        ],
+        primary_key=("venue", "instrument_id", "observation_id"),
+        order_key=("event_time", "received_time", "source_sequence", "instrument_id"),
+    ),
+    _make_spec(
+        RecordType.WIRE_MESSAGE,
+        [
+            _field("connection_epoch", pa.uint64()),
+            _field("arrival_sequence", pa.uint64()),
+            _field("channel", pa.string(), nullable=True),
+            _field("message_asset", pa.string(), nullable=True),
+            _field("raw_message", pa.string()),
+            _field("is_json", pa.bool_()),
+            _field("payload_sha256", pa.string()),
+        ],
+        primary_key=(
+            "venue",
+            "connection_id",
+            "connection_epoch",
+            "arrival_sequence",
+        ),
+        order_key=(
+            "event_time",
+            "received_time",
+            "connection_epoch",
+            "arrival_sequence",
+        ),
+    ),
+    _make_spec(
         RecordType.CANDLE,
         [
             _field("interval", pa.string()),
@@ -106,22 +175,36 @@ _V1_SPECS = (
             _field("base_volume", MARKET_DECIMAL),
             _field("quote_volume", MARKET_DECIMAL, nullable=True),
             _field("trade_count", pa.uint64(), nullable=True),
-            _field("is_final", pa.bool_()),
+            _field("is_final", pa.bool_(), nullable=True),
+            _field("observation_id", pa.string()),
         ],
-        primary_key=("venue", "asset", "interval", "open_time"),
+        primary_key=("venue", "asset", "interval", "open_time", "observation_id"),
         order_key=("event_time", "received_time", "source_sequence", "open_time"),
+        version=2,
     ),
     _make_spec(
         RecordType.BBO,
         [
-            _field("update_id", pa.string(), nullable=True),
-            _field("bid_price", MARKET_DECIMAL),
-            _field("bid_quantity", MARKET_DECIMAL),
-            _field("ask_price", MARKET_DECIMAL),
-            _field("ask_quantity", MARKET_DECIMAL),
+            _field("update_id", pa.string()),
+            _field("bid_price", MARKET_DECIMAL, nullable=True),
+            _field("bid_quantity", MARKET_DECIMAL, nullable=True),
+            _field("ask_price", MARKET_DECIMAL, nullable=True),
+            _field("ask_quantity", MARKET_DECIMAL, nullable=True),
         ],
-        primary_key=("venue", "asset", "event_time", "received_time", "source_sequence"),
+        primary_key=("venue", "asset", "update_id"),
         order_key=("event_time", "received_time", "source_sequence"),
+        version=2,
+    ),
+    _make_spec(
+        RecordType.L2_BOOK_STATE,
+        [
+            _field("snapshot_id", pa.string()),
+            _field("book_epoch_id", pa.string()),
+            _field("bid_level_count", pa.uint32()),
+            _field("ask_level_count", pa.uint32()),
+        ],
+        primary_key=("venue", "asset", "snapshot_id"),
+        order_key=("event_time", "received_time", "snapshot_id"),
     ),
     _make_spec(
         RecordType.L2_SNAPSHOT,
@@ -189,9 +272,11 @@ _V1_SPECS = (
             _field("rate_kind", pa.string()),
             _field("mark_price", MARKET_DECIMAL, nullable=True),
             _field("oracle_price", MARKET_DECIMAL, nullable=True),
+            _field("observation_id", pa.string()),
         ],
-        primary_key=("venue", "asset", "funding_time", "rate_kind"),
+        primary_key=("venue", "asset", "funding_time", "rate_kind", "observation_id"),
         order_key=("event_time", "received_time", "source_sequence", "funding_time"),
+        version=2,
     ),
     _make_spec(
         RecordType.OPEN_INTEREST,
@@ -247,20 +332,86 @@ _V1_SPECS = (
     ),
 )
 
-_SCHEMA_REGISTRY = {(spec.record_type, spec.version): spec for spec in _V1_SPECS}
+_LEGACY_V1_SPECS = (
+    _make_spec(
+        RecordType.CANDLE,
+        [
+            _field("interval", pa.string()),
+            _field("open_time", UTC_TIMESTAMP),
+            _field("close_time", UTC_TIMESTAMP),
+            _field("open", MARKET_DECIMAL),
+            _field("high", MARKET_DECIMAL),
+            _field("low", MARKET_DECIMAL),
+            _field("close", MARKET_DECIMAL),
+            _field("base_volume", MARKET_DECIMAL),
+            _field("quote_volume", MARKET_DECIMAL, nullable=True),
+            _field("trade_count", pa.uint64(), nullable=True),
+            _field("is_final", pa.bool_()),
+        ],
+        primary_key=("venue", "asset", "interval", "open_time"),
+        order_key=("event_time", "received_time", "source_sequence", "open_time"),
+    ),
+    _make_spec(
+        RecordType.BBO,
+        [
+            _field("update_id", pa.string(), nullable=True),
+            _field("bid_price", MARKET_DECIMAL),
+            _field("bid_quantity", MARKET_DECIMAL),
+            _field("ask_price", MARKET_DECIMAL),
+            _field("ask_quantity", MARKET_DECIMAL),
+        ],
+        primary_key=("venue", "asset", "event_time", "received_time", "source_sequence"),
+        order_key=("event_time", "received_time", "source_sequence"),
+    ),
+    _make_spec(
+        RecordType.FUNDING,
+        [
+            _field("funding_time", UTC_TIMESTAMP),
+            _field("funding_rate", MARKET_DECIMAL),
+            _field("funding_interval_seconds", pa.uint32()),
+            _field("rate_kind", pa.string()),
+            _field("mark_price", MARKET_DECIMAL, nullable=True),
+            _field("oracle_price", MARKET_DECIMAL, nullable=True),
+        ],
+        primary_key=("venue", "asset", "funding_time", "rate_kind"),
+        order_key=("event_time", "received_time", "source_sequence", "funding_time"),
+    ),
+)
+
+
+BREAKING_SCHEMA_TRANSITIONS: dict[tuple[RecordType, int, int], str] = {
+    (RecordType.BBO, 1, 2): "nullable one-sided public book and collector-frame identity",
+    (RecordType.CANDLE, 1, 2): "public observations retain revisions without fabricated finality",
+    (RecordType.FUNDING, 1, 2): "received-time observations permit explicit source corrections",
+}
+
+
+_SCHEMA_REGISTRY = {(spec.record_type, spec.version): spec for spec in (*_V1_SPECS, *_LEGACY_V1_SPECS)}
+
+
+def _normalize_record_type(record_type: RecordType | str) -> RecordType:
+    try:
+        return record_type if isinstance(record_type, RecordType) else RecordType(record_type)
+    except ValueError:
+        raise ValueError(f"unknown record type: {record_type}") from None
 
 
 def schema_for(record_type: RecordType | str, version: int = 1) -> SchemaSpec:
-    try:
-        normalized = record_type if isinstance(record_type, RecordType) else RecordType(record_type)
-    except ValueError:
-        raise ValueError(f"unknown record type: {record_type}") from None
+    normalized = _normalize_record_type(record_type)
     try:
         return _SCHEMA_REGISTRY[(normalized, version)]
     except KeyError:
-        raise ValueError(
-            f"unknown schema version {version} for record type {normalized.value}"
-        ) from None
+        raise ValueError(f"unknown schema version {version} for record type {normalized.value}") from None
+
+
+def latest_schema_for(record_type: RecordType | str) -> SchemaSpec:
+    normalized = _normalize_record_type(record_type)
+    versions = [
+        registered_version
+        for registered_type, registered_version in _SCHEMA_REGISTRY
+        if registered_type == normalized
+    ]
+    return _SCHEMA_REGISTRY[(normalized, max(versions))]
 
 
 def registered_schemas() -> tuple[SchemaSpec, ...]:

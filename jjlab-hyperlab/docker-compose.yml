@@ -28,7 +28,7 @@ services:
     image: ghcr.io/REPLACE_WITH_GITHUB_USER/REPLACE_WITH_REPOSITORY:REPLACE_WITH_TAG
     user: "1000:1000"
     init: true
-    command: ["collect", "--interval-seconds", "60", "--samples", "0", "--network", "mainnet"]
+    command: ["collect", "--network", "mainnet", "--assets", "BTC,ETH", "--candle-intervals", "1m"]
     environment:
       HYPERLAB_MODE: readonly
       HYPERLAB_DATA_DIR: /data
@@ -41,3 +41,4 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    stop_grace_period: 30s

@@ -26,6 +26,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Ouvrez ensuite `reports\demo\comparison.html`.
 
+La recherche Phase 08 dispose désormais d'une sélection de paires train-only,
+d'un choix rolling/Kalman/cointégration sur validation, de stops bornés et des
+gates de retrait de la meilleure paire et de rupture de corrélation. Voir
+[`docs/PAIRS_TRADING_PHASE08.md`](docs/PAIRS_TRADING_PHASE08.md).
+
 Le rapport de démonstration porte le statut visible `SYNTHETIC`. Le moteur Phase 04
 sépare cibles et fills, simule profondeur/slippage, non-fills maker, jambes retardées
 et IOC d'urgence, puis réconcilie le PnL par composante, actif, mois UTC, régime et

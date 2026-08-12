@@ -11,6 +11,12 @@ from hyperlab.backtest.cross_exchange import (
 )
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.execution import ExecutionConfig, MakerFillModel
+from hyperlab.backtest.pairs import (
+    PairSelectionConfig,
+    PairsGateConfig,
+    audit_pairs_panel,
+    run_pairs_validation,
+)
 from hyperlab.backtest.point_in_time import (
     CandleFinalityPolicy,
     join_venues_as_of,
@@ -57,6 +63,8 @@ __all__ = [
     "FundingCalendar",
     "FundingConvention",
     "MakerFillModel",
+    "PairSelectionConfig",
+    "PairsGateConfig",
     "PanelBacktester",
     "ResearchRegistry",
     "ResearchWorkflowArtifacts",
@@ -72,12 +80,14 @@ __all__ = [
     "WalkForwardResult",
     "WalkForwardSpec",
     "aggregate_pnl",
+    "audit_pairs_panel",
     "block_bootstrap_ci",
     "causal_evaluation_with_terminal_mark",
     "causal_regimes",
     "chronological_split",
     "generate_causal_evaluation",
     "join_venues_as_of",
+    "run_pairs_validation",
     "run_research_workflow",
     "run_stress_matrix",
     "run_walk_forward",

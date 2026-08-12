@@ -260,3 +260,54 @@ venue, le haircut du stablecoin, les limites de retrait ou la récupération apr
 insolvabilité. Ces limites sont détaillées dans
 `docs/CROSS_EXCHANGE_FUNDING_PHASE07.md`. Aucun client privé, secret, signer ou
 chemin d'ordre réel n'a été ajouté.
+
+---
+
+# Validation — Phase 08, pairs trading robuste
+
+Date de validation : 12 août 2026
+
+Checkpoint antérieur aux travaux : `90a68aa`
+
+Branche : `phase-08-pairs-trading`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (64 fichiers) et les
+505 tests `pytest -p no:cacheprovider` passent. Les cinq tests Phase 08 couvrent
+l'audit anti-survivorship, l'invisibilité du test final pendant la sélection,
+la causalité des z-scores/hedges, les stops/cooldown/sizing borné et les deux
+stress obligatoires avec rapport JSON/HTML.
+
+## Verdict Phase 08
+
+Le cadre logiciel Phase 08 est implémenté. La validation économique reste
+`BLOCKED_INSUFFICIENT_REAL_DATA` : le lake local ne fournit pas 180 jours horaires
+multi-actifs Hyperliquid point-in-time avec lifecycle historique, marchés délistés,
+funding réalisé, profondeur et coûts/fills calibrés. Les fixtures synthétiques
+exercent les invariants mais ne constituent aucune preuve de rentabilité.
+
+Les identités des paires sont classées sur train seulement après contrôles de
+chevauchement, corrélation de rendements, demi-vie et stabilité du hedge ratio.
+La validation choisit ensuite, pour chaque paire déjà figée, entre rolling, Kalman
+causal et cointégration OLS. Modifier tout le test final ne change aucun choix.
+
+Le z-score à `t` normalise le spread courant avec des moments arrêtés à `t-1`.
+Le sizing cible la volatilité passée du spread et reste plafonné par paire et au
+niveau portefeuille. Les sorties comprennent retour à la moyenne, stop dur de
+spread, time stop, indisponibilité d'une jambe et cooldown. Il n'existe ni
+martingale, ni doublement après perte, ni moyenne à la baisse non bornée.
+
+Le moteur Phase 04 conserve l'attribution prix/funding/spread/frais/slippage et le
+turnover. La gate retire la meilleure paire selon la validation — jamais selon le
+test final — et impose une rupture déterministe de corrélation, marquée
+`SYNTHETIC`. Une seule paire, une equity non positive/non finie ou un rendement
+stressé sous le seuil préenregistré bloque la promotion.
+
+## Limites connues
+
+Le filtre de cointégration utilise une régression OLS et une demi-vie AR(1), pas une
+batterie asymptotique complète dépendante d'une bibliothèque statistique externe.
+La rupture de corrélation est un contrefactuel déterministe, pas une estimation de
+probabilité. La grille horaire ignore les excursions intrabar. Les paramètres
+Kalman, seuils de z-score et horizons restent des hypothèses de recherche à
+préenregistrer puis valider sur données réelles. Aucun client privé, secret,
+signer, martingale ou chemin d'ordre réel n'a été ajouté.

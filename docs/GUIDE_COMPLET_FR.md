@@ -137,6 +137,16 @@ Le bot trade l'écart entre deux actifs corrélés. Il entre lorsque le spread e
 
 Aucune martingale n'est permise.
 
+La Phase 08 sélectionne les identités de paires sur train uniquement, choisit sur
+validation un hedge rolling, Kalman ou de cointégration, puis gèle la variante
+avant le test final. Le z-score et le sizing par volatilité sont causaux ; stop de
+spread, time stop et cooldown sont obligatoires. Le rapport intègre funding,
+coûts et turnover. Sa gate retire la meilleure paire selon la validation et casse
+les corrélations sur un chemin contrefactuel signalé `SYNTHETIC`. Voir
+[`PAIRS_TRADING_PHASE08.md`](PAIRS_TRADING_PHASE08.md). Faute d'un historique
+point-in-time suffisamment long avec marchés délistés et exécution calibrée, le
+statut reste `BLOCKED_INSUFFICIENT_REAL_DATA`.
+
 ### 3.5 Momentum/régime
 
 Le bot prend une exposition directionnelle quand la tendance dépasse le bruit, avec sizing par volatilité et pénalité si le funding coûte trop cher.
@@ -799,6 +809,10 @@ temps non couvert sous stress bloque la promotion économique.
 ### Pairs
 
 Objectif : spread robuste, stop et time stop.
+
+La gate Phase 08 exige que le test final reste au-dessus du seuil préenregistré
+après retrait de la meilleure paire (déterminée sur validation) et sous rupture
+simulée des corrélations. Une paire unique ne peut donc pas franchir la gate.
 
 ### Momentum
 

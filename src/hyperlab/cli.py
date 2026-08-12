@@ -42,6 +42,13 @@ from hyperlab.backtest.funding_basket import (
     funding_basket_stress_scenarios,
     write_funding_basket_report,
 )
+from hyperlab.backtest.pairs import (
+    PairSelectionConfig,
+    PairsGateConfig,
+    audit_pairs_panel,
+    run_pairs_validation,
+    write_pairs_report,
+)
 from hyperlab.backtest.report import write_comparison_report
 from hyperlab.backtest.workflow import ResearchWorkflowSpec, run_research_workflow
 from hyperlab.config import Settings, load_settings
@@ -619,6 +626,97 @@ def cross_exchange_audit(
     console.print(f"Rapport Phase 07 : {output.resolve()}")
     if not audit.passed:
         raise typer.Exit(2)
+
+
+@app.command("pairs-audit")
+def pairs_audit(
+    data: Annotated[
+        Path,
+        typer.Option(help="Export panel Phase 08 point-in-time avec lifecycle, funding et profondeur"),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de préparation Phase 08"),
+    ] = Path("reports/pairs-readiness.json"),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 180 * 24,
+    minimum_assets: Annotated[int, typer.Option(min=4)] = 6,
+) -> None:
+    """Audite l'univers historique Phase 08 sans simuler ni envoyer aucun ordre."""
+
+    panel = load_panel_csv(data)
+    audit = audit_pairs_panel(
+        panel,
+        minimum_history_hours=minimum_history_hours,
+        minimum_assets=minimum_assets,
+    )
+    payload = asdict(audit)
+    payload["passed"] = audit.passed
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Phase 08 : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
+
+
+@app.command("pairs-backtest")
+def pairs_backtest(
+    data: Annotated[Path, typer.Option(help="Export CSV Phase 08 point-in-time")],
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 08")] = Path(
+        "reports/pairs"
+    ),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 180 * 24,
+    minimum_assets: Annotated[int, typer.Option(min=4)] = 6,
+    maximum_pairs: Annotated[int, typer.Option(min=2)] = 3,
+    minimum_stressed_return: Annotated[float, typer.Option(min=-1.0)] = 0.0,
+) -> None:
+    """Exécute la Phase 08 avec sélection gelée et gates de rupture/retrait."""
+
+    panel = load_panel_csv(data)
+    settings = _settings()
+    audit = audit_pairs_panel(
+        panel,
+        minimum_history_hours=minimum_history_hours,
+        minimum_assets=minimum_assets,
+    )
+    train_bars = max(24, int(len(panel.prices) * settings.research.train_fraction))
+    validation_bars = max(12, int(len(panel.prices) * settings.research.validation_fraction))
+    selection = PairSelectionConfig(
+        maximum_pairs=maximum_pairs,
+        minimum_train_bars=train_bars,
+        minimum_validation_bars=validation_bars,
+        lookback_bars=min(30 * 24, max(12, train_bars // 3)),
+    )
+    gate = PairsGateConfig(
+        train_fraction=settings.research.train_fraction,
+        validation_fraction=settings.research.validation_fraction,
+        minimum_stressed_return=minimum_stressed_return,
+    )
+    engine = PanelBacktester(
+        costs=settings.cost_schedule,
+        risk_limits=settings.risk_profiles["offensive"],
+        execution=replace(
+            settings.execution,
+            require_depth=True,
+            require_point_in_time=True,
+        ),
+        benchmark=settings.research.benchmark,
+    )
+    validation = run_pairs_validation(
+        panel,
+        engine=engine,
+        selection_config=selection,
+        gate_config=gate,
+        audit=audit,
+    )
+    report = write_pairs_report(validation, output_dir=output)
+    console.print(f"Statut Phase 08 : {validation.status}")
+    console.print(f"Rapport Phase 08 : {report.resolve()}")
 
 
 @app.command("cross-exchange-backtest")

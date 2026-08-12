@@ -54,9 +54,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "pairs_mean_reversion": {
         "label": "Pairs trading / retour à la moyenne",
         "tier": "Niveau 3 — offensif",
-        "status": "Baseline incluse",
-        "data": "Historique multi-actifs propre et sans survivorship bias",
-        "summary": "Trade un écart statistique entre deux actifs corrélés sans martingale.",
+        "status": "Validateur Phase 08 inclus — gate fermée sans univers historique calibré",
+        "data": "Perps, funding, profondeur et lifecycle point-in-time avec marchés délistés",
+        "summary": "Sélection train-only, hedge validé puis stress de rupture sans martingale.",
     },
     "momentum_regime": {
         "label": "Momentum avec filtre de régime",

@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -510,9 +510,9 @@ def simulate_cross_exchange_funding(
             if convention.calendar.settles_at(timestamp):
                 rate = hourly_rates.at[timestamp, venue]
                 if not pd.isna(rate):
-                    settlement_hours.at[timestamp] = float(rate) / convention.calendar.period_hours_at(
-                        timestamp
-                    )
+                    settlement_hours.at[timestamp] = float(
+                        cast(Any, rate)
+                    ) / convention.calendar.period_hours_at(timestamp)
         hourly_rates[venue] = settlement_hours
     signal_rates = hourly_rates.ffill().rolling(
         config.lookback_hours,
@@ -557,7 +557,7 @@ def simulate_cross_exchange_funding(
         if abs(delta) <= config.uncovered_tolerance_quantity:
             quantity[venue] = target_quantity
             return
-        current_mark = float(data.mark_prices.at[timestamp, venue])
+        current_mark = float(cast(Any, data.mark_prices.at[timestamp, venue]))
         notional = abs(delta) * current_mark
         rule = risk_rules[venue]
         fee = notional * rule.fee_bps / 10_000.0
@@ -592,7 +592,7 @@ def simulate_cross_exchange_funding(
         targets: dict[str, float],
     ) -> bool:
         for venue in venues:
-            mark_price = float(data.mark_prices.at[timestamp, venue])
+            mark_price = float(cast(Any, data.mark_prices.at[timestamp, venue]))
             delta_notional = abs(targets[venue] - quantity[venue]) * mark_price
             rule = risk_rules[venue]
             projected_cost = delta_notional * (rule.fee_bps + rule.slippage_bps) / 10_000.0
@@ -605,8 +605,12 @@ def simulate_cross_exchange_funding(
         return True
 
     for row_number, timestamp in enumerate(index):
-        mark = {venue: float(data.mark_prices.at[timestamp, venue]) for venue in venues}
-        oracle = {venue: float(data.oracle_prices.at[timestamp, venue]) for venue in venues}
+        mark = {
+            venue: float(cast(Any, data.mark_prices.at[timestamp, venue])) for venue in venues
+        }
+        oracle = {
+            venue: float(cast(Any, data.oracle_prices.at[timestamp, venue])) for venue in venues
+        }
         row_price_pnl = dict.fromkeys(venues, 0.0)
         row_funding_pnl = dict.fromkeys(venues, 0.0)
 
@@ -652,7 +656,7 @@ def simulate_cross_exchange_funding(
                     quantity=quantity[venue],
                     mark_price=mark[venue],
                     oracle_price=oracle[venue],
-                    observed_rate=float(observed_rate),
+                    observed_rate=float(cast(Any, observed_rate)),
                 )
                 cash[venue] += pnl
                 funding_pnl[venue] += pnl
@@ -714,7 +718,7 @@ def simulate_cross_exchange_funding(
         if not incident_halt and row_number < len(index) - 1:
             if row_number % config.position_rebalance_hours == 0:
                 observed_signal = {
-                    venue: float(signal_rates.at[timestamp, venue])
+                    venue: float(cast(Any, signal_rates.at[timestamp, venue]))
                     for venue in venues
                     if not pd.isna(signal_rates.at[timestamp, venue])
                 }

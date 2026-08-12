@@ -202,6 +202,15 @@ statut reste <code>BLOCKED_INSUFFICIENT_REAL_DATA</code>.</p>
 <h3 id="3-4-pairs-trading">3.4 Pairs trading<a class="heading-link" href="#3-4-pairs-trading" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot trade l'écart entre deux actifs corrélés. Il entre lorsque le spread est anormal, sort au retour à la moyenne et ferme également sur rupture ou délai maximal.</p>
 <p>Aucune martingale n'est permise.</p>
+<p>La Phase 08 sélectionne les identités de paires sur train uniquement, choisit sur
+validation un hedge rolling, Kalman ou de cointégration, puis gèle la variante
+avant le test final. Le z-score et le sizing par volatilité sont causaux ; stop de
+spread, time stop et cooldown sont obligatoires. Le rapport intègre funding,
+coûts et turnover. Sa gate retire la meilleure paire selon la validation et casse
+les corrélations sur un chemin contrefactuel signalé <code>SYNTHETIC</code>. Voir
+<a href="PAIRS_TRADING_PHASE08.md"><code>PAIRS_TRADING_PHASE08.md</code></a>. Faute d'un historique
+point-in-time suffisamment long avec marchés délistés et exécution calibrée, le
+statut reste <code>BLOCKED_INSUFFICIENT_REAL_DATA</code>.</p>
 <h3 id="3-5-momentum-regime">3.5 Momentum/régime<a class="heading-link" href="#3-5-momentum-regime" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot prend une exposition directionnelle quand la tendance dépasse le bruit, avec sizing par volatilité et pénalité si le funding coûte trop cher.</p>
 <p>Cette stratégie peut produire plus, mais son drawdown peut être nettement supérieur.</p>
@@ -656,6 +665,9 @@ temps non couvert sous stress bloque la promotion économique.</p>
 <h2 id="39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque<a class="heading-link" href="#39-vague-3-alpha-moyen-risque" aria-label="Lien vers cette section">#</a></h2>
 <h3 id="pairs">Pairs<a class="heading-link" href="#pairs" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : spread robuste, stop et time stop.</p>
+<p>La gate Phase 08 exige que le test final reste au-dessus du seuil préenregistré
+après retrait de la meilleure paire (déterminée sur validation) et sous rupture
+simulée des corrélations. Une paire unique ne peut donc pas franchir la gate.</p>
 <h3 id="momentum">Momentum<a class="heading-link" href="#momentum" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : rendement directionnel contrôlé, régime explicite.</p>
 <h2 id="40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence<a class="heading-link" href="#40-vague-4-haute-performance-haute-exigence" aria-label="Lien vers cette section">#</a></h2>

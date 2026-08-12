@@ -45,6 +45,7 @@ def generate_demo_panel(
     funding: dict[str, np.ndarray] = {}
     spreads: dict[str, np.ndarray] = {}
     volume: dict[str, np.ndarray] = {}
+    open_interest: dict[str, np.ndarray] = {}
 
     common_shock = rng.normal(0.0, 0.006, hours)
     regime = np.repeat(rng.choice([-1.0, 0.0, 1.0], size=(hours // 360) + 2), 360)[:hours]
@@ -100,12 +101,16 @@ def generate_demo_panel(
         volume[hl_spot] = rng.lognormal(np.log(base_volume * 0.08), 0.35, hours)
         volume[hl_perp] = rng.lognormal(np.log(base_volume), 0.30, hours)
         volume[ref_perp] = rng.lognormal(np.log(base_volume * 1.8), 0.25, hours)
+        open_interest[hl_spot] = np.full(hours, np.nan)
+        open_interest[hl_perp] = rng.lognormal(np.log(base_volume * 0.7), 0.18, hours)
+        open_interest[ref_perp] = rng.lognormal(np.log(base_volume), 0.18, hours)
 
     price_frame = pd.DataFrame(prices, index=index)
     funding_frame = pd.DataFrame(funding, index=index)[price_frame.columns]
     spread_frame = pd.DataFrame(spreads, index=index)[price_frame.columns]
     volume_frame = pd.DataFrame(volume, index=index)[price_frame.columns]
     depth_frame = (volume_frame * 0.002).clip(lower=25_000.0)
+    open_interest_frame = pd.DataFrame(open_interest, index=index)[price_frame.columns]
     available_at = pd.DataFrame(
         {column: index for column in price_frame.columns},
         index=index,
@@ -119,6 +124,7 @@ def generate_demo_panel(
         spreads_bps=spread_frame,
         volume_usd=volume_frame,
         depth_usd=depth_frame,
+        open_interest_usd=open_interest_frame,
         available_at=available_at,
         finality=pd.DataFrame(True, index=index, columns=price_frame.columns),
         tradable=pd.DataFrame(True, index=index, columns=price_frame.columns),

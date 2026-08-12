@@ -17,6 +17,7 @@ def save_panel_csv(panel: MarketPanel, directory: Path) -> None:
     panel.volume_usd.to_csv(directory / "volume_usd.csv")
     optional_frames = {
         "depth_usd.csv": panel.depth_usd,
+        "open_interest_usd.csv": panel.open_interest_usd,
         "available_at.csv": panel.available_at,
         "finality.csv": panel.finality,
         "tradable.csv": panel.tradable,
@@ -89,6 +90,7 @@ def load_panel_csv(directory: Path) -> MarketPanel:
         volume_usd=volume,
         metadata=metadata,
         depth_usd=read_optional("depth_usd.csv"),
+        open_interest_usd=read_optional("open_interest_usd.csv"),
         available_at=available_at,
         finality=finality,
         tradable=tradable,
@@ -119,6 +121,7 @@ def save_panel_parquet(panel: MarketPanel, directory: Path) -> None:
     }
     for name, frame in {
         "depth_usd.parquet": panel.depth_usd,
+        "open_interest_usd.parquet": panel.open_interest_usd,
         "available_at.parquet": panel.available_at,
         "finality.parquet": panel.finality,
         "tradable.parquet": panel.tradable,

@@ -93,6 +93,15 @@ Le bot achète le spot et shorte le perp du même actif. Il recherche le funding
 
 Le backtest doit calculer le rendement sur **tout le capital immobilisé**, pas uniquement sur la marge du short.
 
+La Phase 05 ajoute un validateur fail-closed : funding 8/24/72 h, persistance et
+tendance, basis/convergence, profondeur spot/perp, volatilité, OI et edge net aux
+trois horizons. Les deux jambes tentent un maker puis le moteur peut simuler un IOC
+de hedge risk-reducing. Le rapport chiffre aussi marge conservatrice, liquidation,
+coût d'opportunité et capacité. Voir
+[`CASH_AND_CARRY_PHASE05.md`](CASH_AND_CARRY_PHASE05.md). Avec seulement environ
+24 h de données réelles locales au 12 août 2026, son statut reste
+`BLOCKED_INSUFFICIENT_REAL_DATA` ; aucun rendement réel n'est revendiqué.
+
 ### 3.2 Basket de funding
 
 Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La version sérieuse ajoutera neutralité bêta, inverse-vol, covariance et pénalité de turnover.
@@ -743,6 +752,10 @@ On ne le réduit pas. On cherche d'abord :
 Objectif : fiabiliser deux jambes, coûts et funding.
 
 Gate : rendement stressé supérieur au passif avec drawdown et marge raisonnables.
+
+La gate Phase 05 exige en plus 30 jours point-in-time, des coûts/fills calibrés, une
+fermeture simulée complète et une surperformance positive dans le pire scénario,
+y compris l'inversion du funding. Elle ne crée jamais d'autorisation de trading.
 
 ## 38. Vague 2 : market-neutral relatif
 

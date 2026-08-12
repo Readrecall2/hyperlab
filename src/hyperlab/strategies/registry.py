@@ -33,9 +33,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "cash_and_carry": {
         "label": "Cash-and-carry spot/perp",
         "tier": "Niveau 1 — défensif",
-        "status": "Backtester de base inclus",
-        "data": "Prix spot/perp + funding + coûts",
-        "summary": "Long spot et short perp quand le funding positif paraît persistant.",
+        "status": "Validateur Phase 05 inclus — gate fermée sans données calibrées",
+        "data": "Spot/perp, funding, BBO/profondeur, volume, OI et frais du compte",
+        "summary": "Long spot et short perp sur edge net 8/24/72 h, avec hedge IOC simulé.",
     },
     "funding_basket": {
         "label": "Basket de funding",

@@ -34,6 +34,7 @@ def _copy_panel_index(
             "research_slice": slice_metadata,
         },
         depth_usd=optional_frame(panel.depth_usd),
+        open_interest_usd=optional_frame(panel.open_interest_usd),
         available_at=optional_frame(panel.available_at),
         finality=optional_frame(panel.finality),
         tradable=optional_frame(panel.tradable),
@@ -98,6 +99,9 @@ def _strategy_feature_view(panel: MarketPanel) -> MarketPanel:
         metadata={**panel.metadata, "feature_universe_masked": True},
         depth_usd=panel.depth_usd.loc[:, visible_columns].where(mask)
         if panel.depth_usd is not None
+        else None,
+        open_interest_usd=panel.open_interest_usd.loc[:, visible_columns].where(mask)
+        if panel.open_interest_usd is not None
         else None,
         available_at=panel.available_at.loc[:, visible_columns].where(mask)
         if panel.available_at is not None

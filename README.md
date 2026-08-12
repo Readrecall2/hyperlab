@@ -88,3 +88,9 @@ variante. Le test final reste verrouillé sans `--reveal-final`. Elle exige une
 exportation point-in-time complète (profondeur, disponibilité, finalité,
 lifecycle/tradabilité, hash du lifecycle et métadonnées); elle refuse un ancien panel
 de quatre CSV au lieu d'inventer les données manquantes.
+
+Le validateur cash-and-carry Phase 05, ses signaux 8/24/72 h, son stress
+d'inversion du funding et sa gate face au benchmark passif sont documentés dans
+[`docs/CASH_AND_CARRY_PHASE05.md`](docs/CASH_AND_CARRY_PHASE05.md). Le lake local
+reste insuffisant pour une validation économique : le statut actuel est
+`BLOCKED_INSUFFICIENT_REAL_DATA`.

@@ -392,6 +392,7 @@ class PanelBacktester:
                     "random_draw": draw,
                     "participation": participation,
                     "depth_usd": recorded_depth,
+                    "capacity_usd": estimate.capacity_usd if estimate is not None else math.nan,
                     "size_bucket": _size_bucket(
                         participation,
                         missed=filled_weight == 0.0,

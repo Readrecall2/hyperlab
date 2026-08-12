@@ -25,7 +25,11 @@ Seul le premier statut, avec Gates B et C satisfaites, permet une conclusion
 
 **Risques :** frais spot élevés, inversion du funding, basis, jambe non couverte, marge du perp, liquidité du spot.
 
-**Données minimales :** spot/perp, funding horaire, BBO, profondeur, volume, frais du compte.
+**Données minimales :** spot/perp, funding horaire, BBO, profondeur, volume, OI,
+frais du compte et lifecycle point-in-time. La Phase 05 exige 30 jours, calcule
+l'edge net à 8/24/72 h, simule maker puis hedge IOC, réserve une marge perp
+conservatrice et refuse la promotion si le pire stress ne bat pas le passif. Voir
+[`CASH_AND_CARRY_PHASE05.md`](CASH_AND_CARRY_PHASE05.md).
 
 ## Niveau 2 — basket de funding
 

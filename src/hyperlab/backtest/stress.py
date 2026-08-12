@@ -22,6 +22,7 @@ class StressScenario:
     maker_fill_multiplier: float = 1.0
     added_latency_bars: int = 0
     remove_best_trade_fraction: float = 0.0
+    funding_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -32,6 +33,8 @@ class StressScenario:
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(self.funding_multiplier):
+            raise ValueError("funding_multiplier must be finite")
         if (
             not isinstance(self.added_latency_bars, int)
             or isinstance(self.added_latency_bars, bool)
@@ -299,13 +302,23 @@ def run_stress_matrix(
         raise ValueError("stress scenario names must be unique")
     results: dict[str, BacktestResult] = {}
     for scenario in scenarios:
+        stressed_panel = panel
+        if scenario.funding_multiplier != 1.0:
+            stressed_panel = replace(
+                panel,
+                funding=panel.funding * scenario.funding_multiplier,
+                metadata={
+                    **panel.metadata,
+                    "funding_stress_multiplier": scenario.funding_multiplier,
+                },
+            )
         engine = PanelBacktester(
             costs=costs,
             risk_limits=risk_limits,
             execution=execution_for_scenario(base_execution, scenario),
             benchmark=benchmark,
         )
-        result = engine.run(panel, output)
+        result = engine.run(stressed_panel, output)
         if scenario.remove_best_trade_fraction > 0.0:
             result = remove_best_trades(result, scenario.remove_best_trade_fraction)
         result.diagnostics["stress_scenario"] = scenario.name

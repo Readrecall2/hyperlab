@@ -84,3 +84,41 @@ Chaque exécution de recherche écrit un plan, un registre vérifiable, les ledg
 folds OOS, les paramètres complets, les rapports et un manifeste SHA-256. Le fichier
 `MANIFEST_SHA256.txt` couvre les fichiers livrés; les résultats de recherche ignorés par
 Git disposent en plus de leur propre `run_manifest.json`.
+
+---
+
+# Validation — Phase 05, cash-and-carry spot/perp
+
+Date d'audit : 12 août 2026
+
+Checkpoint antérieur aux travaux : `5e98ff5`
+
+Branche : `phase-05-cash-and-carry`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (61 fichiers) et
+`pytest --basetemp .pytest_tmp/full-phase05` (481 tests) passent.
+
+## Verdict Phase 05
+
+Le cadre logiciel Phase 05 est implémenté. La stratégie n'est pas promue : le lake
+réel local contient trois observations de funding Binance par actif sur environ
+24 heures et aucune série Hyperliquid spot/perp simultanée couvrant les 720 heures
+de la Gate B. Il manque donc une donnée indispensable ; aucun résultat économique
+n'est fabriqué. Statut attendu : `BLOCKED_INSUFFICIENT_REAL_DATA`.
+
+L'inventaire local observé au moment de l'audit contient 88 lignes de snapshots
+SQLite Hyperliquid. Le collecteur de référence annonce 1 074 950 lignes publiques,
+mais ce volume est principalement composé de BBO/wire/candles minute et ne remplace
+ni 30 jours de funding réalisé, ni une paire spot/perp point-in-time complète.
+
+Le validateur ajoute les features causales funding 8/24/72 h, persistance et tendance,
+basis/convergence, liquidité, volatilité, OI et edge net multi-horizon. La simulation
+réutilise les deux jambes non atomiques du moteur Phase 04, impose des intentions
+maker, conserve l'IOC d'urgence risk-reducing, chiffre le capital spot + marge perp,
+la capacité par profondeur et la liquidation pré-déclarée. Le stress d'inversion
+multiplie réellement la matrice de funding par `-1`.
+
+Le rapport dédié montre rendement sur capital total, temps investi, funding, basis,
+frais, spread, slippage, hedge, fermeture, coût d'opportunité, drawdown et capacité.
+La gate refuse toute promotion si les preuves sont incomplètes, si la fermeture
+échoue ou si la pire surperformance stressée ne dépasse pas le benchmark passif.

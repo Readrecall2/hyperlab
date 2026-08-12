@@ -170,6 +170,14 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
 <h3 id="3-1-cash-and-carry">3.1 Cash-and-carry<a class="heading-link" href="#3-1-cash-and-carry" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot achète le spot et shorte le perp du même actif. Il recherche le funding reçu par le short, diminué des frais, du slippage, du coût de couverture et du risque de basis.</p>
 <p>Le backtest doit calculer le rendement sur <strong>tout le capital immobilisé</strong>, pas uniquement sur la marge du short.</p>
+<p>La Phase 05 ajoute un validateur fail-closed : funding 8/24/72 h, persistance et
+tendance, basis/convergence, profondeur spot/perp, volatilité, OI et edge net aux
+trois horizons. Les deux jambes tentent un maker puis le moteur peut simuler un IOC
+de hedge risk-reducing. Le rapport chiffre aussi marge conservatrice, liquidation,
+coût d'opportunité et capacité. Voir
+<a href="CASH_AND_CARRY_PHASE05.md"><code>CASH_AND_CARRY_PHASE05.md</code></a>. Avec seulement environ
+24 h de données réelles locales au 12 août 2026, son statut reste
+<code>BLOCKED_INSUFFICIENT_REAL_DATA</code> ; aucun rendement réel n'est revendiqué.</p>
 <h3 id="3-2-basket-de-funding">3.2 Basket de funding<a class="heading-link" href="#3-2-basket-de-funding" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot classe les perps : il achète les fundings faibles ou négatifs et shorte les fundings élevés. La version sérieuse ajoutera neutralité bêta, inverse-vol, covariance et pénalité de turnover.</p>
 <p>Ce n'est pas un arbitrage pur : deux actifs différents peuvent diverger violemment.</p>
@@ -614,6 +622,9 @@ pas les Gates B/C ni la rentabilité d'une stratégie.</p>
 <h3 id="cash-and-carry">Cash-and-carry<a class="heading-link" href="#cash-and-carry" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : fiabiliser deux jambes, coûts et funding.</p>
 <p>Gate : rendement stressé supérieur au passif avec drawdown et marge raisonnables.</p>
+<p>La gate Phase 05 exige en plus 30 jours point-in-time, des coûts/fills calibrés, une
+fermeture simulée complète et une surperformance positive dans le pire scénario,
+y compris l'inversion du funding. Elle ne crée jamais d'autorisation de trading.</p>
 <h2 id="38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif<a class="heading-link" href="#38-vague-2-market-neutral-relatif" aria-label="Lien vers cette section">#</a></h2>
 <h3 id="basket-funding">Basket funding<a class="heading-link" href="#basket-funding" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : optimiser le portefeuille sans bêta caché.</p>

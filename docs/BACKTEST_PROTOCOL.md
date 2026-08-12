@@ -232,8 +232,9 @@ Les rapports réconcilient le PnL par :
 
 La suppression regroupe les jambes d'un même hedge en un trade, tranche les ties de
 façon déterministe, ne refit aucun paramètre et enregistre les identifiants retirés.
-Des scénarios de funding réduit, volatilité et panne de venue restent à ajouter au
-niveau de chaque stratégie lorsqu'un dataset réel suffisant existe.
+Le cash-and-carry ajoute un scénario propre d'inversion du funding (`× -1`). Les
+scénarios de volatilité et panne de venue restent à ajouter au niveau de chaque
+stratégie lorsqu'un dataset réel suffisant existe.
 
 ## 11. Limites restantes
 

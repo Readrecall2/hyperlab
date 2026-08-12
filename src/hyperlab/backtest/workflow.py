@@ -52,6 +52,7 @@ class ResearchWorkflowSpec:
     bootstrap_confidence_level: float = 0.95
     bootstrap_seed: int = 42
     reveal_final: bool = False
+    final_liquidation_bars: int = 0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.train_fraction < 1.0:
@@ -82,6 +83,12 @@ class ResearchWorkflowSpec:
             raise ValueError("bootstrap_confidence_level must be in (0, 1)")
         if self.bootstrap_seed < 0:
             raise ValueError("bootstrap_seed must be non-negative")
+        if (
+            isinstance(self.final_liquidation_bars, bool)
+            or not isinstance(self.final_liquidation_bars, int)
+            or self.final_liquidation_bars < 0
+        ):
+            raise ValueError("final_liquidation_bars must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +101,7 @@ class ResearchWorkflowArtifacts:
     manifest_path: Path
     selected_variant_hash: str
     final_revealed: bool
+    supplemental_report_path: Path | None = None
 
 
 def _json_value(value: object) -> object:
@@ -153,6 +161,7 @@ def hash_market_panel(panel: MarketPanel) -> str:
         "spreads_bps",
         "volume_usd",
         "depth_usd",
+        "open_interest_usd",
         "available_at",
         "finality",
         "tradable",
@@ -311,6 +320,7 @@ def run_research_workflow(
     output_dir: Path,
     registry_path: Path | None = None,
     stress_scenarios: tuple[StressScenario, ...] | None = None,
+    final_reporter: Callable[[BacktestResult, dict[str, BacktestResult], Path], Path] | None = None,
 ) -> ResearchWorkflowArtifacts:
     """Run the only auditable Phase-04 path from locked split to artifacts.
 
@@ -499,6 +509,7 @@ def run_research_workflow(
     lock = FinalTestLock(plan)
     token = registry.freeze_final_test(selected.variant_hash, lock)
     report_path: Path | None = None
+    supplemental_report_path: Path | None = None
     final_revealed = False
     if spec.reveal_final:
         try:
@@ -541,6 +552,9 @@ def run_research_workflow(
                 depth_usd=panel.depth_usd.loc[execution_index].copy()
                 if panel.depth_usd is not None
                 else None,
+                open_interest_usd=panel.open_interest_usd.loc[execution_index].copy()
+                if panel.open_interest_usd is not None
+                else None,
                 available_at=panel.available_at.loc[execution_index].copy()
                 if panel.available_at is not None
                 else None,
@@ -554,6 +568,18 @@ def run_research_workflow(
                 pd.DatetimeIndex(final_decisions.prices.index),
                 panel.prices.index[-1],
             )
+            if spec.final_liquidation_bars > 0:
+                liquidation_count = min(spec.final_liquidation_bars, len(final_decisions.prices.index))
+                liquidation_index = final_decisions.prices.index[-liquidation_count:]
+                final_output.weights.loc[liquidation_index] = 0.0
+                final_output.weights.loc[panel.prices.index[-1]] = 0.0
+                final_output.diagnostics.update(
+                    {
+                        "predeclared_final_liquidation": True,
+                        "final_liquidation_bars": liquidation_count,
+                        "final_liquidation_start": liquidation_index[0].isoformat(),
+                    }
+                )
             final_result = engine_template.run(final_panel, final_output)
             final_result.diagnostics.update(
                 {
@@ -638,6 +664,14 @@ def run_research_workflow(
                 "scenarios": {name: result.metrics.as_dict() for name, result in stress_results.items()},
             },
         )
+        if final_reporter is not None:
+            supplemental_report_path = final_reporter(final_result, stress_results, output_dir)
+            if not supplemental_report_path.is_file():
+                raise ValueError("final_reporter must return an existing report file")
+            try:
+                supplemental_report_path.resolve().relative_to(output_dir.resolve())
+            except ValueError:
+                raise ValueError("final_reporter output must stay inside the research directory") from None
         final_revealed = True
 
     manifest_path = output_dir / "run_manifest.json"
@@ -662,6 +696,7 @@ def run_research_workflow(
         manifest_path=manifest_path,
         selected_variant_hash=selected.variant_hash,
         final_revealed=final_revealed,
+        supplemental_report_path=supplemental_report_path,
     )
 
 

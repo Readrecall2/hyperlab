@@ -17,6 +17,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from hyperlab.backtest.carry import (
+    audit_carry_panel,
+    carry_stress_scenarios,
+    evaluate_carry_gate,
+    write_carry_report,
+)
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.report import write_comparison_report
 from hyperlab.backtest.workflow import ResearchWorkflowSpec, run_research_workflow
@@ -271,12 +277,39 @@ def backtest(
     settings = _settings()
     panel = load_panel_csv(data)
     selected = create_strategy(strategy)
+    if strategy == "cash_and_carry" and is_dataclass(selected):
+        selected = replace(
+            selected,
+            round_trip_fees_bps=(
+                2.0 * (settings.costs.spot_fee_bps + settings.costs.perp_fee_bps)
+            ),
+            estimated_round_trip_slippage_bps=4.0 * settings.costs.base_slippage_bps,
+            benchmark_annual_rate=settings.research.benchmark.annual_rate,
+        )
     parameters = asdict(selected) if is_dataclass(selected) else {"factory": strategy}
     research = settings.research
+    stress_scenarios = carry_stress_scenarios() if strategy == "cash_and_carry" else None
+
+    def phase05_reporter(
+        base_result: BacktestResult,
+        stress_results: dict[str, BacktestResult],
+        directory: Path,
+    ) -> Path:
+        results = {"base": base_result, **stress_results}
+        audit = audit_carry_panel(panel, minimum_history_hours=30 * 24)
+        gate = evaluate_carry_gate(results, audit=audit)
+        return write_carry_report(
+            results,
+            gate=gate,
+            audit=audit,
+            output_dir=directory,
+            perp_margin_fraction=float(parameters.get("perp_margin_fraction", 1.0)),
+        )
+
     artifacts = run_research_workflow(
         panel,
         strategy_name=strategy,
-        fit_strategy=lambda _train: create_strategy(strategy),
+        fit_strategy=lambda _train: replace(selected) if is_dataclass(selected) else selected,
         strategy_parameters=parameters,
         costs=settings.cost_schedule,
         risk_limits=settings.risk_profiles[_profile_for(strategy)],
@@ -298,9 +331,12 @@ def backtest(
             bootstrap_confidence_level=research.bootstrap_confidence_level,
             bootstrap_seed=research.bootstrap_seed,
             reveal_final=reveal_final,
+            final_liquidation_bars=2 if strategy == "cash_and_carry" else 0,
         ),
         output_dir=output,
         registry_path=research.registry_path,
+        stress_scenarios=stress_scenarios,
+        final_reporter=phase05_reporter if strategy == "cash_and_carry" else None,
     )
     console.print(f"Plan verrouillé : {artifacts.split_plan_path.resolve()}")
     console.print(f"Registre vérifiable : {artifacts.registry_path.resolve()}")
@@ -312,6 +348,38 @@ def backtest(
         )
     else:
         console.print(f"Rapport final et stress : {artifacts.report_path.resolve()}")
+    if artifacts.supplemental_report_path is not None:
+        console.print(f"Rapport et gate Phase 05 : {artifacts.supplemental_report_path.resolve()}")
+
+
+@app.command("carry-audit")
+def carry_audit(
+    data: Annotated[
+        Path,
+        typer.Option(help="Export panel point-in-time avec spot/perp, OI et profondeur"),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de préparation Gate B"),
+    ] = Path("reports/carry-readiness.json"),
+    minimum_history_hours: Annotated[int, typer.Option(min=72)] = 30 * 24,
+) -> None:
+    """Audite les données Phase 05 sans simuler ni envoyer aucun ordre."""
+    panel = load_panel_csv(data)
+    audit = audit_carry_panel(panel, minimum_history_hours=minimum_history_hours)
+    payload = asdict(audit)
+    payload["passed"] = audit.passed
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Gate B : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
 
 
 @app.command()

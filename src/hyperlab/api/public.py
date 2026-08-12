@@ -14,6 +14,19 @@ _VALID_CANDLE_INTERVALS = frozenset(
     {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w", "1M"}
 )
 
+# A spot token name is permissionless and can collide with a perp ticker. The
+# HIP-1 tokenId is the stable L1 identity, so carry comparisons are admitted
+# only after that identity has been reviewed against the corresponding perp.
+_VERIFIED_SPOT_TOKEN_ID_BY_PERP = {
+    "AZTEC": "0x32b15e526a6136d7215cbbbfa924afc7",
+    "HYPE": "0x0d01dc56dcaaca66ad901c959b4011ec",
+    "PURR": "0xc1fb593aeffbeb02f85e0308e9956a90",
+    "STABLE": "0xec43194f64d555bdaef5afb5b6c6c686",
+}
+_PERP_BY_VERIFIED_SPOT_TOKEN_ID = {
+    token_id: perp for perp, token_id in _VERIFIED_SPOT_TOKEN_ID_BY_PERP.items()
+}
+
 
 class PublicInfo(Protocol):
     """Narrow public surface used from the pinned official SDK."""
@@ -109,7 +122,7 @@ def parse_carry_markets(
         if isinstance(coin, str) and coin:
             spot_context_by_coin[coin] = context
 
-    spot_by_asset: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    spot_by_perp: dict[str, tuple[str, Mapping[str, Any]]] = {}
     for position, pair in enumerate(spot_universe):
         token_indexes = pair.get("tokens")
         if not isinstance(token_indexes, Sequence) or len(token_indexes) != 2:
@@ -118,7 +131,10 @@ def parse_carry_markets(
         quote = token_by_index.get(int(token_indexes[1]))
         if not base or not quote or str(quote.get("name")) != "USDC":
             continue
-        asset = str(base.get("name", ""))
+        token_id = str(base.get("tokenId", ""))
+        perp_asset = _PERP_BY_VERIFIED_SPOT_TOKEN_ID.get(token_id)
+        if perp_asset is None:
+            continue
         source_coin = hyperliquid_spot_coin(pair)
         spot_context = spot_context_by_coin.get(source_coin)
         if spot_context is None and isinstance(pair.get("index"), int):
@@ -129,14 +145,19 @@ def parse_carry_markets(
                     spot_context = candidate
         if spot_context is None and not spot_context_by_coin and len(spot_universe) == len(spot_contexts):
             spot_context = spot_contexts[position]
-        if asset and spot_context is not None:
-            spot_by_asset[asset] = (str(pair.get("name") or f"{asset}/USDC"), spot_context)
+        if spot_context is not None:
+            if perp_asset in spot_by_perp:
+                raise ValueError(f"multiple spot pairs resolve to verified perp identity: {perp_asset}")
+            spot_by_perp[perp_asset] = (
+                str(pair.get("name") or f"{base.get('name', perp_asset)}/USDC"),
+                spot_context,
+            )
 
     timestamp = observed_at_ms if observed_at_ms is not None else int(time.time() * 1000)
     snapshots: list[CarrySnapshot] = []
     for meta, context in zip(perp_universe, perp_contexts, strict=True):
         asset = str(meta.get("name", ""))
-        spot_match = spot_by_asset.get(asset)
+        spot_match = spot_by_perp.get(asset)
         if not asset or spot_match is None:
             continue
         spot_pair, spot_context = spot_match

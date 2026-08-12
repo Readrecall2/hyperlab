@@ -219,6 +219,22 @@ la valeur source. Les messages de contexte ne portent pas tous une heure source 
 `received_time` décrit alors l’observation locale et ne doit pas être présenté
 comme une heure d’échange.
 
+### Identité spot/perp du snapshot carry
+
+Les noms de tokens HIP-1 sont permissionless : un spot et un perp homonymes ne
+sont donc pas nécessairement le même actif économique. Le snapshot carry ne
+joint jamais les marchés sur le seul ticker. Il utilise une table d'identités
+spot vérifiées, indexée par le `tokenId` L1 immuable et associée explicitement
+au nom du perp.
+
+L'audit mainnet du 12 août 2026 valide AZTEC, HYPE, PURR et STABLE. Les spots
+BERA, MON, PUMP et TRUMP observés sont des déploiements HIP-1 antérieurs et
+indépendants des perps homonymes ; ils sont exclus avant lecture des prix et
+aucun basis n'est calculé. `isCanonical` ne suffit pas comme filtre générique :
+HYPE, AZTEC et STABLE sont actuellement marqués `false`. Tout nouvel actif ou
+changement de `tokenId` exige une revue explicite des métadonnées publiques ;
+l'absence de preuve exclut le couple plutôt que de fabriquer une comparabilité.
+
 `prevDayPx` est obligatoire dans les types officiels REST/WS, mais Hyperliquid
 transmet pourtant `"0.0"` sur certains spots quand aucun prix de la veille
 exploitable n'est disponible. Ce zero source reste distinct d'un champ absent

@@ -256,7 +256,10 @@ Cette commande :
 - utilise uniquement l'Info API ;
 - ne demande pas d'adresse ;
 - n'utilise pas de secret ;
-- repère les actifs présents en spot USDC et perp ;
+- repère uniquement les actifs dont l'identité spot/perp a été vérifiée par
+  `tokenId`, car un ticker HIP-1 homonyme ne prouve pas qu'il s'agit du même
+  actif économique ;
+- exclut tout couple non vérifié avant de calculer un basis ;
 - stocke le résultat dans `data\hyperlab.sqlite3`.
 
 ## 12. Lancer une collecte courte

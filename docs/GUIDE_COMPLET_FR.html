@@ -271,7 +271,10 @@ Installation saine
 <li>utilise uniquement l'Info API ;</li>
 <li>ne demande pas d'adresse ;</li>
 <li>n'utilise pas de secret ;</li>
-<li>repère les actifs présents en spot USDC et perp ;</li>
+<li>repère uniquement les actifs dont l'identité spot/perp a été vérifiée par
+<code>tokenId</code>, car un ticker HIP-1 homonyme ne prouve pas qu'il s'agit du même
+actif économique ;</li>
+<li>exclut tout couple non vérifié avant de calculer un basis ;</li>
 <li>stocke le résultat dans <code>data\hyperlab.sqlite3</code>.</li>
 </ul>
 <h2 id="12-lancer-une-collecte-courte">12. Lancer une collecte courte<a class="heading-link" href="#12-lancer-une-collecte-courte" aria-label="Lien vers cette section">#</a></h2>

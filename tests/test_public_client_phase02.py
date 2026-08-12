@@ -42,37 +42,116 @@ def _spot_context(*, coin: str, mid: str, volume: str) -> dict[str, str]:
 
 def test_spot_contexts_are_joined_by_coin_across_index_gaps_and_reordering() -> None:
     perp_payload = [
-        {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+        {"universe": [{"name": "HYPE"}, {"name": "STABLE"}]},
         [
-            _perp_context(mid="60010", volume="1000"),
-            _perp_context(mid="3010", volume="2000"),
+            _perp_context(mid="55.1", volume="1000"),
+            _perp_context(mid="0.0324", volume="2000"),
         ],
     ]
     spot_payload = [
         {
             "tokens": [
-                {"index": 0, "name": "BTC"},
-                {"index": 1, "name": "USDC"},
-                {"index": 7, "name": "ETH"},
+                {"index": 0, "name": "USDC", "tokenId": "quote"},
+                {
+                    "index": 150,
+                    "name": "REMAPPED-HYPE",
+                    "tokenId": "0x0d01dc56dcaaca66ad901c959b4011ec",
+                },
+                {
+                    "index": 398,
+                    "name": "STABLE",
+                    "tokenId": "0xec43194f64d555bdaef5afb5b6c6c686",
+                },
             ],
             "universe": [
-                {"index": 0, "name": "@0", "tokens": [0, 1]},
-                {"index": 9, "name": "@9", "tokens": [7, 1]},
+                {"index": 107, "name": "@107", "tokens": [150, 0]},
+                {"index": 258, "name": "@258", "tokens": [398, 0]},
             ],
         },
         [
-            _spot_context(coin="@9", mid="3000", volume="222"),
-            _spot_context(coin="@0", mid="60000", volume="111"),
+            _spot_context(coin="@258", mid="0.0323", volume="222"),
+            _spot_context(coin="@107", mid="55.0", volume="111"),
         ],
     ]
 
     snapshots = parse_carry_markets(perp_payload, spot_payload, observed_at_ms=123)
 
     assert [(row.asset, row.spot_mid, row.spot_volume_usd) for row in snapshots] == [
-        ("BTC", Decimal("60000"), Decimal("111")),
-        ("ETH", Decimal("3000"), Decimal("222")),
+        ("HYPE", Decimal("55.0"), Decimal("111")),
+        ("STABLE", Decimal("0.0323"), Decimal("222")),
     ]
     assert [row.observed_at_ms for row in snapshots] == [123, 123]
+
+
+def test_mainnet_carry_identity_regression_uses_token_id_not_shared_ticker() -> None:
+    identities = (
+        ("AZTEC", "@285", 285, 442, "0x32b15e526a6136d7215cbbbfa924afc7", None, False),
+        ("BERA", "@117", 117, 80, "0x0b6ae68f39bfd088744374daa99db226", None, False),
+        ("HYPE", "@107", 107, 150, "0x0d01dc56dcaaca66ad901c959b4011ec", "Hyperliquid", False),
+        ("MON", "@129", 129, 164, "0x622cf551933f19f9136303dcab56488c", "MON", False),
+        ("PUMP", "@20", 20, 26, "0xefa7e286b99ea49ce6a21d21bb41636f", None, False),
+        ("PURR", "PURR/USDC", 0, 1, "0xc1fb593aeffbeb02f85e0308e9956a90", None, True),
+        ("STABLE", "@258", 258, 398, "0xec43194f64d555bdaef5afb5b6c6c686", "Stable", False),
+        ("TRUMP", "@9", 9, 10, "0x368cb581f0d51e21aa19996d38ffdf6f", None, False),
+    )
+    perp_payload = [
+        {"universe": [{"name": symbol} for symbol, *_rest in identities]},
+        [_perp_context(mid="1", volume="1000") for _identity in identities],
+    ]
+    spot_payload = [
+        {
+            "tokens": [
+                {"index": 0, "name": "USDC", "tokenId": "quote", "isCanonical": True},
+                *[
+                    {
+                        "index": token_index,
+                        "name": symbol,
+                        "tokenId": token_id,
+                        "fullName": full_name,
+                        "isCanonical": is_canonical,
+                    }
+                    for (
+                        symbol,
+                        _pair_name,
+                        _pair_index,
+                        token_index,
+                        token_id,
+                        full_name,
+                        is_canonical,
+                    ) in identities
+                ],
+            ],
+            "universe": [
+                {
+                    "index": pair_index,
+                    "name": pair_name,
+                    "tokens": [token_index, 0],
+                    "isCanonical": is_canonical,
+                }
+                for (
+                    _symbol,
+                    pair_name,
+                    pair_index,
+                    token_index,
+                    _token_id,
+                    _full_name,
+                    is_canonical,
+                ) in identities
+            ],
+        },
+        [
+            _spot_context(
+                coin=pair_name if pair_name == "PURR/USDC" else f"@{pair_index}",
+                mid="1",
+                volume="100",
+            )
+            for _symbol, pair_name, pair_index, *_rest in identities
+        ],
+    ]
+
+    snapshots = parse_carry_markets(perp_payload, spot_payload, observed_at_ms=123)
+
+    assert [row.asset for row in snapshots] == ["AZTEC", "HYPE", "PURR", "STABLE"]
 
 
 def test_funding_history_paginates_inclusively_without_duplicates() -> None:

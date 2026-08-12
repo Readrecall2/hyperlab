@@ -98,6 +98,29 @@ resynchronisation est une erreur de qualité, jamais un trou masqué.
 - hash de chaque partition ;
 - rapport quotidien de fraîcheur.
 
+## Vue de recherche point-in-time
+
+Le backtester ne consomme pas directement la dernière ligne connue aujourd'hui. Une
+vue point-in-time sélectionne, pour chaque décision, uniquement les événements dont
+`received_time` est antérieur ou égal à cette décision. Pour les candles, la fenêtre
+doit aussi être fermée et `is_final=false` est exclu. Une finalité `null` conserve sa
+provenance et suit un délai d'éligibilité préenregistré; elle n'est jamais remplacée
+par `true`.
+
+Les jointures multi-venues sont backward sur le temps de réception, avec âge et
+staleness visibles. L'univers vient des événements `instrument_lifecycle` connus à
+la date simulée. Sans lifecycle, une sélection cross-sectionnelle échoue fermé au
+lieu d'utiliser la liste actuelle des actifs.
+
+Chaque run doit référencer les hashes des partitions, versions de schéma, bornes UTC
+et états qualité qui ont produit cette vue.
+
+Lorsqu'une vue multi-champs est aplatie en `MarketPanel`, son `available_at` par
+instrument/barre est le maximum des `received_time` de tous les champs non nuls
+exposés dans cette cellule. Sa finalité agrégée n'est vraie que si chaque observation
+de bougie correspondante est éligible. Cette règle empêche qu'un timestamp de prix
+précoce masque, par exemple, un funding ou une profondeur reçus plus tard.
+
 La cadence n'est jamais déduite des observations. Elle vient du schéma ou des
 métadonnées pour les flux cadencés, comme les bougies. Les trades, BBO et
 événements L2 sont irréguliers : leurs pertes se détectent avec les séquences et

@@ -75,6 +75,11 @@ class MarketPanel:
     spreads_bps: pd.DataFrame
     volume_usd: pd.DataFrame
     metadata: dict[str, Any] = field(default_factory=dict)
+    depth_usd: pd.DataFrame | None = None
+    available_at: pd.DataFrame | None = None
+    finality: pd.DataFrame | None = None
+    tradable: pd.DataFrame | None = None
+    regimes: pd.Series | None = None
 
     def validate(self) -> None:
         if self.prices.empty:
@@ -99,8 +104,44 @@ class MarketPanel:
                 raise ValueError(f"{name} index differs from prices")
             if list(frame.columns) != list(self.prices.columns):
                 raise ValueError(f"{name} columns differ from prices")
+        for optional_name, optional_frame in {
+            "depth_usd": self.depth_usd,
+            "available_at": self.available_at,
+            "finality": self.finality,
+            "tradable": self.tradable,
+        }.items():
+            if optional_frame is None:
+                continue
+            if not optional_frame.index.equals(self.prices.index):
+                raise ValueError(f"{optional_name} index differs from prices")
+            if list(optional_frame.columns) != list(self.prices.columns):
+                raise ValueError(f"{optional_name} columns differ from prices")
+        if self.regimes is not None and not self.regimes.index.equals(self.prices.index):
+            raise ValueError("regimes index differs from prices")
         if self.prices.isna().all(axis=None):
             raise ValueError("prices are entirely missing")
+        if self.depth_usd is not None:
+            numeric_depth = self.depth_usd.apply(pd.to_numeric, errors="coerce")
+            supplied = self.depth_usd.notna()
+            if bool((supplied & (~numeric_depth.map(math.isfinite) | numeric_depth.le(0.0))).any(axis=None)):
+                raise ValueError("depth_usd values must be finite and positive when supplied")
+        if self.available_at is not None:
+            for column in self.available_at.columns:
+                for value in self.available_at[column].dropna():
+                    timestamp = pd.Timestamp(value)
+                    if timestamp.tz is None:
+                        raise ValueError("available_at timestamps must use UTC")
+                    if str(timestamp.tz).upper() not in {"UTC", "UTC+00:00"}:
+                        raise ValueError("available_at timestamps must use UTC")
+        for boolean_name, boolean_frame in {
+            "finality": self.finality,
+            "tradable": self.tradable,
+        }.items():
+            if boolean_frame is None:
+                continue
+            valid = boolean_frame.map(lambda value: isinstance(value, bool) or pd.isna(value))
+            if not bool(valid.all(axis=None)):
+                raise ValueError(f"{boolean_name} values must be boolean or missing")
 
 
 @dataclass(slots=True)
@@ -109,6 +150,8 @@ class StrategyOutput:
     risk_tier: str
     weights: pd.DataFrame
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    order_types: pd.DataFrame | None = None
+    hedge_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -128,6 +171,15 @@ class BacktestMetrics:
     price_contribution: float
     funding_contribution: float
     cost_contribution: float
+    basis_contribution: float = 0.0
+    spread_contribution: float = 0.0
+    fee_contribution: float = 0.0
+    slippage_contribution: float = 0.0
+    hedge_contribution: float = 0.0
+    worst_hour: float = 0.0
+    benchmark_return: float = 0.0
+    excess_vs_benchmark: float = 0.0
+    fill_rate: float = 1.0
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -146,6 +198,15 @@ class BacktestMetrics:
             "price_contribution": self.price_contribution,
             "funding_contribution": self.funding_contribution,
             "cost_contribution": self.cost_contribution,
+            "basis_contribution": self.basis_contribution,
+            "spread_contribution": self.spread_contribution,
+            "fee_contribution": self.fee_contribution,
+            "slippage_contribution": self.slippage_contribution,
+            "hedge_contribution": self.hedge_contribution,
+            "worst_hour": self.worst_hour,
+            "benchmark_return": self.benchmark_return,
+            "excess_vs_benchmark": self.excess_vs_benchmark,
+            "fill_rate": self.fill_rate,
         }
 
 
@@ -159,3 +220,9 @@ class BacktestResult:
     metrics: BacktestMetrics
     diagnostics: dict[str, Any] = field(default_factory=dict)
     report_path: Path | None = None
+    target_weights: pd.DataFrame | None = None
+    fills: pd.DataFrame = field(default_factory=pd.DataFrame)
+    attribution: pd.DataFrame = field(default_factory=pd.DataFrame)
+    benchmark: pd.Series | None = None
+    breakdowns: dict[str, pd.DataFrame] = field(default_factory=dict)
+    uncertainty: dict[str, Any] = field(default_factory=dict)

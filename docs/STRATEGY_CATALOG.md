@@ -1,5 +1,22 @@
 # Catalogue des stratégies
 
+## Contrat de validation Phase 04
+
+Chaque stratégie déclare tous ses paramètres dans le registre avant exécution. Sa
+calibration reçoit uniquement le train; la comparaison se fait sur validation
+walk-forward, puis une seule variante figée accède au test final. Les rapports
+montrent le benchmark passif, le PnL par composante/actif/mois/régime/taille et les
+scénarios coûts ×2, maker dégradé, latence dégradée et meilleurs trades supprimés.
+
+Les stratégies multi-jambes déclarent leurs `hedge_groups` : carry spot/perp,
+funding inter-venues et paire statistique. Le moteur mesure ainsi le délai, le PnL
+de hedge transitoire et les IOC simulés. Basket, momentum et lead-lag conservent une
+attribution de prix directionnelle ou cross-sectionnelle.
+
+Les données et modèles doivent porter `CALIBRATED`, `UNCALIBRATED` ou `SYNTHETIC`.
+Seul le premier statut, avec Gates B et C satisfaites, permet une conclusion
+économique; aucun statut n'autorise une exécution réelle dans la branche 0.2.x.
+
 ## Niveau 1 — cash-and-carry spot/perp
 
 **Position :** long spot + short perp du même actif lorsque le funding positif semble suffisamment persistant.

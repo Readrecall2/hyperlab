@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 
+from hyperlab.backtest.bootstrap import block_bootstrap_ci
 from hyperlab.models import BacktestResult
 
 
@@ -15,6 +17,28 @@ def _pct(value: float) -> str:
 
 def _num(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ")
+
+
+def _is_explicitly_out_of_sample(result: BacktestResult) -> bool:
+    scope = str(result.diagnostics.get("evaluation_scope", "")).strip().lower()
+    split = str(result.diagnostics.get("evaluation_split", "")).strip().lower()
+    return (
+        result.diagnostics.get("is_out_of_sample") is True
+        or scope == "out_of_sample"
+        or split in {"walk_forward_oos", "validation_oos", "final_test", "stress_final_test"}
+    )
+
+
+def _annual_rate_over_result_period(result: BacktestResult, annual_rate: float) -> float:
+    index = result.equity.index
+    if len(index) < 2:
+        elapsed_seconds = 86_400.0
+    else:
+        datetime_index = np.asarray(index.view("int64"), dtype=np.int64)
+        median_nanoseconds = float(np.median(np.diff(datetime_index)))
+        elapsed_seconds = float(datetime_index[-1] - datetime_index[0] + median_nanoseconds) / 1e9
+    elapsed_years = elapsed_seconds / (365.25 * 24.0 * 3600.0)
+    return math.expm1(math.log1p(annual_rate) * elapsed_years)
 
 
 def _sparkline(result: BacktestResult, width: int = 620, height: int = 150) -> str:
@@ -46,6 +70,10 @@ def write_comparison_report(
     title: str = "HyperLab — comparaison des stratégies",
     data_label: str = "Données synthétiques de démonstration",
     benchmark_annual_return: float = 0.045,
+    bootstrap_block_size: int = 24,
+    bootstrap_resamples: int = 1_000,
+    bootstrap_seed: int = 42,
+    bootstrap_confidence_level: float = 0.95,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[str] = []
@@ -60,7 +88,61 @@ def write_comparison_report(
 
     for result in results:
         m = result.metrics
-        excess_vs_benchmark = m.annualized_return - benchmark_annual_return
+        audit_status = str(result.diagnostics.get("audit_status", "UNCALIBRATED"))
+        result.diagnostics.setdefault("audit_status", audit_status)
+        if result.benchmark is not None:
+            benchmark_return = m.benchmark_return
+            excess_vs_benchmark = m.excess_vs_benchmark
+        else:
+            benchmark_return = _annual_rate_over_result_period(result, benchmark_annual_return)
+            excess_vs_benchmark = m.total_return - benchmark_return
+        block_size = min(bootstrap_block_size, len(result.returns))
+        if _is_explicitly_out_of_sample(result):
+            uncertainty = block_bootstrap_ci(
+                result.returns["net_return"],
+                block_size=max(1, block_size),
+                n_resamples=bootstrap_resamples,
+                confidence_level=bootstrap_confidence_level,
+                seed=bootstrap_seed,
+            )
+            result.uncertainty = {
+                "available": True,
+                "status": "AVAILABLE_OOS",
+                "statistic": "mean_bar_return",
+                "estimate": uncertainty.estimate,
+                "lower": uncertainty.lower,
+                "upper": uncertainty.upper,
+                "confidence_level": uncertainty.confidence_level,
+                "block_size": uncertainty.block_size,
+                "n_resamples": uncertainty.n_resamples,
+                "seed": uncertainty.seed,
+                "insufficient_sample": uncertainty.insufficient_sample,
+                "time_index_verified": uncertainty.time_index_verified,
+                "cadence": uncertainty.cadence,
+            }
+            uncertainty_text = f"{_pct(uncertainty.lower)} à {_pct(uncertainty.upper)}"
+        else:
+            reason = "Intervalle indisponible : le résultat n'est pas explicitement étiqueté out-of-sample."
+            result.uncertainty = {
+                "available": False,
+                "status": "UNAVAILABLE_NOT_OOS",
+                "reason": reason,
+                "statistic": "mean_bar_return",
+                "estimate": None,
+                "lower": None,
+                "upper": None,
+                "confidence_level": bootstrap_confidence_level,
+                "block_size": max(1, block_size),
+                "n_resamples": bootstrap_resamples,
+                "seed": bootstrap_seed,
+                "time_index_verified": False,
+                "cadence": None,
+            }
+            warnings = list(result.diagnostics.get("warnings", []))
+            if reason not in warnings:
+                warnings.append(reason)
+            result.diagnostics["warnings"] = warnings
+            uncertainty_text = "Indisponible — résultat non étiqueté OOS"
         rows.append(
             "<tr>"
             f"<td><strong>{html.escape(result.strategy_name)}</strong><br><small>{html.escape(result.risk_tier)}</small></td>"
@@ -75,9 +157,15 @@ def write_comparison_report(
             "</tr>"
         )
         diagnostic_text = html.escape(json.dumps(result.diagnostics, ensure_ascii=False))
+        warning_text = " ".join(str(item) for item in result.diagnostics.get("warnings", []))
+        breakdown_tables = "".join(
+            f"<details><summary>PnL par {html.escape(name)}</summary>{frame.to_html(border=0)}</details>"
+            for name, frame in result.breakdowns.items()
+        )
         cards.append(
             f"""
             <section class="strategy-card">
+              <div class="notice"><strong>{html.escape(audit_status)}</strong> — {html.escape(warning_text or "Hypothèses de recherche enregistrées.")}</div>
               <div class="strategy-head">
                 <div><span class="tier">{html.escape(result.risk_tier)}</span><h2>{html.escape(result.strategy_name)}</h2></div>
                 <div class="return">{_pct(m.total_return)}</div>
@@ -88,7 +176,11 @@ def write_comparison_report(
                 <div><span>Sharpe</span><strong>{_num(m.sharpe)}</strong></div>
                 <div><span>Drawdown max</span><strong>{_pct(m.max_drawdown)}</strong></div>
                 <div><span>Exposition brute max</span><strong>{_num(m.max_gross_leverage)}&times;</strong></div>
+                <div><span>Fill rate</span><strong>{_pct(m.fill_rate)}</strong></div>
+                <div><span>Benchmark période</span><strong>{_pct(benchmark_return)}</strong></div>
+                <div><span>IC bootstrap moyenne/barre</span><strong>{html.escape(uncertainty_text)}</strong></div>
               </div>
+              {breakdown_tables}
               <details><summary>Diagnostics</summary><code>{diagnostic_text}</code></details>
             </section>
             """
@@ -99,6 +191,11 @@ def write_comparison_report(
                 "risk_tier": result.risk_tier,
                 "metrics": m.as_dict(),
                 "diagnostics": result.diagnostics,
+                "uncertainty": result.uncertainty,
+                "breakdowns": {
+                    name: json.loads(frame.reset_index().to_json(orient="records", date_format="iso"))
+                    for name, frame in result.breakdowns.items()
+                },
             }
         )
 
@@ -134,6 +231,7 @@ small,.tier {{ color:var(--muted); }}
 .mini-grid span {{ display:block; color:var(--muted); font-size:.82rem; }}
 .mini-grid strong {{ display:block; margin-top:3px; }}
 details {{ margin-top:16px; }} code {{ display:block; white-space:pre-wrap; color:#cfe4ff; margin-top:8px; }}
+details table {{ margin-top:10px; width:100%; min-width:720px; }}
 footer {{ color:var(--muted); margin-top:34px; }}
 @media (max-width:760px) {{ .mini-grid {{ grid-template-columns:repeat(2,1fr); }} .strategy-head {{ display:block; }} .return {{ margin-top:8px; }} }}
 </style>
@@ -148,9 +246,9 @@ footer {{ color:var(--muted); margin-top:34px; }}
 </section>
 <div class="table-wrap"><table>
 <thead><tr><th>Stratégie</th><th>Retour total</th><th>Annualisé</th><th>Écart vs benchmark</th><th>Sharpe</th><th>Drawdown</th><th>Pire jour</th><th>Turnover</th><th>Temps investi</th></tr></thead>
-<tbody>{''.join(rows)}</tbody>
+<tbody>{"".join(rows)}</tbody>
 </table></div>
-{''.join(cards)}
+{"".join(cards)}
 <footer>HyperLab 0.2.0 — mode recherche uniquement, aucun exécuteur d'ordres inclus.</footer>
 </main></body></html>"""
 

@@ -16,12 +16,23 @@
 
 ## Gate C — backtest
 
-- test final hors échantillon ;
-- résultat positif après coûts réalistes ;
-- stress ×2 encore acceptable ;
+- plan train/validation/test hashé et révélation finale unique ;
+- variantes, pertes et erreurs inscrites avant consultation du résultat ;
+- walk-forward chronologique avec embargo et OOS non chevauchant ;
+- données point-in-time, lifecycle et finalité disponibles ;
+- coûts, profondeur, fills et latence calibrés sur des observations versionnées ;
+- hashes des preuves de calibration présents et contenu/méthode/couverture audités
+  (la présence d'un hash ne suffit pas à elle seule) ;
+- résultat économique mesuré après coûts réalistes, sans conditionner la conformité
+  technique du moteur à un rendement positif ;
+- stress ×2, maker et latence dégradés documentés ;
 - pas de dépendance à un seul actif ou mois ;
 - PnL attribué au mécanisme attendu ;
 - avantage économique clair face au rendement passif.
+
+La réussite des tests Phase 04 valide uniquement le cadre technique. Avec des
+données `SYNTHETIC` ou des hypothèses `UNCALIBRATED`, les Gates B et C restent
+fermées quel que soit le rendement affiché.
 
 ## Gate D — paper
 

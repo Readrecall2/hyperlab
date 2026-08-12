@@ -30,3 +30,22 @@ Transformer le moteur bar-level de démonstration en cadre de recherche crédibl
 - coûts ×2 et latence dégradée.
 
 Aucun rendement cible ne doit apparaître dans la fonction d'optimisation.
+
+## Définition de terminé
+
+- toutes les observations de décision sont point-in-time (`received_time <= t`),
+  les bougies provisoires sont exclues et l'univers vient du lifecycle historique ;
+- le plan UTC train/validation/test est sérialisé et hashé avant les essais ;
+- la sélection ne reçoit pas le test final, puis une variante figée le révèle une
+  seule fois ;
+- le walk-forward calibre sur le passé et produit des fenêtres OOS non chevauchantes ;
+- chaque variante, perte et erreur est inscrite avant le résultat dans un registre
+  append-only vérifiable ;
+- les fills, non-fills, partials, délais de jambes et IOC sont simulés sans aucune
+  route réseau ou capacité d'ordre réel ;
+- le ledger et toutes ses ventilations réconcilient exactement la courbe de capital ;
+- les seeds, hashes, statuts de calibration, stress et intervalles bootstrap sont
+  présents dans les artefacts ;
+- `ruff check .`, `mypy src/hyperlab` et `pytest` passent ;
+- les limites de données empêchent explicitement toute prétention de calibration ou
+  de validation économique non démontrée.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -70,9 +71,7 @@ def generate_demo_panel(
         basis = _ar1(rng, hours, phi=0.92, sigma=0.00015)
         funding_regime = _ar1(rng, hours, phi=0.985, sigma=0.000003)
         hl_funding = (
-            funding_bias.get(asset, 0.000008)
-            + funding_regime
-            + np.clip(basis, -0.003, 0.003) * 0.006
+            funding_bias.get(asset, 0.000008) + funding_regime + np.clip(basis, -0.003, 0.003) * 0.006
         )
         ref_funding = 0.45 * hl_funding + rng.normal(0.0, 0.0000035, hours)
         if asset_idx % 2:
@@ -106,14 +105,30 @@ def generate_demo_panel(
     funding_frame = pd.DataFrame(funding, index=index)[price_frame.columns]
     spread_frame = pd.DataFrame(spreads, index=index)[price_frame.columns]
     volume_frame = pd.DataFrame(volume, index=index)[price_frame.columns]
+    depth_frame = (volume_frame * 0.002).clip(lower=25_000.0)
+    available_at = pd.DataFrame(
+        {column: index for column in price_frame.columns},
+        index=index,
+    )
+    synthetic_lifecycle_hash = hashlib.sha256(
+        ("synthetic-lifecycle:" + ",".join(str(column) for column in price_frame.columns)).encode("utf-8")
+    ).hexdigest()
     return MarketPanel(
         prices=price_frame,
         funding=funding_frame,
         spreads_bps=spread_frame,
         volume_usd=volume_frame,
+        depth_usd=depth_frame,
+        available_at=available_at,
+        finality=pd.DataFrame(True, index=index, columns=price_frame.columns),
+        tradable=pd.DataFrame(True, index=index, columns=price_frame.columns),
         metadata={
             "source": "synthetic-demo-only",
             "seed": seed,
+            "point_in_time": True,
+            "historical_universe_source": "synthetic-lifecycle-fixture",
+            "lifecycle_hash": synthetic_lifecycle_hash,
+            "calibration_status": "SYNTHETIC",
             "warning": "Never use synthetic results as an investment decision.",
         },
     )

@@ -1,6 +1,6 @@
 # HyperLab — guide complet Windows 11 + Umbrel + Codex
 
-**Version : 0.2.0 — 11 août 2026**
+**Version : 0.2.0 — 12 août 2026**
 
 Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un **laboratoire multi-stratégies** : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.
 
@@ -618,6 +618,12 @@ Point de départ :
 
 Le test final n'est regardé qu'après avoir figé la stratégie.
 
+La Phase 04 matérialise cette règle avec un `SplitPlan` UTC hashé et persisté avant
+les essais. Le sélecteur ne reçoit qu'une vue train/validation; `FinalTestLock` lie
+ensuite une variante figée au plan et ne révèle la plage finale qu'une seule fois.
+Le gel, la sélection et la révélation sont inscrits dans le registre durable. Ce
+verrou est une garde de protocole auditable, pas un mécanisme de sécurité hostile.
+
 ## 32. Walk-forward
 
 Pour chaque fenêtre :
@@ -627,6 +633,15 @@ Pour chaque fenêtre :
 3. trader la fenêtre suivante ;
 4. avancer ;
 5. agréger les résultats hors échantillon.
+
+`WalkForwardSpec` impose des fenêtres non vides, ordonnées et OOS non
+chevauchantes, avec embargo explicite. `run_walk_forward` donne uniquement le train
+au calibrateur et exécute la validation suivante. Toutes les variantes, y compris
+les pertes et erreurs, sont écrites avant résultat dans un registre JSONL
+append-only chaîné par hashes.
+Le registre ajoute un head atomique et un verrou interprocessus, de sorte qu'une
+troncature terminale est détectée. La commande `backtest` utilise ce parcours; elle
+garde le final verrouillé par défaut et exige `--reveal-final` pour l'unique révélation.
 
 ## 33. Coûts
 
@@ -646,24 +661,29 @@ transferts inter-venues
 rendement passif abandonné
 ```
 
-Les frais de `config/research.toml` sont des placeholders. La future phase paper doit récupérer les frais réels du compte.
+Les frais de `config/research.toml` sont des placeholders `UNCALIBRATED`. La future
+phase paper doit récupérer les frais réels du compte. La Phase 04 recherche une
+règle par venue/instrument/période, fait croître l'impact avec
+`taille / profondeur`, permet le non-fill maker, retarde les jambes et simule les IOC
+d'urgence sans aucune route d'ordre réelle. Déclarer les données, les coûts ou les
+fills maker `CALIBRATED` sans leur `calibration_evidence_hash` SHA-256 est refusé.
+Une source ou un identifiant encore marqué synthétique, par défaut ou placeholder est
+également refusé. Ce hash fournit la traçabilité de la preuve déclarée; il ne remplace
+ni son audit ni les Gates B/C.
 
-## 34. Trois scénarios minimum
+## 34. Scénarios obligatoires
 
-```text
-informatif/optimiste
-réaliste
-défavorable : frais et slippage ×2
-```
+La matrice Phase 04 exécute et inscrit avant résultat :
 
-Ajouter ensuite :
+- base ;
+- coûts ×2 ;
+- probabilité de fill maker réduite ;
+- latence dégradée ;
+- suppression déterministe des meilleurs 5 % de trades économiques clôturés.
 
-- taux de fill maker réduit ;
-- funding prévu réduit ;
-- suppression des meilleurs trades ;
-- choc de volatilité ;
-- coupure d'une venue ;
-- délai de couverture plus long.
+Les scénarios de funding réduit, choc de volatilité et coupure de venue demandent
+encore un dataset réel suffisant et une définition propre à la stratégie; ils ne sont
+pas simulés artificiellement dans la matrice générique.
 
 ## 35. Rapport obligatoire
 
@@ -680,7 +700,21 @@ Pour chaque stratégie :
 - PnL par composante ;
 - répartition par actif/mois/régime ;
 - capacité ;
-- comparaison au passif 4–5 %.
+- comparaison à un benchmark passif sourcé et explicitement séparé de l'objectif de
+  sélection.
+
+Le rapport Phase 04 ajoute le fill rate, le benchmark sous forme de série alignée,
+le PnL prix/funding/basis/spread/frais/slippage/hedge, les ventilations par taille et
+un intervalle bootstrap par blocs avec seed. Les régimes utilisent uniquement le
+passé. `SYNTHETIC` ou `UNCALIBRATED` apparaît visiblement tant que les données et
+modèles ne sont pas calibrés.
+Le bootstrap exige un index UTC régulier et une provenance OOS explicite. La démo
+in-sample conserve donc un statut `UNAVAILABLE_NOT_OOS` au lieu d'afficher un faux IC.
+
+Le détail normatif et les limites se trouvent dans
+[`BACKTEST_PROTOCOL.md`](BACKTEST_PROTOCOL.md). Le dataset local du 12 août 2026 ne
+contient pas encore trente jours multi-venues propres : la Phase 04 valide le cadre,
+pas les Gates B/C ni la rentabilité d'une stratégie.
 
 ## 36. Interpréter un résultat très élevé
 

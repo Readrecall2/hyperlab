@@ -7,6 +7,7 @@ import signal
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
@@ -18,6 +19,7 @@ from rich.table import Table
 
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.report import write_comparison_report
+from hyperlab.backtest.workflow import ResearchWorkflowSpec, run_research_workflow
 from hyperlab.config import Settings, load_settings
 from hyperlab.data.cli import data_app
 from hyperlab.data.io import load_panel_csv, save_panel_csv
@@ -155,7 +157,17 @@ def _run_panel_strategies(strategy_names: list[str], hours: int, seed: int) -> l
     for name in strategy_names:
         strategy = create_strategy(name)
         profile = settings.risk_profiles[_profile_for(name)]
-        engine = PanelBacktester(costs=settings.costs, risk_limits=profile)
+        engine = PanelBacktester(
+            costs=settings.cost_schedule,
+            risk_limits=profile,
+            execution=replace(
+                settings.execution,
+                seed=seed,
+                require_depth=True,
+                require_point_in_time=True,
+            ),
+            benchmark=settings.research.benchmark,
+        )
         results.append(engine.run(panel, strategy.generate(panel)))
     return results
 
@@ -180,12 +192,26 @@ def demo(
     results = _run_panel_strategies(names, hours, seed)
     if strategy in {"all", "inventory_market_making"}:
         micro = generate_microstructure_demo(events=25_000, seed=seed + 1)
-        results.append(InventoryAwareMarketMaker(seed=seed + 2).run(micro.events))
+        market_making_result = InventoryAwareMarketMaker(seed=seed + 2).run(micro.events)
+        market_making_result.diagnostics.update(
+            {
+                "audit_status": "SYNTHETIC",
+                "data_status": "SYNTHETIC",
+                "warnings": ["Synthetic toy market-making replay; no L2 queue calibration or live evidence."],
+            }
+        )
+        results.append(market_making_result)
 
+    research_settings = _settings().research
     report = write_comparison_report(
         results,
         output,
         data_label="Données synthétiques conçues uniquement pour vérifier le moteur",
+        benchmark_annual_return=research_settings.benchmark.annual_rate,
+        bootstrap_block_size=research_settings.bootstrap_block_size,
+        bootstrap_resamples=research_settings.bootstrap_resamples,
+        bootstrap_seed=research_settings.bootstrap_seed,
+        bootstrap_confidence_level=research_settings.bootstrap_confidence_level,
     )
     table = Table(title="Résultats synthétiques — aucune valeur prédictive")
     table.add_column("Stratégie")
@@ -219,37 +245,73 @@ def demo_data(
 
 @app.command()
 def backtest(
-    data: Annotated[Path, typer.Option(help="Dossier contenant prices/funding/spreads/volume CSV")],
+    data: Annotated[
+        Path,
+        typer.Option(
+            help=(
+                "Export point-in-time: prices/funding/spreads/volume/depth, "
+                "available_at/finality/tradable et metadata"
+            )
+        ),
+    ],
     strategy: Annotated[str, typer.Option(help="Nom de stratégie")],
     output: Annotated[Path, typer.Option(help="Dossier de rapport")] = Path("reports/custom"),
     stress_multiplier: Annotated[float, typer.Option(min=0.1, max=20.0)] = 1.0,
+    reveal_final: Annotated[
+        bool,
+        typer.Option(
+            "--reveal-final/--keep-final-locked",
+            help="Révèle une seule fois le test final après sélection; verrouillé par défaut.",
+        ),
+    ] = False,
 ) -> None:
-    """Backteste un panel local. N'autorise aucun ordre."""
+    """Exécute le protocole Phase 04 auditable. N'autorise aucun ordre réel."""
     if strategy not in STRATEGY_FACTORIES:
         raise typer.BadParameter(f"Stratégie inconnue: {strategy}")
     settings = _settings()
     panel = load_panel_csv(data)
-    base = settings.costs
-    stressed_costs = type(base)(
-        spot_fee_bps=base.spot_fee_bps,
-        perp_fee_bps=base.perp_fee_bps,
-        external_perp_fee_bps=base.external_perp_fee_bps,
-        base_slippage_bps=base.base_slippage_bps,
-        stress_multiplier=stress_multiplier,
-    )
-    engine = PanelBacktester(
-        costs=stressed_costs,
-        risk_limits=settings.risk_profiles[_profile_for(strategy)],
-    )
     selected = create_strategy(strategy)
-    result = engine.run(panel, selected.generate(panel))
-    report = write_comparison_report(
-        [result],
-        output,
-        title=f"HyperLab — {strategy}",
-        data_label=f"Panel local : {data.resolve()}",
+    parameters = asdict(selected) if is_dataclass(selected) else {"factory": strategy}
+    research = settings.research
+    artifacts = run_research_workflow(
+        panel,
+        strategy_name=strategy,
+        fit_strategy=lambda _train: create_strategy(strategy),
+        strategy_parameters=parameters,
+        costs=settings.cost_schedule,
+        risk_limits=settings.risk_profiles[_profile_for(strategy)],
+        execution=replace(
+            settings.execution,
+            cost_multiplier=settings.execution.cost_multiplier * stress_multiplier,
+        ),
+        benchmark=research.benchmark,
+        spec=ResearchWorkflowSpec(
+            train_fraction=research.train_fraction,
+            validation_fraction=research.validation_fraction,
+            walk_forward_train_bars=research.walk_forward_train_bars,
+            walk_forward_validation_bars=research.walk_forward_validation_bars,
+            walk_forward_step_bars=research.walk_forward_step_bars,
+            embargo_bars=research.embargo_bars,
+            expanding=research.expanding,
+            bootstrap_block_size=research.bootstrap_block_size,
+            bootstrap_resamples=research.bootstrap_resamples,
+            bootstrap_confidence_level=research.bootstrap_confidence_level,
+            bootstrap_seed=research.bootstrap_seed,
+            reveal_final=reveal_final,
+        ),
+        output_dir=output,
+        registry_path=research.registry_path,
     )
-    console.print(f"Rapport : {report.resolve()}")
+    console.print(f"Plan verrouillé : {artifacts.split_plan_path.resolve()}")
+    console.print(f"Registre vérifiable : {artifacts.registry_path.resolve()}")
+    console.print(f"Validation OOS : {artifacts.validation_path.resolve()}")
+    if artifacts.report_path is None:
+        console.print(
+            "[yellow]Test final toujours verrouillé. Relancez dans un nouveau run seulement "
+            "avec une procédure explicite de révélation.[/yellow]"
+        )
+    else:
+        console.print(f"Rapport final et stress : {artifacts.report_path.resolve()}")
 
 
 @app.command()
@@ -336,9 +398,7 @@ def collect(
 @app.command("collect-reference")
 def collect_reference(
     assets: Annotated[str, typer.Option(help="Actifs de base séparés par des virgules")] = "BTC,ETH",
-    candle_intervals: Annotated[
-        str, typer.Option(help="Intervalles candle séparés par des virgules")
-    ] = "1m",
+    candle_intervals: Annotated[str, typer.Option(help="Intervalles candle séparés par des virgules")] = "1m",
     duration_seconds: Annotated[float, typer.Option(min=0.0, help="0 = boucle continue")] = 0.0,
     max_messages: Annotated[int, typer.Option(min=0, help="0 = aucune limite")] = 0,
     batch_size: Annotated[int, typer.Option(min=1, max=10_000)] = 500,
@@ -433,9 +493,7 @@ def status() -> None:
     reference_runtime_path = settings.app.data_dir / "runtime_status_binance_usdm.json"
     if reference_runtime_path.exists():
         try:
-            payload["reference_runtime"] = json.loads(
-                reference_runtime_path.read_text(encoding="utf-8")
-            )
+            payload["reference_runtime"] = json.loads(reference_runtime_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             payload["reference_runtime"] = {
                 "ok": False,

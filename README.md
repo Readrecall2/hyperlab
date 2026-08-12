@@ -26,6 +26,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Ouvrez ensuite `reports\demo\comparison.html`.
 
+Le rapport de démonstration porte le statut visible `SYNTHETIC`. Le moteur Phase 04
+sépare cibles et fills, simule profondeur/slippage, non-fills maker, jambes retardées
+et IOC d'urgence, puis réconcilie le PnL par composante, actif, mois UTC, régime et
+taille. Il inclut un benchmark passif. L'intervalle bootstrap reste explicitement
+indisponible pour cette démo in-sample; il n'est publié que sur une série OOS tracée.
+
 ## Données publiques Hyperliquid
 
 ```powershell
@@ -73,3 +79,12 @@ Commencez par [`docs/GUIDE_COMPLET_FR.md`](docs/GUIDE_COMPLET_FR.md).
 Le contrat détaillé du collecteur public, ses limites de reprise et le protocole
 soak non encore certifié sont dans
 [`docs/HYPERLIQUID_COLLECTOR.md`](docs/HYPERLIQUID_COLLECTOR.md). Suivez ensuite les prompts Codex dans `prompts/` dans l'ordre.
+
+Le protocole de recherche verrouillé, le walk-forward, le registre append-only et
+les limites de calibration Phase 04 sont décrits dans
+[`docs/BACKTEST_PROTOCOL.md`](docs/BACKTEST_PROTOCOL.md). La commande `backtest`
+locale exécute le plan hashé, le walk-forward OOS, le registre central et le gel de la
+variante. Le test final reste verrouillé sans `--reveal-final`. Elle exige une
+exportation point-in-time complète (profondeur, disponibilité, finalité,
+lifecycle/tradabilité, hash du lifecycle et métadonnées); elle refuse un ancien panel
+de quatre CSV au lieu d'inventer les données manquantes.

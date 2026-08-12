@@ -136,6 +136,21 @@ suppose pas qu'un snapshot complet tient dans un seul fichier.
 Aucun de ces contrôles n'autorise un forward-fill. Une donnée manquante reste
 visible dans le manifeste et dans l'export.
 
+## Éligibilité au backtest
+
+Une partition valide n'est pas automatiquement disponible pour une décision
+historique. La couche Phase 04 impose ensuite `received_time <= decision_time`, la
+clôture effective des candles, une politique explicite pour la finalité inconnue,
+un seuil de staleness et l'appartenance au lifecycle connu à cette date. Cette couche
+ne modifie jamais les données source et ne transforme jamais une révision tardive en
+information disponible plus tôt.
+
+Pour un export `MarketPanel`, `available_at` représente le maximum des temps de
+réception de tous les champs non nuls de la cellule instrument/barre, et `finality`
+est l'agrégat conservateur de leurs états d'éligibilité. Un export qui ne peut pas
+reconstruire ces deux valeurs depuis les événements bruts ne peut pas être marqué
+point-in-time.
+
 ## Limite de passage à l'échelle
 
 La validation inter-segments lit un fichier à la fois, mais la vérification de

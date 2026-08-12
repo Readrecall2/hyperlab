@@ -30,7 +30,9 @@ class CashAndCarryStrategy:
     def generate(self, panel: MarketPanel) -> StrategyOutput:
         weights = empty_weights(panel)
         perp_columns = columns_by(panel, exchange="HL", kind="perp")
-        funding_mean = panel.funding[perp_columns].rolling(self.lookback_hours, min_periods=self.lookback_hours).mean()
+        funding_mean = (
+            panel.funding[perp_columns].rolling(self.lookback_hours, min_periods=self.lookback_hours).mean()
+        )
         positive_share = (
             (panel.funding[perp_columns] > 0)
             .rolling(self.lookback_hours, min_periods=self.lookback_hours)
@@ -83,5 +85,10 @@ class CashAndCarryStrategy:
                 "logic": "long spot + short perp",
                 "lookback_hours": self.lookback_hours,
                 "max_positions": self.max_positions,
+            },
+            hedge_groups={
+                f"carry:{asset_from(perp)}": (f"HL:{asset_from(perp)}:spot", perp)
+                for perp in perp_columns
+                if f"HL:{asset_from(perp)}:spot" in panel.prices.columns
             },
         )

@@ -44,3 +44,17 @@ def test_environment_cannot_enable_an_execution_mode(
 
     with pytest.raises(ValueError, match="only allows readonly/research"):
         load_settings(_write_config(tmp_path, "readonly"))
+
+
+def test_default_research_settings_have_locked_split_and_no_return_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HYPERLAB_MODE", raising=False)
+    settings = load_settings(_write_config(tmp_path, "research"))
+
+    assert settings.research.train_fraction == 0.60
+    assert settings.research.validation_fraction == 0.20
+    assert settings.research.walk_forward_step_bars == settings.research.walk_forward_validation_bars
+    assert settings.research.benchmark.annual_rate == 0.045
+    assert not hasattr(settings.research, "target_return")

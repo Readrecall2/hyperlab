@@ -18,7 +18,9 @@ def test_all_panel_strategies_run() -> None:
         assert not output.weights.isna().any(axis=None)
         result = engine.run(panel, output)
         assert math.isfinite(result.metrics.total_return)
-        assert result.metrics.max_gross_leverage <= 1.0 + 1e-12
+        assert result.target_weights is not None
+        assert float(result.target_weights.abs().sum(axis=1).max()) <= 1.0 + 1e-12
+        assert math.isfinite(result.metrics.max_gross_leverage)
 
 
 def test_market_maker_demo_runs_and_flattens() -> None:

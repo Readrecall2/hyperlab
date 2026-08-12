@@ -40,10 +40,10 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
 <div class="layout">
 <aside>
 <div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.0 · 11 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
-<nav><a class="l2" href="#1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd&#x27;hui</a><a class="l3" href="#ce-qu-il-ne-fait-pas-encore">Ce qu&#x27;il ne fait pas encore</a><a class="l2" href="#2-architecture-retenue">2. Architecture retenue</a><a class="l3" href="#pourquoi-les-deux-machines">Pourquoi les deux machines</a><a class="l2" href="#3-les-sept-strategies">3. Les sept stratégies</a><a class="l3" href="#3-1-cash-and-carry">3.1 Cash-and-carry</a><a class="l3" href="#3-2-basket-de-funding">3.2 Basket de funding</a><a class="l3" href="#3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges</a><a class="l3" href="#3-4-pairs-trading">3.4 Pairs trading</a><a class="l3" href="#3-5-momentum-regime">3.5 Momentum/régime</a><a class="l3" href="#3-6-lead-lag">3.6 Lead-lag</a><a class="l3" href="#3-7-market-making">3.7 Market making</a><a class="l2" href="#4-philosophie-des-resultats">4. Philosophie des résultats</a><a class="l1" href="#partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11</a><a class="l2" href="#5-installer-les-outils">5. Installer les outils</a><a class="l2" href="#6-extraire-le-pack">6. Extraire le pack</a><a class="l2" href="#7-installer-l-environnement-python">7. Installer l&#x27;environnement Python</a><a class="l2" href="#8-afficher-les-strategies">8. Afficher les stratégies</a><a class="l2" href="#9-lancer-la-demonstration-complete">9. Lancer la démonstration complète</a><a class="l2" href="#10-tester-une-strategie-seule">10. Tester une stratégie seule</a><a class="l2" href="#11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid</a><a class="l2" href="#12-lancer-une-collecte-courte">12. Lancer une collecte courte</a><a class="l2" href="#13-dashboard-windows">13. Dashboard Windows</a><a class="l2" href="#13-bis-venue-de-reference-publique">13 bis. Venue de référence publique</a><a class="l1" href="#partie-b-git-et-codex">PARTIE B — GIT ET CODEX</a><a class="l2" href="#14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git</a><a class="l2" href="#15-ouvrir-dans-codex">15. Ouvrir dans Codex</a><a class="l2" href="#16-premier-prompt-codex">16. Premier prompt Codex</a><a class="l2" href="#17-controler-les-changements">17. Contrôler les changements</a><a class="l2" href="#18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l&#x27;ordre</a><a class="l1" href="#partie-c-docker-local">PARTIE C — DOCKER LOCAL</a><a class="l2" href="#19-construire-l-image">19. Construire l&#x27;image</a><a class="l2" href="#20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard</a><a class="l1" href="#partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL</a><a class="l2" href="#21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry</a><a class="l2" href="#22-creer-un-depot-github">22. Créer un dépôt GitHub</a><a class="l2" href="#23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel</a><a class="l2" href="#24-publier-l-image">24. Publier l&#x27;image</a><a class="l2" href="#25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS</a><a class="l2" href="#26-verifier-umbrel">26. Vérifier Umbrel</a><a class="l2" href="#27-collecter-pendant-le-developpement">27. Collecter pendant le développement</a><a class="l1" href="#partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES</a><a class="l2" href="#28-donnees-lentes">28. Données lentes</a><a class="l2" href="#29-donnees-rapides">29. Données rapides</a><a class="l2" href="#30-qualite">30. Qualité</a><a class="l1" href="#partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST</a><a class="l2" href="#31-decoupage-temporel">31. Découpage temporel</a><a class="l2" href="#32-walk-forward">32. Walk-forward</a><a class="l2" href="#33-couts">33. Coûts</a><a class="l2" href="#34-trois-scenarios-minimum">34. Trois scénarios minimum</a><a class="l2" href="#35-rapport-obligatoire">35. Rapport obligatoire</a><a class="l2" href="#36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé</a><a class="l1" href="#partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES</a><a class="l2" href="#37-vague-1-defensive">37. Vague 1 : défensive</a><a class="l3" href="#cash-and-carry">Cash-and-carry</a><a class="l2" href="#38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif</a><a class="l3" href="#basket-funding">Basket funding</a><a class="l3" href="#funding-inter-exchanges">Funding inter-exchanges</a><a class="l2" href="#39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque</a><a class="l3" href="#pairs">Pairs</a><a class="l3" href="#momentum">Momentum</a><a class="l2" href="#40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence</a><a class="l3" href="#lead-lag">Lead-lag</a><a class="l3" href="#market-making">Market making</a><a class="l1" href="#partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT</a><a class="l2" href="#41-paper-live">41. Paper live</a><a class="l2" href="#42-testnet">42. Testnet</a><a class="l2" href="#43-micro-mainnet">43. Micro-mainnet</a><a class="l2" href="#44-augmentation">44. Augmentation</a><a class="l1" href="#partie-i-securite">PARTIE I — SÉCURITÉ</a><a class="l2" href="#45-secrets">45. Secrets</a><a class="l2" href="#46-umbrel">46. Umbrel</a><a class="l2" href="#47-separation-future">47. Séparation future</a><a class="l2" href="#48-kill-switches">48. Kill switches</a><a class="l1" href="#partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE</a><a class="l2" href="#49-cette-semaine">49. Cette semaine</a><a class="l2" href="#50-ensuite">50. Ensuite</a><a class="l2" href="#51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles</a><a class="l2" href="#52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie</a><a class="l1" href="#conclusion">Conclusion</a><a class="l1" href="#sources-officielles">Sources officielles</a></nav>
+<nav><a class="l2" href="#1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd&#x27;hui</a><a class="l3" href="#ce-qu-il-ne-fait-pas-encore">Ce qu&#x27;il ne fait pas encore</a><a class="l2" href="#2-architecture-retenue">2. Architecture retenue</a><a class="l3" href="#pourquoi-les-deux-machines">Pourquoi les deux machines</a><a class="l2" href="#3-les-sept-strategies">3. Les sept stratégies</a><a class="l3" href="#3-1-cash-and-carry">3.1 Cash-and-carry</a><a class="l3" href="#3-2-basket-de-funding">3.2 Basket de funding</a><a class="l3" href="#3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges</a><a class="l3" href="#3-4-pairs-trading">3.4 Pairs trading</a><a class="l3" href="#3-5-momentum-regime">3.5 Momentum/régime</a><a class="l3" href="#3-6-lead-lag">3.6 Lead-lag</a><a class="l3" href="#3-7-market-making">3.7 Market making</a><a class="l2" href="#4-philosophie-des-resultats">4. Philosophie des résultats</a><a class="l1" href="#partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11</a><a class="l2" href="#5-installer-les-outils">5. Installer les outils</a><a class="l2" href="#6-extraire-le-pack">6. Extraire le pack</a><a class="l2" href="#7-installer-l-environnement-python">7. Installer l&#x27;environnement Python</a><a class="l2" href="#8-afficher-les-strategies">8. Afficher les stratégies</a><a class="l2" href="#9-lancer-la-demonstration-complete">9. Lancer la démonstration complète</a><a class="l2" href="#10-tester-une-strategie-seule">10. Tester une stratégie seule</a><a class="l2" href="#11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid</a><a class="l2" href="#12-lancer-une-collecte-courte">12. Lancer une collecte courte</a><a class="l2" href="#13-dashboard-windows">13. Dashboard Windows</a><a class="l2" href="#13-bis-venue-de-reference-publique">13 bis. Venue de référence publique</a><a class="l1" href="#partie-b-git-et-codex">PARTIE B — GIT ET CODEX</a><a class="l2" href="#14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git</a><a class="l2" href="#15-ouvrir-dans-codex">15. Ouvrir dans Codex</a><a class="l2" href="#16-premier-prompt-codex">16. Premier prompt Codex</a><a class="l2" href="#17-controler-les-changements">17. Contrôler les changements</a><a class="l2" href="#18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l&#x27;ordre</a><a class="l1" href="#partie-c-docker-local">PARTIE C — DOCKER LOCAL</a><a class="l2" href="#19-construire-l-image">19. Construire l&#x27;image</a><a class="l2" href="#20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard</a><a class="l1" href="#partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL</a><a class="l2" href="#21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry</a><a class="l2" href="#22-creer-un-depot-github">22. Créer un dépôt GitHub</a><a class="l2" href="#23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel</a><a class="l2" href="#24-publier-l-image">24. Publier l&#x27;image</a><a class="l2" href="#25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS</a><a class="l2" href="#26-verifier-umbrel">26. Vérifier Umbrel</a><a class="l2" href="#27-collecter-pendant-le-developpement">27. Collecter pendant le développement</a><a class="l1" href="#partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES</a><a class="l2" href="#28-donnees-lentes">28. Données lentes</a><a class="l2" href="#29-donnees-rapides">29. Données rapides</a><a class="l2" href="#30-qualite">30. Qualité</a><a class="l1" href="#partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST</a><a class="l2" href="#31-decoupage-temporel">31. Découpage temporel</a><a class="l2" href="#32-walk-forward">32. Walk-forward</a><a class="l2" href="#33-couts">33. Coûts</a><a class="l2" href="#34-scenarios-obligatoires">34. Scénarios obligatoires</a><a class="l2" href="#35-rapport-obligatoire">35. Rapport obligatoire</a><a class="l2" href="#36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé</a><a class="l1" href="#partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES</a><a class="l2" href="#37-vague-1-defensive">37. Vague 1 : défensive</a><a class="l3" href="#cash-and-carry">Cash-and-carry</a><a class="l2" href="#38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif</a><a class="l3" href="#basket-funding">Basket funding</a><a class="l3" href="#funding-inter-exchanges">Funding inter-exchanges</a><a class="l2" href="#39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque</a><a class="l3" href="#pairs">Pairs</a><a class="l3" href="#momentum">Momentum</a><a class="l2" href="#40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence</a><a class="l3" href="#lead-lag">Lead-lag</a><a class="l3" href="#market-making">Market making</a><a class="l1" href="#partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT</a><a class="l2" href="#41-paper-live">41. Paper live</a><a class="l2" href="#42-testnet">42. Testnet</a><a class="l2" href="#43-micro-mainnet">43. Micro-mainnet</a><a class="l2" href="#44-augmentation">44. Augmentation</a><a class="l1" href="#partie-i-securite">PARTIE I — SÉCURITÉ</a><a class="l2" href="#45-secrets">45. Secrets</a><a class="l2" href="#46-umbrel">46. Umbrel</a><a class="l2" href="#47-separation-future">47. Séparation future</a><a class="l2" href="#48-kill-switches">48. Kill switches</a><a class="l1" href="#partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE</a><a class="l2" href="#49-cette-semaine">49. Cette semaine</a><a class="l2" href="#50-ensuite">50. Ensuite</a><a class="l2" href="#51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles</a><a class="l2" href="#52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie</a><a class="l1" href="#conclusion">Conclusion</a><a class="l1" href="#sources-officielles">Sources officielles</a></nav>
 </aside>
 <main><article><h1 id="hyperlab-guide-complet-windows-11-umbrel-codex">HyperLab — guide complet Windows 11 + Umbrel + Codex<a class="heading-link" href="#hyperlab-guide-complet-windows-11-umbrel-codex" aria-label="Lien vers cette section">#</a></h1>
-<p><strong>Version : 0.2.0 — 11 août 2026</strong></p>
+<p><strong>Version : 0.2.0 — 12 août 2026</strong></p>
 <p>Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un <strong>laboratoire multi-stratégies</strong> : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.</p>
 <hr />
 <h2 id="1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd'hui<a class="heading-link" href="#1-ce-que-le-pack-fait-aujourd-hui" aria-label="Lien vers cette section">#</a></h2>
@@ -509,6 +509,11 @@ hash des fichiers
 20 % test final verrouillé
 </code></pre>
 <p>Le test final n'est regardé qu'après avoir figé la stratégie.</p>
+<p>La Phase 04 matérialise cette règle avec un <code>SplitPlan</code> UTC hashé et persisté avant
+les essais. Le sélecteur ne reçoit qu'une vue train/validation; <code>FinalTestLock</code> lie
+ensuite une variante figée au plan et ne révèle la plage finale qu'une seule fois.
+Le gel, la sélection et la révélation sont inscrits dans le registre durable. Ce
+verrou est une garde de protocole auditable, pas un mécanisme de sécurité hostile.</p>
 <h2 id="32-walk-forward">32. Walk-forward<a class="heading-link" href="#32-walk-forward" aria-label="Lien vers cette section">#</a></h2>
 <p>Pour chaque fenêtre :</p>
 <ol>
@@ -518,6 +523,14 @@ hash des fichiers
 <li>avancer ;</li>
 <li>agréger les résultats hors échantillon.</li>
 </ol>
+<p><code>WalkForwardSpec</code> impose des fenêtres non vides, ordonnées et OOS non
+chevauchantes, avec embargo explicite. <code>run_walk_forward</code> donne uniquement le train
+au calibrateur et exécute la validation suivante. Toutes les variantes, y compris
+les pertes et erreurs, sont écrites avant résultat dans un registre JSONL
+append-only chaîné par hashes.
+Le registre ajoute un head atomique et un verrou interprocessus, de sorte qu'une
+troncature terminale est détectée. La commande <code>backtest</code> utilise ce parcours; elle
+garde le final verrouillé par défaut et exige <code>--reveal-final</code> pour l'unique révélation.</p>
 <h2 id="33-couts">33. Coûts<a class="heading-link" href="#33-couts" aria-label="Lien vers cette section">#</a></h2>
 <p>Le backtest réaliste inclut :</p>
 <pre><code class="language-text">fees maker/taker
@@ -532,21 +545,27 @@ funding réel
 transferts inter-venues
 rendement passif abandonné
 </code></pre>
-<p>Les frais de <code>config/research.toml</code> sont des placeholders. La future phase paper doit récupérer les frais réels du compte.</p>
-<h2 id="34-trois-scenarios-minimum">34. Trois scénarios minimum<a class="heading-link" href="#34-trois-scenarios-minimum" aria-label="Lien vers cette section">#</a></h2>
-<pre><code class="language-text">informatif/optimiste
-réaliste
-défavorable : frais et slippage ×2
-</code></pre>
-<p>Ajouter ensuite :</p>
+<p>Les frais de <code>config/research.toml</code> sont des placeholders <code>UNCALIBRATED</code>. La future
+phase paper doit récupérer les frais réels du compte. La Phase 04 recherche une
+règle par venue/instrument/période, fait croître l'impact avec
+<code>taille / profondeur</code>, permet le non-fill maker, retarde les jambes et simule les IOC
+d'urgence sans aucune route d'ordre réelle. Déclarer les données, les coûts ou les
+fills maker <code>CALIBRATED</code> sans leur <code>calibration_evidence_hash</code> SHA-256 est refusé.
+Une source ou un identifiant encore marqué synthétique, par défaut ou placeholder est
+également refusé. Ce hash fournit la traçabilité de la preuve déclarée; il ne remplace
+ni son audit ni les Gates B/C.</p>
+<h2 id="34-scenarios-obligatoires">34. Scénarios obligatoires<a class="heading-link" href="#34-scenarios-obligatoires" aria-label="Lien vers cette section">#</a></h2>
+<p>La matrice Phase 04 exécute et inscrit avant résultat :</p>
 <ul>
-<li>taux de fill maker réduit ;</li>
-<li>funding prévu réduit ;</li>
-<li>suppression des meilleurs trades ;</li>
-<li>choc de volatilité ;</li>
-<li>coupure d'une venue ;</li>
-<li>délai de couverture plus long.</li>
+<li>base ;</li>
+<li>coûts ×2 ;</li>
+<li>probabilité de fill maker réduite ;</li>
+<li>latence dégradée ;</li>
+<li>suppression déterministe des meilleurs 5 % de trades économiques clôturés.</li>
 </ul>
+<p>Les scénarios de funding réduit, choc de volatilité et coupure de venue demandent
+encore un dataset réel suffisant et une définition propre à la stratégie; ils ne sont
+pas simulés artificiellement dans la matrice générique.</p>
 <h2 id="35-rapport-obligatoire">35. Rapport obligatoire<a class="heading-link" href="#35-rapport-obligatoire" aria-label="Lien vers cette section">#</a></h2>
 <p>Pour chaque stratégie :</p>
 <ul>
@@ -561,8 +580,20 @@ défavorable : frais et slippage ×2
 <li>PnL par composante ;</li>
 <li>répartition par actif/mois/régime ;</li>
 <li>capacité ;</li>
-<li>comparaison au passif 4–5 %.</li>
+<li>comparaison à un benchmark passif sourcé et explicitement séparé de l'objectif de
+sélection.</li>
 </ul>
+<p>Le rapport Phase 04 ajoute le fill rate, le benchmark sous forme de série alignée,
+le PnL prix/funding/basis/spread/frais/slippage/hedge, les ventilations par taille et
+un intervalle bootstrap par blocs avec seed. Les régimes utilisent uniquement le
+passé. <code>SYNTHETIC</code> ou <code>UNCALIBRATED</code> apparaît visiblement tant que les données et
+modèles ne sont pas calibrés.
+Le bootstrap exige un index UTC régulier et une provenance OOS explicite. La démo
+in-sample conserve donc un statut <code>UNAVAILABLE_NOT_OOS</code> au lieu d'afficher un faux IC.</p>
+<p>Le détail normatif et les limites se trouvent dans
+<a href="BACKTEST_PROTOCOL.md"><code>BACKTEST_PROTOCOL.md</code></a>. Le dataset local du 12 août 2026 ne
+contient pas encore trente jours multi-venues propres : la Phase 04 valide le cadre,
+pas les Gates B/C ni la rentabilité d'une stratégie.</p>
 <h2 id="36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé<a class="heading-link" href="#36-interpreter-un-resultat-tres-eleve" aria-label="Lien vers cette section">#</a></h2>
 <p>Exemple : 5 % net par mois.</p>
 <p>On ne le réduit pas. On cherche d'abord :</p>

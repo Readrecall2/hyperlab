@@ -29,3 +29,21 @@ Le collecteur, le moteur de stratégie et l'éventuel exécuteur ne doivent pas 
 - `dashboard/` : interface locale read-only ;
 - `umbrel-app-store.yml` et `jjlab-hyperlab/` : store Umbrel à la racine, conforme au template officiel ;
 - `prompts/` : phases Codex séquentielles.
+
+## Pipeline de recherche Phase 04
+
+```text
+lake Parquet + manifestes vérifiés
+  → point_in_time.py (received_time, finalité, lifecycle, staleness)
+  → protocol.py (split hashé, walk-forward, verrou final)
+  → registry.py (toutes les variantes, JSONL append-only)
+  → engine.py + costs.py + execution.py (fills simulés, jambes, IOC)
+  → attribution.py + bootstrap.py + benchmark.py
+  → report.py (actif, mois UTC, régime, taille, incertitude)
+```
+
+`target_weights` appartient au modèle de stratégie; `weights` appartient au
+simulateur d'exécution et représente seulement les fills obtenus. Cette séparation
+empêche un ordre manqué d'être compté comme position réelle. Tous les objets d'ordre
+de cette couche sont inertes : aucun module de transport ou SDK d'exécution n'est
+importé.

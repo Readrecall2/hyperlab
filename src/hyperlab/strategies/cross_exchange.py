@@ -72,4 +72,12 @@ class CrossExchangeFundingStrategy:
                 "logic": "long lower funding venue / short higher funding venue",
                 "external_exchange": self.external_exchange,
             },
+            hedge_groups={
+                f"cross_venue:{asset_from(hl)}": (
+                    hl,
+                    f"{self.external_exchange.upper()}:{asset_from(hl)}:perp",
+                )
+                for hl in hl_perps
+                if f"{self.external_exchange.upper()}:{asset_from(hl)}:perp" in panel.prices.columns
+            },
         )

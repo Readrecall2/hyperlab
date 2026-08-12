@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from hyperlab.cli import _secret_like_environment_variables
@@ -11,6 +12,37 @@ def test_source_tree_has_no_exchange_executor_import() -> None:
     forbidden = ["from hyperliquid.exchange import", "import hyperliquid.exchange", "private_key", "seed_phrase"]
     for token in forbidden:
         assert token not in content
+
+
+def test_backtest_package_has_no_network_or_venue_route_import() -> None:
+    backtest_root = Path(__file__).resolve().parents[1] / "src" / "hyperlab" / "backtest"
+    forbidden_roots = {
+        "aiohttp",
+        "httpx",
+        "hyperlab.api",
+        "hyperlab.venues",
+        "hyperliquid",
+        "requests",
+        "socket",
+        "urllib",
+        "websocket",
+        "websockets",
+    }
+    imported: list[tuple[Path, str]] = []
+    for path in backtest_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.extend((path, alias.name) for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.append((path, node.module))
+
+    violations = [
+        f"{path.name}: {module}"
+        for path, module in imported
+        if any(module == root or module.startswith(f"{root}.") for root in forbidden_roots)
+    ]
+    assert violations == []
 
 
 def test_secret_diagnostic_covers_all_forbidden_credential_names() -> None:

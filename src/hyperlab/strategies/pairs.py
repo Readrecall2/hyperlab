@@ -72,4 +72,5 @@ class PairsMeanReversionStrategy:
                 "enter_z": self.enter_z,
                 "stop_z": self.stop_z,
             },
+            hedge_groups={"statistical_pair": (column_a, column_b)},
         )

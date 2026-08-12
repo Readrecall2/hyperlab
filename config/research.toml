@@ -9,11 +9,83 @@ mode = "readonly"
 [costs]
 # Research placeholders only. Before paper/live evaluation, fetch account-specific rates
 # via Hyperliquid userFees and calibrate slippage from real/replayed fills.
+# CALIBRATED additionally requires calibration_evidence_hash with the audited sample SHA-256.
+calibration_status = "UNCALIBRATED"
 spot_fee_bps = 4.0
 perp_fee_bps = 1.5
 external_perp_fee_bps = 2.0
 base_slippage_bps = 1.0
 stress_multiplier = 1.0
+
+[costs.instruments."HL:*:spot"]
+maker_fee_bps = 4.0
+taker_fee_bps = 4.0
+base_slippage_bps = 1.0
+impact_coefficient_bps = 20.0
+impact_exponent = 0.5
+max_participation = 0.10
+source = "UNCALIBRATED research placeholder"
+
+[costs.instruments."HL:*:perp"]
+maker_fee_bps = 1.5
+taker_fee_bps = 1.5
+base_slippage_bps = 1.0
+impact_coefficient_bps = 15.0
+impact_exponent = 0.5
+max_participation = 0.10
+source = "UNCALIBRATED research placeholder"
+
+[costs.instruments."REF:*:perp"]
+maker_fee_bps = 2.0
+taker_fee_bps = 2.0
+base_slippage_bps = 1.0
+impact_coefficient_bps = 12.0
+impact_exponent = 0.5
+max_participation = 0.10
+source = "UNCALIBRATED research placeholder"
+
+[execution]
+initial_capital = 100000.0
+default_order_type = "taker"
+maker_fill_multiplier = 1.0
+maker_timeout_bars = 1
+emergency_ioc = true
+ioc_fill_probability = 1.0
+ioc_extra_slippage_bps = 2.0
+base_latency_bars = 0
+leg_delay_bars = 0
+cost_multiplier = 1.0
+seed = 42
+require_depth = false
+require_point_in_time = false
+
+[execution.maker_fill]
+# CALIBRATED additionally requires calibration_evidence_hash with the audited sample SHA-256.
+base_probability = 0.65
+participation_decay = 2.0
+calibration_id = "uncalibrated-default"
+calibration_status = "UNCALIBRATED"
+
+[research_protocol]
+train_fraction = 0.60
+validation_fraction = 0.20
+walk_forward_train_bars = 720
+walk_forward_validation_bars = 168
+walk_forward_step_bars = 168
+embargo_bars = 1
+expanding = true
+registry_path = "reports/research/variants.jsonl"
+
+[bootstrap]
+block_size = 24
+resamples = 2000
+confidence_level = 0.95
+seed = 42
+
+[benchmark]
+annual_rate = 0.045
+label = "passive_cash_yield"
+source = "UNCALIBRATED research assumption"
 
 [risk_profiles.defensive]
 max_gross_leverage = 0.75

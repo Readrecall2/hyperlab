@@ -121,6 +121,16 @@ Même actif, deux plateformes : long sur la venue au funding inférieur et short
 
 Le risque principal vient de la marge séparée : le portefeuille global peut être neutre, mais une jambe locale peut être liquidée.
 
+La Phase 07 ajoute un simulateur dédié à deux comptes : calendrier et base de
+funding par venue, marks/oracles distincts, capital immobilisé et marge libre
+locaux, frais/slippage par jambe, transferts différés ou bloqués en crise,
+liquidation locale et rebalancing de collatéral. Le rapport compare la base aux
+pannes 1 h/6 h/24 h et chiffre rendement sur capital total, rendement par venue,
+déficit de marge local, temps non couvert et frais de transfert. Voir
+[`CROSS_EXCHANGE_FUNDING_PHASE07.md`](CROSS_EXCHANGE_FUNDING_PHASE07.md). Sans
+trente jours réels synchronisés et des paramètres de marge/transfert calibrés, le
+statut reste `BLOCKED_INSUFFICIENT_REAL_DATA`.
+
 ### 3.4 Pairs trading
 
 Le bot trade l'écart entre deux actifs corrélés. Il entre lorsque le spread est anormal, sort au retour à la moyenne et ferme également sur rupture ou délai maximal.
@@ -778,6 +788,11 @@ survivants actuels.
 ### Funding inter-exchanges
 
 Objectif : même actif, neutralité de prix, gestion de marge séparée.
+
+La gate Phase 07 exige également les règlements propres à chaque calendrier, les
+bases mark/oracle, les marges et coûts calibrés par venue, ainsi qu'une simulation
+préenregistrée des indisponibilités 1 h/6 h/24 h. Une liquidation locale ou un
+temps non couvert sous stress bloque la promotion économique.
 
 ## 39. Vague 3 : alpha moyen risque
 

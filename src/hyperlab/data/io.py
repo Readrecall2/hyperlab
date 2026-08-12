@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from hyperlab.backtest.cross_exchange import CrossVenueMarketData, FundingConvention
 from hyperlab.models import MarketPanel
 
 
@@ -98,6 +99,145 @@ def load_panel_csv(directory: Path) -> MarketPanel:
     )
     panel.validate()
     return panel
+
+
+def save_cross_venue_csv(
+    data: CrossVenueMarketData,
+    directory: Path,
+    *,
+    conventions: dict[str, FundingConvention],
+) -> None:
+    """Write a reproducible Phase-07 matrix export with explicit venue semantics."""
+
+    data.validate(conventions)
+    directory.mkdir(parents=True, exist_ok=True)
+    data.mark_prices.to_csv(directory / "mark_prices.csv")
+    data.oracle_prices.to_csv(directory / "oracle_prices.csv")
+    data.funding_rates.to_csv(directory / "funding_rates.csv")
+    if data.venue_available is not None:
+        data.venue_available.to_csv(directory / "venue_available.csv")
+    if data.transfers_available is not None:
+        data.transfers_available.to_frame("available").to_csv(
+            directory / "transfers_available.csv"
+        )
+    (directory / "cross_venue_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "asset": data.asset,
+                "venues": list(data.venues),
+                "conventions": {
+                    venue: {
+                        "interval_hours": convention.calendar.interval_hours,
+                        "anchor_hour_utc": convention.calendar.anchor_hour_utc,
+                        "explicit_settlements": [
+                            timestamp.isoformat()
+                            for timestamp in convention.calendar.explicit_settlements
+                        ],
+                        "notional_price_source": convention.notional_price_source,
+                        "formula_name": convention.formula_name,
+                        "documentation_url": convention.documentation_url,
+                    }
+                    for venue, convention in conventions.items()
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (directory / "metadata.json").write_text(
+        json.dumps(data.metadata, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_cross_venue_csv(
+    directory: Path,
+    *,
+    conventions: dict[str, FundingConvention],
+) -> CrossVenueMarketData:
+    """Load the explicit Phase-07 format; never infer a venue funding calendar."""
+
+    def read(name: str) -> pd.DataFrame:
+        frame = pd.read_csv(directory / name, index_col=0, parse_dates=True)
+        frame.index = pd.DatetimeIndex(frame.index)
+        return frame
+
+    def strict_boolean(value: object, *, field: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        raise ValueError(f"{field} contains a non-boolean value: {value!r}")
+
+    manifest_value = json.loads(
+        (directory / "cross_venue_manifest.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(manifest_value, dict):
+        raise ValueError("cross_venue_manifest.json must contain an object")
+    if manifest_value.get("schema_version") != 1:
+        raise ValueError("unsupported cross-venue manifest schema_version")
+    asset = manifest_value.get("asset")
+    if not isinstance(asset, str) or not asset.strip():
+        raise ValueError("cross-venue manifest needs an asset")
+    declared_conventions = manifest_value.get("conventions")
+    if not isinstance(declared_conventions, dict):
+        raise ValueError("cross-venue manifest needs explicit funding conventions")
+    expected = {
+        venue: {
+            "interval_hours": convention.calendar.interval_hours,
+            "anchor_hour_utc": convention.calendar.anchor_hour_utc,
+            "explicit_settlements": [
+                timestamp.isoformat() for timestamp in convention.calendar.explicit_settlements
+            ],
+            "notional_price_source": convention.notional_price_source,
+            "formula_name": convention.formula_name,
+            "documentation_url": convention.documentation_url,
+        }
+        for venue, convention in conventions.items()
+    }
+    if declared_conventions != expected:
+        raise ValueError("cross-venue funding conventions differ from the requested model")
+
+    marks = read("mark_prices.csv")
+    if manifest_value.get("venues") != list(marks.columns):
+        raise ValueError("cross-venue manifest venues differ from mark_prices.csv")
+    oracles = read("oracle_prices.csv").reindex(columns=marks.columns)
+    funding = read("funding_rates.csv").reindex(columns=marks.columns)
+    availability_path = directory / "venue_available.csv"
+    availability = read("venue_available.csv").reindex(columns=marks.columns) if availability_path.exists() else None
+    if availability is not None:
+        availability = availability.map(
+            lambda value: strict_boolean(value, field="venue_available")
+        )
+    transfers_path = directory / "transfers_available.csv"
+    transfers = None
+    if transfers_path.exists():
+        transfers_frame = read("transfers_available.csv")
+        transfers = transfers_frame["available"].map(
+            lambda value: strict_boolean(value, field="transfers_available")
+        )
+    metadata_value = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    if not isinstance(metadata_value, dict):
+        raise ValueError("cross-venue metadata.json must contain an object")
+    data = CrossVenueMarketData(
+        asset=asset,
+        mark_prices=marks,
+        oracle_prices=oracles,
+        funding_rates=funding,
+        metadata=metadata_value,
+        venue_available=availability,
+        transfers_available=transfers,
+    )
+    data.validate(conventions)
+    return data
 
 
 def save_panel_parquet(panel: MarketPanel, directory: Path) -> None:

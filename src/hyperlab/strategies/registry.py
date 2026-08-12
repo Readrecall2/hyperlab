@@ -47,9 +47,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "cross_exchange_funding": {
         "label": "Arbitrage de funding inter-venues",
         "tier": "Niveau 2 — équilibré",
-        "status": "Backtester de base inclus",
-        "data": "HL + seconde plateforme synchronisée",
-        "summary": "Même actif, long sur le funding bas et short sur le funding haut.",
+        "status": "Simulateur Phase 07 inclus — gate fermée sans données calibrées",
+        "data": "Marks/oracles, funding réalisé, marges, frais et transferts HL + Binance",
+        "summary": "Même actif sur deux comptes de marge, avec pannes et liquidation locale.",
     },
     "pairs_mean_reversion": {
         "label": "Pairs trading / retour à la moyenne",

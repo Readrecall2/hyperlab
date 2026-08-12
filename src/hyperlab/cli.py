@@ -13,6 +13,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Annotated, Any
 
+import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -22,6 +23,17 @@ from hyperlab.backtest.carry import (
     carry_stress_scenarios,
     evaluate_carry_gate,
     write_carry_report,
+)
+from hyperlab.backtest.cross_exchange import (
+    CrossVenueConfig,
+    audit_cross_venue_data,
+    default_cross_venue_config,
+    default_cross_venue_risk_rules,
+    default_funding_conventions,
+    generate_cross_exchange_demo_data,
+    run_cross_exchange_validation,
+    venue_risk_rules_from_metadata,
+    write_cross_exchange_report,
 )
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.funding_basket import (
@@ -34,7 +46,7 @@ from hyperlab.backtest.report import write_comparison_report
 from hyperlab.backtest.workflow import ResearchWorkflowSpec, run_research_workflow
 from hyperlab.config import Settings, load_settings
 from hyperlab.data.cli import data_app
-from hyperlab.data.io import load_panel_csv, save_panel_csv
+from hyperlab.data.io import load_cross_venue_csv, load_panel_csv, save_panel_csv
 from hyperlab.data.synthetic import generate_demo_panel, generate_microstructure_demo
 from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
@@ -185,6 +197,29 @@ def _run_panel_strategies(strategy_names: list[str], hours: int, seed: int) -> l
     return results
 
 
+def _write_cross_exchange_demo(*, hours: int, seed: int, output: Path) -> Path:
+    data = generate_cross_exchange_demo_data(hours=max(hours, 72), seed=seed + 707)
+    conventions = default_funding_conventions()
+    risk_rules = default_cross_venue_risk_rules()
+    config = default_cross_venue_config()
+    audit = audit_cross_venue_data(
+        data,
+        conventions=conventions,
+        risk_rules=risk_rules,
+    )
+    outage_position = min(len(data.mark_prices) // 2, len(data.mark_prices) - 25)
+    validation = run_cross_exchange_validation(
+        data,
+        conventions=conventions,
+        risk_rules=risk_rules,
+        config=config,
+        failed_venue="HL",
+        outage_start=data.mark_prices.index[outage_position],
+        audit=audit,
+    )
+    return write_cross_exchange_report(validation, output_dir=output)
+
+
 @app.command()
 def demo(
     strategy: Annotated[str, typer.Option(help="Nom de stratégie ou 'all'")] = "all",
@@ -226,6 +261,13 @@ def demo(
         bootstrap_seed=research_settings.bootstrap_seed,
         bootstrap_confidence_level=research_settings.bootstrap_confidence_level,
     )
+    detailed_cross_exchange_report = None
+    if "cross_exchange_funding" in names:
+        detailed_cross_exchange_report = _write_cross_exchange_demo(
+            hours=hours,
+            seed=seed,
+            output=output / "cross_exchange_funding",
+        )
     table = Table(title="Résultats synthétiques — aucune valeur prédictive")
     table.add_column("Stratégie")
     table.add_column("Retour total", justify="right")
@@ -246,9 +288,29 @@ def demo(
         )
     console.print(table)
     console.print(f"[bold green]Rapport : {report.resolve()}[/bold green]")
+    if detailed_cross_exchange_report is not None:
+        console.print(
+            "[bold green]Rapport Phase 07 à marges séparées : "
+            f"{detailed_cross_exchange_report.resolve()}[/bold green]"
+        )
     console.print(
         "[yellow]Ces résultats synthétiques valident l'installation, jamais une rentabilité.[/yellow]"
     )
+
+
+@app.command("cross-exchange-demo")
+def cross_exchange_demo(
+    hours: Annotated[int, typer.Option(min=72, help="Nombre d'heures synthétiques")] = 240,
+    seed: Annotated[int, typer.Option(help="Graine déterministe")] = 707,
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 07")] = Path(
+        "reports/cross-exchange-demo"
+    ),
+) -> None:
+    """Exerce marges séparées et pannes 1/6/24 h sur données synthétiques visibles."""
+
+    report = _write_cross_exchange_demo(hours=hours, seed=seed, output=output)
+    console.print("[yellow]SYNTHETIC — aucune valeur prédictive ni route d'ordre.[/yellow]")
+    console.print(f"Rapport Phase 07 : {report.resolve()}")
 
 
 @app.command("demo-data")
@@ -519,6 +581,104 @@ def funding_basket_audit(
     console.print(f"Rapport Phase 06 : {output.resolve()}")
     if not audit.passed:
         raise typer.Exit(2)
+
+
+@app.command("cross-exchange-audit")
+def cross_exchange_audit(
+    data: Annotated[
+        Path,
+        typer.Option(help="Export Phase 07 avec marks, oracles et funding par venue"),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de préparation Phase 07"),
+    ] = Path("reports/cross-exchange-readiness.json"),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 30 * 24,
+) -> None:
+    """Audite deux venues et leurs marges sans simuler ni envoyer aucun ordre."""
+
+    conventions = default_funding_conventions()
+    market = load_cross_venue_csv(data, conventions=conventions)
+    risk_rules = venue_risk_rules_from_metadata(market.metadata)
+    audit = audit_cross_venue_data(
+        market,
+        conventions=conventions,
+        risk_rules=risk_rules,
+        minimum_history_hours=minimum_history_hours,
+    )
+    payload = asdict(audit)
+    payload["passed"] = audit.passed
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Phase 07 : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
+
+
+@app.command("cross-exchange-backtest")
+def cross_exchange_backtest(
+    data: Annotated[Path, typer.Option(help="Export CSV Phase 07 point-in-time")],
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 07")] = Path(
+        "reports/cross-exchange"
+    ),
+    capital_hl: Annotated[float, typer.Option(min=1.0)] = 50_000.0,
+    capital_binance: Annotated[float, typer.Option(min=1.0)] = 50_000.0,
+    target_notional: Annotated[float, typer.Option(min=1.0)] = 40_000.0,
+    failed_venue: Annotated[str, typer.Option(help="Venue indisponible dans les stress")] = "HL",
+    outage_start: Annotated[
+        str | None,
+        typer.Option(help="Début UTC ISO-8601; milieu de période par défaut"),
+    ] = None,
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 30 * 24,
+) -> None:
+    """Simule la Phase 07 en recherche seule avec pannes préenregistrées 1/6/24 h."""
+
+    conventions = default_funding_conventions()
+    market = load_cross_venue_csv(data, conventions=conventions)
+    if len(market.mark_prices) < 25:
+        raise typer.BadParameter(
+            "la matrice de panne exige 24 heures d'incident puis une barre de reprise"
+        )
+    risk_rules = venue_risk_rules_from_metadata(market.metadata)
+    audit = audit_cross_venue_data(
+        market,
+        conventions=conventions,
+        risk_rules=risk_rules,
+        minimum_history_hours=minimum_history_hours,
+    )
+    if outage_start is None:
+        position = min(len(market.mark_prices) // 2, len(market.mark_prices) - 25)
+        resolved_outage_start = market.mark_prices.index[position]
+    else:
+        resolved_outage_start = pd.Timestamp(outage_start)
+        if (
+            resolved_outage_start.tz is None
+            or resolved_outage_start.utcoffset() != pd.Timedelta(0)
+        ):
+            raise typer.BadParameter("outage-start doit être un horodatage UTC explicite")
+        resolved_outage_start = resolved_outage_start.tz_convert("UTC")
+    config = CrossVenueConfig(
+        initial_capital_by_venue={"HL": capital_hl, "BINANCE_USDM": capital_binance},
+        target_notional_usd=target_notional,
+    )
+    validation = run_cross_exchange_validation(
+        market,
+        conventions=conventions,
+        risk_rules=risk_rules,
+        config=config,
+        failed_venue=failed_venue,
+        outage_start=resolved_outage_start,
+        audit=audit,
+    )
+    report = write_cross_exchange_report(validation, output_dir=output)
+    console.print(f"Statut Phase 07 : {validation.status}")
+    console.print(f"Rapport Phase 07 : {report.resolve()}")
 
 
 @app.command()

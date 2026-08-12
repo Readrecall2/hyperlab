@@ -14,7 +14,7 @@ Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher et backt
 6. lead-lag multi-exchange, baseline bar-level ;
 7. market making avec inventaire, simulateur microstructurel simplifié.
 
-Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité. Le basket Phase 06 compare ranking inverse-vol et optimisation dollar/bêta BTC/ETH neutre, avec covariance shrinkée, pénalité de turnover et stress dédiés ; ses scénarios synthétiques ne valident pas davantage une rentabilité.
+Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité. Le basket Phase 06 compare ranking inverse-vol et optimisation dollar/bêta BTC/ETH neutre, avec covariance shrinkée, pénalité de turnover et stress dédiés ; ses scénarios synthétiques ne valident pas davantage une rentabilité. La Phase 07 ajoute deux comptes de marge indépendants, transferts, liquidation locale et pannes 1 h/6 h/24 h ; sa démo reste elle aussi strictement synthétique.
 
 ## Windows 11
 
@@ -99,3 +99,10 @@ Le basket de funding Phase 06, son filtre de squeeze, sa neutralisation, ses str
 de corrélation/squeeze et sa validation leave-one-out avec marchés délistés sont
 décrits dans [`docs/FUNDING_BASKET_PHASE06.md`](docs/FUNDING_BASKET_PHASE06.md).
 La gate reste fermée sans 90 jours d'univers Hyperliquid point-in-time calibré.
+
+Le funding inter-exchanges Phase 07, ses calendriers Hyperliquid/Binance, ses
+marks/oracles distincts, ses marges locales, ses transferts et sa matrice de panne
+sont décrits dans
+[`docs/CROSS_EXCHANGE_FUNDING_PHASE07.md`](docs/CROSS_EXCHANGE_FUNDING_PHASE07.md).
+Le lake local n'offre pas encore trente jours synchronisés sur les deux venues :
+statut `BLOCKED_INSUFFICIENT_REAL_DATA`.

@@ -190,6 +190,15 @@ pas encore les 90 jours d'univers Hyperliquid point-in-time calibré exigés : s
 <h3 id="3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges<a class="heading-link" href="#3-3-arbitrage-de-funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
 <p>Même actif, deux plateformes : long sur la venue au funding inférieur et short sur celle au funding supérieur.</p>
 <p>Le risque principal vient de la marge séparée : le portefeuille global peut être neutre, mais une jambe locale peut être liquidée.</p>
+<p>La Phase 07 ajoute un simulateur dédié à deux comptes : calendrier et base de
+funding par venue, marks/oracles distincts, capital immobilisé et marge libre
+locaux, frais/slippage par jambe, transferts différés ou bloqués en crise,
+liquidation locale et rebalancing de collatéral. Le rapport compare la base aux
+pannes 1 h/6 h/24 h et chiffre rendement sur capital total, rendement par venue,
+déficit de marge local, temps non couvert et frais de transfert. Voir
+<a href="CROSS_EXCHANGE_FUNDING_PHASE07.md"><code>CROSS_EXCHANGE_FUNDING_PHASE07.md</code></a>. Sans
+trente jours réels synchronisés et des paramètres de marge/transfert calibrés, le
+statut reste <code>BLOCKED_INSUFFICIENT_REAL_DATA</code>.</p>
 <h3 id="3-4-pairs-trading">3.4 Pairs trading<a class="heading-link" href="#3-4-pairs-trading" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot trade l'écart entre deux actifs corrélés. Il entre lorsque le spread est anormal, sort au retour à la moyenne et ferme également sur rupture ou délai maximal.</p>
 <p>Aucune martingale n'est permise.</p>
@@ -640,6 +649,10 @@ marché délisté dans l'univers historique afin de ne pas valider uniquement le
 survivants actuels.</p>
 <h3 id="funding-inter-exchanges">Funding inter-exchanges<a class="heading-link" href="#funding-inter-exchanges" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : même actif, neutralité de prix, gestion de marge séparée.</p>
+<p>La gate Phase 07 exige également les règlements propres à chaque calendrier, les
+bases mark/oracle, les marges et coûts calibrés par venue, ainsi qu'une simulation
+préenregistrée des indisponibilités 1 h/6 h/24 h. Une liquidation locale ou un
+temps non couvert sous stress bloque la promotion économique.</p>
 <h2 id="39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque<a class="heading-link" href="#39-vague-3-alpha-moyen-risque" aria-label="Lien vers cette section">#</a></h2>
 <h3 id="pairs">Pairs<a class="heading-link" href="#pairs" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : spread robuste, stop et time stop.</p>

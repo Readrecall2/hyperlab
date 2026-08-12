@@ -1,6 +1,14 @@
 from hyperlab.backtest.attribution import aggregate_pnl, causal_regimes
 from hyperlab.backtest.bootstrap import block_bootstrap_ci
 from hyperlab.backtest.costs import CostRule, CostSchedule, SlippageModel
+from hyperlab.backtest.cross_exchange import (
+    CrossVenueConfig,
+    CrossVenueMarketData,
+    FundingCalendar,
+    FundingConvention,
+    VenueRiskRule,
+    simulate_cross_exchange_funding,
+)
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.execution import ExecutionConfig, MakerFillModel
 from hyperlab.backtest.point_in_time import (
@@ -42,8 +50,12 @@ __all__ = [
     "CandleFinalityPolicy",
     "CostRule",
     "CostSchedule",
+    "CrossVenueConfig",
+    "CrossVenueMarketData",
     "ExecutionConfig",
     "FinalTestLock",
+    "FundingCalendar",
+    "FundingConvention",
     "MakerFillModel",
     "PanelBacktester",
     "ResearchRegistry",
@@ -56,6 +68,7 @@ __all__ = [
     "TimeRange",
     "ValidationResult",
     "VariantSpec",
+    "VenueRiskRule",
     "WalkForwardResult",
     "WalkForwardSpec",
     "aggregate_pnl",
@@ -70,6 +83,7 @@ __all__ = [
     "run_walk_forward",
     "select_best_variant",
     "select_candle_revisions_as_of",
+    "simulate_cross_exchange_funding",
     "slice_panel",
     "universe_mask_as_of",
     "write_comparison_report",

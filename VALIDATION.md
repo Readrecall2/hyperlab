@@ -199,3 +199,64 @@ Les neutralités bêta sont exactes aux décisions de rebalance et peuvent déri
 entre deux décisions quand les estimations changent. Les chocs de corrélation et de
 squeeze sont contrefactuels et visibles comme tels ; ils mesurent une sensibilité,
 pas une probabilité de crise. La Phase 06 ne crée aucune route d'ordre réel.
+
+---
+
+# Validation — Phase 07, funding inter-exchanges
+
+Date d'audit : 12 août 2026
+
+Checkpoint antérieur aux travaux : `520c906`
+
+Branche : `phase-07-cross-exchange-funding`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (63 fichiers) et les
+500 tests `pytest -p no:cacheprovider` passent. Les neuf tests Phase 07 couvrent
+calendriers/formules, causalité, bases mark/oracle, liquidation locale, transferts,
+pannes, audit, export CSV et rapport JSON/HTML.
+
+## Verdict Phase 07
+
+Le modèle logiciel et les stress 1 h/6 h/24 h sont implémentés. La validation
+économique reste `BLOCKED_INSUFFICIENT_REAL_DATA` : le lake événementiel local ne
+contient que Binance USDⓈ-M sur les 11–12 août 2026 et aucun historique
+Hyperliquid événementiel synchronisé suffisant. Les 88 snapshots du statut legacy
+Hyperliquid ne constituent ni trente jours horaires, ni un panel point-in-time de
+marks, oracles et règlements sur les deux venues. Aucun rendement réel n'a été
+fabriqué.
+
+Le simulateur garde deux equities, marges initiales, marges de maintenance et
+marges libres indépendantes. La variation du mark et le funding sont crédités à la
+venue concernée. Hyperliquid utilise l'oracle pour le notional de funding et son
+mark pour le risque ; Binance utilise le taux réalisé et le mark associés au
+règlement. Les taux sont comparés après normalisation par la durée du calendrier,
+à partir des seules observations déjà disponibles.
+
+Les frais, le slippage et les pénalités sont débités par jambe. Un transfert retire
+montant et frais de la source, place le principal en transit, puis ne crédite la
+destination qu'après le délai et si les rails sont disponibles. Une crise peut
+bloquer départ et arrivée. La liquidation locale est évaluée avant la prochaine
+décision utilisateur et peut survenir alors que le capital total reste positif.
+Après liquidation, toute nouvelle entrée est interdite et l'autre jambe est
+débouclée dès que sa venue est disponible.
+
+La matrice de panne ne modifie pas le chemin de prix. Elle bloque les actions
+utilisateur et transferts de la venue choisie pendant exactement 1, 6 ou 24 heures,
+avec une barre de reprise obligatoire. La gate bloque une liquidation locale ou un
+temps non couvert dans n'importe quel scénario.
+
+Le rapport reproductible contient rendement brut/net sur capital total, rendement
+économique par venue, drawdown, pire heure, turnover, exposition brute/nette, PnL
+mark/funding/coûts, capital immobilisé, pire déficit de marge local, temps non
+couvert, frais de rebalancing et liquidations. Les hypothèses de risque, calendriers,
+formules, bases de prix, provenance et durées de panne sont inscrites dans le JSON.
+
+## Limites connues
+
+La grille est horaire : elle sous-estime potentiellement une liquidation intrabar.
+Les valeurs par défaut de marge, frais et transfert sont `UNCALIBRATED` et ne
+franchissent jamais l'audit. Le modèle ne couvre pas encore l'ADL, la faillite de
+venue, le haircut du stablecoin, les limites de retrait ou la récupération après
+insolvabilité. Ces limites sont détaillées dans
+`docs/CROSS_EXCHANGE_FUNDING_PHASE07.md`. Aucun client privé, secret, signer ou
+chemin d'ordre réel n'a été ajouté.

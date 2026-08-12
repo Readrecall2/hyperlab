@@ -54,6 +54,13 @@ Voir [`FUNDING_BASKET_PHASE06.md`](FUNDING_BASKET_PHASE06.md).
 
 **Risques :** capital séparé, mark/oracle différents, panne d'une venue, transfert impossible, liquidation locale malgré neutralité globale.
 
+**Validation Phase 07 :** simulateur événementiel à deux comptes de marge,
+calendriers et bases de funding propres à chaque venue, frais/slippage par jambe,
+transferts différés ou bloqués, liquidation locale, rebalancing de collatéral et
+pannes préenregistrées 1 h/6 h/24 h. Le rapport expose rendement total et par
+venue, déficit de marge, temps non couvert et coûts de transfert. Voir
+[`CROSS_EXCHANGE_FUNDING_PHASE07.md`](CROSS_EXCHANGE_FUNDING_PHASE07.md).
+
 ## Niveau 3 — pairs trading
 
 **Position :** long d'un actif et short d'un autre lorsque leur écart statistique s'éloigne de son régime estimé.

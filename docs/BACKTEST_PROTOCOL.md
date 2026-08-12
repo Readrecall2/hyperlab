@@ -236,8 +236,10 @@ Le cash-and-carry ajoute un scénario propre d'inversion du funding (`× -1`). L
 stress Phase 06 du basket ajoutent une rupture déterministe des corrélations et un
 squeeze simultané de tous les perps détenus short, sans recalculer les poids après
 observation du choc. Ils sont préenregistrés avant révélation du test final. Les
-scénarios de volatilité et panne de venue restent à ajouter au niveau de chaque
-stratégie lorsqu'un dataset réel suffisant existe.
+scénarios de panne de venue restent à ajouter au niveau de chaque stratégie lorsqu'un
+dataset réel suffisant existe. La Phase 09 ajoute une gate directionnelle : labels de
+régime causaux, PnL hors `trend_up`, concentration maximale des profits bull,
+cooldown de liquidations et levier déployable plafonné à 1×.
 
 ## 11. Limites restantes
 

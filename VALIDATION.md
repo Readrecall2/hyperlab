@@ -311,3 +311,53 @@ probabilité. La grille horaire ignore les excursions intrabar. Les paramètres
 Kalman, seuils de z-score et horizons restent des hypothèses de recherche à
 préenregistrer puis valider sur données réelles. Aucun client privé, secret,
 signer, martingale ou chemin d'ordre réel n'a été ajouté.
+
+# Validation — Phase 09, momentum et régimes
+
+Date : 12 août 2026
+
+Checkpoint antérieur aux travaux : `5710381`
+
+Branche : `phase-09-momentum-regime`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (65 fichiers) et les
+510 tests `pytest -p no:cacheprovider` passent. Les cinq tests Phase 09 couvrent
+l'audit fail-closed des données directionnelles, la causalité des features et
+régimes, l'invisibilité du test final pendant la sélection, les stops/corrélation/
+cooldowns/caps de risque et le rapport anti-dépendance au bull market.
+
+## Verdict Phase 09
+
+Le cadre logiciel directionnel est implémenté et reste séparé des modules
+market-neutral. La validation économique demeure
+`BLOCKED_INSUFFICIENT_REAL_DATA` : le lake local ne fournit pas 365 jours horaires
+multi-actifs point-in-time avec lifecycle historique, marchés délistés, volume,
+OI, funding réalisé, liquidations observées, profondeur et coûts/fills calibrés.
+Les fixtures `SYNTHETIC` exercent les invariants mais ne prouvent aucun rendement.
+
+Les variantes time-series multi-horizons, breakout et combinée sont toutes
+enregistrées. La sélection ne voit que train/validation et la variante choisie est
+gelée avant le test final. Volume et OI confirment l'amplitude ; le funding agit
+comme coût/confirmation sans pouvoir retourner seul le signal. Tous les calculs à
+`t` ne gagnent qu'à partir de `t → t+1`.
+
+Le profil déployable cible la volatilité, applique un stop suiveur de volatilité,
+borne le poids par actif, refuse les nouvelles positions trop corrélées et met le
+portefeuille à plat pendant un cooldown après spike de liquidations. Le levier brut
+est validé à 1× maximum dans la stratégie, la configuration et le résultat rempli.
+Il n'existe ni martingale, ni doublement après perte, ni chemin d'ordre réel.
+
+Le rapport JSON/HTML sépare prix, funding et coûts par régime sur le test final. La
+gate exige `trend_up`, `trend_down` et `chaos`, un PnL hors `trend_up` au-dessus du
+seuil préenregistré et une concentration maximale des profits bull. Une stratégie
+qui ne fonctionne que dans un bull market est explicitement rejetée.
+
+## Limites connues
+
+La classification de régime repose sur moyenne et volatilité bar-level, pas sur un
+modèle latent. Le breakout utilise les clôtures et le stop la volatilité réalisée :
+sans high/low intrabar, les excursions ATR et gaps internes à l'heure restent
+inobservables. La limite de corrélation utilise une fenêtre rolling et ne garantit
+pas qu'une corrélation ne change pas après l'entrée. Les seuils, horizons, coûts et
+notionnels de liquidations doivent être préenregistrés puis calibrés sur données
+réelles avant toute conclusion économique.

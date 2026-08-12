@@ -214,6 +214,14 @@ statut reste <code>BLOCKED_INSUFFICIENT_REAL_DATA</code>.</p>
 <h3 id="3-5-momentum-regime">3.5 Momentum/régime<a class="heading-link" href="#3-5-momentum-regime" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot prend une exposition directionnelle quand la tendance dépasse le bruit, avec sizing par volatilité et pénalité si le funding coûte trop cher.</p>
 <p>Cette stratégie peut produire plus, mais son drawdown peut être nettement supérieur.</p>
+<p>La Phase 09 compare sur validation le momentum time-series multi-horizons, le
+breakout et leur combinaison, puis gèle une variante avant le test final. Volume et
+OI confirment le signal ; funding et volatilité réalisée modulent son coût et sa
+taille. Les régimes <code>calm</code>, <code>trend_up</code>, <code>trend_down</code> et <code>chaos</code> sont calculés sans
+observation future. Le profil déployable impose un stop de volatilité, des caps
+total/par actif, une limite de corrélation, un cooldown après spike de liquidations
+et un levier maximal de 1×. Le rapport rejette une performance provenant uniquement
+d'un bull market. Voir <a href="MOMENTUM_REGIME_PHASE09.md"><code>MOMENTUM_REGIME_PHASE09.md</code></a>.</p>
 <h3 id="3-6-lead-lag">3.6 Lead-lag<a class="heading-link" href="#3-6-lead-lag" aria-label="Lien vers cette section">#</a></h3>
 <p>Une venue de référence bouge ; Hyperliquid réagit légèrement plus tard ; le bot tente d'exploiter ce délai.</p>
 <p>Le prototype inclus utilise des barres horaires uniquement pour exercer le moteur. Une conclusion réelle exige flux sub-seconde, horloges synchronisées, mesure de latence et replay du carnet.</p>
@@ -670,6 +678,11 @@ après retrait de la meilleure paire (déterminée sur validation) et sous ruptu
 simulée des corrélations. Une paire unique ne peut donc pas franchir la gate.</p>
 <h3 id="momentum">Momentum<a class="heading-link" href="#momentum" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : rendement directionnel contrôlé, régime explicite.</p>
+<p>La gate Phase 09 exige plusieurs régimes observés, un PnL hors <code>trend_up</code> au-dessus
+du seuil préenregistré, une concentration bornée des profits bull, des stops et
+cooldowns effectivement exercés, ainsi qu'une exposition brute ne dépassant jamais
+1×. Sans liquidations horaires observées, OI, lifecycle historique et exécution
+calibrée, le statut reste bloqué.</p>
 <h2 id="40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence<a class="heading-link" href="#40-vague-4-haute-performance-haute-exigence" aria-label="Lien vers cette section">#</a></h2>
 <h3 id="lead-lag">Lead-lag<a class="heading-link" href="#lead-lag" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : edge après latence et coûts réels.</p>

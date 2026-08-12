@@ -42,6 +42,13 @@ from hyperlab.backtest.funding_basket import (
     funding_basket_stress_scenarios,
     write_funding_basket_report,
 )
+from hyperlab.backtest.momentum import (
+    MomentumGateConfig,
+    MomentumSelectionConfig,
+    audit_momentum_panel,
+    run_momentum_validation,
+    write_momentum_report,
+)
 from hyperlab.backtest.pairs import (
     PairSelectionConfig,
     PairsGateConfig,
@@ -413,6 +420,11 @@ def backtest(
                 if panel.open_interest_usd is not None
                 else None
             ),
+            liquidation_usd=(
+                panel.liquidation_usd.loc[final_index].copy()
+                if panel.liquidation_usd is not None
+                else None
+            ),
             available_at=(
                 panel.available_at.loc[final_index].copy()
                 if panel.available_at is not None
@@ -717,6 +729,98 @@ def pairs_backtest(
     report = write_pairs_report(validation, output_dir=output)
     console.print(f"Statut Phase 08 : {validation.status}")
     console.print(f"Rapport Phase 08 : {report.resolve()}")
+
+
+@app.command("momentum-audit")
+def momentum_audit(
+    data: Annotated[
+        Path,
+        typer.Option(
+            help="Export Phase 09 point-in-time avec volume, OI, funding et liquidations"
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de preparation Phase 09"),
+    ] = Path("reports/momentum-readiness.json"),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 365 * 24,
+    minimum_assets: Annotated[int, typer.Option(min=2)] = 6,
+) -> None:
+    """Audite les donnees directionnelles Phase 09 sans route d'ordre."""
+
+    panel = load_panel_csv(data)
+    audit = audit_momentum_panel(
+        panel,
+        minimum_history_hours=minimum_history_hours,
+        minimum_assets=minimum_assets,
+    )
+    payload = asdict(audit)
+    payload["passed"] = audit.passed
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Phase 09 : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
+
+
+@app.command("momentum-backtest")
+def momentum_backtest(
+    data: Annotated[Path, typer.Option(help="Export CSV Phase 09 point-in-time")],
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 09")] = Path(
+        "reports/momentum"
+    ),
+    minimum_history_hours: Annotated[int, typer.Option(min=24)] = 365 * 24,
+    minimum_assets: Annotated[int, typer.Option(min=2)] = 6,
+    minimum_non_bull_pnl: Annotated[float, typer.Option()] = 0.0,
+    maximum_bull_profit_fraction: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.80,
+) -> None:
+    """Compare momentum/breakout puis evalue le test final par regime."""
+
+    panel = load_panel_csv(data)
+    settings = _settings()
+    audit = audit_momentum_panel(
+        panel,
+        minimum_history_hours=minimum_history_hours,
+        minimum_assets=minimum_assets,
+    )
+    train_bars = max(24, int(len(panel.prices) * settings.research.train_fraction))
+    validation_bars = max(12, int(len(panel.prices) * settings.research.validation_fraction))
+    selection = MomentumSelectionConfig(
+        minimum_train_bars=train_bars,
+        minimum_validation_bars=validation_bars,
+    )
+    gate = MomentumGateConfig(
+        train_fraction=settings.research.train_fraction,
+        validation_fraction=settings.research.validation_fraction,
+        minimum_non_bull_pnl=minimum_non_bull_pnl,
+        maximum_bull_profit_fraction=maximum_bull_profit_fraction,
+    )
+    engine = PanelBacktester(
+        costs=settings.cost_schedule,
+        risk_limits=settings.risk_profiles["offensive"],
+        execution=replace(
+            settings.execution,
+            require_depth=True,
+            require_point_in_time=True,
+        ),
+        benchmark=settings.research.benchmark,
+    )
+    validation = run_momentum_validation(
+        panel,
+        engine=engine,
+        selection_config=selection,
+        gate_config=gate,
+        audit=audit,
+    )
+    report = write_momentum_report(validation, output_dir=output)
+    console.print(f"Statut Phase 09 : {validation.status}")
+    console.print(f"Rapport Phase 09 : {report.resolve()}")
 
 
 @app.command("cross-exchange-backtest")

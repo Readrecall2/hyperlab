@@ -47,6 +47,7 @@ def generate_demo_panel(
     spreads: dict[str, np.ndarray] = {}
     volume: dict[str, np.ndarray] = {}
     open_interest: dict[str, np.ndarray] = {}
+    liquidations: dict[str, np.ndarray] = {}
 
     common_shock = rng.normal(0.0, 0.006, hours)
     regime = np.repeat(rng.choice([-1.0, 0.0, 1.0], size=(hours // 360) + 2), 360)[:hours]
@@ -123,6 +124,10 @@ def generate_demo_panel(
         open_interest[hl_spot] = np.full(hours, np.nan)
         open_interest[hl_perp] = rng.lognormal(np.log(base_volume * 0.7), 0.18, hours)
         open_interest[ref_perp] = rng.lognormal(np.log(base_volume), 0.18, hours)
+        liquidations[hl_spot] = np.zeros(hours)
+        liquidations[hl_perp] = rng.lognormal(np.log(2_000.0), 0.45, hours)
+        liquidations[ref_perp] = np.zeros(hours)
+        liquidations[hl_perp][hours * 2 // 3] = 5_000_000.0 / (asset_idx + 1)
 
     price_frame = pd.DataFrame(prices, index=index)
     funding_frame = pd.DataFrame(funding, index=index)[price_frame.columns]
@@ -130,6 +135,7 @@ def generate_demo_panel(
     volume_frame = pd.DataFrame(volume, index=index)[price_frame.columns]
     depth_frame = (volume_frame * 0.002).clip(lower=25_000.0)
     open_interest_frame = pd.DataFrame(open_interest, index=index)[price_frame.columns]
+    liquidation_frame = pd.DataFrame(liquidations, index=index)[price_frame.columns]
     available_at = pd.DataFrame(
         {column: index for column in price_frame.columns},
         index=index,
@@ -144,6 +150,7 @@ def generate_demo_panel(
         volume_usd=volume_frame,
         depth_usd=depth_frame,
         open_interest_usd=open_interest_frame,
+        liquidation_usd=liquidation_frame,
         available_at=available_at,
         finality=pd.DataFrame(True, index=index, columns=price_frame.columns),
         tradable=pd.DataFrame(True, index=index, columns=price_frame.columns),
@@ -154,6 +161,7 @@ def generate_demo_panel(
             "historical_universe_source": "synthetic-lifecycle-fixture",
             "lifecycle_hash": synthetic_lifecycle_hash,
             "calibration_status": "SYNTHETIC",
+            "liquidation_semantics": "synthetic_hourly_notional",
             "warning": "Never use synthetic results as an investment decision.",
             "synthetic_validation_scenarios": {
                 "cash_and_carry": {

@@ -8,7 +8,7 @@ from hyperlab.strategies.carry import CashAndCarryStrategy
 from hyperlab.strategies.cross_exchange import CrossExchangeFundingStrategy
 from hyperlab.strategies.funding_basket import FundingBasketStrategy
 from hyperlab.strategies.lead_lag import LeadLagStrategy
-from hyperlab.strategies.momentum import MomentumRegimeStrategy
+from hyperlab.strategies.momentum import RobustMomentumStrategy
 from hyperlab.strategies.pairs import PairsMeanReversionStrategy
 
 
@@ -25,7 +25,7 @@ STRATEGY_FACTORIES: dict[str, Callable[[], Strategy]] = {
     "funding_basket": FundingBasketStrategy,
     "cross_exchange_funding": CrossExchangeFundingStrategy,
     "pairs_mean_reversion": PairsMeanReversionStrategy,
-    "momentum_regime": MomentumRegimeStrategy,
+    "momentum_regime": RobustMomentumStrategy,
     "lead_lag": LeadLagStrategy,
 }
 
@@ -61,9 +61,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "momentum_regime": {
         "label": "Momentum avec filtre de régime",
         "tier": "Niveau 3 — offensif",
-        "status": "Baseline incluse",
-        "data": "OHLCV, funding, OI, volatilité",
-        "summary": "Directionnel, sizing par volatilité et pénalité de funding défavorable.",
+        "status": "Validateur Phase 09 inclus — gate fermée sans historique calibré multi-régimes",
+        "data": "Perps, volume, OI, funding, liquidations, profondeur et lifecycle point-in-time",
+        "summary": "Momentum/breakout, régimes causaux, stop volatilité et exposition 1x maximum.",
     },
     "lead_lag": {
         "label": "Lead-lag multi-exchange",

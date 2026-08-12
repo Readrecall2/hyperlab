@@ -100,6 +100,14 @@ d'inversion du funding et sa gate face au benchmark passif sont documentés dans
 reste insuffisant pour une validation économique : le statut actuel est
 `BLOCKED_INSUFFICIENT_REAL_DATA`.
 
+La Phase 09 ajoute un validateur directionnel séparé : comparaison momentum
+multi-horizons/breakout sur validation, régimes causaux, volatilité cible, stop de
+volatilité, limite de corrélation, cooldown après liquidations et exposition
+déployable plafonnée à 1×. Le rapport ventile le PnL par régime et vérifie qu'il ne
+provient pas uniquement de `trend_up`. Sans historique point-in-time multi-régimes
+et modèles calibrés, aucune performance économique n'est revendiquée. Voir
+[`docs/MOMENTUM_REGIME_PHASE09.md`](docs/MOMENTUM_REGIME_PHASE09.md).
+
 Le basket de funding Phase 06, son filtre de squeeze, sa neutralisation, ses stress
 de corrélation/squeeze et sa validation leave-one-out avec marchés délistés sont
 décrits dans [`docs/FUNDING_BASKET_PHASE06.md`](docs/FUNDING_BASKET_PHASE06.md).

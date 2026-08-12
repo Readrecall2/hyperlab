@@ -153,6 +153,15 @@ Le bot prend une exposition directionnelle quand la tendance dépasse le bruit, 
 
 Cette stratégie peut produire plus, mais son drawdown peut être nettement supérieur.
 
+La Phase 09 compare sur validation le momentum time-series multi-horizons, le
+breakout et leur combinaison, puis gèle une variante avant le test final. Volume et
+OI confirment le signal ; funding et volatilité réalisée modulent son coût et sa
+taille. Les régimes `calm`, `trend_up`, `trend_down` et `chaos` sont calculés sans
+observation future. Le profil déployable impose un stop de volatilité, des caps
+total/par actif, une limite de corrélation, un cooldown après spike de liquidations
+et un levier maximal de 1×. Le rapport rejette une performance provenant uniquement
+d'un bull market. Voir [`MOMENTUM_REGIME_PHASE09.md`](MOMENTUM_REGIME_PHASE09.md).
+
 ### 3.6 Lead-lag
 
 Une venue de référence bouge ; Hyperliquid réagit légèrement plus tard ; le bot tente d'exploiter ce délai.
@@ -817,6 +826,12 @@ simulée des corrélations. Une paire unique ne peut donc pas franchir la gate.
 ### Momentum
 
 Objectif : rendement directionnel contrôlé, régime explicite.
+
+La gate Phase 09 exige plusieurs régimes observés, un PnL hors `trend_up` au-dessus
+du seuil préenregistré, une concentration bornée des profits bull, des stops et
+cooldowns effectivement exercés, ainsi qu'une exposition brute ne dépassant jamais
+1×. Sans liquidations horaires observées, OI, lifecycle historique et exécution
+calibrée, le statut reste bloqué.
 
 ## 40. Vague 4 : haute performance / haute exigence
 

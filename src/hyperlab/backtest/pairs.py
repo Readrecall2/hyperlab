@@ -243,6 +243,9 @@ def _slice_panel(panel: MarketPanel, index: pd.DatetimeIndex) -> MarketPanel:
         open_interest_usd=(
             panel.open_interest_usd.loc[index].copy() if panel.open_interest_usd is not None else None
         ),
+        liquidation_usd=(
+            panel.liquidation_usd.loc[index].copy() if panel.liquidation_usd is not None else None
+        ),
         available_at=panel.available_at.loc[index].copy() if panel.available_at is not None else None,
         finality=panel.finality.loc[index].copy() if panel.finality is not None else None,
         tradable=panel.tradable.loc[index].copy() if panel.tradable is not None else None,

@@ -77,6 +77,7 @@ class MarketPanel:
     metadata: dict[str, Any] = field(default_factory=dict)
     depth_usd: pd.DataFrame | None = None
     open_interest_usd: pd.DataFrame | None = None
+    liquidation_usd: pd.DataFrame | None = None
     available_at: pd.DataFrame | None = None
     finality: pd.DataFrame | None = None
     tradable: pd.DataFrame | None = None
@@ -108,6 +109,7 @@ class MarketPanel:
         for optional_name, optional_frame in {
             "depth_usd": self.depth_usd,
             "open_interest_usd": self.open_interest_usd,
+            "liquidation_usd": self.liquidation_usd,
             "available_at": self.available_at,
             "finality": self.finality,
             "tradable": self.tradable,
@@ -133,6 +135,14 @@ class MarketPanel:
             invalid = supplied & (~numeric_oi.map(math.isfinite) | numeric_oi.lt(0.0))
             if bool(invalid.any(axis=None)):
                 raise ValueError("open_interest_usd values must be finite and non-negative when supplied")
+        if self.liquidation_usd is not None:
+            numeric_liquidations = self.liquidation_usd.apply(pd.to_numeric, errors="coerce")
+            supplied = self.liquidation_usd.notna()
+            invalid = supplied & (
+                ~numeric_liquidations.map(math.isfinite) | numeric_liquidations.lt(0.0)
+            )
+            if bool(invalid.any(axis=None)):
+                raise ValueError("liquidation_usd values must be finite and non-negative when supplied")
         if self.available_at is not None:
             for column in self.available_at.columns:
                 for value in self.available_at[column].dropna():

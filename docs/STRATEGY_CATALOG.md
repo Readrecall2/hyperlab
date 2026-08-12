@@ -79,6 +79,14 @@ venue, déficit de marge, temps non couvert et coûts de transfert. Voir
 
 **Risques :** faux breakouts, whipsaw, gaps, funding payé, levier directionnel.
 
+**Validation Phase 09 :** comparaison sur validation du momentum time-series
+multi-horizons, du breakout et de leur combinaison, avec confirmation volume/OI,
+funding traité comme coût, volatilité réalisée et régimes causaux. Le risque impose
+volatilité cible, stop de volatilité, caps total/par actif de 1× maximum, limite de
+corrélation et cooldown après spike de liquidations observé. Le rapport ventile le
+PnL par régime et rejette une performance concentrée uniquement en `trend_up`. Voir
+[`MOMENTUM_REGIME_PHASE09.md`](MOMENTUM_REGIME_PHASE09.md).
+
 ## Niveau 4 — lead-lag multi-exchange
 
 **Position :** utilise une variation sur une venue de référence pour prédire une réaction très courte d'Hyperliquid.

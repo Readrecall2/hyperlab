@@ -254,6 +254,10 @@ class PanelBacktester:
         )
         if panel.depth_usd is not None:
             observed |= panel.depth_usd.notna()
+        if panel.open_interest_usd is not None:
+            observed |= panel.open_interest_usd.notna()
+        if panel.liquidation_usd is not None:
+            observed |= panel.liquidation_usd.notna()
 
         if panel.available_at is not None:
             for row_number, timestamp in enumerate(panel.prices.index):

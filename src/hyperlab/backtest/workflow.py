@@ -555,6 +555,9 @@ def run_research_workflow(
                 open_interest_usd=panel.open_interest_usd.loc[execution_index].copy()
                 if panel.open_interest_usd is not None
                 else None,
+                liquidation_usd=panel.liquidation_usd.loc[execution_index].copy()
+                if panel.liquidation_usd is not None
+                else None,
                 available_at=panel.available_at.loc[execution_index].copy()
                 if panel.available_at is not None
                 else None,

@@ -802,7 +802,21 @@ class PanelBacktester:
                 or abs(float(positions.sum())) > self.risk_limits.max_net_exposure + _TOLERANCE
                 or bool(positions.abs().gt(self.risk_limits.max_instrument_weight + _TOLERANCE).any())
             )
-            changed = desired_changed | pd.Series(bool(risk_rebalance), index=columns)
+            # A missed or partial close must remain an outstanding objective. Without
+            # this reconciliation, a target transition to zero is attempted only once
+            # and any execution residual can drift for the rest of the backtest.
+            pending_instruments = {
+                pending.instrument
+                for pending_orders in due.values()
+                for pending in pending_orders
+            }
+            closing_gap = desired.abs().le(_TOLERANCE) & positions.abs().gt(_TOLERANCE)
+            closing_gap &= ~closing_gap.index.to_series().isin(pending_instruments).to_numpy()
+            changed = (
+                desired_changed
+                | pd.Series(bool(risk_rebalance), index=columns)
+                | closing_gap
+            )
             for instrument in columns[changed.to_numpy()]:
                 # The t decision is known before orders due at t execute. It cancels
                 # every obsolete latent order for the same leg, including due-now.
@@ -953,6 +967,21 @@ class PanelBacktester:
         if panel.depth_usd is None:
             warnings.append("No executable depth supplied; legacy runs assume unlimited capacity.")
 
+        target_active = target.abs().sum(axis=1).gt(_TOLERANCE)
+        position_active = actual.abs().sum(axis=1).gt(_TOLERANCE)
+        target_entry_signals = int(
+            (target_active & ~target_active.shift(1, fill_value=False)).sum()
+        )
+        target_exit_signals = int(
+            (~target_active & target_active.shift(1, fill_value=False)).sum()
+        )
+        position_entries = int(
+            (position_active & ~position_active.shift(1, fill_value=False)).sum()
+        )
+        position_exits = int(
+            (~position_active & position_active.shift(1, fill_value=False)).sum()
+        )
+
         diagnostics = {
             **output.diagnostics,
             "audit_status": audit_status,
@@ -967,6 +996,12 @@ class PanelBacktester:
             "data_calibration_evidence_hash": panel.metadata.get("calibration_evidence_hash"),
             "execution_seed": self.execution.seed,
             "initial_capital": self.execution.initial_capital,
+            "target_entry_signals": target_entry_signals,
+            "target_exit_signals": target_exit_signals,
+            "target_active_bars": int(target_active.sum()),
+            "position_entries": position_entries,
+            "position_exits": position_exits,
+            "position_active_bars": int(position_active.sum()),
             "hedge_groups": {
                 group_id: list(instruments) for group_id, instruments in output.hedge_groups.items()
             },

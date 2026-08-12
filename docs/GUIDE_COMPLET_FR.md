@@ -238,7 +238,7 @@ Ouvre le rapport :
 Start-Process .\reports\demo\comparison.html
 ```
 
-**Attention :** les données synthétiques ont volontairement des structures reconnaissables par plusieurs baselines. Un rendement élevé dans ce rapport ne signifie rien sur le vrai marché.
+**Attention :** les données synthétiques ont volontairement des structures reconnaissables par plusieurs baselines. Le scénario Cash & Carry contient notamment une fenêtre BTC courte, étiquetée dans les métadonnées, afin d'exercer une entrée, le hedge IOC, le funding, les coûts et une sortie. Un rendement élevé dans ce rapport ne signifie rien sur le vrai marché et ne franchit aucune gate économique.
 
 ## 10. Tester une stratégie seule
 

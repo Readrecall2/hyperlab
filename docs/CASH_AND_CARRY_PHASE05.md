@@ -72,6 +72,24 @@ Le test final réserve des barres de liquidation déclarées dans le plan avant 
 révélation. Elles mettent les cibles à zéro sans exposer la marque terminale au
 signal. Toute exposition encore ouverte ferme la gate.
 
+## Validation synthétique déterministe
+
+La commande `demo --strategy cash_and_carry --hours 1200 --seed 42` contient une
+courte fenêtre BTC déclarée dans `synthetic_validation_scenarios`. Elle est conçue
+uniquement pour exercer le chemin logiciel : une entrée, deux jambes maker non
+atomiques, un hedge IOC, du funding encaissé, les coûts et une sortie entièrement
+réconciliée. Les seuils économiques de la stratégie ne sont pas modifiés.
+
+Le tableau CLI publie les nombres de signaux d'entrée, de positions effectivement
+ouvertes et d'ordres. Les diagnostics détaillent aussi les échecs et survivants de
+chaque gate. Le moteur réessaie une clôture maker/IOC manquée ou partielle tant que
+la cible est nulle ; il n'abandonne plus un reliquat d'exécution jusqu'à la fin du
+backtest.
+
+Cette fixture est `SYNTHETIC`, son rendement peut être positif ou négatif selon le
+PnL de hedge transitoire, et n'est ni une validation économique, ni une calibration,
+ni un moyen de franchir les Gates B/C.
+
 ## Stress et rapport
 
 La matrice Phase 05 ajoute l'inversion réelle du funding (`× -1`) aux scénarios

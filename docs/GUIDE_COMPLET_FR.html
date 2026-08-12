@@ -259,7 +259,7 @@ Installation saine
 <p>Ouvre le rapport :</p>
 <pre><code class="language-powershell">Start-Process .\reports\demo\comparison.html
 </code></pre>
-<p><strong>Attention :</strong> les données synthétiques ont volontairement des structures reconnaissables par plusieurs baselines. Un rendement élevé dans ce rapport ne signifie rien sur le vrai marché.</p>
+<p><strong>Attention :</strong> les données synthétiques ont volontairement des structures reconnaissables par plusieurs baselines. Le scénario Cash &amp; Carry contient notamment une fenêtre BTC courte, étiquetée dans les métadonnées, afin d'exercer une entrée, le hedge IOC, le funding, les coûts et une sortie. Un rendement élevé dans ce rapport ne signifie rien sur le vrai marché et ne franchit aucune gate économique.</p>
 <h2 id="10-tester-une-strategie-seule">10. Tester une stratégie seule<a class="heading-link" href="#10-tester-une-strategie-seule" aria-label="Lien vers cette section">#</a></h2>
 <pre><code class="language-powershell">.\.venv\Scripts\python.exe -m hyperlab demo --strategy cash_and_carry
 .\.venv\Scripts\python.exe -m hyperlab demo --strategy funding_basket

@@ -96,7 +96,7 @@ Checkpoint antérieur aux travaux : `5e98ff5`
 Branche : `phase-05-cash-and-carry`
 
 Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (61 fichiers) et
-`pytest --basetemp .pytest_tmp/full-phase05` (481 tests) passent.
+`pytest --basetemp reports/.pytest-phase05-final` (482 tests) passent.
 
 ## Verdict Phase 05
 
@@ -122,3 +122,29 @@ Le rapport dédié montre rendement sur capital total, temps investi, funding, b
 frais, spread, slippage, hedge, fermeture, coût d'opportunité, drawdown et capacité.
 La gate refuse toute promotion si les preuves sont incomplètes, si la fermeture
 échoue ou si la pire surperformance stressée ne dépasse pas le benchmark passif.
+
+## Audit de la démo Cash & Carry
+
+Avant correction, la démo 1200 h/seed 42 examinait 600 observations candidates,
+dont 564 complètes, mais n'émettait aucun signal et n'ouvrait aucune position. Les
+échecs non exclusifs étaient : funding 184, persistance positive 201, profondeur
+284 et edge net multi-horizon 564 ; basis, volume, OI et volatilité n'éliminaient
+aucune observation complète. L'edge était donc la gate décisive : même son meilleur
+minimum 8/24/72 h restait négatif sur chaque actif après frais, spread, slippage et
+coût d'opportunité.
+
+Le zéro était cohérent avec les gates, mais involontaire pour le contrat de la
+fixture synthétique, censée exercer chaque module. La correction n'assouplit aucun
+seuil : elle ajoute une fenêtre BTC bornée et visible dans les métadonnées. Pour la
+même commande, les diagnostics donnent désormais 600 candidates, 564 complètes,
+une candidate éligible, un signal d'entrée, une position ouverte, un signal de
+sortie, une position fermée et 12 ordres. Le parcours comprend des non-fills maker,
+des IOC, du funding positif, des coûts négatifs, du basis et un hedge transitoire.
+
+Un second défaut a été corrigé : après une clôture partielle, le moteur ne retraitait
+pas le reliquat si la cible restait à zéro. La démo conservait alors une poussière
+spot jusqu'à la fin. Les clôtures incomplètes sont maintenant réconciliées de façon
+explicite et le test de non-régression exige des poids finaux exactement nuls.
+
+Cette démo valide le câblage Cash & Carry de bout en bout, pas la stratégie sur le
+marché réel. Le verdict économique reste `BLOCKED_INSUFFICIENT_REAL_DATA`.

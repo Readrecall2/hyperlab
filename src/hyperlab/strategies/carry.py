@@ -157,11 +157,26 @@ class CashAndCarryStrategy:
         rebalance = rebalance_mask(panel.prices.index, self.rebalance_hours)
         current = pd.Series(0.0, index=panel.prices.columns)
         pair_leg_weight = self.capital_fraction / (1.0 + self.perp_margin_fraction)
+        gate_names = (
+            "funding",
+            "positive_share",
+            "basis",
+            "depth",
+            "volume",
+            "open_interest",
+            "volatility",
+            "edge",
+        )
+        candidate_observations = 0
+        complete_candidate_observations = 0
+        gate_failure_counts = dict.fromkeys(gate_names, 0)
+        gate_survivor_counts = dict.fromkeys(gate_names, 0)
 
         for timestamp in panel.prices.index:
             if bool(rebalance.loc[timestamp]):
                 candidates: list[tuple[float, str, str]] = []
                 for asset, frame in feature_sets.items():
+                    candidate_observations += 1
                     spot = f"HL:{asset}:spot"
                     perp = f"HL:{asset}:perp"
                     row = frame.loc[timestamp]
@@ -181,22 +196,52 @@ class CashAndCarryStrategy:
                     ]
                     if row[required].isna().any():
                         continue
-                    if float(row["funding_72h"]) / 72.0 < self.min_mean_funding_hourly:
-                        continue
-                    if float(row["positive_funding_share_72h"]) < self.min_positive_share:
-                        continue
-                    if abs(float(row["basis_bps"])) > self.max_abs_basis_bps:
-                        continue
-                    if min(float(row["spot_depth_usd"]), float(row["perp_depth_usd"])) < self.min_depth_usd:
-                        continue
-                    if min(float(row["spot_volume_usd"]), float(row["perp_volume_usd"])) < self.min_volume_usd:
-                        continue
-                    if float(row["open_interest_usd"]) < self.min_open_interest_usd:
-                        continue
-                    if float(row["annualized_volatility"]) > self.max_annualized_volatility:
-                        continue
+                    complete_candidate_observations += 1
                     edges = [float(row[f"edge_net_{hours}h_bps"]) for hours in _FUNDING_WINDOWS]
-                    if min(edges) < self.minimum_net_edge_bps:
+                    gate_checks = {
+                        "funding": (
+                            float(row["funding_72h"]) / 72.0
+                            >= self.min_mean_funding_hourly
+                        ),
+                        "positive_share": (
+                            float(row["positive_funding_share_72h"])
+                            >= self.min_positive_share
+                        ),
+                        "basis": abs(float(row["basis_bps"])) <= self.max_abs_basis_bps,
+                        "depth": (
+                            min(
+                                float(row["spot_depth_usd"]),
+                                float(row["perp_depth_usd"]),
+                            )
+                            >= self.min_depth_usd
+                        ),
+                        "volume": (
+                            min(
+                                float(row["spot_volume_usd"]),
+                                float(row["perp_volume_usd"]),
+                            )
+                            >= self.min_volume_usd
+                        ),
+                        "open_interest": (
+                            float(row["open_interest_usd"])
+                            >= self.min_open_interest_usd
+                        ),
+                        "volatility": (
+                            float(row["annualized_volatility"])
+                            <= self.max_annualized_volatility
+                        ),
+                        "edge": min(edges) >= self.minimum_net_edge_bps,
+                    }
+                    alive = True
+                    for gate_name in gate_names:
+                        passed = gate_checks[gate_name]
+                        if not passed:
+                            gate_failure_counts[gate_name] += 1
+                        if alive and passed:
+                            gate_survivor_counts[gate_name] += 1
+                        else:
+                            alive = False
+                    if not all(gate_checks.values()):
                         continue
                     candidates.append((min(edges), spot, perp))
 
@@ -209,6 +254,15 @@ class CashAndCarryStrategy:
                         current[spot] = weight
                         current[perp] = -weight
             weights.loc[timestamp] = current
+
+        target_gross = weights.abs().sum(axis=1)
+        target_active = target_gross.gt(1e-12)
+        target_entry_signals = int(
+            (target_active & ~target_active.shift(1, fill_value=False)).sum()
+        )
+        target_exit_signals = int(
+            (~target_active & target_active.shift(1, fill_value=False)).sum()
+        )
 
         hedge_groups: dict[str, tuple[str, ...]] = {
             f"carry:{asset}": (f"HL:{asset}:spot", f"HL:{asset}:perp")
@@ -229,6 +283,14 @@ class CashAndCarryStrategy:
                 "edge_horizons_hours": list(_FUNDING_WINDOWS),
                 "fees_in_signal_bps": self.round_trip_fees_bps,
                 "slippage_in_signal_bps": self.estimated_round_trip_slippage_bps,
+                "candidate_observations": candidate_observations,
+                "complete_candidate_observations": complete_candidate_observations,
+                "gate_failure_counts": gate_failure_counts,
+                "gate_survivor_counts": gate_survivor_counts,
+                "eligible_candidate_observations": gate_survivor_counts["edge"],
+                "target_entry_signals": target_entry_signals,
+                "target_exit_signals": target_exit_signals,
+                "target_active_bars": int(target_active.sum()),
             },
             order_types=order_types,
             hedge_groups=hedge_groups,

@@ -224,12 +224,18 @@ def demo(
     table.add_column("Retour total", justify="right")
     table.add_column("Drawdown", justify="right")
     table.add_column("Sharpe", justify="right")
+    table.add_column("Signaux entrée", justify="right")
+    table.add_column("Positions", justify="right")
+    table.add_column("Ordres", justify="right")
     for result in results:
         table.add_row(
             result.strategy_name,
             f"{result.metrics.total_return * 100:.2f}%",
             f"{result.metrics.max_drawdown * 100:.2f}%",
             f"{result.metrics.sharpe:.2f}",
+            str(result.diagnostics.get("target_entry_signals", "n/a")),
+            str(result.diagnostics.get("position_entries", "n/a")),
+            str(result.diagnostics.get("orders", "n/a")),
         )
     console.print(table)
     console.print(f"[bold green]Rapport : {report.resolve()}[/bold green]")

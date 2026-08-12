@@ -16,6 +16,7 @@ from hyperlab.backtest.carry import (
 from hyperlab.backtest.engine import PanelBacktester
 from hyperlab.backtest.execution import ExecutionConfig, MakerFillModel
 from hyperlab.backtest.stress import StressScenario, run_stress_matrix
+from hyperlab.cli import _run_panel_strategies
 from hyperlab.data.io import load_panel_csv, save_panel_csv
 from hyperlab.models import CostModel, MarketPanel, RiskLimits, StrategyOutput
 from hyperlab.strategies.carry import CashAndCarryStrategy
@@ -283,3 +284,23 @@ def test_fill_ledger_exposes_size_dependent_capacity() -> None:
 
     assert "capacity_usd" in result.fills
     assert result.fills.loc[result.fills["filled_weight"].ne(0.0), "capacity_usd"].gt(0.0).all()
+
+
+def test_phase05_demo_exercises_entry_hedge_funding_costs_and_exit() -> None:
+    result = _run_panel_strategies(["cash_and_carry"], hours=1_200, seed=42)[0]
+
+    assert result.diagnostics["target_entry_signals"] == 1
+    assert result.diagnostics["target_exit_signals"] == 1
+    assert result.diagnostics["position_entries"] == 1
+    assert result.diagnostics["position_exits"] == 1
+    assert result.diagnostics["eligible_candidate_observations"] > 0
+    assert result.diagnostics["orders"] > 0
+    assert result.metrics.funding_contribution > 0.0
+    assert result.metrics.cost_contribution < 0.0
+    assert abs(result.metrics.basis_contribution) > 0.0
+    assert abs(result.metrics.hedge_contribution) > 0.0
+    paired = result.weights[[SPOT, PERP]].ne(0.0).all(axis=1)
+    assert paired.any()
+    assert result.weights.iloc[-1].abs().le(1e-12).all()
+    filled = result.fills[result.fills["filled_weight"].abs().gt(1e-12)]
+    assert {SPOT, PERP}.issubset(set(filled["instrument"]))

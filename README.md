@@ -14,7 +14,7 @@ Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher et backt
 6. lead-lag multi-exchange, baseline bar-level ;
 7. market making avec inventaire, simulateur microstructurel simplifié.
 
-Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation.
+Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité.
 
 ## Windows 11
 

@@ -32,9 +32,10 @@ def generate_demo_panel(
 ) -> MarketPanel:
     """Generate deterministic synthetic data for installation checks only.
 
-    The series deliberately contain mild carry, cross-sectional, momentum, and lead-lag
-    structure so every research module can be exercised. They are not evidence that any
-    strategy is profitable on real markets.
+    The series deliberately contain carry, cross-sectional, momentum, and lead-lag
+    validation structures so every research module executes its intended path. The
+    BTC carry window is explicit in metadata and exists to test entry/exit plumbing,
+    never to establish or target profitability on real markets.
     """
     if hours < 600:
         raise ValueError("hours must be at least 600 for rolling strategies")
@@ -53,6 +54,10 @@ def generate_demo_panel(
 
     starts = {"BTC": 45_000.0, "ETH": 2_400.0, "SOL": 100.0, "HYPE": 25.0}
     funding_bias = {"BTC": 0.000006, "ETH": 0.000009, "SOL": 0.000014, "HYPE": 0.000020}
+    carry_high_start = max(96, (hours // 3 // 8) * 8)
+    carry_context_start = carry_high_start - 72
+    carry_high_stop = min(hours, carry_high_start + 13)
+    carry_liquidity_stop = min(hours, carry_high_start + 21)
 
     for asset_idx, asset in enumerate(assets):
         idio = rng.normal(0.0, 0.003 + asset_idx * 0.0008, hours)
@@ -74,6 +79,11 @@ def generate_demo_panel(
         hl_funding = (
             funding_bias.get(asset, 0.000008) + funding_regime + np.clip(basis, -0.003, 0.003) * 0.006
         )
+        if asset == "BTC":
+            # A bounded, visibly synthetic high-carry regime makes the Phase-05
+            # maker/hedge/funding/exit path testable without weakening its gates.
+            hl_funding[carry_context_start:carry_high_start] = 0.00001
+            hl_funding[carry_high_start:carry_high_stop] = 0.00035
         ref_funding = 0.45 * hl_funding + rng.normal(0.0, 0.0000035, hours)
         if asset_idx % 2:
             ref_funding -= 0.000004
@@ -101,6 +111,15 @@ def generate_demo_panel(
         volume[hl_spot] = rng.lognormal(np.log(base_volume * 0.08), 0.35, hours)
         volume[hl_perp] = rng.lognormal(np.log(base_volume), 0.30, hours)
         volume[ref_perp] = rng.lognormal(np.log(base_volume * 1.8), 0.25, hours)
+        if asset == "BTC":
+            volume[hl_spot][carry_high_start:carry_liquidity_stop] = np.maximum(
+                volume[hl_spot][carry_high_start:carry_liquidity_stop],
+                250_000_000.0,
+            )
+            volume[hl_perp][carry_high_start:carry_liquidity_stop] = np.maximum(
+                volume[hl_perp][carry_high_start:carry_liquidity_stop],
+                1_000_000_000.0,
+            )
         open_interest[hl_spot] = np.full(hours, np.nan)
         open_interest[hl_perp] = rng.lognormal(np.log(base_volume * 0.7), 0.18, hours)
         open_interest[ref_perp] = rng.lognormal(np.log(base_volume), 0.18, hours)
@@ -136,6 +155,19 @@ def generate_demo_panel(
             "lifecycle_hash": synthetic_lifecycle_hash,
             "calibration_status": "SYNTHETIC",
             "warning": "Never use synthetic results as an investment decision.",
+            "synthetic_validation_scenarios": {
+                "cash_and_carry": {
+                    "asset": "BTC",
+                    "context_start": index[carry_context_start].isoformat(),
+                    "high_funding_start": index[carry_high_start].isoformat(),
+                    "high_funding_end_exclusive": (
+                        index[carry_high_stop].isoformat() if carry_high_stop < hours else None
+                    ),
+                    "context_funding_hourly": 0.00001,
+                    "funding_hourly": 0.00035,
+                    "purpose": "exercise entry, two-leg hedge, funding, costs, and exit",
+                }
+            },
         },
     )
 

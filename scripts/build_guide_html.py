@@ -94,10 +94,10 @@ footer{{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:
 <body id="top">
 <div class="layout">
 <aside>
-<div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.0 · 11 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
+<div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.1 · 13 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
 <nav>{nav}</nav>
 </aside>
-<main><article>{body}<footer>HyperLab 0.2.0 · Laboratoire de recherche multi-stratégies · aucune promesse de rendement.</footer></article></main>
+<main><article>{body}<footer>HyperLab 0.2.1 · Laboratoire de recherche multi-stratégies · aucune promesse de rendement.</footer></article></main>
 </div>
 <a class="backtop" href="#top" aria-label="Retour en haut">↑</a>
 <script>

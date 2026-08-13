@@ -2,7 +2,7 @@
 
 ## Version actuelle — paper-only
 
-HyperLab 0.2.0 n'accepte aucun secret et n'importe pas l'API privée d'échange. Le
+HyperLab 0.2.1 n'accepte aucun secret et n'importe pas l'API privée d'échange. Le
 paper engine ne fait que simuler localement le cycle des ordres. Il ne contient ni
 wallet, ni signature, ni nonce exchange, ni authentification, ni route permettant
 d'envoyer, modifier ou annuler un ordre réel. Même `EMERGENCY_FLATTEN` est une

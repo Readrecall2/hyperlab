@@ -417,3 +417,49 @@ def test_collect_rejects_unsafe_configuration_before_network_construction(
     assert result.exit_code == 2
     assert expected_error in result.output
     assert "Traceback" not in result.output
+
+
+def test_strict_collect_invalidates_old_ready_status_before_config_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / ".hyperlab-volume").write_text(
+        "hyperlab-runtime-volume-v1\n",
+        encoding="utf-8",
+    )
+    status_path = runtime / "runtime_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "mode": "readonly",
+                "orders_enabled": False,
+                "updated_at": "2026-08-13T12:00:00+00:00",
+                "pending_rows": 0,
+                "metrics": {
+                    "state": "live",
+                    "connection_alive": True,
+                    "stale_channels": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_module, "CONFIG", tmp_path / "missing.toml")
+
+    result = runner.invoke(
+        app,
+        ["collect", "--max-messages", "1"],
+        env={
+            "HYPERLAB_DATA_DIR": str(runtime),
+            "HYPERLAB_REQUIRE_PERSISTENT_LAYOUT": "1",
+        },
+    )
+
+    assert result.exit_code == 2
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["ok"] is False
+    assert status["metrics"]["state"] == "starting"

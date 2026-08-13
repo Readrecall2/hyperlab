@@ -573,6 +573,31 @@ def test_invalid_batch_flush_is_terminal_and_close_does_not_retry_it(
     assert attempts == 1
 
 
+def test_disk_full_flush_is_terminal_and_close_does_not_retry_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    collector, _rest, _factory, sink = _collector(tmp_path, _config(), timer, [])
+    attempts = 0
+
+    def fail_disk_full() -> FlushResult:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sink, "flush", fail_disk_full)
+
+    with pytest.raises(OSError, match="disk full"):
+        collector._flush()
+    collector.close()
+
+    assert attempts == 1
+    assert sink._closed is True
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    assert status["error"] == "OSError: disk full"
+
+
 def test_close_releases_resources_when_completed_rest_refresh_application_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

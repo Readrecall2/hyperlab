@@ -1,40 +1,140 @@
 name: hyperlab
+
+networks:
+  dashboard:
+    internal: true
+  collector_egress:
+    internal: false
+
 services:
   dashboard:
-    build: .
+    build:
+      context: .
     image: hyperlab:local
+    user: "1000:1000"
+    init: true
     command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       HYPERLAB_MODE: readonly
       HYPERLAB_DATA_DIR: /data
+      HYPERLAB_CONFIG: /app/config/research.toml
+      HYPERLAB_REQUIRE_PERSISTENT_LAYOUT: "1"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./data:/data
+      - "./data/runtime:/data:ro"
+      - "./data/reports:/data/reports:ro"
+      - "./data/paper:/data/paper:ro"
+      - "./data/config:/app/config:ro"
     read_only: true
     tmpfs:
-      - /tmp:size=64m
+      - "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"
+    privileged: false
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    pids_limit: 128
+    cpus: "0.50"
+    mem_limit: 512m
+    mem_reservation: 128m
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          response = urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2);
+          payload = json.load(response);
+          response.close();
+          assert payload.get('ok') is True and payload.get('ready') is True;
+          assert payload.get('mode') == 'readonly' and payload.get('orders_enabled') is False;
+          checks = payload.get('checks', {});
+          assert checks.get('runtime_status') == 'ready' and checks.get('legacy_database') == 'ready';
+          assert checks.get('paper_database') in {'not_configured', 'ready'}
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - dashboard
 
   collector:
-    build: .
+    build:
+      context: .
     image: hyperlab:local
+    user: "1000:1000"
+    init: true
     command: ["collect", "--network", "mainnet", "--assets", "BTC,ETH", "--candle-intervals", "1m"]
     environment:
       HYPERLAB_MODE: readonly
       HYPERLAB_DATA_DIR: /data
+      HYPERLAB_CONFIG: /app/config/research.toml
+      HYPERLAB_REQUIRE_PERSISTENT_LAYOUT: "1"
+      HYPERLAB_MIN_FREE_BYTES: "2147483648"
+      HYPERLAB_MIN_FREE_PERCENT: "5.0"
     volumes:
-      - ./data:/data
+      - "./data/runtime:/data"
+      - "./data/market:/data/lake"
+      - "./data/config:/app/config:ro"
     read_only: true
     tmpfs:
-      - /tmp:size=64m
+      - "/tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777"
+    privileged: false
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    stop_grace_period: 30s
+    pids_limit: 256
+    cpus: "2.00"
+    mem_limit: 2g
+    mem_reservation: 512m
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json;
+          from datetime import UTC, datetime;
+          from pathlib import Path;
+          path = Path('/data/runtime_status.json');
+          payload = json.loads(path.read_text(encoding='utf-8'));
+          metrics = payload.get('metrics', {});
+          updated_at = datetime.fromisoformat(payload['updated_at']).astimezone(UTC);
+          age = (datetime.now(UTC) - updated_at).total_seconds();
+          assert 0 <= age <= 90 and payload.get('ok') is True;
+          assert payload.get('mode') == 'readonly' and payload.get('orders_enabled') is False;
+          assert metrics.get('state') == 'live' and metrics.get('connection_alive') is True;
+          assert metrics.get('stale_channels') == []
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "5"
+    networks:
+      - collector_egress

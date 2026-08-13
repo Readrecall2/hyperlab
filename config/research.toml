@@ -7,8 +7,8 @@ request_timeout_seconds = 15.0
 mode = "readonly"
 
 [costs]
-# Research placeholders only. Before paper/live evaluation, fetch account-specific rates
-# via Hyperliquid userFees and calibrate slippage from real/replayed fills.
+# Research placeholders only. Before any paper evaluation, use a public, versioned and
+# hashed fee schedule with the conservative public tier; never query private account data.
 # CALIBRATED additionally requires calibration_evidence_hash with the audited sample SHA-256.
 calibration_status = "UNCALIBRATED"
 spot_fee_bps = 4.0

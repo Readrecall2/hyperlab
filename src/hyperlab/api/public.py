@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -10,6 +13,11 @@ from typing import Any, Protocol
 
 _FUNDING_PAGE_SIZE = 500
 _CANDLE_PAGE_SIZE = 5_000
+_MAX_PUBLIC_INFO_RESPONSE_BYTES = 64 * 1024 * 1024
+_PUBLIC_INFO_URLS = {
+    "mainnet": "https://api.hyperliquid.xyz",
+    "testnet": "https://api.hyperliquid-testnet.xyz",
+}
 _VALID_CANDLE_INTERVALS = frozenset(
     {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w", "1M"}
 )
@@ -29,9 +37,56 @@ _PERP_BY_VERIFIED_SPOT_TOKEN_ID = {
 
 
 class PublicInfo(Protocol):
-    """Narrow public surface used from the pinned official SDK."""
+    """Narrow, injectable transport for the public ``/info`` endpoint."""
 
     def post(self, url_path: str, payload: Any = None) -> Any: ...
+
+
+class _StdlibPublicInfo:
+    """Minimal public-only HTTP client; it contains no wallet or order API."""
+
+    def __init__(self, base_url: str, *, timeout_seconds: float) -> None:
+        if base_url not in _PUBLIC_INFO_URLS.values():
+            raise ValueError("public API base URL is not allowlisted")
+        if timeout_seconds <= 0:
+            raise ValueError("public API timeout must be positive")
+        self._base_url = base_url
+        self._timeout_seconds = timeout_seconds
+
+    def post(self, url_path: str, payload: Any = None) -> Any:
+        if url_path != "/info" or not isinstance(payload, Mapping):
+            raise ValueError("only mapping payloads to the public /info endpoint are allowed")
+        body = json.dumps(
+            dict(payload),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        request = urllib.request.Request(
+            f"{self._base_url}/info",
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "HyperLab-readonly/0.2.1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                encoded = response.read(_MAX_PUBLIC_INFO_RESPONSE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Hyperliquid public Info HTTP error: {exc.code}") from None
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise RuntimeError(
+                f"Hyperliquid public Info transport failed: {type(exc).__name__}"
+            ) from None
+        if len(encoded) > _MAX_PUBLIC_INFO_RESPONSE_BYTES:
+            raise RuntimeError("Hyperliquid public Info response exceeds the safety limit")
+        try:
+            return json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise RuntimeError("Hyperliquid public Info API returned invalid JSON") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,9 +284,6 @@ class WeightedMinuteLimiter:
             )
             self.sleeper(min(delay, 0.25))
 
-    """Read-only wrapper around the official Hyperliquid Python SDK."""
-
-
 class HyperliquidPublicClient:
     def __init__(
         self,
@@ -241,7 +293,7 @@ class HyperliquidPublicClient:
         info: PublicInfo | None = None,
         rate_limiter: WeightedMinuteLimiter | None = None,
     ) -> None:
-        if network not in {"mainnet", "testnet"}:
+        if network not in _PUBLIC_INFO_URLS:
             raise ValueError(f"unsupported network: {network}")
         self.network = network
         self._rate_limiter = rate_limiter or WeightedMinuteLimiter()
@@ -249,21 +301,9 @@ class HyperliquidPublicClient:
         if info is not None:
             self.info = info
             return
-        try:
-            from hyperliquid.info import Info
-            from hyperliquid.utils import constants
-        except ImportError as exc:
-            raise RuntimeError("Install the project dependencies before calling the API") from exc
-
-        base_url = constants.MAINNET_API_URL if network == "mainnet" else constants.TESTNET_API_URL
-        # Info 0.24.0 otherwise performs implicit spotMeta and meta requests in
-        # __init__. Empty metadata makes every network request explicit.
-        self.info = Info(
-            base_url,
-            skip_ws=True,
-            timeout=timeout_seconds,
-            meta={"universe": []},
-            spot_meta={"tokens": [], "universe": []},
+        self.info = _StdlibPublicInfo(
+            _PUBLIC_INFO_URLS[network],
+            timeout_seconds=timeout_seconds,
         )
 
     def __enter__(self) -> HyperliquidPublicClient:

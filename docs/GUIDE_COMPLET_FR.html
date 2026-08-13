@@ -39,11 +39,11 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
 <body id="top">
 <div class="layout">
 <aside>
-<div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.0 · 11 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
-<nav><a class="l2" href="#1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd&#x27;hui</a><a class="l3" href="#ce-qu-il-ne-fait-pas">Ce qu&#x27;il ne fait pas</a><a class="l2" href="#2-architecture-retenue">2. Architecture retenue</a><a class="l3" href="#pourquoi-les-deux-machines">Pourquoi les deux machines</a><a class="l2" href="#3-les-sept-strategies">3. Les sept stratégies</a><a class="l3" href="#3-1-cash-and-carry">3.1 Cash-and-carry</a><a class="l3" href="#3-2-basket-de-funding">3.2 Basket de funding</a><a class="l3" href="#3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges</a><a class="l3" href="#3-4-pairs-trading">3.4 Pairs trading</a><a class="l3" href="#3-5-momentum-regime">3.5 Momentum/régime</a><a class="l3" href="#3-6-lead-lag">3.6 Lead-lag</a><a class="l3" href="#3-7-market-making">3.7 Market making</a><a class="l2" href="#4-philosophie-des-resultats">4. Philosophie des résultats</a><a class="l1" href="#partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11</a><a class="l2" href="#5-installer-les-outils">5. Installer les outils</a><a class="l2" href="#6-extraire-le-pack">6. Extraire le pack</a><a class="l2" href="#7-installer-l-environnement-python">7. Installer l&#x27;environnement Python</a><a class="l2" href="#8-afficher-les-strategies">8. Afficher les stratégies</a><a class="l2" href="#9-lancer-la-demonstration-complete">9. Lancer la démonstration complète</a><a class="l2" href="#10-tester-une-strategie-seule">10. Tester une stratégie seule</a><a class="l2" href="#11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid</a><a class="l2" href="#12-lancer-une-collecte-courte">12. Lancer une collecte courte</a><a class="l2" href="#13-dashboard-windows">13. Dashboard Windows</a><a class="l2" href="#13-bis-venue-de-reference-publique">13 bis. Venue de référence publique</a><a class="l1" href="#partie-b-git-et-codex">PARTIE B — GIT ET CODEX</a><a class="l2" href="#14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git</a><a class="l2" href="#15-ouvrir-dans-codex">15. Ouvrir dans Codex</a><a class="l2" href="#16-premier-prompt-codex">16. Premier prompt Codex</a><a class="l2" href="#17-controler-les-changements">17. Contrôler les changements</a><a class="l2" href="#18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l&#x27;ordre</a><a class="l1" href="#partie-c-docker-local">PARTIE C — DOCKER LOCAL</a><a class="l2" href="#19-construire-l-image">19. Construire l&#x27;image</a><a class="l2" href="#20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard</a><a class="l1" href="#partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL</a><a class="l2" href="#21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry</a><a class="l2" href="#22-creer-un-depot-github">22. Créer un dépôt GitHub</a><a class="l2" href="#23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel</a><a class="l2" href="#24-publier-l-image">24. Publier l&#x27;image</a><a class="l2" href="#25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS</a><a class="l2" href="#26-verifier-umbrel">26. Vérifier Umbrel</a><a class="l2" href="#27-collecter-pendant-le-developpement">27. Collecter pendant le développement</a><a class="l1" href="#partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES</a><a class="l2" href="#28-donnees-lentes">28. Données lentes</a><a class="l2" href="#29-donnees-rapides">29. Données rapides</a><a class="l2" href="#30-qualite">30. Qualité</a><a class="l1" href="#partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST</a><a class="l2" href="#31-decoupage-temporel">31. Découpage temporel</a><a class="l2" href="#32-walk-forward">32. Walk-forward</a><a class="l2" href="#33-couts">33. Coûts</a><a class="l2" href="#34-scenarios-obligatoires">34. Scénarios obligatoires</a><a class="l2" href="#35-rapport-obligatoire">35. Rapport obligatoire</a><a class="l2" href="#36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé</a><a class="l1" href="#partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES</a><a class="l2" href="#37-vague-1-defensive">37. Vague 1 : défensive</a><a class="l3" href="#cash-and-carry">Cash-and-carry</a><a class="l2" href="#38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif</a><a class="l3" href="#basket-funding">Basket funding</a><a class="l3" href="#funding-inter-exchanges">Funding inter-exchanges</a><a class="l2" href="#39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque</a><a class="l3" href="#pairs">Pairs</a><a class="l3" href="#momentum">Momentum</a><a class="l2" href="#40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence</a><a class="l3" href="#lead-lag">Lead-lag</a><a class="l3" href="#market-making">Market making</a><a class="l1" href="#partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT</a><a class="l2" href="#41-paper-live">41. Paper live</a><a class="l2" href="#42-testnet">42. Testnet</a><a class="l2" href="#43-micro-mainnet">43. Micro-mainnet</a><a class="l2" href="#44-augmentation">44. Augmentation</a><a class="l1" href="#partie-i-securite">PARTIE I — SÉCURITÉ</a><a class="l2" href="#45-secrets">45. Secrets</a><a class="l2" href="#46-umbrel">46. Umbrel</a><a class="l2" href="#47-separation-future">47. Séparation future</a><a class="l2" href="#48-kill-switches">48. Kill switches</a><a class="l1" href="#partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE</a><a class="l2" href="#49-cette-semaine">49. Cette semaine</a><a class="l2" href="#50-ensuite">50. Ensuite</a><a class="l2" href="#51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles</a><a class="l2" href="#52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie</a><a class="l1" href="#conclusion">Conclusion</a><a class="l1" href="#sources-officielles">Sources officielles</a></nav>
+<div class="brand"><strong>HyperLab</strong><span>Guide complet · v0.2.1 · 13 août 2026</span><span class="pill">READ-ONLY PAR DÉFAUT</span></div>
+<nav><a class="l2" href="#1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd&#x27;hui</a><a class="l3" href="#ce-qu-il-ne-fait-pas">Ce qu&#x27;il ne fait pas</a><a class="l2" href="#2-architecture-retenue">2. Architecture retenue</a><a class="l3" href="#pourquoi-les-deux-machines">Pourquoi les deux machines</a><a class="l2" href="#3-les-sept-strategies">3. Les sept stratégies</a><a class="l3" href="#3-1-cash-and-carry">3.1 Cash-and-carry</a><a class="l3" href="#3-2-basket-de-funding">3.2 Basket de funding</a><a class="l3" href="#3-3-arbitrage-de-funding-inter-exchanges">3.3 Arbitrage de funding inter-exchanges</a><a class="l3" href="#3-4-pairs-trading">3.4 Pairs trading</a><a class="l3" href="#3-5-momentum-regime">3.5 Momentum/régime</a><a class="l3" href="#3-6-lead-lag">3.6 Lead-lag</a><a class="l3" href="#3-7-market-making">3.7 Market making</a><a class="l2" href="#4-philosophie-des-resultats">4. Philosophie des résultats</a><a class="l1" href="#partie-a-installation-windows-11">PARTIE A — INSTALLATION WINDOWS 11</a><a class="l2" href="#5-installer-les-outils">5. Installer les outils</a><a class="l2" href="#6-extraire-le-pack">6. Extraire le pack</a><a class="l2" href="#7-installer-l-environnement-python">7. Installer l&#x27;environnement Python</a><a class="l2" href="#8-afficher-les-strategies">8. Afficher les stratégies</a><a class="l2" href="#9-lancer-la-demonstration-complete">9. Lancer la démonstration complète</a><a class="l2" href="#10-tester-une-strategie-seule">10. Tester une stratégie seule</a><a class="l2" href="#11-lire-les-donnees-publiques-hyperliquid">11. Lire les données publiques Hyperliquid</a><a class="l2" href="#12-lancer-une-collecte-courte">12. Lancer une collecte courte</a><a class="l2" href="#13-dashboard-windows">13. Dashboard Windows</a><a class="l2" href="#13-bis-venue-de-reference-publique">13 bis. Venue de référence publique</a><a class="l1" href="#partie-b-git-et-codex">PARTIE B — GIT ET CODEX</a><a class="l2" href="#14-creer-le-premier-checkpoint-git">14. Créer le premier checkpoint Git</a><a class="l2" href="#15-ouvrir-dans-codex">15. Ouvrir dans Codex</a><a class="l2" href="#16-premier-prompt-codex">16. Premier prompt Codex</a><a class="l2" href="#17-controler-les-changements">17. Contrôler les changements</a><a class="l2" href="#18-executer-les-phases-dans-l-ordre">18. Exécuter les phases dans l&#x27;ordre</a><a class="l1" href="#partie-c-docker-local">PARTIE C — DOCKER LOCAL</a><a class="l2" href="#19-construire-l-image">19. Construire l&#x27;image</a><a class="l2" href="#20-demarrer-collecteur-et-dashboard">20. Démarrer collecteur et dashboard</a><a class="l1" href="#partie-d-installation-umbrel">PARTIE D — INSTALLATION UMBREL</a><a class="l2" href="#21-pourquoi-passer-par-github-container-registry">21. Pourquoi passer par GitHub Container Registry</a><a class="l2" href="#22-creer-un-depot-github">22. Créer un dépôt GitHub</a><a class="l2" href="#23-publier-le-candidat-signe">23. Publier le candidat signé</a><a class="l2" href="#24-personnaliser-le-package-umbrel">24. Personnaliser le package Umbrel</a><a class="l2" href="#25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS</a><a class="l2" href="#26-verifier-umbrel">26. Vérifier Umbrel</a><a class="l2" href="#27-collecter-pendant-le-developpement">27. Collecter pendant le développement</a><a class="l1" href="#partie-e-construction-des-donnees-reelles">PARTIE E — CONSTRUCTION DES DONNÉES RÉELLES</a><a class="l2" href="#28-donnees-lentes">28. Données lentes</a><a class="l2" href="#29-donnees-rapides">29. Données rapides</a><a class="l2" href="#30-qualite">30. Qualité</a><a class="l1" href="#partie-f-protocole-de-backtest">PARTIE F — PROTOCOLE DE BACKTEST</a><a class="l2" href="#31-decoupage-temporel">31. Découpage temporel</a><a class="l2" href="#32-walk-forward">32. Walk-forward</a><a class="l2" href="#33-couts">33. Coûts</a><a class="l2" href="#34-scenarios-obligatoires">34. Scénarios obligatoires</a><a class="l2" href="#35-rapport-obligatoire">35. Rapport obligatoire</a><a class="l2" href="#36-interpreter-un-resultat-tres-eleve">36. Interpréter un résultat très élevé</a><a class="l1" href="#partie-g-ordre-de-validation-des-strategies">PARTIE G — ORDRE DE VALIDATION DES STRATÉGIES</a><a class="l2" href="#37-vague-1-defensive">37. Vague 1 : défensive</a><a class="l3" href="#cash-and-carry">Cash-and-carry</a><a class="l2" href="#38-vague-2-market-neutral-relatif">38. Vague 2 : market-neutral relatif</a><a class="l3" href="#basket-funding">Basket funding</a><a class="l3" href="#funding-inter-exchanges">Funding inter-exchanges</a><a class="l2" href="#39-vague-3-alpha-moyen-risque">39. Vague 3 : alpha moyen risque</a><a class="l3" href="#pairs">Pairs</a><a class="l3" href="#momentum">Momentum</a><a class="l2" href="#40-vague-4-haute-performance-haute-exigence">40. Vague 4 : haute performance / haute exigence</a><a class="l3" href="#lead-lag">Lead-lag</a><a class="l3" href="#market-making">Market making</a><a class="l1" href="#partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT</a><a class="l2" href="#41-paper-live">41. Paper live</a><a class="l2" href="#42-testnet">42. Testnet</a><a class="l2" href="#43-micro-mainnet">43. Micro-mainnet</a><a class="l2" href="#44-augmentation">44. Augmentation</a><a class="l1" href="#partie-i-securite">PARTIE I — SÉCURITÉ</a><a class="l2" href="#45-secrets">45. Secrets</a><a class="l2" href="#46-umbrel">46. Umbrel</a><a class="l2" href="#47-separation-future">47. Séparation future</a><a class="l2" href="#48-kill-switches">48. Kill switches</a><a class="l1" href="#partie-j-routine-pratique">PARTIE J — ROUTINE PRATIQUE</a><a class="l2" href="#49-cette-semaine">49. Cette semaine</a><a class="l2" href="#50-ensuite">50. Ensuite</a><a class="l2" href="#51-commandes-quotidiennes-utiles">51. Commandes quotidiennes utiles</a><a class="l2" href="#52-quand-abandonner-une-strategie">52. Quand abandonner une stratégie</a><a class="l1" href="#conclusion">Conclusion</a><a class="l1" href="#sources-officielles">Sources officielles</a></nav>
 </aside>
 <main><article><h1 id="hyperlab-guide-complet-windows-11-umbrel-codex">HyperLab — guide complet Windows 11 + Umbrel + Codex<a class="heading-link" href="#hyperlab-guide-complet-windows-11-umbrel-codex" aria-label="Lien vers cette section">#</a></h1>
-<p><strong>Version : 0.2.0 — 13 août 2026</strong></p>
+<p><strong>Version : 0.2.1 — 13 août 2026</strong></p>
 <p>Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un <strong>laboratoire multi-stratégies</strong> : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.</p>
 <hr />
 <h2 id="1-ce-que-le-pack-fait-aujourd-hui">1. Ce que le pack fait aujourd'hui<a class="heading-link" href="#1-ce-que-le-pack-fait-aujourd-hui" aria-label="Lien vers cette section">#</a></h2>
@@ -272,7 +272,7 @@ docker --version
 <h2 id="6-extraire-le-pack">6. Extraire le pack<a class="heading-link" href="#6-extraire-le-pack" aria-label="Lien vers cette section">#</a></h2>
 <pre><code class="language-powershell">New-Item -ItemType Directory -Force C:\Dev
 Expand-Archive `
-  -Path &quot;$HOME\Downloads\hyperlab-multistrategy-v0.2.0.zip&quot; `
+  -Path &quot;$HOME\Downloads\hyperlab-multistrategy-v0.2.1.zip&quot; `
   -DestinationPath &quot;C:\Dev&quot; `
   -Force
 </code></pre>
@@ -455,7 +455,7 @@ docker compose ps
 <pre><code class="language-powershell">docker compose down
 </code></pre>
 <p>Le collecteur reçoit <code>SIGINT</code>/<code>SIGTERM</code> de façon coopérative. Les compositions
-locale et Umbrel lui accordent 30 secondes pour fermer le socket, publier le
+locale et Umbrel lui accordent 60 secondes pour fermer le socket, publier le
 dernier statut et flusher le dernier batch avant un éventuel arrêt forcé.</p>
 <p>Les services sont non-root, read-only, sans capacités Linux et sans Docker socket.</p>
 <hr />
@@ -472,25 +472,41 @@ linux/arm64
 git branch -M main
 git push -u origin main
 </code></pre>
-<h2 id="23-personnaliser-le-package-umbrel">23. Personnaliser le package Umbrel<a class="heading-link" href="#23-personnaliser-le-package-umbrel" aria-label="Lien vers cette section">#</a></h2>
-<p>Les fichiers <code>umbrel-app-store.yml</code> et <code>jjlab-hyperlab/</code> sont volontairement à la <strong>racine du dépôt</strong> : c'est la structure attendue par le template officiel Umbrel.</p>
-<pre><code class="language-powershell">.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB
+<h2 id="23-publier-le-candidat-signe">23. Publier le candidat signé<a class="heading-link" href="#23-publier-le-candidat-signe" aria-label="Lien vers cette section">#</a></h2>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py --reset-template
+.\.venv\Scripts\python.exe scripts\verify_manifest.py --write
+.\.venv\Scripts\python.exe scripts\verify_release.py --template --tag v0.2.1 --check-manifest
+git tag v0.2.1
+git push origin v0.2.1
 </code></pre>
-<p>Vérifie :</p>
-<pre><code class="language-powershell">Get-ChildItem .\jjlab-hyperlab -Recurse -File | Select-String &quot;REPLACE_WITH_&quot;
+<p>Le workflow doit terminer tests, Gitleaks et scans Trivy <code>amd64</code>/<code>arm64</code> avant tout
+push, puis scanner les deux digests enfants exacts, publier leurs SBOM, la provenance,
+les attestations, la signature Cosign et un reçu signé. Un build seul n'autorise pas
+le déploiement.</p>
+<h2 id="24-personnaliser-le-package-umbrel">24. Personnaliser le package Umbrel<a class="heading-link" href="#24-personnaliser-le-package-umbrel" aria-label="Lien vers cette section">#</a></h2>
+<p>Les fichiers <code>umbrel-app-store.yml</code> et <code>jjlab-hyperlab/</code> sont volontairement à la
+racine du dépôt. Télécharge <code>signed-release-receipt-v0.2.1</code> depuis le run vert du tag
+exact. Après seulement la réussite de tous les gates, injecte le digest dans la branche
+de store déployable ; le préparateur revalide les preuves et le tag GHCR :</p>
+<pre><code class="language-powershell">.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB `
+  --repository hyperlab --image-version 0.2.1 `
+  --image-digest DIGEST_MULTIARCH_64_HEX `
+  --release-receipt .\release-evidence\release-receipt.json `
+  --receipt-bundle .\release-evidence\release-receipt.sigstore.json
+.\.venv\Scripts\python.exe scripts\verify_manifest.py --write
+.\.venv\Scripts\python.exe scripts\verify_release.py --prepared --tag v0.2.1 --check-manifest
+Get-ChildItem .\jjlab-hyperlab -Recurse -File | Select-String &quot;REPLACE_WITH_&quot;
 </code></pre>
-<p>Aucun résultat attendu.</p>
+<p>Aucun résultat n'est attendu. Les deux services doivent utiliser le même
+<code>0.2.1@sha256:DIGEST</code>; <code>latest</code> est interdit.</p>
 <p>Commit :</p>
-<pre><code class="language-powershell">git add umbrel-app-store.yml jjlab-hyperlab scripts\prepare_umbrel_store.py
+<pre><code class="language-powershell">git add MANIFEST_SHA256.txt umbrel-app-store.yml jjlab-hyperlab
 git commit -m &quot;chore: configure Umbrel community app store&quot;
 git push
 </code></pre>
-<h2 id="24-publier-l-image">24. Publier l'image<a class="heading-link" href="#24-publier-l-image" aria-label="Lien vers cette section">#</a></h2>
-<pre><code class="language-powershell">git tag v0.2.0
-git push origin v0.2.0
-</code></pre>
-<p>Dans GitHub, vérifie l'Action <code>Publish container</code> et le package <code>hyperlab:0.2.0</code>.</p>
-<p>Ouvre ensuite la page du package, puis <strong>Package settings → Change visibility → Public</strong>. Umbrel ne possède pas d'identifiants GHCR pour télécharger une image privée. La première version ne contient aucun secret ; le code et l'image peuvent donc être publics.</p>
+<p>Ouvre la page du package, puis <strong>Package settings → Change visibility → Public</strong>.
+Umbrel ne reçoit aucun credential GHCR. Garde le dernier store sain inchangé jusqu'à
+ce que le nouveau digest soit totalement vérifié.</p>
 <h2 id="25-ajouter-le-store-dans-umbrelos">25. Ajouter le store dans umbrelOS<a class="heading-link" href="#25-ajouter-le-store-dans-umbrelos" aria-label="Lien vers cette section">#</a></h2>
 <p>Dans Umbrel :</p>
 <ol>
@@ -514,6 +530,13 @@ le collecteur Parquet Phase 02 tourne. Vérifie aussi :</p>
 /api/status
 </code></pre>
 <p>Le dashboard n'est pas un panneau d'administration de trading. Il ne possède aucun bouton d'ordre.</p>
+<p>Avant update, rollback, reinstall ou uninstall, arrête le writer puis exécute
+<code>ops check-layout</code>, <code>ops backup</code>, <code>ops verify-backup</code> et <code>ops restore</code> vers une racine
+neuve. La sauvegarde et son restore-smoke doivent être <strong>hors de <code>${APP_DATA_DIR}</code></strong>.
+Le chemin legacy d'umbrelOS supprime <code>${APP_DATA_DIR}</code> à l'uninstall ; aucune
+conservation automatique n'est promise. <code>ops export-parquet</code> produit les rapports
+téléchargeables. Le runbook exact est dans
+<a href="UMBREL_SETUP.md"><code>docs/UMBREL_SETUP.md</code></a>.</p>
 <h2 id="27-collecter-pendant-le-developpement">27. Collecter pendant le développement<a class="heading-link" href="#27-collecter-pendant-le-developpement" aria-label="Lien vers cette section">#</a></h2>
 <p>Laisse Umbrel tourner pendant que Codex implémente les phases 01 à 04. Cela crée un jeu de données forward jamais vu pendant la calibration.</p>
 <p>La collecte officielle historique est utile, mais sa publication peut être espacée. Notre propre flux réduit la dépendance à sa fraîcheur.</p>
@@ -923,13 +946,12 @@ docker compose logs --tail 100 collector
 <li>Hyperliquid historical data : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data">https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data</a></li>
 <li>Hyperliquid WebSocket subscriptions : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions">https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions</a></li>
 <li>Hyperliquid funding : <a href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding">https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding</a></li>
-<li>SDK Python officiel : <a href="https://github.com/hyperliquid-dex/hyperliquid-python-sdk">https://github.com/hyperliquid-dex/hyperliquid-python-sdk</a></li>
 <li>Umbrel Community App Store : <a href="https://umbrel.com/support/apps/how-to-add-a-community-app-store">https://umbrel.com/support/apps/how-to-add-a-community-app-store</a></li>
 <li>Template Community App Store : <a href="https://github.com/getumbrel/umbrel-community-app-store">https://github.com/getumbrel/umbrel-community-app-store</a></li>
 <li>Codex security and approvals : <a href="https://developers.openai.com/codex/agent-approvals-security">https://developers.openai.com/codex/agent-approvals-security</a></li>
 </ul>
 <p>Vérifie de nouveau ces pages avant toute phase testnet ou mainnet : les APIs, frais, limites et formats évoluent.</p>
-<footer>HyperLab 0.2.0 · Laboratoire de recherche multi-stratégies · aucune promesse de rendement.</footer></article></main>
+<footer>HyperLab 0.2.1 · Laboratoire de recherche multi-stratégies · aucune promesse de rendement.</footer></article></main>
 </div>
 <a class="backtop" href="#top" aria-label="Retour en haut">↑</a>
 <script>

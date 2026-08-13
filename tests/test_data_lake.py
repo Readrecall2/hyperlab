@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import hyperlab.data.lake as lake_module
 import hyperlab.data.quality as quality_module
 import hyperlab.data.schema as data_schema
 from hyperlab.data.catalog import build_catalog, export_dataset
@@ -39,6 +40,29 @@ DAY = date(2026, 8, 11)
 
 def _utc(hour: int, minute: int = 0) -> datetime:
     return datetime(2026, 8, 11, hour, minute, tzinfo=UTC)
+
+
+def test_new_partition_directory_chain_is_durably_synced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "new-lake"
+    synced: list[Path] = []
+    monkeypatch.setattr(lake_module, "_fsync_directory", lambda path: synced.append(path))
+    key = PartitionKey("hyperliquid", DAY, "BTC", RecordType.CANDLE)
+
+    manifest = write_partition(root, key, _candle_table())
+
+    leaf = (root / manifest.relative_data_path).parent
+    expected_creation_parents = {
+        root.parent,
+        root,
+        root / "venue=hyperliquid",
+        root / "venue=hyperliquid" / f"date={DAY.isoformat()}",
+        root / "venue=hyperliquid" / f"date={DAY.isoformat()}" / "asset=BTC",
+    }
+    assert expected_creation_parents <= set(synced)
+    assert leaf in synced
 
 
 def _directory_link(link: Path, target: Path) -> None:

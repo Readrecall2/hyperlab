@@ -18,7 +18,7 @@ Exemple :
 
 ```powershell
 New-Item -ItemType Directory -Force C:\Dev
-Expand-Archive "$HOME\Downloads\hyperlab-multistrategy-v0.2.0.zip" C:\Dev -Force
+Expand-Archive "$HOME\Downloads\hyperlab-multistrategy-v0.2.1.zip" C:\Dev -Force
 cd C:\Dev\hyperlab-multistrategy
 ```
 

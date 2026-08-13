@@ -1,4 +1,4 @@
-# HyperLab 0.2.0
+# HyperLab 0.2.1
 
 Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher, backtester et
 faire tourner en paper des stratégies sur données publiques live.
@@ -103,15 +103,36 @@ Dashboard : `http://127.0.0.1:8000`.
 
 ## Umbrel
 
-Le dépôt contient un Community App Store à sa racine (`umbrel-app-store.yml` et `jjlab-hyperlab/`). Après avoir créé un dépôt GitHub public nommé `hyperlab` :
+Le dépôt contient un Community App Store à sa racine (`umbrel-app-store.yml` et
+`jjlab-hyperlab/`). Publiez d'abord le tag source contrôlé :
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB
-git tag v0.2.0
-git push origin v0.2.0
+.\.venv\Scripts\python.exe scripts\verify_release.py --template --tag v0.2.1 --check-manifest
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
-Le workflow GitHub publie une image `amd64`/`arm64`. Le guide explique ensuite comment ajouter l'URL du dépôt dans **App Store → Community App Stores**.
+Après réussite de tous les tests, scans pré-publication, attestations, SBOM et signature,
+téléchargez le reçu et son bundle Sigstore depuis le run vert du tag exact. Le
+préparateur vérifie ces preuves et l'égalité du tag SemVer dans GHCR avant toute
+écriture :
+
+Le dépôt doit auparavant protéger `refs/tags/v*`, la branche/le workflow de release et
+l'environment `signed-release` avec revue humaine indépendante. Tant que cette
+configuration GitHub externe n'est pas prouvée, la publication reste bloquée.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB `
+  --repository hyperlab --image-version 0.2.1 `
+  --image-digest DIGEST_MULTIARCH_64_HEX `
+  --release-receipt .\release-evidence\release-receipt.json `
+  --receipt-bundle .\release-evidence\release-receipt.sigstore.json
+```
+
+Le guide [`docs/UMBREL_SETUP.md`](docs/UMBREL_SETUP.md) couvre installation, health,
+backup/restore, update, rollback et désinstallation. Umbrel peut supprimer
+`${APP_DATA_DIR}` à l'uninstall : une sauvegarde vérifiée hors de ce répertoire et un
+restore-smoke réussi sont obligatoires avant toute suppression.
 
 ## Documentation
 

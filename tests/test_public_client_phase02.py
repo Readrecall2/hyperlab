@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
+from urllib.request import Request
 
 import pytest
 
@@ -19,6 +21,55 @@ class FakeInfo:
         copied = dict(payload)
         self.posts.append((url_path, copied))
         return self.responder(copied)
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.payload if size < 0 else self.payload[:size]
+
+
+def test_default_transport_is_public_info_only_and_sdk_is_not_a_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Request, float]] = []
+    responses = iter(
+        (
+            b'[{"universe":[]},[]]',
+            b'[{"tokens":[],"universe":[]},[]]',
+        )
+    )
+
+    def fake_urlopen(request: Request, *, timeout: float) -> _FakeHttpResponse:
+        calls.append((request, timeout))
+        return _FakeHttpResponse(next(responses))
+
+    monkeypatch.setattr("hyperlab.api.public.urllib.request.urlopen", fake_urlopen)
+
+    result = HyperliquidPublicClient(network="mainnet", timeout_seconds=7.0).bootstrap(
+        observed_at_ms=123
+    )
+
+    assert result.observed_at_ms == 123
+    assert [request.full_url for request, _ in calls] == [
+        "https://api.hyperliquid.xyz/info",
+        "https://api.hyperliquid.xyz/info",
+    ]
+    assert [request.method for request, _ in calls] == ["POST", "POST"]
+    assert [timeout for _, timeout in calls] == [7.0, 7.0]
+    assert b'"type":"metaAndAssetCtxs"' in calls[0][0].data
+    assert b'"type":"spotMetaAndAssetCtxs"' in calls[1][0].data
+
+    project = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert "hyperliquid-python-sdk" not in project.read_text(encoding="utf-8")
 
 
 def _perp_context(*, mid: str, volume: str) -> dict[str, str]:

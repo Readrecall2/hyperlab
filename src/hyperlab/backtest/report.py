@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from hyperlab import __version__
 from hyperlab.backtest.bootstrap import block_bootstrap_ci
 from hyperlab.models import BacktestResult
 
@@ -249,7 +250,7 @@ footer {{ color:var(--muted); margin-top:34px; }}
 <tbody>{"".join(rows)}</tbody>
 </table></div>
 {"".join(cards)}
-<footer>HyperLab 0.2.0 — mode recherche uniquement, aucun exécuteur d'ordres inclus.</footer>
+<footer>HyperLab {html.escape(__version__)} — mode recherche uniquement, aucun exécuteur d'ordres inclus.</footer>
 </main></body></html>"""
 
     report_path = output_dir / "comparison.html"

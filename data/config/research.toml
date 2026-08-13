@@ -1,0 +1,7 @@
+# Local Compose accepts public market data only. No credential field is supported.
+
+[app]
+network = "mainnet"
+data_dir = "/data"
+request_timeout_seconds = 15.0
+mode = "readonly"

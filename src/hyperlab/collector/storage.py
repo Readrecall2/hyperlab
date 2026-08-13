@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -14,12 +16,15 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from hyperlab.collector.models import ParsedRecord
 from hyperlab.data.lake import (
     PartitionKey,
     PartitionManifest,
+    PartitionValidationError,
     discover_partitions,
+    inventory_partitions,
     read_hashed_table,
     recover_partition_manifest,
     validate_partition,
@@ -37,6 +42,14 @@ class FlushResult:
 
 class CoordinatedWriterError(RuntimeError):
     """Fatal coordinated-writer incompatibility or storage failure."""
+
+
+class StorageCapacityError(OSError):
+    """The persistent lake cannot safely accept another flush."""
+
+
+class LakeWriterActiveError(RuntimeError):
+    """Another process owns the lake writer/maintenance lock."""
 
 
 class LakeSink(Protocol):
@@ -65,6 +78,9 @@ _ObservationHeadKey = tuple[str, str]
 _StablePrimaryKey = tuple[str, str]
 _OBSERVATION_INDEX_VERSION = 3
 _PERSISTENT_PRIMARY_KEY_TYPES = frozenset({RecordType.TRADE})
+_DEFAULT_MIN_FREE_BYTES = 128 * 1024 * 1024
+_DEFAULT_MIN_FREE_PERCENT = 2.0
+_SESSION_FILE = ".collector-session.json"
 
 
 def _canonical_scalar(value: object) -> object:
@@ -161,14 +177,24 @@ class _RootWriterLock:
     """Process-scoped, non-blocking writer lock retained for the sink lifetime."""
 
     def __init__(self, root: Path) -> None:
-        root.mkdir(parents=True, exist_ok=True)
+        missing: list[Path] = []
+        current = root
+        while not current.exists():
+            missing.append(current)
+            if current.parent == current:
+                raise CoordinatedWriterError("writer root has no existing ancestor")
+            current = current.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            _fsync_parent(directory)
         self.path = root / ".collector-writer.lock"
         stream = self.path.open("a+b")
         try:
             self._lock(stream)
         except OSError:
             stream.close()
-            raise RuntimeError(f"collector lake already has an active writer: {root}") from None
+            raise LakeWriterActiveError(f"collector lake already has an active writer: {root}") from None
+        _fsync_parent(self.path)
         self._stream: BinaryIO | None = stream
 
     @staticmethod
@@ -177,6 +203,7 @@ class _RootWriterLock:
         if stream.read(1) == b"":
             stream.write(b"\0")
             stream.flush()
+            os.fsync(stream.fileno())
         stream.seek(0)
         if os.name == "nt":
             import msvcrt
@@ -204,6 +231,174 @@ class _RootWriterLock:
         stream.close()
 
 
+@contextmanager
+def exclusive_lake_maintenance(root: Path) -> Iterator[None]:
+    """Exclude collectors while a backup, restore, or repair inspects the lake."""
+
+    lock = _RootWriterLock(root)
+    try:
+        yield
+    finally:
+        lock.close()
+
+
+def _configured_non_negative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a non-negative integer") from None
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _configured_percentage(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be between 0 and 100") from None
+    if not 0.0 <= value <= 100.0:
+        raise ValueError(f"{name} must be between 0 and 100")
+    return value
+
+
+def ensure_storage_capacity(
+    root: Path,
+    *,
+    min_free_bytes: int | None = None,
+    min_free_percent: float | None = None,
+) -> dict[str, int | float]:
+    """Fail closed before writes when the persistent filesystem reserve is exhausted."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    required_bytes = (
+        _configured_non_negative_int("HYPERLAB_MIN_FREE_BYTES", _DEFAULT_MIN_FREE_BYTES)
+        if min_free_bytes is None
+        else min_free_bytes
+    )
+    required_percent = (
+        _configured_percentage("HYPERLAB_MIN_FREE_PERCENT", _DEFAULT_MIN_FREE_PERCENT)
+        if min_free_percent is None
+        else min_free_percent
+    )
+    if required_bytes < 0 or not 0.0 <= required_percent <= 100.0:
+        raise ValueError("storage reserve limits are invalid")
+    usage = shutil.disk_usage(root)
+    free_percent = 0.0 if usage.total == 0 else usage.free * 100.0 / usage.total
+    if usage.free < required_bytes or free_percent < required_percent:
+        raise StorageCapacityError(
+            "persistent storage reserve exhausted: "
+            f"free_bytes={usage.free}, required_bytes={required_bytes}, "
+            f"free_percent={free_percent:.2f}, required_percent={required_percent:.2f}"
+        )
+    return {
+        "free_bytes": usage.free,
+        "total_bytes": usage.total,
+        "free_percent": free_percent,
+        "required_free_bytes": required_bytes,
+        "required_free_percent": required_percent,
+    }
+
+
+def _fsync_parent(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_session_marker(root: Path, *, clean_shutdown: bool, recovered_unclean: bool) -> None:
+    target = root / _SESSION_FILE
+    temporary = root / f".{_SESSION_FILE}.{os.getpid()}.tmp"
+    payload = {
+        "schema_version": 1,
+        "clean_shutdown": clean_shutdown,
+        "recovered_unclean_restart": recovered_unclean,
+        "pid": os.getpid(),
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+    }
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+        _fsync_parent(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _clear_session_marker(root: Path) -> None:
+    marker = root / _SESSION_FILE
+    marker.unlink(missing_ok=True)
+    _fsync_parent(marker)
+
+
+def _previous_session_was_unclean(root: Path) -> bool:
+    marker = root / _SESSION_FILE
+    if not marker.exists():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    return not isinstance(payload, dict) or payload.get("clean_shutdown") is not True
+
+
+def _recover_interrupted_publications(root: Path) -> None:
+    """Recover complete temp Parquet files and reject ambiguous crash debris."""
+
+    for temporary in sorted(root.rglob(".*.parquet.tmp"), key=lambda path: path.as_posix()):
+        try:
+            pq.ParquetFile(temporary).read()
+        except Exception as exc:
+            raise PartitionValidationError(
+                f"invalid interrupted Parquet publication {temporary.name}: {exc}"
+            ) from None
+        with temporary.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        target = temporary.with_name(f"part-{digest}.parquet")
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise PartitionValidationError(
+                    f"interrupted Parquet conflicts with immutable file {target.name}"
+                ) from None
+        temporary.unlink()
+        _fsync_parent(target)
+
+    _recover_orphans(root)
+
+    for temporary in sorted(root.rglob(".*.manifest.tmp"), key=lambda path: path.as_posix()):
+        try:
+            payload = json.loads(temporary.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("manifest root is not an object")
+            manifest = PartitionManifest.from_dict(payload)
+            target = temporary.with_name(manifest.manifest_file)
+            if temporary.read_bytes() != target.read_bytes():
+                raise ValueError("recovered manifest does not match published manifest")
+            validate_partition(target)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise PartitionValidationError(
+                f"ambiguous interrupted manifest publication {temporary.name}: {exc}"
+            ) from None
+        temporary.unlink()
+        _fsync_parent(target)
+
+
 def _recover_orphans(root: Path) -> None:
     for data_path in sorted(root.rglob("part-*.parquet"), key=lambda path: path.as_posix()):
         manifest_path = data_path.with_name(f"{data_path.stem}.manifest.json")
@@ -222,18 +417,50 @@ class _PersistentObservationIndex:
         serialized_cross_thread_access: bool = False,
     ) -> None:
         root.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(
-            root / ".collector-observations.sqlite3",
-            check_same_thread=not serialized_cross_thread_access,
+        index_path = root / ".collector-observations.sqlite3"
+        if index_path.is_symlink():
+            raise PartitionValidationError("derived observation index must not be a symlink")
+        self._connection = self._connect(
+            index_path,
+            serialized_cross_thread_access=serialized_cross_thread_access,
         )
         try:
-            self._connection.execute("PRAGMA journal_mode=DELETE")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._migrate()
-            self._reconcile(root)
+            self._initialize(root)
+        except sqlite3.DatabaseError:
+            self._connection.close()
+            inventory_partitions(root)
+            for suffix in ("", "-journal", "-shm", "-wal"):
+                (root / f"{index_path.name}{suffix}").unlink(missing_ok=True)
+            _fsync_parent(index_path)
+            self._connection = self._connect(
+                index_path,
+                serialized_cross_thread_access=serialized_cross_thread_access,
+            )
+            try:
+                self._initialize(root)
+            except BaseException:
+                self._connection.close()
+                raise
         except BaseException:
             self._connection.close()
             raise
+
+    @staticmethod
+    def _connect(
+        path: Path,
+        *,
+        serialized_cross_thread_access: bool,
+    ) -> sqlite3.Connection:
+        return sqlite3.connect(
+            path,
+            check_same_thread=not serialized_cross_thread_access,
+        )
+
+    def _initialize(self, root: Path) -> None:
+        self._connection.execute("PRAGMA journal_mode=DELETE")
+        self._connection.execute("PRAGMA synchronous=FULL")
+        self._migrate()
+        self._reconcile(root)
 
     def _migrate(self) -> None:
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -419,12 +646,18 @@ class BatchingLakeSink:
         recent_key_capacity: int = 100_000,
         persistent_dedup: bool = True,
         _serialized_cross_thread_access: bool = False,
+        min_free_bytes: int | None = None,
+        min_free_percent: float | None = None,
+        validate_integrity: bool = False,
     ) -> None:
         if batch_size <= 0 or queue_capacity < batch_size or recent_key_capacity <= 0:
             raise ValueError("invalid batch or queue capacity")
         self.root = root
         self._writer_lock = _RootWriterLock(root)
         self._observation_index: _PersistentObservationIndex | None = None
+        self._min_free_bytes = min_free_bytes
+        self._min_free_percent = min_free_percent
+        self.unclean_restart_detected = _previous_session_was_unclean(root)
         self.batch_size = batch_size
         self.queue_capacity = queue_capacity
         self.recent_key_capacity = recent_key_capacity
@@ -434,12 +667,24 @@ class BatchingLakeSink:
         self._pending_observations: OrderedDict[_ObservationHeadKey, _ObservationSignature] = OrderedDict()
         self._pending_stable_primary_keys: set[_StablePrimaryKey] = set()
         try:
-            _recover_orphans(root)
+            ensure_storage_capacity(
+                root,
+                min_free_bytes=self._min_free_bytes,
+                min_free_percent=self._min_free_percent,
+            )
+            _recover_interrupted_publications(root)
+            if validate_integrity:
+                inventory_partitions(root)
             if persistent_dedup:
                 self._observation_index = _PersistentObservationIndex(
                     root,
                     serialized_cross_thread_access=_serialized_cross_thread_access,
                 )
+            _write_session_marker(
+                root,
+                clean_shutdown=False,
+                recovered_unclean=self.unclean_restart_detected,
+            )
         except BaseException:
             self._writer_lock.close()
             raise
@@ -547,6 +792,11 @@ class BatchingLakeSink:
             raise
 
     def flush(self) -> FlushResult:
+        ensure_storage_capacity(
+            self.root,
+            min_free_bytes=self._min_free_bytes,
+            min_free_percent=self._min_free_percent,
+        )
         if not self._groups:
             duplicates = self._duplicate_count
             self._duplicate_count = 0
@@ -593,12 +843,29 @@ class BatchingLakeSink:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        cleanup_errors: list[BaseException] = []
         try:
             if self._observation_index is not None:
-                self._observation_index.close()
+                try:
+                    self._observation_index.close()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if self._pending_count == 0:
+                try:
+                    _clear_session_marker(self.root)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
         finally:
-            self._writer_lock.close()
+            try:
+                self._writer_lock.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            self._closed = True
+        if cleanup_errors:
+            first = cleanup_errors[0]
+            for error in cleanup_errors[1:]:
+                first.add_note(f"cleanup also failed: {type(error).__name__}: {error}")
+            raise first
 
     @staticmethod
     def _primary_key(spec: SchemaSpec, row: dict[str, object]) -> tuple[object, ...]:
@@ -653,6 +920,10 @@ class CoordinatedLakeSink:
         return self._owner._client_should_flush(self)
 
     @property
+    def unclean_restart_detected(self) -> bool:
+        return self._owner.unclean_restart_detected
+
+    @property
     def high_water(self) -> int:
         return self._owner._client_high_water(self)
 
@@ -680,6 +951,8 @@ class CoordinatedLakeWriter:
         batch_size: int = 500,
         queue_capacity: int = 10_000,
         recent_key_capacity: int = 100_000,
+        min_free_bytes: int | None = None,
+        min_free_percent: float | None = None,
     ) -> None:
         if not venues or len(venues) != len(set(venues)) or any(not venue for venue in venues):
             raise ValueError("coordinated writer venues must be non-empty and unique")
@@ -692,6 +965,8 @@ class CoordinatedLakeWriter:
             queue_capacity=queue_capacity,
             recent_key_capacity=recent_key_capacity,
             _serialized_cross_thread_access=True,
+            min_free_bytes=min_free_bytes,
+            min_free_percent=min_free_percent,
         )
         self._clients: dict[str, CoordinatedLakeSink] = {}
         self._pending_by_venue = {venue: 0 for venue in venues}
@@ -701,6 +976,10 @@ class CoordinatedLakeWriter:
         self._row_credit = {venue: 0 for venue in venues}
         self._duplicate_credit = {venue: 0 for venue in venues}
         self._closed = False
+
+    @property
+    def unclean_restart_detected(self) -> bool:
+        return self._sink.unclean_restart_detected
 
     @property
     def pending_count(self) -> int:

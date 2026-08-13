@@ -2,6 +2,10 @@
 .venv
 __pycache__
 .pytest_cache
+.pytest*
+**/.pytest*
+.pytest-tmp*
+**/.pytest-tmp*
 .ruff_cache
 .mypy_cache
 .env
@@ -14,6 +18,11 @@ __pycache__
 *.pfx
 *.keystore
 *keystore*
+*wallet*
+*seed*
+*.sqlite
+*.sqlite3
+*.db
 data
 reports
 *.zip

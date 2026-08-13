@@ -1,6 +1,6 @@
 # HyperLab — guide complet Windows 11 + Umbrel + Codex
 
-**Version : 0.2.0 — 13 août 2026**
+**Version : 0.2.1 — 13 août 2026**
 
 Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un **laboratoire multi-stratégies** : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.
 
@@ -238,7 +238,7 @@ Python 3.12 est recommandé. Python 3.11 et 3.13 sont également acceptés par l
 ```powershell
 New-Item -ItemType Directory -Force C:\Dev
 Expand-Archive `
-  -Path "$HOME\Downloads\hyperlab-multistrategy-v0.2.0.zip" `
+  -Path "$HOME\Downloads\hyperlab-multistrategy-v0.2.1.zip" `
   -DestinationPath "C:\Dev" `
   -Force
 ```
@@ -511,7 +511,7 @@ docker compose down
 ```
 
 Le collecteur reçoit `SIGINT`/`SIGTERM` de façon coopérative. Les compositions
-locale et Umbrel lui accordent 30 secondes pour fermer le socket, publier le
+locale et Umbrel lui accordent 60 secondes pour fermer le socket, publier le
 dernier statut et flusher le dernier batch avant un éventuel arrêt forcé.
 
 Les services sont non-root, read-only, sans capacités Linux et sans Docker socket.
@@ -541,41 +541,53 @@ git branch -M main
 git push -u origin main
 ```
 
-## 23. Personnaliser le package Umbrel
-
-Les fichiers `umbrel-app-store.yml` et `jjlab-hyperlab/` sont volontairement à la **racine du dépôt** : c'est la structure attendue par le template officiel Umbrel.
-
+## 23. Publier le candidat signé
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB
+.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py --reset-template
+.\.venv\Scripts\python.exe scripts\verify_manifest.py --write
+.\.venv\Scripts\python.exe scripts\verify_release.py --template --tag v0.2.1 --check-manifest
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
-Vérifie :
+Le workflow doit terminer tests, Gitleaks et scans Trivy `amd64`/`arm64` avant tout
+push, puis scanner les deux digests enfants exacts, publier leurs SBOM, la provenance,
+les attestations, la signature Cosign et un reçu signé. Un build seul n'autorise pas
+le déploiement.
+
+## 24. Personnaliser le package Umbrel
+
+Les fichiers `umbrel-app-store.yml` et `jjlab-hyperlab/` sont volontairement à la
+racine du dépôt. Télécharge `signed-release-receipt-v0.2.1` depuis le run vert du tag
+exact. Après seulement la réussite de tous les gates, injecte le digest dans la branche
+de store déployable ; le préparateur revalide les preuves et le tag GHCR :
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\prepare_umbrel_store.py VOTRE_NOM_GITHUB `
+  --repository hyperlab --image-version 0.2.1 `
+  --image-digest DIGEST_MULTIARCH_64_HEX `
+  --release-receipt .\release-evidence\release-receipt.json `
+  --receipt-bundle .\release-evidence\release-receipt.sigstore.json
+.\.venv\Scripts\python.exe scripts\verify_manifest.py --write
+.\.venv\Scripts\python.exe scripts\verify_release.py --prepared --tag v0.2.1 --check-manifest
 Get-ChildItem .\jjlab-hyperlab -Recurse -File | Select-String "REPLACE_WITH_"
 ```
 
-Aucun résultat attendu.
+Aucun résultat n'est attendu. Les deux services doivent utiliser le même
+`0.2.1@sha256:DIGEST`; `latest` est interdit.
 
 Commit :
 
 ```powershell
-git add umbrel-app-store.yml jjlab-hyperlab scripts\prepare_umbrel_store.py
+git add MANIFEST_SHA256.txt umbrel-app-store.yml jjlab-hyperlab
 git commit -m "chore: configure Umbrel community app store"
 git push
 ```
 
-## 24. Publier l'image
-
-```powershell
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-Dans GitHub, vérifie l'Action `Publish container` et le package `hyperlab:0.2.0`.
-
-Ouvre ensuite la page du package, puis **Package settings → Change visibility → Public**. Umbrel ne possède pas d'identifiants GHCR pour télécharger une image privée. La première version ne contient aucun secret ; le code et l'image peuvent donc être publics.
+Ouvre la page du package, puis **Package settings → Change visibility → Public**.
+Umbrel ne reçoit aucun credential GHCR. Garde le dernier store sain inchangé jusqu'à
+ce que le nouveau digest soit totalement vérifié.
 
 ## 25. Ajouter le store dans umbrelOS
 
@@ -609,6 +621,14 @@ le collecteur Parquet Phase 02 tourne. Vérifie aussi :
 ```
 
 Le dashboard n'est pas un panneau d'administration de trading. Il ne possède aucun bouton d'ordre.
+
+Avant update, rollback, reinstall ou uninstall, arrête le writer puis exécute
+`ops check-layout`, `ops backup`, `ops verify-backup` et `ops restore` vers une racine
+neuve. La sauvegarde et son restore-smoke doivent être **hors de `${APP_DATA_DIR}`**.
+Le chemin legacy d'umbrelOS supprime `${APP_DATA_DIR}` à l'uninstall ; aucune
+conservation automatique n'est promise. `ops export-parquet` produit les rapports
+téléchargeables. Le runbook exact est dans
+[`docs/UMBREL_SETUP.md`](UMBREL_SETUP.md).
 
 ## 27. Collecter pendant le développement
 
@@ -1138,7 +1158,6 @@ Umbrel commence à accumuler les données immédiatement, tandis que Windows et 
 - Hyperliquid historical data : https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data
 - Hyperliquid WebSocket subscriptions : https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions
 - Hyperliquid funding : https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding
-- SDK Python officiel : https://github.com/hyperliquid-dex/hyperliquid-python-sdk
 - Umbrel Community App Store : https://umbrel.com/support/apps/how-to-add-a-community-app-store
 - Template Community App Store : https://github.com/getumbrel/umbrel-community-app-store
 - Codex security and approvals : https://developers.openai.com/codex/agent-approvals-security

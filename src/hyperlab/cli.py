@@ -18,6 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from hyperlab import __version__
 from hyperlab.backtest.carry import (
     audit_carry_panel,
     carry_stress_scenarios,
@@ -96,6 +97,12 @@ SECRET_ENV_MARKERS = (
 )
 
 app.add_typer(data_app, name="data")
+operations_app = typer.Typer(
+    name="ops",
+    help="Sauvegarde, restauration et contrôles fail-closed du déploiement read-only.",
+    no_args_is_help=True,
+)
+app.add_typer(operations_app, name="ops")
 paper_app = typer.Typer(
     name="paper",
     help="Supervision locale du moteur paper-only Phase 12.",
@@ -118,9 +125,55 @@ _APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = Mapping
 
 
 def _settings() -> Settings:
-    if not CONFIG.exists():
-        raise typer.BadParameter(f"Configuration introuvable: {CONFIG.resolve()}")
-    return load_settings(CONFIG)
+    config = Path(os.getenv("HYPERLAB_CONFIG", str(CONFIG)))
+    if not config.exists():
+        raise typer.BadParameter(f"Configuration introuvable: {config.resolve()}")
+    return load_settings(config)
+
+
+def _configured_directory(name: str, default: Path) -> Path:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip()
+    if not normalized:
+        raise typer.BadParameter(f"{name} ne peut pas être vide")
+    return Path(normalized)
+
+
+def _strict_persistence_enabled() -> bool:
+    value = os.getenv("HYPERLAB_REQUIRE_PERSISTENT_LAYOUT")
+    if value is None or value == "0":
+        return False
+    if value != "1":
+        raise typer.BadParameter("HYPERLAB_REQUIRE_PERSISTENT_LAYOUT doit valoir 0 ou 1")
+    return True
+
+
+def _validate_service_mounts(settings: Settings, *, service: str) -> bool:
+    strict = _strict_persistence_enabled()
+    if not strict:
+        return False
+    from hyperlab.operations import DeploymentIntegrityError, validate_service_persistence
+
+    config = Path(os.getenv("HYPERLAB_CONFIG", str(CONFIG)))
+    try:
+        validate_service_persistence(settings.app.data_dir, config, service=service)
+    except (DeploymentIntegrityError, OSError, ValueError) as exc:
+        raise typer.BadParameter(f"persistance {service} refusée: {exc}") from None
+    return True
+
+
+def _invalidate_collector_readiness_if_strict() -> None:
+    if not _strict_persistence_enabled():
+        return
+    from hyperlab.operations import DeploymentIntegrityError, publish_collector_starting_status
+
+    data_root = _configured_directory("HYPERLAB_DATA_DIR", Path("data"))
+    try:
+        publish_collector_starting_status(data_root)
+    except (DeploymentIntegrityError, OSError, ValueError) as exc:
+        raise typer.BadParameter(f"statut de démarrage refusé: {exc}") from None
 
 
 def _csv_values(value: str, *, label: str) -> tuple[str, ...]:
@@ -185,6 +238,112 @@ def _secret_like_environment_variables(environment: Mapping[str, str]) -> list[s
     return sorted(key for key in environment if any(marker in key.upper() for marker in SECRET_ENV_MARKERS))
 
 
+@operations_app.command("check-layout")
+def operations_check_layout(
+    data_root: Annotated[Path, typer.Argument(exists=True, file_okay=False, dir_okay=True)],
+    writable: Annotated[
+        bool,
+        typer.Option("--writable/--read-only", help="Exige une écriture durable de contrôle."),
+    ] = False,
+) -> None:
+    """Vérifie les volumes persistants explicites et la configuration read-only."""
+
+    from hyperlab.operations import DeploymentIntegrityError, validate_persistent_layout
+
+    try:
+        payload = validate_persistent_layout(data_root, require_writable=writable)
+    except (DeploymentIntegrityError, OSError, ValueError) as exc:
+        typer.echo(f"PERSISTENCE_UNHEALTHY: {exc}", err=True)
+        raise typer.Exit(2) from None
+    console.print_json(json.dumps(payload))
+
+
+@operations_app.command("backup")
+def operations_backup(
+    data_root: Annotated[Path, typer.Argument(exists=True, file_okay=False, dir_okay=True)],
+    backup_root: Annotated[
+        Path | None,
+        typer.Option(help="Répertoire de sauvegarde; défaut: DATA_ROOT/backups."),
+    ] = None,
+    backup_id: Annotated[str | None, typer.Option(help="Identifiant stable optionnel.")] = None,
+) -> None:
+    """Crée une sauvegarde complète après arrêt propre et verrouillage exclusif du lake."""
+
+    from hyperlab.operations import DeploymentIntegrityError, create_backup
+
+    try:
+        result = create_backup(data_root, backup_root=backup_root, backup_id=backup_id)
+    except (DeploymentIntegrityError, FileExistsError, OSError, ValueError) as exc:
+        typer.echo(f"BACKUP_REFUSED: {exc}", err=True)
+        raise typer.Exit(2) from None
+    console.print_json(json.dumps(result.as_dict()))
+
+
+@operations_app.command("export-parquet")
+def operations_export_parquet(
+    data_root: Annotated[Path, typer.Argument(exists=True, file_okay=False, dir_okay=True)],
+    output_name: Annotated[str, typer.Argument(help="Nom simple du rapport .parquet")],
+    record_type: Annotated[str, typer.Option("--type", help="Type de données exact")],
+    venue: Annotated[str | None, typer.Option(help="Venue exacte")] = None,
+    asset: Annotated[str | None, typer.Option(help="Actif exact")] = None,
+    start: Annotated[str | None, typer.Option(help="Date UTC incluse YYYY-MM-DD")] = None,
+    end: Annotated[str | None, typer.Option(help="Date UTC incluse YYYY-MM-DD")] = None,
+    schema_version: Annotated[int | None, typer.Option(min=1)] = None,
+) -> None:
+    """Exporte un Parquet vérifié après arrêt propre et verrouillage exclusif du lake."""
+
+    from hyperlab.operations import DeploymentIntegrityError, create_parquet_export
+
+    try:
+        payload = create_parquet_export(
+            data_root,
+            output_name=output_name,
+            record_type=record_type,
+            venue=venue,
+            asset=asset,
+            start=start,
+            end=end,
+            schema_version=schema_version,
+        )
+    except (DeploymentIntegrityError, FileExistsError, OSError, ValueError) as exc:
+        typer.echo(f"EXPORT_REFUSED: {exc}", err=True)
+        raise typer.Exit(2) from None
+    console.print_json(json.dumps(payload))
+
+
+@operations_app.command("verify-backup")
+def operations_verify_backup(
+    backup: Annotated[Path, typer.Argument(exists=True, file_okay=False, dir_okay=True)],
+) -> None:
+    """Vérifie le marqueur complet, les hashes, SQLite, Parquet et la configuration."""
+
+    from hyperlab.operations import DeploymentIntegrityError, verify_backup
+
+    try:
+        result = verify_backup(backup)
+    except (DeploymentIntegrityError, OSError, ValueError) as exc:
+        typer.echo(f"BACKUP_INVALID: {exc}", err=True)
+        raise typer.Exit(2) from None
+    console.print_json(json.dumps(result.as_dict()))
+
+
+@operations_app.command("restore")
+def operations_restore(
+    backup: Annotated[Path, typer.Argument(exists=True, file_okay=False, dir_okay=True)],
+    target: Annotated[Path, typer.Argument(help="Nouvelle racine inexistante; aucun merge autorisé.")],
+) -> None:
+    """Restaure vers une nouvelle racine, sans écraser ni fusionner l'état actif."""
+
+    from hyperlab.operations import DeploymentIntegrityError, restore_backup
+
+    try:
+        result = restore_backup(backup, target)
+    except (DeploymentIntegrityError, FileExistsError, OSError, ValueError) as exc:
+        typer.echo(f"RESTORE_REFUSED: {exc}", err=True)
+        raise typer.Exit(2) from None
+    console.print_json(json.dumps(result.as_dict()))
+
+
 @app.command()
 def doctor() -> None:
     """Vérifie l'installation et confirme l'absence d'exécution réelle."""
@@ -201,7 +360,9 @@ def doctor() -> None:
     table.add_row("Variables secrètes détectées", ", ".join(secret_like) if secret_like else "aucune")
     console.print(table)
     if settings.app.mode not in {"readonly", "research"}:
-        console.print("[bold red]Refus : HyperLab 0.2.0 n'autorise que readonly/research.[/bold red]")
+        console.print(
+            f"[bold red]Refus : HyperLab {__version__} n'autorise que readonly/research.[/bold red]"
+        )
         raise typer.Exit(2)
     console.print("[bold green]Installation saine : aucun chemin d'ordre réel n'est inclus.[/bold green]")
 
@@ -1080,9 +1241,13 @@ def collect(
     from hyperlab.collector.runtime import PublicCollector
     from hyperlab.collector.websocket import WebsocketClientFactory
 
+    _invalidate_collector_readiness_if_strict()
     settings = _settings()
+    strict_persistence = _validate_service_mounts(settings, service="collector")
     if settings.app.mode not in {"readonly", "research"}:
-        raise typer.BadParameter("Le collecteur 0.2.0 refuse tout mode autre que readonly/research")
+        raise typer.BadParameter(
+            f"Le collecteur {__version__} refuse tout mode autre que readonly/research"
+        )
     try:
         config = CollectorConfig(
             network=network,
@@ -1099,6 +1264,7 @@ def collect(
         data_dir=settings.app.data_dir,
         request_timeout_seconds=settings.app.request_timeout_seconds,
         socket_factory=socket_factory,
+        validate_storage_integrity=strict_persistence,
     )
     try:
         with _cooperative_signal_handlers(collector.stop):
@@ -1600,7 +1766,7 @@ def paper_run(
 
 @app.command()
 def serve(
-    host: Annotated[str, typer.Option()] = "0.0.0.0",
+    host: Annotated[str, typer.Option()] = "127.0.0.1",
     port: Annotated[int, typer.Option(min=1, max=65_535)] = 8000,
 ) -> None:
     """Lance le dashboard local read-only."""
@@ -1609,7 +1775,15 @@ def serve(
     from hyperlab.dashboard.app import create_app
 
     settings = _settings()
-    uvicorn.run(create_app(data_dir=settings.app.data_dir), host=host, port=port)
+    _validate_service_mounts(settings, service="dashboard")
+    data_dir = settings.app.data_dir
+    dashboard = create_app(
+        data_dir=data_dir,
+        runtime_dir=_configured_directory("HYPERLAB_RUNTIME_DIR", data_dir),
+        reports_dir=_configured_directory("HYPERLAB_REPORTS_DIR", data_dir / "reports"),
+        paper_dir=_configured_directory("HYPERLAB_PAPER_DIR", data_dir / "paper"),
+    )
+    uvicorn.run(dashboard, host=host, port=port)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
@@ -67,13 +68,23 @@ def save_carry_snapshots(path: Path, snapshots: Iterable[CarrySnapshot]) -> int:
 
 
 def database_status(path: Path) -> dict[str, int | None]:
+    """Inspect the legacy collector database without creating or migrating it."""
+
+    if path.is_symlink():
+        raise OSError("refusing to inspect a symlinked SQLite database")
     if not path.exists():
         return {"snapshot_count": 0, "last_observed_at_ms": None}
-    initialize(path)
-    with sqlite3.connect(path) as connection:
+    if not path.is_file():
+        raise OSError("legacy SQLite path is not a regular file")
+    uri = f"{path.resolve(strict=True).as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        connection.execute("PRAGMA query_only=ON")
         row = connection.execute(
             "SELECT COUNT(*), MAX(observed_at_ms) FROM carry_snapshots"
         ).fetchone()
+    finally:
+        connection.close()
     return {
         "snapshot_count": int(row[0]) if row else 0,
         "last_observed_at_ms": int(row[1]) if row and row[1] is not None else None,
@@ -83,5 +94,18 @@ def database_status(path: Path) -> dict[str, int | None]:
 def write_runtime_status(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    encoded = json.dumps(payload, indent=2, ensure_ascii=False).encode()
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)

@@ -1,6 +1,6 @@
 # Collecteur public Hyperliquid — Phase 02
 
-Dernière vérification documentaire et SDK : 12 août 2026.
+Dernière vérification documentaire et transport public : 13 août 2026.
 
 ## Statut de la phase
 
@@ -21,8 +21,9 @@ qu’après exécution et archivage du protocole décrit plus bas.
   l’instanciation ;
 - aucune signature, création, modification ou annulation d’ordre n’existe dans
   ce module ;
-- le SDK officiel n’est utilisé que par `hyperliquid.info.Info` pour les appels
-  REST publics, avec `skip_ws=True` ;
+- le runtime n’embarque pas le SDK Hyperliquid complet : un transport standard-library
+  limité aux deux hôtes publics allowlistés et au seul chemin `/info` réalise les appels
+  REST, avec timeout et limite de réponse explicites ;
 - le transport WebSocket est public et supervisé localement afin de contrôler
   les acquittements, heartbeats, reconnexions et resynchronisations ;
 - le mode replay n’importe ni ne construit aucun client réseau.
@@ -150,7 +151,7 @@ bornée. Les attentes de backoff et de limite de connexions sont interruptibles.
 La CLI intercepte `SIGINT` et `SIGTERM` pour demander un arrêt coopératif :
 sortie de la boucle, fermeture du socket, flush final, publication du dernier
 `runtime_status.json`, fermeture du sink et du client REST. Les compositions
-Docker locale et Umbrel accordent `stop_grace_period: 30s`; leur configuration
+Docker locale et Umbrel accordent `stop_grace_period: 60s`; leur configuration
 REST par défaut utilise un timeout de 15 secondes. L’annulation empêche toute
 nouvelle page ou requête et interrompt l’attente du rate limiter ; une requête
 HTTP déjà en vol reste néanmoins bornée par son timeout. Si un processus ne
@@ -158,55 +159,22 @@ termine pas dans cette fenêtre, l’orchestrateur peut encore le tuer : la preu
 d’un arrêt propre reste donc le statut final et la validation des manifestes,
 pas la seule réception du signal.
 
-## SDK officiel épinglé
+## Transport REST public minimal
 
-La dépendance de production est exactement
-`hyperliquid-python-sdk==0.24.0`. Les signatures suivantes ont été inspectées
-dans cette distribution installée ; elles ne sont pas déduites d’exemples :
+`src/hyperlab/api/public.py` implémente un adaptateur injectable autour de
+`urllib.request`. Sa surface est volontairement plus petite qu’un SDK de venue :
 
-~~~python
-Info(
-    base_url: Optional[str] = None,
-    skip_ws: Optional[bool] = False,
-    meta: Optional[Meta] = None,
-    spot_meta: Optional[SpotMeta] = None,
-    perp_dexs: Optional[List[str]] = None,
-    timeout: Optional[float] = None,
-)
+- hôtes acceptés exactement `https://api.hyperliquid.xyz` et
+  `https://api.hyperliquid-testnet.xyz` ;
+- seule une requête `POST` JSON vers `/info` est constructible ;
+- payload obligatoire de type mapping, JSON canonique sans `NaN` ;
+- timeout positif et réponse plafonnée à 64 MiB ;
+- aucune méthode exchange, wallet, signature, ordre ou annulation.
 
-Info.meta(self, dex: str = "") -> Meta
-Info.meta_and_asset_ctxs(self) -> Any
-Info.spot_meta(self) -> SpotMeta
-Info.spot_meta_and_asset_ctxs(self) -> Tuple[SpotMeta, List[SpotAssetCtx]]
-Info.funding_history(
-    self, name: str, startTime: int, endTime: Optional[int] = None
-) -> Any
-Info.candles_snapshot(
-    self, name: str, interval: str, startTime: int, endTime: int
-) -> Any
-Info.l2_snapshot(self, name: str) -> Any
-Info.all_mids(self, dex: str = "") -> Any
-Info.subscribe(self, subscription: Subscription, callback: Callable[[Any], None]) -> int
-Info.unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool
-Info.disconnect_websocket(self)
-~~~
-
-Deux conséquences sont importantes :
-
-1. `meta_and_asset_ctxs` n’accepte pas de paramètre `dex` dans cette version.
-2. `l2_snapshot` n’accepte que `name`. Quand les champs REST documentés
-   `nSigFigs` et `mantissa` sont nécessaires, l’adaptateur envoie un payload
-   `info` public explicite au lieu de prétendre que le SDK expose ces arguments.
-
-Le gestionnaire WebSocket du SDK 0.24.0 ne fournit pas les hooks nécessaires
-pour observer fermeture/erreur, superviser le backoff et imposer une
-resynchronisation. C’est la raison du transport WebSocket dédié ; ce choix
-n’autorise aucun endpoint d’échange.
-
-- SDK officiel, tag 0.24.0 :
-  https://github.com/hyperliquid-dex/hyperliquid-python-sdk/tree/0.24.0
-- source de `Info` pour ce tag :
-  https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/0.24.0/hyperliquid/info.py
+Le mode Umbrel utilise exclusivement la collecte publique mainnet ; la présence d’une
+URL publique testnet dans l’adaptateur ne constitue ni un service testnet, ni une
+promotion des phases 13/14. Le transport WebSocket public reste dédié afin d’observer
+fermeture/erreur, superviser le backoff et imposer une resynchronisation.
 
 ## Sémantique des données
 
@@ -419,9 +387,9 @@ ne doit pas être présentée comme une capture live.
 
 1. Utiliser un dossier de données neuf et dédié à ce run, sans supprimer les
    preuves d’un run précédent.
-2. Archiver la révision Git, `python --version`, la sortie de
-   `python -m pip freeze` et son SHA-256, la version
-   `hyperliquid-python-sdk==0.24.0`, l’OS et l’heure UTC de départ.
+2. Archiver la révision Git, `python --version`, les SHA-256 de
+   `requirements-runtime.lock`, `requirements-ci.lock` et du manifest source, l’OS et
+   l’heure UTC de départ ; confirmer que le graphe ne contient aucun SDK exchange.
 3. Lancer `ruff check .`, `mypy src/hyperlab` et `pytest` avec succès.
 4. Vérifier le test replay deux fois et archiver les hashes canoniques.
 5. Choisir à l’avance les deux fenêtres de coupure contrôlée et les seuils

@@ -21,7 +21,7 @@ PHASES ULTÉRIEURES, services et versions séparés
 ## Principe de séparation
 
 Le collecteur, le moteur de stratégie, le paper engine, le dashboard et un éventuel
-exécuteur réel ne doivent pas partager le même niveau de privilège. HyperLab 0.2.0
+exécuteur réel ne doivent pas partager le même niveau de privilège. HyperLab 0.2.1
 reste read-only vis-à-vis des venues : le paper engine transforme les décisions en
 événements d'ordre **simulés localement**, sans clé, signature, client privé ou
 transport d'ordre. Le dashboard ne peut ni soumettre une décision, ni annuler un

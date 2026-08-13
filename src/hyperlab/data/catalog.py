@@ -11,7 +11,6 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -49,6 +48,13 @@ def _sha256(path: Path) -> str:
 
 def build_catalog(root: Path, database: Path) -> Path:
     """Rebuild a derived DuckDB catalog from hash-validated immutable partitions."""
+
+    try:
+        import duckdb
+    except ImportError:
+        raise DataLakeError(
+            "DuckDB catalog support is optional; install hyperlab[research]"
+        ) from None
 
     inventory = inventory_partitions(root)
     database_target = database.resolve()
@@ -274,12 +280,20 @@ def _load_sorted_export(
 
 
 def _publish_export(temporary: Path, output: Path) -> None:
+    with temporary.open("r+b") as stream:
+        os.fsync(stream.fileno())
     try:
         os.link(temporary, output)
     except FileExistsError:
         raise DataLakeError(f"output already exists: {output}") from None
     finally:
         temporary.unlink(missing_ok=True)
+    if os.name != "nt":
+        descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _csv_value(value: object) -> str:

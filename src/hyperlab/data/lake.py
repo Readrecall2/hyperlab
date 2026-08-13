@@ -1090,6 +1090,36 @@ def _publish_exclusive(temporary: Path, target: Path, *, expected_bytes: bytes |
             raise PartitionExistsError(f"refusing to overwrite immutable file: {target.name}") from None
     finally:
         temporary.unlink(missing_ok=True)
+        _fsync_directory(target.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory entries on Linux; Windows has no portable directory fsync."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _mkdir_parents_durable(root: Path, leaf: Path) -> None:
+    """Create a partition path and persist every new directory entry on Linux."""
+
+    canonical_root = root.resolve()
+    _require_under_root(canonical_root, leaf, label="partition leaf")
+    missing: list[Path] = []
+    current = leaf
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            raise PartitionValidationError("partition path has no existing ancestor")
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        _fsync_directory(directory.parent)
 
 
 def _schema_spec_for_write(key: PartitionKey, table: pa.Table) -> SchemaSpec:
@@ -1131,7 +1161,7 @@ def write_partition(
     canonical_root = root.resolve()
     leaf = key.path(root)
     _require_under_root(canonical_root, leaf, label="partition leaf")
-    leaf.mkdir(parents=True, exist_ok=True)
+    _mkdir_parents_durable(root, leaf)
     _require_under_root(canonical_root, leaf, label="partition leaf")
     temporary = leaf / f".{uuid.uuid4().hex}.parquet.tmp"
     _require_under_root(canonical_root, temporary, label="temporary Parquet")
@@ -1147,6 +1177,11 @@ def write_partition(
             row_group_size=65_536,
             store_schema=True,
         )
+        # PyArrow closes the file before returning, but a close alone does not make
+        # the bytes durable across abrupt power loss.  Sync before publishing the
+        # content-addressed name, then sync the directory in _publish_exclusive.
+        with temporary.open("r+b") as stream:
+            os.fsync(stream.fileno())
         digest = _sha256(temporary)
         data_file = f"part-{digest}.parquet"
         data_path = leaf / data_file

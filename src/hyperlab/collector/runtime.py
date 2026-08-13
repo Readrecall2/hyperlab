@@ -37,7 +37,7 @@ from hyperlab.collector.websocket import (
     PublicSocketFactory,
     ReceivedWireMessage,
 )
-from hyperlab.data.lake import PartitionValidationError
+from hyperlab.data.lake import DataLakeError
 from hyperlab.data.schema import RecordType
 from hyperlab.storage.sqlite import write_runtime_status
 
@@ -154,7 +154,7 @@ class PublicCollector:
         self._rest_future: Future[tuple[ParsedRecord, ...]] | None = None
         self._rest_refresh_counter = 0
         self._closed = False
-        self._flush_failure: PartitionValidationError | None = None
+        self._flush_failure: Exception | None = None
         self._flush_attempts = 0
         self._successful_flush_attempts = 0
         self._connection_attempts: deque[float] = deque()
@@ -175,6 +175,7 @@ class PublicCollector:
         request_timeout_seconds: float,
         socket_factory: PublicSocketFactory,
         sink: LakeSink | None = None,
+        validate_storage_integrity: bool = False,
     ) -> PublicCollector:
         rest = HyperliquidPublicClient(
             network=config.network,
@@ -185,6 +186,7 @@ class PublicCollector:
                 data_dir / "lake",
                 batch_size=config.batch_size,
                 queue_capacity=config.queue_capacity,
+                validate_integrity=validate_storage_integrity,
             )
             if sink is None
             else sink
@@ -232,7 +234,7 @@ class PublicCollector:
             else:
                 try:
                     self._flush()
-                except PartitionValidationError as exc:
+                except (DataLakeError, OSError) as exc:
                     with suppress(Exception):
                         self._publish_status(error=f"{type(exc).__name__}: {exc}")
                     raise
@@ -641,7 +643,7 @@ class PublicCollector:
         self._flush_attempts += 1
         try:
             result = self.sink.flush()
-        except PartitionValidationError as exc:
+        except (DataLakeError, OSError) as exc:
             self._flush_failure = exc
             raise
         self._successful_flush_attempts += 1
@@ -695,6 +697,9 @@ class PublicCollector:
             "network": self.config.network,
             "updated_at": now.isoformat(),
             "pending_rows": self.sink.pending_count,
+            "unclean_restart_detected": bool(
+                getattr(self.sink, "unclean_restart_detected", False)
+            ),
             "metrics": self.metrics.as_dict(now),
         }
         if self.metrics.last_error is not None:

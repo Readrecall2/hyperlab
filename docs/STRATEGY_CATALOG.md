@@ -105,7 +105,15 @@ PnL par régime et rejette une performance concentrée uniquement en `trend_up`.
 
 **Risques :** adverse selection, file d'attente inconnue, inventaire, cancel tardif, panne, événement brutal.
 
-**Exigence :** replay L2 event-by-event, modèle de queue, délai réel, rejets, fills partiels et cancel acknowledgements.
+**Implémentation Phase 11 :** replay L2 event-by-event déterministe, fair value
+multi-venue, queue agrégée, latences quote/cancel, perte de priorité au replace,
+fills partiels, markouts 100 ms/1 s/5 s, retrait toxique, hedge taker optionnel et
+pannes fail-closed. Le moteur est `EVENT_REPLAY_RESEARCH_ONLY` ; la démo
+synthétique antérieure reste `TOY`.
+
+**Exigence restante :** séquences cibles observables, modèle de queue/latence/frais
+calibré sur données réelles, rejets et acknowledgements privés, validation
+chronologique hors échantillon. Voir [`MARKET_MAKING_PHASE11.md`](MARKET_MAKING_PHASE11.md).
 
 ## Exclusions
 

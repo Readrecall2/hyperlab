@@ -14,7 +14,7 @@ Le dépôt livré contient :
 - des coûts configurables ;
 - des limites d'exposition ;
 - six baselines bar-level ;
-- un simulateur simplifié de market making ;
+- un simulateur `TOY` et un replay L2 Phase 11 de recherche pour le market making ;
 - un générateur synthétique déterministe pour vérifier l'installation ;
 - un lecteur public Hyperliquid spot/perp ;
 - un stockage SQLite ;
@@ -31,7 +31,7 @@ Le dépôt livré contient :
 - aucune clé ;
 - aucun wallet ;
 - aucun paper engine événementiel complet ;
-- aucun replay L2 réel ;
+- aucune validation économique L2 calibrée sur données réelles ;
 - aucune preuve qu'une stratégie est rentable ;
 - aucun passage automatique vers testnet ou mainnet.
 
@@ -85,7 +85,7 @@ Pour une stratégie sub-seconde, le mini-PC domestique pourra servir de laborato
 | 3 | Pairs trading | Relative value | Élevée | Baseline incluse |
 | 3 | Momentum/régime | Directionnelle | Élevée | Baseline incluse |
 | 4 | Lead-lag | Très court terme | Très élevée | Prototype horaire seulement |
-| 4 | Market making | Inventaire + spread | Extrême | Simulateur jouet seulement |
+| 4 | Market making | Inventaire + spread | Extrême | Replay L2 Phase 11 ; démo synthétique `TOY` |
 
 ### 3.1 Cash-and-carry
 
@@ -173,6 +173,15 @@ Le prototype inclus utilise des barres horaires uniquement pour exercer le moteu
 Le bot place bid et ask autour d'une fair value, réduit son risque selon l'inventaire et retire ses ordres quand le flux devient toxique.
 
 Un simple backtest OHLC est invalide ici. Il faut estimer la place dans la file, les fills, les cancel/replace et l'adverse selection.
+
+La Phase 11 ajoute un replay causal par `received_time`, reconstruit snapshots et
+deltas atomiques, calcule fair value multi-venue, microprice, imbalance et order
+flow, puis simule spread minimal, skew/taille d'inventaire, retrait toxique, file,
+latences quote/cancel, perte de priorité, fills partiels, markouts et hedge taker
+optionnel. Les gaps et pannes bloquent la cotation. Sans séquences Hyperliquid
+observables ni calibration réelle, le statut reste
+`BLOCKED_INSUFFICIENT_REAL_DATA` et la démo synthétique reste `TOY`. Voir
+[`MARKET_MAKING_PHASE11.md`](MARKET_MAKING_PHASE11.md).
 
 ---
 
@@ -842,6 +851,13 @@ Objectif : edge après latence et coûts réels.
 ### Market making
 
 Objectif : spread net après markout adverse, queue et inventaire.
+
+Le rapport Phase 11 sépare spread capturé, markout et adverse selection à 100 ms,
+1 s et 5 s. Il publie aussi inventaire maximal, taux maker/taker, fill ratio,
+cancel-to-fill, tailles, retraits toxiques, pertes pendant spikes, gaps,
+resynchronisations et quotes abandonnées. Le replay exige deux venues, des
+séquences cibles et une preuve SHA-256 de calibration pour quitter ses statuts
+bloqués ; il reste dans tous les cas un outil de recherche sans route d'ordre.
 
 Ces deux modules ne doivent pas retarder le déploiement du collecteur lent : leurs données sont collectées en parallèle.
 

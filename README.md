@@ -12,7 +12,7 @@ Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher et backt
 4. pairs trading / retour à la moyenne ;
 5. momentum avec sizing par volatilité ;
 6. lead-lag multi-exchange, baseline bar-level ;
-7. market making avec inventaire, simulateur microstructurel simplifié.
+7. market making avec replay L2 événementiel de recherche ; la démo synthétique reste `TOY`.
 
 Les résultats de démonstration utilisent des données synthétiques et servent uniquement à vérifier l'installation. La fixture Cash & Carry comprend une fenêtre BTC explicitement étiquetée pour exercer une entrée, les deux jambes, le hedge IOC, le funding, les coûts et une sortie ; elle ne valide aucune rentabilité. Le basket Phase 06 compare ranking inverse-vol et optimisation dollar/bêta BTC/ETH neutre, avec covariance shrinkée, pénalité de turnover et stress dédiés ; ses scénarios synthétiques ne valident pas davantage une rentabilité. La Phase 07 ajoute deux comptes de marge indépendants, transferts, liquidation locale et pannes 1 h/6 h/24 h ; sa démo reste elle aussi strictement synthétique.
 
@@ -114,6 +114,15 @@ déployable plafonnée à 1×. Le rapport ventile le PnL par régime et vérifie
 provient pas uniquement de `trend_up`. Sans historique point-in-time multi-régimes
 et modèles calibrés, aucune performance économique n'est revendiquée. Voir
 [`docs/MOMENTUM_REGIME_PHASE09.md`](docs/MOMENTUM_REGIME_PHASE09.md).
+
+La Phase 11 ajoute un replay L2 déterministe : fair value multi-venue, microprice,
+imbalance, order flow, spread couvrant frais/toxicité, skew et taille d'inventaire,
+retrait toxique, file, cancel/replace avec perte de priorité, fills partiels,
+markouts 100 ms/1 s/5 s, hedge taker optionnel et traitement fail-closed des gaps
+et pannes. Le checkout ne contient pas encore les données et calibrations réelles
+requises ; le statut économique reste `BLOCKED_INSUFFICIENT_REAL_DATA` et la démo
+historique reste `TOY`. Voir
+[`docs/MARKET_MAKING_PHASE11.md`](docs/MARKET_MAKING_PHASE11.md).
 
 Le basket de funding Phase 06, son filtre de squeeze, sa neutralisation, ses stress
 de corrélation/squeeze et sa validation leave-one-out avec marchés délistés sont

@@ -30,6 +30,7 @@ class InventoryAwareMarketMaker:
     toxicity_limit: float = 1.35
     queue_ahead_units: float = 1.5
     seed: int = 123
+    simulation_label: str = "TOY"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -242,7 +243,8 @@ class InventoryAwareMarketMaker:
             weights=weights,
             metrics=metrics,
             diagnostics={
-                "warning": "synthetic queue model only; not sufficient for live deployment",
+                "simulation_label": self.simulation_label,
+                "warning": "TOY synthetic queue model only; not sufficient for live deployment",
                 "fill_timing": "event t flow applies only to quotes created at t-1",
                 "maker_fills": maker_fills,
                 "partial_fills": partial_fills,

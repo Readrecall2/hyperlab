@@ -361,3 +361,91 @@ inobservables. La limite de corrélation utilise une fenêtre rolling et ne gara
 pas qu'une corrélation ne change pas après l'entrée. Les seuils, horizons, coûts et
 notionnels de liquidations doivent être préenregistrés puis calibrés sur données
 réelles avant toute conclusion économique.
+
+---
+
+# Validation — Phase 11, market making adaptatif
+
+Date de validation : 13 août 2026
+
+Checkpoint antérieur aux travaux : `2ae488f`
+
+Branche : `phase-11-market-making`
+
+Contrôles globaux : `ruff check .`, `mypy src/hyperlab` (67 fichiers) et les
+546 tests `pytest -p no:cacheprovider` passent avec un code de sortie nul. Le cache
+pytest est désactivé parce que `.pytest_cache` n'est pas inscriptible dans le sandbox.
+Le lanceur du
+`.venv` référence un Python 3.12 supprimé ; les contrôles utilisent donc le runtime
+Python 3.12 embarqué par Codex avec `src` et `.venv/Lib/site-packages` dans
+`PYTHONPATH`, et un `TEMP` local au workspace. Ce contournement ne modifie ni le
+code ni les dépendances testées.
+
+## Verdict Phase 11
+
+Le cadre logiciel Phase 11 est implémenté : replay L2 causal par timestamp de
+réception, snapshots/en-têtes atomiques, deltas séquencés, trades groupés par trame,
+fair value multi-venue, microprice, imbalance, order flow, spread frais/toxicité,
+skew et taille d'inventaire, retrait toxique, queue, cancel/replace, fills partiels,
+markouts 100 ms/1 s/5 s, adverse selection, hedge taker optionnel, spikes et pannes.
+
+La validation économique reste `BLOCKED_INSUFFICIENT_REAL_DATA`. Le dossier `data`
+de ce checkout ne contient aucun lake Phase 11 réel. En outre, les snapshots
+Hyperliquid `l2Book` normalisés n'exposent pas de séquence serveur publique ; ils ne
+peuvent donc pas satisfaire la gate de couverture sans preuve supplémentaire. Les
+frais, latences, position de queue, toxicité et seuils ne sont pas calibrés. Aucun
+rendement réel n'est calculé ou revendiqué.
+
+Le simulateur synthétique historique reste explicitement `TOY`. Le nouveau moteur
+reste `EVENT_REPLAY_RESEARCH_ONLY`, même si un hash de calibration est fourni. Il
+n'existe aucun client privé, secret, signer, import
+`hyperliquid.exchange.Exchange`, ni route permettant d'envoyer, modifier ou annuler
+un ordre réel.
+
+## Contrôles de causalité et microstructure
+
+- une quote créée à `t` ne peut pas être remplie par le flux reçu à `t` ;
+- toutes les transactions d'une même trame reçue sont appliquées aux seules quotes
+  préexistantes avant recalcul de l'order flow et des quotes ;
+- modifier un carnet futur ne réécrit ni observations ni fills du préfixe ;
+- chaque `l2_book_state` est rapproché de tous les niveaux du `snapshot_id`, avec
+  niveaux uniques, contigus et nombres bid/ask exacts ;
+- un delta non croissant est refusé et un gap suspend la cotation jusqu'à une
+  resynchronisation explicite ;
+- les quantités affichées devant la quote sont consommées avant tout fill ; une
+  baisse de quantité L2 réduit seulement la file devant nous, une hausse n'ajoute
+  pas de priorité devant un ordre déjà posé ;
+- un carnet qui traverse une quote active sans trade public ne fabrique pas de
+  fill : il bloque l'état comme trade-through non résolu ; avant activation, il
+  compte un rejet post-only simulé ;
+- un remplacement attend la latence d'annulation et repart derrière la quantité
+  affichée, tandis que l'ancienne quote reste exposée avant acknowledgement ;
+- une venue configurée mais stale bloque la fair value au lieu d'un fallback
+  silencieux ;
+- une coupure compte les quotes abandonnées, interdit les fills fantômes et laisse
+  le statut `BLOCKED_UNRECONCILED_QUOTES` sans resynchronisation ;
+- les markouts séparent spread capturé et déplacement adverse de fair value.
+
+## Audit, rapports et gates
+
+`market-making-audit` valide les manifestes immuables du lake, les en-têtes et
+niveaux L2, les trades, deux venues, les timestamps UTC, l'absence d'égalité
+inter-frame ambiguë, les séquences cibles, les gaps, les resynchronisations et la
+preuve SHA-256 de calibration. `market-making-replay` écrit un readiness report et
+s'arrête avant simulation si cet audit échoue.
+
+Le rapport JSON/HTML reproductible publie configuration et manifestes hashés, PnL
+net/spread/frais/hedge, markouts et adverse selection, inventaire maximal, taux
+maker/taker, fill ratio, cancel-to-fill, fills partiels, tailles, retraits toxiques,
+spikes, gaps, pannes et quotes abandonnées. Une étiquette `SYNTHETIC`, `TOY`,
+`UNVERIFIED`, `DEFAULT` ou `PLACEHOLDER` ne peut pas être déclarée `CALIBRATED`.
+
+## Limites restantes
+
+Le carnet agrégé ne fournit pas l'identité order-by-order, la liquidité cachée,
+les acknowledgements ou rejets privés, ni la véritable position de notre ordre.
+Les variations de quantité affichée ne distinguent pas parfaitement annulation et
+exécution. La calibration doit être effectuée chronologiquement sur train, figée
+sur validation puis évaluée sur un test final non utilisé pour le réglage. Ces
+limites et les commandes de reproduction sont détaillées dans
+`docs/MARKET_MAKING_PHASE11.md`.

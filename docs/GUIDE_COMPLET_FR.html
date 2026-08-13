@@ -53,7 +53,7 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
 <li>des coûts configurables ;</li>
 <li>des limites d'exposition ;</li>
 <li>six baselines bar-level ;</li>
-<li>un simulateur simplifié de market making ;</li>
+<li>un simulateur <code>TOY</code> et un replay L2 Phase 11 de recherche pour le market making ;</li>
 <li>un générateur synthétique déterministe pour vérifier l'installation ;</li>
 <li>un lecteur public Hyperliquid spot/perp ;</li>
 <li>un stockage SQLite ;</li>
@@ -70,7 +70,7 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
 <li>aucune clé ;</li>
 <li>aucun wallet ;</li>
 <li>aucun paper engine événementiel complet ;</li>
-<li>aucun replay L2 réel ;</li>
+<li>aucune validation économique L2 calibrée sur données réelles ;</li>
 <li>aucune preuve qu'une stratégie est rentable ;</li>
 <li>aucun passage automatique vers testnet ou mainnet.</li>
 </ul>
@@ -163,7 +163,7 @@ footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:v
   <td>Market making</td>
   <td>Inventaire + spread</td>
   <td>Extrême</td>
-  <td>Simulateur jouet seulement</td>
+  <td>Replay L2 Phase 11 ; démo synthétique <code>TOY</code></td>
 </tr>
 </tbody>
 </table>
@@ -228,6 +228,14 @@ d'un bull market. Voir <a href="MOMENTUM_REGIME_PHASE09.md"><code>MOMENTUM_REGIM
 <h3 id="3-7-market-making">3.7 Market making<a class="heading-link" href="#3-7-market-making" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot place bid et ask autour d'une fair value, réduit son risque selon l'inventaire et retire ses ordres quand le flux devient toxique.</p>
 <p>Un simple backtest OHLC est invalide ici. Il faut estimer la place dans la file, les fills, les cancel/replace et l'adverse selection.</p>
+<p>La Phase 11 ajoute un replay causal par <code>received_time</code>, reconstruit snapshots et
+deltas atomiques, calcule fair value multi-venue, microprice, imbalance et order
+flow, puis simule spread minimal, skew/taille d'inventaire, retrait toxique, file,
+latences quote/cancel, perte de priorité, fills partiels, markouts et hedge taker
+optionnel. Les gaps et pannes bloquent la cotation. Sans séquences Hyperliquid
+observables ni calibration réelle, le statut reste
+<code>BLOCKED_INSUFFICIENT_REAL_DATA</code> et la démo synthétique reste <code>TOY</code>. Voir
+<a href="MARKET_MAKING_PHASE11.md"><code>MARKET_MAKING_PHASE11.md</code></a>.</p>
 <hr />
 <h2 id="4-philosophie-des-resultats">4. Philosophie des résultats<a class="heading-link" href="#4-philosophie-des-resultats" aria-label="Lien vers cette section">#</a></h2>
 <p>HyperLab ne contient aucun objectif du type « 1 % par mois ». Le backtest peut afficher :</p>
@@ -688,6 +696,12 @@ calibrée, le statut reste bloqué.</p>
 <p>Objectif : edge après latence et coûts réels.</p>
 <h3 id="market-making">Market making<a class="heading-link" href="#market-making" aria-label="Lien vers cette section">#</a></h3>
 <p>Objectif : spread net après markout adverse, queue et inventaire.</p>
+<p>Le rapport Phase 11 sépare spread capturé, markout et adverse selection à 100 ms,
+1 s et 5 s. Il publie aussi inventaire maximal, taux maker/taker, fill ratio,
+cancel-to-fill, tailles, retraits toxiques, pertes pendant spikes, gaps,
+resynchronisations et quotes abandonnées. Le replay exige deux venues, des
+séquences cibles et une preuve SHA-256 de calibration pour quitter ses statuts
+bloqués ; il reste dans tous les cas un outil de recherche sans route d'ordre.</p>
 <p>Ces deux modules ne doivent pas retarder le déploiement du collecteur lent : leurs données sont collectées en parallèle.</p>
 <hr />
 <h1 id="partie-h-paper-testnet-et-vrai-argent">PARTIE H — PAPER, TESTNET ET VRAI ARGENT<a class="heading-link" href="#partie-h-paper-testnet-et-vrai-argent" aria-label="Lien vers cette section">#</a></h1>

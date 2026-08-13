@@ -66,6 +66,13 @@ from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
 from hyperlab.strategies.funding_basket import FundingBasketStrategy
 from hyperlab.strategies.market_making import InventoryAwareMarketMaker
+from hyperlab.strategies.market_making_l2 import (
+    AdaptiveMarketMakerConfig,
+    L2MarketMakingReplay,
+    audit_market_making_records,
+    load_market_making_records,
+    write_market_making_report,
+)
 from hyperlab.strategies.registry import STRATEGY_CATALOG, STRATEGY_FACTORIES, create_strategy
 
 app = typer.Typer(
@@ -821,6 +828,125 @@ def momentum_backtest(
     report = write_momentum_report(validation, output_dir=output)
     console.print(f"Statut Phase 09 : {validation.status}")
     console.print(f"Rapport Phase 09 : {report.resolve()}")
+
+
+@app.command("market-making-audit")
+def market_making_audit(
+    data: Annotated[Path, typer.Option(help="Racine du lake Parquet immuable")],
+    asset: Annotated[str, typer.Option(help="Actif public a auditer")] = "BTC",
+    target_venue: Annotated[str, typer.Option(help="Venue simulee")] = "hyperliquid",
+    reference_venues: Annotated[
+        str,
+        typer.Option(help="Venues publiques de fair value, separees par des virgules"),
+    ] = "binance_usdm",
+    output: Annotated[
+        Path,
+        typer.Option(help="Rapport JSON de preparation Phase 11"),
+    ] = Path("reports/market-making-readiness.json"),
+    minimum_events: Annotated[int, typer.Option(min=1)] = 10_000,
+    calibration_evidence_hash: Annotated[
+        str | None,
+        typer.Option(help="SHA-256 optionnel de la preuve de calibration"),
+    ] = None,
+) -> None:
+    """Audite les flux L2 Phase 11 sans reseau, secret ni route d'ordre."""
+
+    references = _csv_values(reference_venues, label="reference_venues")
+    venues = (target_venue, *references)
+    records, manifests = load_market_making_records(data, asset=asset, venues=venues)
+    audit = audit_market_making_records(
+        records,
+        asset=asset,
+        target_venue=target_venue,
+        minimum_events=minimum_events,
+        calibration_evidence_hash=calibration_evidence_hash,
+        manifest_hashes=(manifest.sha256 for manifest in manifests),
+    )
+    payload = audit.as_dict()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    console.print_json(json.dumps(payload, ensure_ascii=False))
+    console.print(f"Rapport Phase 11 : {output.resolve()}")
+    if not audit.passed:
+        raise typer.Exit(2)
+
+
+@app.command("market-making-replay")
+def market_making_replay(
+    data: Annotated[Path, typer.Option(help="Racine du lake Parquet immuable")],
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 11")] = Path(
+        "reports/market-making"
+    ),
+    asset: Annotated[str, typer.Option(help="Actif public a rejouer")] = "BTC",
+    target_venue: Annotated[str, typer.Option(help="Venue simulee")] = "hyperliquid",
+    reference_venues: Annotated[
+        str,
+        typer.Option(help="Venues publiques de fair value, separees par des virgules"),
+    ] = "binance_usdm",
+    minimum_events: Annotated[int, typer.Option(min=1)] = 10_000,
+    calibration_evidence_hash: Annotated[
+        str | None,
+        typer.Option(help="SHA-256 optionnel de la preuve de calibration"),
+    ] = None,
+    maker_fee_bps: Annotated[float, typer.Option(min=0.0)] = 1.5,
+    taker_fee_bps: Annotated[float, typer.Option(min=0.0)] = 4.5,
+    quote_latency_ms: Annotated[int, typer.Option(min=0)] = 25,
+    cancel_latency_ms: Annotated[int, typer.Option(min=0)] = 25,
+) -> None:
+    """Rejoue le carnet event-by-event; ne construit et n'envoie aucun ordre."""
+
+    references = _csv_values(reference_venues, label="reference_venues")
+    venues = (target_venue, *references)
+    records, manifests = load_market_making_records(data, asset=asset, venues=venues)
+    audit = audit_market_making_records(
+        records,
+        asset=asset,
+        target_venue=target_venue,
+        minimum_events=minimum_events,
+        calibration_evidence_hash=calibration_evidence_hash,
+        manifest_hashes=(manifest.sha256 for manifest in manifests),
+    )
+    if not audit.passed:
+        output.mkdir(parents=True, exist_ok=True)
+        readiness = output / "market_making_readiness.json"
+        temporary = readiness.with_name(f".{readiness.name}.tmp")
+        temporary.write_text(
+            json.dumps(audit.as_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(readiness)
+        console.print("Statut Phase 11 : BLOCKED_DATA_READINESS")
+        console.print(f"Audit Phase 11 : {readiness.resolve()}")
+        raise typer.Exit(2)
+    weights = {target_venue: 0.75}
+    reference_weight = 0.25 / len(references)
+    weights.update({venue: reference_weight for venue in references})
+    config = AdaptiveMarketMakerConfig(
+        target_venue=target_venue,
+        asset=asset,
+        maker_fee_bps=maker_fee_bps,
+        taker_fee_bps=taker_fee_bps,
+        quote_latency_ms=quote_latency_ms,
+        cancel_latency_ms=cancel_latency_ms,
+        venue_weights=weights,
+        calibration_status=(
+            "CALIBRATED" if calibration_evidence_hash is not None else "UNCALIBRATED"
+        ),
+        calibration_evidence_hash=calibration_evidence_hash,
+        data_label="IMMUTABLE_LAKE_REPLAY",
+    )
+    result = L2MarketMakingReplay(config).run(records)
+    report = write_market_making_report(result, output_dir=output, audit=audit)
+    console.print(f"Statut Phase 11 : {result.status}")
+    console.print(f"Audit Phase 11 : {'PASS' if audit.passed else 'BLOCKED'}")
+    console.print(f"Rapport Phase 11 : {report.resolve()}")
+    if result.status != "RESEARCH_REPLAY_COMPLETE":
+        raise typer.Exit(2)
 
 
 @app.command("cross-exchange-backtest")

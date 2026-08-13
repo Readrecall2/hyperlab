@@ -75,9 +75,9 @@ STRATEGY_CATALOG: dict[str, CatalogEntry] = {
     "inventory_market_making": {
         "label": "Market making adaptatif",
         "tier": "Niveau 4 — agressif",
-        "status": "Simulateur jouet, pas validateur live",
-        "data": "Replay L2 event-by-event + file d'attente + rejets",
-        "summary": "Cotation bid/ask avec skew d'inventaire et filtre de toxicité.",
+        "status": "Replay L2 Phase 11 inclus; démo synthétique toujours TOY",
+        "data": "Snapshots/deltas/trades multi-venues, séquences et timestamps de réception",
+        "summary": "Fair value, queue, latences, markouts et pannes; aucune route d'ordre.",
     },
 }
 

@@ -5,7 +5,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -433,9 +433,7 @@ class PublicCollector:
 
                     self._update_staleness(observed_at)
                     critical_stale = tuple(
-                        key
-                        for key in self.metrics.stale_channels
-                        if key in self._critical_stream_keys
+                        key for key in self.metrics.stale_channels if key in self._critical_stream_keys
                     )
                     if live and critical_stale:
                         raise TimeoutError(f"stale critical public streams: {list(critical_stale)}")
@@ -616,18 +614,22 @@ class PublicCollector:
                         current = self.metrics.last_exchange_event_by_channel.get(metric_key)
                         if current is None or latest > current:
                             self.metrics.last_exchange_event_by_channel[metric_key] = latest
-        for record in parsed.records:
-            self._store_record(record)
+        self._store_records(parsed.records)
         return parsed
 
     def _store_record(self, record: ParsedRecord) -> None:
-        if record.record_type == RecordType.FUNDING:
-            funding_time = record.row.get("funding_time")
-            if isinstance(funding_time, datetime):
-                current = self.metrics.last_funding_by_asset.get(record.asset)
-                if current is None or funding_time > current:
-                    self.metrics.last_funding_by_asset[record.asset] = funding_time
-        self.sink.add(record)
+        self._store_records((record,))
+
+    def _store_records(self, records: Iterable[ParsedRecord]) -> None:
+        batch = tuple(records)
+        for record in batch:
+            if record.record_type == RecordType.FUNDING:
+                funding_time = record.row.get("funding_time")
+                if isinstance(funding_time, datetime):
+                    current = self.metrics.last_funding_by_asset.get(record.asset)
+                    if current is None or funding_time > current:
+                        self.metrics.last_funding_by_asset[record.asset] = funding_time
+        self.sink.add_many(batch)
         self.metrics.queue_high_water = max(
             self.metrics.queue_high_water,
             self.sink.high_water,

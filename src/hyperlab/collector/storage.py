@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -51,6 +52,7 @@ class LakeSink(Protocol):
     def should_flush(self) -> bool: ...
 
     def add(self, record: ParsedRecord) -> bool: ...
+    def add_many(self, records: Iterable[ParsedRecord]) -> int: ...
 
     def flush(self) -> FlushResult: ...
 
@@ -517,6 +519,33 @@ class BatchingLakeSink:
             self._pending_stable_primary_keys.add(stable_primary_key)
         return True
 
+    def add_many(self, records: Iterable[ParsedRecord]) -> int:
+        """Add one logical source batch without exposing a partial batch to a flush."""
+
+        batch = tuple(records)
+        if len(batch) > self.queue_capacity - self._pending_count:
+            raise BufferError("collector queue capacity exceeded before atomic batch; no record was added")
+        groups = {key: group.copy() for key, group in self._groups.items()}
+        recent = self._recent.copy()
+        observations = self._observations.copy()
+        pending_observations = self._pending_observations.copy()
+        pending_stable_primary_keys = self._pending_stable_primary_keys.copy()
+        pending_count = self._pending_count
+        duplicate_count = self._duplicate_count
+        high_water = self.high_water
+        try:
+            return sum(self.add(record) for record in batch)
+        except BaseException:
+            self._groups = groups
+            self._recent = recent
+            self._observations = observations
+            self._pending_observations = pending_observations
+            self._pending_stable_primary_keys = pending_stable_primary_keys
+            self._pending_count = pending_count
+            self._duplicate_count = duplicate_count
+            self.high_water = high_water
+            raise
+
     def flush(self) -> FlushResult:
         if not self._groups:
             duplicates = self._duplicate_count
@@ -606,6 +635,7 @@ class BatchingLakeSink:
             stream = "default"
         return venue, record_type, asset, day, stream
 
+
 class CoordinatedLakeSink:
     """Venue-scoped view over one process-wide, serialized lake writer."""
 
@@ -628,6 +658,9 @@ class CoordinatedLakeSink:
 
     def add(self, record: ParsedRecord) -> bool:
         return self._owner._client_add(self, record)
+
+    def add_many(self, records: Iterable[ParsedRecord]) -> int:
+        return self._owner._client_add_many(self, records)
 
     def flush(self) -> FlushResult:
         return self._owner._client_flush(self)
@@ -664,9 +697,7 @@ class CoordinatedLakeWriter:
         self._pending_by_venue = {venue: 0 for venue in venues}
         self._high_water_by_venue = {venue: 0 for venue in venues}
         self._duplicates_since_flush = {venue: 0 for venue in venues}
-        self._manifest_credit: dict[str, list[PartitionManifest]] = {
-            venue: [] for venue in venues
-        }
+        self._manifest_credit: dict[str, list[PartitionManifest]] = {venue: [] for venue in venues}
         self._row_credit = {venue: 0 for venue in venues}
         self._duplicate_credit = {venue: 0 for venue in venues}
         self._closed = False
@@ -692,9 +723,7 @@ class CoordinatedLakeWriter:
         if self._closed:
             raise CoordinatedWriterError("coordinated lake writer is closed")
         if client._closed or self._clients.get(client.venue) is not client:
-            raise CoordinatedWriterError(
-                f"coordinated lake client for {client.venue!r} is closed"
-            )
+            raise CoordinatedWriterError(f"coordinated lake client for {client.venue!r} is closed")
 
     def _client_pending(self, client: CoordinatedLakeSink) -> int:
         with self._lock:
@@ -737,6 +766,40 @@ class CoordinatedLakeWriter:
                 self._duplicates_since_flush[client.venue] += 1
             return accepted
 
+    def _client_add_many(
+        self,
+        client: CoordinatedLakeSink,
+        records: Iterable[ParsedRecord],
+    ) -> int:
+        batch = tuple(records)
+        with self._lock:
+            self._require_active(client)
+            mismatched = sorted(
+                {str(record.row.get("venue")) for record in batch if record.row.get("venue") != client.venue}
+            )
+            if mismatched:
+                raise CoordinatedWriterError(
+                    "coordinated lake client venue mismatch: "
+                    f"expected {client.venue!r}, observed {mismatched!r}"
+                )
+            try:
+                if batch and self._sink.should_flush:
+                    self._record_flush(self._sink.flush())
+                accepted = self._sink.add_many(batch)
+            except Exception as exc:
+                raise CoordinatedWriterError(
+                    f"coordinated lake atomic add failed for venue {client.venue!r}"
+                ) from exc
+            duplicates = len(batch) - accepted
+            pending = self._pending_by_venue[client.venue] + accepted
+            self._pending_by_venue[client.venue] = pending
+            self._high_water_by_venue[client.venue] = max(
+                self._high_water_by_venue[client.venue],
+                pending,
+            )
+            self._duplicates_since_flush[client.venue] += duplicates
+            return accepted
+
     def _record_flush(self, result: FlushResult) -> None:
         expected_duplicates = sum(self._duplicates_since_flush.values())
         if result.duplicate_count != expected_duplicates:
@@ -748,9 +811,7 @@ class CoordinatedLakeWriter:
         for manifest in result.manifests:
             venue = manifest.partition.venue
             if venue not in self._venues:
-                raise CoordinatedWriterError(
-                    f"coordinated writer published an incompatible venue: {venue!r}"
-                )
+                raise CoordinatedWriterError(f"coordinated writer published an incompatible venue: {venue!r}")
             rows_by_venue[venue] += manifest.row_count
             self._manifest_credit[venue].append(manifest)
         for venue in self._venues:

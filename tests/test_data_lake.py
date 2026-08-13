@@ -672,6 +672,73 @@ def test_inventory_detects_gaps_and_duplicates_across_segment_boundaries(
         inventory_partitions(duplicate_root)
 
 
+def test_inventory_merges_real_binance_snapshot_split_across_sorted_segments(
+    tmp_path: Path,
+) -> None:
+    """Regression for ETH wire arrival 40862 observed on 2026-08-13."""
+
+    spec = schema_for("l2_snapshot")
+    connection = "fbf0cbd8eb444a2d944e5877bef9c3c6"
+    epoch = f"{connection}:1"
+    event_time = datetime(2026, 8, 13, 0, 34, 15, 69_000, tzinfo=UTC)
+    received_time = datetime(2026, 8, 13, 0, 34, 15, 602_230, tzinfo=UTC)
+    snapshot = f"ws:{connection}:1:40862:ETHUSDT:11274459157841"
+
+    def row(
+        row_event: datetime,
+        row_received: datetime,
+        snapshot_id: str,
+        last_sequence: int,
+        side: str,
+        level: int,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "record_type": "l2_snapshot",
+            "venue": "binance_usdm",
+            "asset": "ETH",
+            "event_time": row_event,
+            "exchange_time": row_event + timedelta(milliseconds=4),
+            "received_time": row_received,
+            "source_sequence": None,
+            "connection_id": connection,
+            "snapshot_id": snapshot_id,
+            "book_epoch_id": epoch,
+            "last_sequence": last_sequence,
+            "side": side,
+            "level": level,
+            "price": Decimal("1880") + Decimal(level) / Decimal("100"),
+            "quantity": Decimal("1"),
+            "order_count": None,
+        }
+
+    earlier_event = datetime(2026, 8, 13, 0, 34, 12, 612_000, tzinfo=UTC)
+    first_rows = [
+        row(
+            earlier_event,
+            earlier_event + timedelta(milliseconds=899),
+            f"ws:{connection}:1:37481:ETHUSDT:11274458515044",
+            11274458515044,
+            "ask",
+            0,
+        ),
+        *[row(event_time, received_time, snapshot, 11274459157841, "ask", level) for level in range(5)],
+        *[row(event_time, received_time, snapshot, 11274459157841, "bid", level) for level in range(20)],
+    ]
+    second_rows = [
+        row(event_time, received_time, snapshot, 11274459157841, "ask", level) for level in range(5, 20)
+    ]
+    key = PartitionKey("binance_usdm", date(2026, 8, 13), "ETH", "l2_snapshot")
+    first = write_partition(tmp_path, key, pa.Table.from_pylist(first_rows, schema=spec.schema))
+    second = write_partition(tmp_path, key, pa.Table.from_pylist(second_rows, schema=spec.schema))
+
+    assert validate_partition(tmp_path / first.relative_manifest_path) == first
+    assert validate_partition(tmp_path / second.relative_manifest_path) == second
+    inventory = inventory_partitions(tmp_path)
+    assert inventory.total_rows == 41
+    assert inventory.cross_segment_gaps == ()
+
+
 def test_inventory_rejects_a_canonical_parquet_without_its_manifest(tmp_path: Path) -> None:
     key = PartitionKey("hyperliquid", DAY, "BTC", "candle")
     manifest = write_partition(tmp_path, key, _candle_table())

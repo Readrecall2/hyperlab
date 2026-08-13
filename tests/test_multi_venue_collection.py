@@ -50,6 +50,33 @@ def _trade(venue: str, index: int) -> ParsedRecord:
     )
 
 
+def _binance_l2_snapshot_level(level: int) -> ParsedRecord:
+    event_time = BASE + timedelta(seconds=1)
+    return ParsedRecord(
+        RecordType.L2_SNAPSHOT,
+        "ETH",
+        {
+            "schema_version": 1,
+            "record_type": RecordType.L2_SNAPSHOT.value,
+            "venue": "binance_usdm",
+            "asset": "ETH",
+            "event_time": event_time,
+            "exchange_time": event_time,
+            "received_time": event_time + timedelta(milliseconds=500),
+            "source_sequence": None,
+            "connection_id": "binance-connection",
+            "snapshot_id": "ws:binance-connection:1:40862:ETHUSDT:11274459157841",
+            "book_epoch_id": "binance-connection:1",
+            "last_sequence": 11274459157841,
+            "side": "ask" if level >= 20 else "bid",
+            "level": level % 20,
+            "price": Decimal("1880") + Decimal(level) / Decimal("100"),
+            "quantity": Decimal("1"),
+            "order_count": None,
+        },
+    )
+
+
 def test_coordinated_writer_serializes_concurrent_venues_without_dedup_collision(
     tmp_path: Path,
 ) -> None:
@@ -108,6 +135,67 @@ def test_coordinated_writer_serializes_concurrent_venues_without_dedup_collision
     # The coordinator released the unchanged root lock after its single writer closed.
     reopened = BatchingLakeSink(root, batch_size=1, queue_capacity=2)
     reopened.close()
+
+
+def test_coordinated_writer_does_not_flush_inside_one_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lake"
+    writer = CoordinatedLakeWriter(
+        root,
+        venues=VENUES,
+        batch_size=1,
+        queue_capacity=100,
+    )
+    hyperliquid = writer.client("hyperliquid")
+    binance = writer.client("binance_usdm")
+    records = tuple(_binance_l2_snapshot_level(level) for level in range(40))
+    first_add_entered = threading.Event()
+    allow_batch_to_finish = threading.Event()
+    flush_attempted = threading.Event()
+    original_add = writer._sink.add
+    add_calls = 0
+
+    def blocking_add(record: ParsedRecord) -> bool:
+        nonlocal add_calls
+        accepted = original_add(record)
+        add_calls += 1
+        if add_calls == 1:
+            first_add_entered.set()
+            assert allow_batch_to_finish.wait(timeout=5)
+        return accepted
+
+    monkeypatch.setattr(writer._sink, "add", blocking_add)
+
+    def peer_flush() -> object:
+        flush_attempted.set()
+        return hyperliquid.flush()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            batch_future = pool.submit(binance.add_many, records)
+            assert first_add_entered.wait(timeout=5)
+            flush_future = pool.submit(peer_flush)
+            assert flush_attempted.wait(timeout=5)
+            assert not flush_future.done()
+            allow_batch_to_finish.set()
+            assert batch_future.result(timeout=5) == 40
+            flush_future.result(timeout=5)
+
+        result = binance.flush()
+        l2_manifests = [
+            manifest
+            for manifest in result.manifests
+            if manifest.partition.record_type == RecordType.L2_SNAPSHOT
+        ]
+        assert len(l2_manifests) == 1
+        assert l2_manifests[0].row_count == 40
+    finally:
+        allow_batch_to_finish.set()
+        hyperliquid.close()
+        binance.close()
+        writer.close()
 
 
 def test_coordinated_writer_fails_closed_on_wrong_or_incompatible_venue(tmp_path: Path) -> None:

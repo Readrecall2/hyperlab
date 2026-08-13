@@ -1517,25 +1517,32 @@ def _has_completed_resync(
     )
 
 
-def _stream_sort_key(manifest: PartitionManifest) -> tuple[object, ...]:
-    sequence = manifest.sequence_min
-    return (
-        manifest.timestamp_bounds["event_time"]["min"] or "",
-        manifest.timestamp_bounds["received_time"]["min"] or "",
-        (1, 0) if sequence is None else (0, sequence),
-        manifest.data_file,
-    )
+@dataclass(frozen=True, slots=True)
+class _CrossSegmentRow:
+    manifest: PartitionManifest
+    order_key: tuple[tuple[int, object], ...]
+    event_ns: int
+    cadence_ns: int
+    source_sequence: int | None
+    connection_id: str | None
+    wire_epoch: int | None
+    arrival_sequence: int | None
+    l2_identifier: str | None
+    l2_epoch: str | None
+    l2_first_sequence: int | None
+    l2_last_sequence: int | None
 
 
 def _cross_segment_gaps(
     root: Path,
     manifests: tuple[PartitionManifest, ...],
 ) -> tuple[tuple[PartitionKey, Gap], ...]:
-    """Validate streams without concatenating historical Arrow tables.
+    """Merge immutable sorted runs before validating dataset-wide invariants.
 
-    Tables are processed one at a time. Exact global duplicate detection still retains
-    one primary-key tuple per row, so memory is O(number of unique records), not O(all
-    Arrow payload columns).
+    A flush boundary is not a semantic ordering boundary: independently sorted Parquet
+    segments may overlap or split one logical source message. Each segment has already
+    been validated in isolation, so this pass performs a stable merge by the declared
+    schema order key and keeps exact duplicate, cadence, sequence and L2 checks.
     """
 
     grouped: dict[
@@ -1579,14 +1586,14 @@ def _cross_segment_gaps(
             group[0].schema_version,
         )
         seen_primary_keys = primary_keys_by_dataset.setdefault(dataset_key, set())
-        previous_order: tuple[tuple[int, object], ...] | None = None
-        previous_cadence_value: int | None = None
-        previous_cadence_time_ns: int | None = None
-        previous_sequences: dict[str | None, int] = {}
-        previous_arrival_sequences: dict[tuple[str, int], int] = {}
-        previous_l2: tuple[str, str | None, str | None, int | None, int] | None = None
+        is_l2 = sample.record_type in {
+            RecordType.L2_SNAPSHOT,
+            RecordType.L2_DELTA,
+        }
+        l2_identifier_name = "update_id" if sample.record_type == RecordType.L2_DELTA else "snapshot_id"
+        stream_rows: list[_CrossSegmentRow] = []
 
-        for manifest in sorted(group, key=_stream_sort_key):
+        for manifest in group:
             table = read_hashed_table(root, manifest)
             l2_definition = _L2_METADATA_DEFINITIONS.get(RecordType(_record_type_value(sample.record_type)))
             if l2_definition is not None:
@@ -1610,6 +1617,7 @@ def _cross_segment_gaps(
                             f"inconsistent L2 {label} metadata for "
                             f"{identifier_name} {normalized_identifier!r} across partitions"
                         )
+
             primary_rows = _rows_for(table, spec.primary_key)
             order_rows = _rows_for(table, spec.order_key)
             event_ns = pc.cast(table.column("event_time"), pa.int64()).to_pylist()
@@ -1630,11 +1638,6 @@ def _cross_segment_gaps(
                 if sample.record_type == RecordType.WIRE_MESSAGE
                 else [None] * table.num_rows
             )
-            is_l2 = sample.record_type in {
-                RecordType.L2_SNAPSHOT,
-                RecordType.L2_DELTA,
-            }
-            l2_identifier_name = "update_id" if sample.record_type == RecordType.L2_DELTA else "snapshot_id"
             l2_identifiers = (
                 table.column(l2_identifier_name).to_pylist() if is_l2 else [None] * table.num_rows
             )
@@ -1646,194 +1649,206 @@ def _cross_segment_gaps(
             )
             l2_last = table.column("last_sequence").to_pylist() if is_l2 else [None] * table.num_rows
 
-            wire_keys_seen_in_manifest: set[tuple[str, int]] = set()
             for index in range(table.num_rows):
                 primary_key = primary_rows[index]
                 if primary_key in seen_primary_keys:
                     raise PartitionValidationError("duplicate primary keys: 1")
                 seen_primary_keys.add(primary_key)
-
-                order_key = _normalized_row(order_rows[index])
-                if previous_order is not None and order_key < previous_order:
-                    raise PartitionValidationError("out-of-order rows: 1")
-                previous_order = order_key
-
-                current_event_ns = int(event_ns[index])
-                current_cadence_time_ns = int(cadence_ns[index])
-                if expected_interval_ns is None:
-                    current_cadence_value = current_cadence_time_ns
-                    cadence_step: int | None = None
-                elif sample.record_type == RecordType.FUNDING:
-                    current_cadence_value = _funding_bucket(
-                        current_cadence_time_ns,
-                        expected_interval_ns,
-                    )
-                    cadence_step = 1
-                else:
-                    current_cadence_value = current_cadence_time_ns
-                    cadence_step = expected_interval_ns
-                if (
-                    previous_cadence_value is not None
-                    and current_cadence_value != previous_cadence_value
-                    and cadence_step is not None
-                    and index == 0
-                ):
-                    assert previous_cadence_time_ns is not None
-                    difference = current_cadence_value - previous_cadence_value
-                    if difference > cadence_step:
-                        is_funding = sample.record_type == RecordType.FUNDING
-                        result.append(
-                            (
-                                manifest.partition,
-                                Gap(
-                                    kind="funding_bucket" if is_funding else "time",
-                                    start=_timestamp_iso(previous_cadence_time_ns),
-                                    end=_timestamp_iso(current_cadence_time_ns),
-                                    missing_count=(
-                                        difference - 1
-                                        if is_funding
-                                        else max(difference // cadence_step - 1, 1)
-                                    ),
-                                ),
-                            )
-                        )
-                if current_cadence_value != previous_cadence_value:
-                    previous_cadence_value = current_cadence_value
-                    previous_cadence_time_ns = current_cadence_time_ns
-
-                connection = None if connections[index] is None else str(connections[index])
                 raw_sequence = sequences[index]
-                if raw_sequence is not None:
-                    sequence = int(raw_sequence)
-                    prior_sequence = previous_sequences.get(connection)
-                    if prior_sequence is not None and index == 0:
-                        if sequence > prior_sequence + 1:
-                            result.append(
-                                (
-                                    manifest.partition,
-                                    Gap(
-                                        kind="sequence",
-                                        start=str(prior_sequence),
-                                        end=str(sequence),
-                                        missing_count=sequence - prior_sequence - 1,
-                                        connection_id=connection,
-                                    ),
-                                )
-                            )
-                        elif sequence < prior_sequence:
-                            result.append(
-                                (
-                                    manifest.partition,
-                                    Gap(
-                                        kind="sequence_regression",
-                                        start=str(prior_sequence),
-                                        end=str(sequence),
-                                        missing_count=0,
-                                        connection_id=connection,
-                                    ),
-                                )
-                            )
-                    if prior_sequence != sequence:
-                        previous_sequences[connection] = sequence
-
-                if sample.record_type == RecordType.WIRE_MESSAGE:
-                    wire_connection = str(connections[index])
-                    raw_wire_epoch = wire_epochs[index]
-                    raw_arrival_sequence = wire_arrivals[index]
-                    assert raw_wire_epoch is not None
-                    assert raw_arrival_sequence is not None
-                    wire_epoch = int(raw_wire_epoch)
-                    arrival_sequence = int(raw_arrival_sequence)
-                    arrival_key = (wire_connection, wire_epoch)
-                    prior_arrival = previous_arrival_sequences.get(arrival_key)
-                    if prior_arrival is not None and arrival_key not in wire_keys_seen_in_manifest:
-                        if arrival_sequence > prior_arrival + 1:
-                            result.append(
-                                (
-                                    manifest.partition,
-                                    Gap(
-                                        kind="arrival_sequence",
-                                        start=str(prior_arrival),
-                                        end=str(arrival_sequence),
-                                        missing_count=arrival_sequence - prior_arrival - 1,
-                                        connection_id=wire_connection,
-                                    ),
-                                )
-                            )
-                        elif arrival_sequence < prior_arrival:
-                            result.append(
-                                (
-                                    manifest.partition,
-                                    Gap(
-                                        kind="arrival_sequence_regression",
-                                        start=str(prior_arrival),
-                                        end=str(arrival_sequence),
-                                        missing_count=0,
-                                        connection_id=wire_connection,
-                                    ),
-                                )
-                            )
-                    wire_keys_seen_in_manifest.add(arrival_key)
-                    if prior_arrival != arrival_sequence:
-                        previous_arrival_sequences[arrival_key] = arrival_sequence
-
-                if not is_l2:
-                    continue
-                identifier = str(l2_identifiers[index])
-                epoch = None if l2_epochs[index] is None else str(l2_epochs[index])
-                raw_first_sequence = l2_first[index]
-                raw_last_sequence = l2_last[index]
-                first_sequence = None if raw_first_sequence is None else int(str(raw_first_sequence))
-                last_sequence = None if raw_last_sequence is None else int(str(raw_last_sequence))
-                if previous_l2 is not None and identifier != previous_l2[0]:
-                    (
-                        prior_identifier,
-                        prior_epoch,
-                        prior_connection,
-                        prior_last,
-                        prior_event_ns,
-                    ) = previous_l2
-                    reset = (
-                        sample.record_type == RecordType.L2_DELTA
-                        and first_sequence is not None
-                        and prior_last is not None
-                        and first_sequence <= prior_last
+                raw_wire_epoch = wire_epochs[index]
+                raw_arrival_sequence = wire_arrivals[index]
+                raw_l2_first = l2_first[index]
+                raw_l2_last = l2_last[index]
+                stream_rows.append(
+                    _CrossSegmentRow(
+                        manifest=manifest,
+                        order_key=_normalized_row(order_rows[index]),
+                        event_ns=int(event_ns[index]),
+                        cadence_ns=int(cadence_ns[index]),
+                        source_sequence=(None if raw_sequence is None else int(raw_sequence)),
+                        connection_id=(None if connections[index] is None else str(connections[index])),
+                        wire_epoch=(None if raw_wire_epoch is None else int(raw_wire_epoch)),
+                        arrival_sequence=(
+                            None if raw_arrival_sequence is None else int(raw_arrival_sequence)
+                        ),
+                        l2_identifier=(None if l2_identifiers[index] is None else str(l2_identifiers[index])),
+                        l2_epoch=(None if l2_epochs[index] is None else str(l2_epochs[index])),
+                        l2_first_sequence=(None if raw_l2_first is None else int(str(raw_l2_first))),
+                        l2_last_sequence=(None if raw_l2_last is None else int(str(raw_l2_last))),
                     )
-                    transitioned = epoch != prior_epoch or connection != prior_connection or reset
-                    resync_key = (sample.venue, sample.asset, epoch, connection)
-                    if transitioned and not _has_completed_resync(
-                        resyncs,
-                        resync_key,
-                        after_ns=prior_event_ns,
-                        before_ns=current_event_ns,
-                    ):
-                        if sample.record_type == RecordType.L2_SNAPSHOT:
-                            prior_cursor = f"snapshot={prior_identifier}"
-                            current_cursor = f"snapshot={identifier}"
-                        else:
-                            prior_cursor = f"sequence={prior_last}"
-                            current_cursor = f"sequence={first_sequence}"
+                )
+
+        stream_rows.sort(key=lambda item: item.order_key)
+        previous_cadence: tuple[int, int, str] | None = None
+        previous_sequences: dict[str | None, tuple[int, str]] = {}
+        previous_arrival_sequences: dict[tuple[str, int], tuple[int, str]] = {}
+        previous_l2: tuple[str, str | None, str | None, int | None, int] | None = None
+
+        for row in stream_rows:
+            manifest_id = row.manifest.data_file
+            if expected_interval_ns is None:
+                current_cadence_value = row.cadence_ns
+                cadence_step: int | None = None
+            elif sample.record_type == RecordType.FUNDING:
+                current_cadence_value = _funding_bucket(
+                    row.cadence_ns,
+                    expected_interval_ns,
+                )
+                cadence_step = 1
+            else:
+                current_cadence_value = row.cadence_ns
+                cadence_step = expected_interval_ns
+            if previous_cadence is not None and cadence_step is not None:
+                previous_value, previous_time_ns, previous_manifest = previous_cadence
+                difference = current_cadence_value - previous_value
+                if difference > cadence_step and previous_manifest != manifest_id:
+                    is_funding = sample.record_type == RecordType.FUNDING
+                    result.append(
+                        (
+                            row.manifest.partition,
+                            Gap(
+                                kind="funding_bucket" if is_funding else "time",
+                                start=_timestamp_iso(previous_time_ns),
+                                end=_timestamp_iso(row.cadence_ns),
+                                missing_count=(
+                                    difference - 1 if is_funding else max(difference // cadence_step - 1, 1)
+                                ),
+                            ),
+                        )
+                    )
+            previous_cadence = (
+                current_cadence_value,
+                row.cadence_ns,
+                manifest_id,
+            )
+
+            if row.source_sequence is not None:
+                sequence = row.source_sequence
+                prior = previous_sequences.get(row.connection_id)
+                if prior is not None and prior[1] != manifest_id:
+                    prior_sequence = prior[0]
+                    if sequence > prior_sequence + 1:
                         result.append(
                             (
-                                manifest.partition,
+                                row.manifest.partition,
                                 Gap(
-                                    kind="l2_resync_missing",
-                                    start=(
-                                        f"epoch={prior_epoch},connection={prior_connection},{prior_cursor}"
-                                    ),
-                                    end=(f"epoch={epoch},connection={connection},{current_cursor}"),
-                                    missing_count=0,
-                                    connection_id=connection,
+                                    kind="sequence",
+                                    start=str(prior_sequence),
+                                    end=str(sequence),
+                                    missing_count=sequence - prior_sequence - 1,
+                                    connection_id=row.connection_id,
                                 ),
                             )
                         )
-                previous_l2 = (
-                    identifier,
-                    epoch,
-                    connection,
-                    last_sequence,
-                    current_event_ns,
+                    elif sequence < prior_sequence:
+                        result.append(
+                            (
+                                row.manifest.partition,
+                                Gap(
+                                    kind="sequence_regression",
+                                    start=str(prior_sequence),
+                                    end=str(sequence),
+                                    missing_count=0,
+                                    connection_id=row.connection_id,
+                                ),
+                            )
+                        )
+                previous_sequences[row.connection_id] = (sequence, manifest_id)
+
+            if sample.record_type == RecordType.WIRE_MESSAGE:
+                assert row.connection_id is not None
+                assert row.wire_epoch is not None
+                assert row.arrival_sequence is not None
+                arrival_key = (row.connection_id, row.wire_epoch)
+                prior_arrival = previous_arrival_sequences.get(arrival_key)
+                if prior_arrival is not None and prior_arrival[1] != manifest_id:
+                    prior_sequence = prior_arrival[0]
+                    if row.arrival_sequence > prior_sequence + 1:
+                        result.append(
+                            (
+                                row.manifest.partition,
+                                Gap(
+                                    kind="arrival_sequence",
+                                    start=str(prior_sequence),
+                                    end=str(row.arrival_sequence),
+                                    missing_count=row.arrival_sequence - prior_sequence - 1,
+                                    connection_id=row.connection_id,
+                                ),
+                            )
+                        )
+                    elif row.arrival_sequence < prior_sequence:
+                        result.append(
+                            (
+                                row.manifest.partition,
+                                Gap(
+                                    kind="arrival_sequence_regression",
+                                    start=str(prior_sequence),
+                                    end=str(row.arrival_sequence),
+                                    missing_count=0,
+                                    connection_id=row.connection_id,
+                                ),
+                            )
+                        )
+                previous_arrival_sequences[arrival_key] = (
+                    row.arrival_sequence,
+                    manifest_id,
                 )
+
+            if not is_l2:
+                continue
+            assert row.l2_identifier is not None
+            if previous_l2 is not None and row.l2_identifier != previous_l2[0]:
+                (
+                    prior_identifier,
+                    prior_epoch,
+                    prior_connection,
+                    prior_last,
+                    prior_event_ns,
+                ) = previous_l2
+                reset = (
+                    sample.record_type == RecordType.L2_DELTA
+                    and row.l2_first_sequence is not None
+                    and prior_last is not None
+                    and row.l2_first_sequence <= prior_last
+                )
+                transitioned = row.l2_epoch != prior_epoch or row.connection_id != prior_connection or reset
+                resync_key = (
+                    sample.venue,
+                    sample.asset,
+                    row.l2_epoch,
+                    row.connection_id,
+                )
+                if transitioned and not _has_completed_resync(
+                    resyncs,
+                    resync_key,
+                    after_ns=prior_event_ns,
+                    before_ns=row.event_ns,
+                ):
+                    if sample.record_type == RecordType.L2_SNAPSHOT:
+                        prior_cursor = f"snapshot={prior_identifier}"
+                        current_cursor = f"snapshot={row.l2_identifier}"
+                    else:
+                        prior_cursor = f"sequence={prior_last}"
+                        current_cursor = f"sequence={row.l2_first_sequence}"
+                    result.append(
+                        (
+                            row.manifest.partition,
+                            Gap(
+                                kind="l2_resync_missing",
+                                start=(f"epoch={prior_epoch},connection={prior_connection},{prior_cursor}"),
+                                end=(f"epoch={row.l2_epoch},connection={row.connection_id},{current_cursor}"),
+                                missing_count=0,
+                                connection_id=row.connection_id,
+                            ),
+                        )
+                    )
+            previous_l2 = (
+                row.l2_identifier,
+                row.l2_epoch,
+                row.connection_id,
+                row.l2_last_sequence,
+                row.event_ns,
+            )
 
     return tuple(
         sorted(

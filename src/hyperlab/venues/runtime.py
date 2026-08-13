@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,9 +41,7 @@ class ReferenceCollectorConfig:
     def __post_init__(self) -> None:
         if not self.assets or len(self.assets) != len(set(self.assets)):
             raise ValueError("assets must be a non-empty unique list")
-        if not self.candle_intervals or len(self.candle_intervals) != len(
-            set(self.candle_intervals)
-        ):
+        if not self.candle_intervals or len(self.candle_intervals) != len(set(self.candle_intervals)):
             raise ValueError("candle intervals must be a non-empty unique list")
         if any(value <= 0 for value in (self.history_lookback_hours, self.batch_size, self.queue_capacity)):
             raise ValueError("reference collector limits must be positive")
@@ -155,14 +153,19 @@ class BinanceReferenceCollector:
         first_label, primary = errors[0]
         primary.add_note(f"cleanup action: {first_label}")
         for label, secondary in errors[1:]:
-            primary.add_note(
-                f"{label} also failed: {type(secondary).__name__}: {secondary}"
-            )
+            primary.add_note(f"{label} also failed: {type(secondary).__name__}: {secondary}")
         raise primary
 
     def _add(self, record: ParsedRecord) -> None:
         if self.sink.add(record):
             self.metrics["records_parsed"] = self._counter("records_parsed") + 1
+        if self.sink.should_flush:
+            result = self.sink.flush()
+            self.metrics["rows_written"] = self._counter("rows_written") + result.row_count
+
+    def _add_many(self, records: Iterable[ParsedRecord]) -> None:
+        accepted = self.sink.add_many(records)
+        self.metrics["records_parsed"] = self._counter("records_parsed") + accepted
         if self.sink.should_flush:
             result = self.sink.flush()
             self.metrics["rows_written"] = self._counter("rows_written") + result.row_count
@@ -306,8 +309,8 @@ class BinanceReferenceCollector:
         if unavailable:
             self.metrics["maintenance_or_absence_detected"] = True
             self.metrics["state"] = "unavailable"
-            self.metrics["last_error"] = (
-                "Binance instruments are not TRADING: " + ", ".join(sorted(unavailable))
+            self.metrics["last_error"] = "Binance instruments are not TRADING: " + ", ".join(
+                sorted(unavailable)
             )
             self._publish()
             raise RuntimeError(str(self.metrics["last_error"]))
@@ -397,26 +400,27 @@ class BinanceReferenceCollector:
                     if parsed.channel in self._critical_stream_last_received:
                         self._critical_stream_last_received[parsed.channel] = received.received_time
                     self.metrics["messages_received"] = self._counter("messages_received") + 1
-                    self.metrics["normalization_issues"] = self._counter(
-                        "normalization_issues"
-                    ) + len(parsed.issues)
+                    self.metrics["normalization_issues"] = self._counter("normalization_issues") + len(
+                        parsed.issues
+                    )
                     self._record_l2_resync_if_needed(
                         parsed,
                         pending_assets=pending_l2_resync_assets,
                         connection_id=connection_id,
                         connection_epoch=epoch,
                     )
-                    for record in parsed.records:
-                        self._add(record)
+                    self._add_many(parsed.records)
                     self._require_critical_streams_fresh(
                         at=now,
                         connection_id=connection_id,
                     )
                     if max_messages is not None and self._counter("messages_received") >= max_messages:
                         break
-                if self._stop or (
-                    duration_seconds is not None and self.monotonic() - started >= duration_seconds
-                ) or (max_messages is not None and self._counter("messages_received") >= max_messages):
+                if (
+                    self._stop
+                    or (duration_seconds is not None and self.monotonic() - started >= duration_seconds)
+                    or (max_messages is not None and self._counter("messages_received") >= max_messages)
+                ):
                     break
             except CoordinatedWriterError as exc:
                 self.metrics["last_error"] = f"{type(exc).__name__}: {exc}"

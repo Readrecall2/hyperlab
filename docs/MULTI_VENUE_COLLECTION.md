@@ -48,6 +48,32 @@ La publication est atomique par fichier et manifeste, pas comme transaction
 globale couvrant toutes les partitions. Les noms de venue conservés sont
 exactement `hyperliquid` et `binance_usdm`.
 
+## Ordre logique et frontières de flush
+
+Un Parquet est un run immuable trié par la clé d'ordre du schéma. Plusieurs
+Parquet d'un même stream forment donc un ensemble de runs triés, et non un
+journal dont l'ordre serait celui des noms de fichiers ou des instants de flush.
+L'inventaire valide chaque run séparément, puis effectue une fusion ordonnée des
+runs avant les contrôles globaux de clés primaires, cadence, séquences et epochs
+L2. Un chevauchement de bornes entre deux segments n'est pas une inversion.
+
+Le smoke test du 13 août 2026 a exercé ce cas réel sur
+`binance_usdm/ETH/l2_snapshot` : le snapshot reçu à
+`2026-08-13T00:34:15.602230Z`, `arrival_sequence=40862`, a été coupé après cinq
+asks et vingt bids ; les quinze asks restants ont formé un second segment. Les
+champs `event_time`, `received_time`, `connection_id`, `snapshot_id`,
+`book_epoch_id` et `last_sequence` concordaient. Le wire 40862 était encadré par
+40861 et 40863 dans le même epoch, et le resync ETH était déjà terminé : ce
+n'était ni une reconnexion, ni une arrivée source hors ordre.
+
+Les runtimes soumettent désormais toutes les lignes normalisées d'une frame
+WebSocket comme un lot logique. Le mutex du writer coordonné interdit à un flush
+d'une autre venue d'entrer au milieu de ce lot. Si le lot entier ne tient pas
+dans la capacité restante, il est refusé avant tout ajout ; une erreur pendant
+l'ajout restaure l'état mémoire antérieur. Le seuil `batch_size` peut donc être
+dépassé par un seul message atomique, sans perte et dans la limite stricte de
+`queue_capacity`.
+
 ## Writer coordonné
 
 `collect-multi-venue` construit un unique `CoordinatedLakeWriter`. Celui-ci

@@ -1,8 +1,13 @@
 # HyperLab 0.2.0
 
-Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher et backtester des stratégies sur Hyperliquid.
+Laboratoire **multi-stratégies**, orienté sécurité, pour rechercher, backtester et
+faire tourner en paper des stratégies sur données publiques live.
 
-> Cette version est volontairement **read-only**. Elle contient un collecteur public, un dashboard, un moteur de backtest et des baselines de recherche. Elle ne contient ni portefeuille, ni clé privée, ni signataire, ni exécuteur d'ordres.
+> Cette version est volontairement **read-only vis-à-vis des venues**. Elle contient
+> un collecteur public, un dashboard, un moteur de backtest, des baselines de
+> recherche et un paper engine local. Elle ne contient ni portefeuille, ni clé
+> privée, ni signataire, ni client privé, ni route d'ordre réel. Tous les ordres,
+> acknowledgements, rejets, fills et cancels Phase 12 sont simulés.
 
 ## Stratégies incluses
 
@@ -36,6 +41,29 @@ sépare cibles et fills, simule profondeur/slippage, non-fills maker, jambes ret
 et IOC d'urgence, puis réconcilie le PnL par composante, actif, mois UTC, régime et
 taille. Il inclut un benchmark passif. L'intervalle bootstrap reste explicitement
 indisponible pour cette démo in-sample; il n'est publié que sur une série OOS tracée.
+
+## Paper trading Phase 12
+
+Le paper engine persiste une machine à onze états, un journal idempotent chaîné par
+hashes, des identifiants SHA-256 déterministes et un ledger réconciliable. Toute
+décision passe par les limites de risque avant l'acceptation simulée, puis conserve
+la trace décision → ordre → ack/reject → fills partiels ou complets/cancel →
+position/cash/frais/PnL. Le replay utilise la configuration figée et son seed ; le
+dashboard ne lit qu'un snapshot read-only.
+
+Les frais proviennent d'un artefact **public, versionné et hashé**, jamais d'un
+compte ou d'un endpoint privé. Sans preuve publique d'une remise, le palier public
+conservateur est retenu. Le statut économique Phase 12 reste **`BLOCKED`** : les 6 à
+8 semaines, le nombre suffisant de cycles, les 14 jours sans incident critique et
+le résultat positif sous coûts stressés ne sont pas encore observés. Les fixtures
+`SYNTHETIC` valident seulement le logiciel. Voir
+[`docs/PAPER_ENGINE_PHASE12.md`](docs/PAPER_ENGINE_PHASE12.md).
+
+Le runtime continu et les commandes `paper status|replay|reconcile|run` sont
+présents. Le registre d'admission live est volontairement vide : tant qu'une
+stratégie figée et un adaptateur de flux **public normalisé** ne sont pas approuvés
+pour le même `config_hash`, `paper run` échoue fermé. Aucun mode global `paper` et
+aucune route d'ordre réelle ne sont ajoutés.
 
 ## Données publiques Hyperliquid
 

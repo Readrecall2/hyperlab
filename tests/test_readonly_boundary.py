@@ -45,6 +45,52 @@ def test_backtest_package_has_no_network_or_venue_route_import() -> None:
     assert violations == []
 
 
+def test_paper_package_has_no_network_wallet_signer_exchange_or_order_transport_import() -> None:
+    paper_root = Path(__file__).resolve().parents[1] / "src" / "hyperlab" / "paper"
+    forbidden_roots = {
+        "aiohttp",
+        "httpx",
+        "hyperlab.api",
+        "hyperlab.venues",
+        "hyperliquid",
+        "requests",
+        "socket",
+        "urllib",
+        "websocket",
+        "websockets",
+    }
+    forbidden_module_parts = {"exchange", "order_transport", "signer", "transport", "wallet"}
+    forbidden_symbols = {
+        "Exchange",
+        "OrderTransport",
+        "Signer",
+        "Wallet",
+        "cancel_order",
+        "place_order",
+        "send_order",
+    }
+    violations: list[str] = []
+    for path in paper_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports = [(alias.name, alias.name.rsplit(".", 1)[-1]) for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports = [(node.module, alias.name) for alias in node.names]
+            else:
+                continue
+            for module, symbol in imports:
+                module_parts = set(module.casefold().split("."))
+                if (
+                    any(module == root or module.startswith(f"{root}.") for root in forbidden_roots)
+                    or module_parts & forbidden_module_parts
+                    or symbol in forbidden_symbols
+                ):
+                    violations.append(f"{path.name}: {module} -> {symbol}")
+
+    assert violations == []
+
+
 def test_secret_diagnostic_covers_all_forbidden_credential_names() -> None:
     expected = {
         "EXCHANGE_API_KEY",

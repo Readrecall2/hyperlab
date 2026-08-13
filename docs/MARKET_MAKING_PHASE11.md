@@ -168,8 +168,11 @@ une donnée manquante par un résultat synthétique présenté comme réel.
 - Les rejets privés, acknowledgements et règles précises de self-trade prevention
   ne sont pas observables dans un flux public.
 - Le modèle de queue doit être calibré par régime, venue, actif, niveau et latence.
-- Les frais réels du compte et la latence aller/retour doivent être gelés sur train,
-  validés hors échantillon, puis testés sur une fenêtre finale jamais utilisée pour
-  régler les paramètres.
-- La Phase 12 devra réconcilier un paper engine persistant ; la Phase 13 restera une
-  branche/version distincte avec revue humaine explicite.
+- Une grille de frais publique, versionnée et hashée, ainsi que la latence
+  aller/retour doivent être gelées sur train, validées hors échantillon, puis
+  testées sur une fenêtre finale jamais utilisée pour régler les paramètres. La
+  Phase 12 paper-only ne consulte jamais les données privées d'un compte ; sans
+  preuve publique d'une remise, elle utilise le palier public conservateur.
+- La Phase 12 réconcilie un paper engine persistant, sans lever les prérequis
+  économiques ci-dessus ; la Phase 13 reste une branche/version distincte avec
+  revue humaine explicite.

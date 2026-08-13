@@ -17,6 +17,29 @@ Les données et modèles doivent porter `CALIBRATED`, `UNCALIBRATED` ou `SYNTHET
 Seul le premier statut, avec Gates B et C satisfaites, permet une conclusion
 économique; aucun statut n'autorise une exécution réelle dans la branche 0.2.x.
 
+## Contrat paper Phase 12
+
+Seule une variante figée selon le protocole ci-dessus peut ouvrir un run paper.
+Chaque décision porte la version de stratégie, le hash de tous ses paramètres, le
+hash des limites, le seed, l'artefact Gates B/C et les preuves de calibration.
+Toutes les stratégies,
+mono- ou multi-jambes, passent par le même contrôle de risque et le même paper
+engine ; aucune ne peut écrire directement un ordre, un fill, une position, le cash
+ou le PnL.
+
+Le moteur conserve le lien décision → ordre simulé → ack/reject → non-fill/fill
+partiel ou complet/cancel → position/cash/frais/PnL. Les sémantiques Phase 04 de
+profondeur, slippage, non-fill maker, IOC et délais de jambes sont réutilisées à la
+granularité applicable. Une stratégie dont les données, latences ou fills requis ne
+sont pas calibrés reste `BLOCKED` ; une hypothèse Phase 10/11 inachevée ne peut pas
+être promue silencieusement en paper.
+
+La Gate D est commune : 6 à 8 semaines, nombre de cycles préenregistré, 14 jours
+sans incident critique, réconciliation exacte, replay déterministe et résultat net
+positif sous coûts stressés. Aucun run n'a encore satisfait ces critères dans ce
+checkout ; le statut économique Phase 12 reste **`BLOCKED`**. Voir
+[`PAPER_ENGINE_PHASE12.md`](PAPER_ENGINE_PHASE12.md).
+
 ## Niveau 1 — cash-and-carry spot/perp
 
 **Position :** long spot + short perp du même actif lorsque le funding positif semble suffisamment persistant.
@@ -26,7 +49,7 @@ Seul le premier statut, avec Gates B et C satisfaites, permet une conclusion
 **Risques :** frais spot élevés, inversion du funding, basis, jambe non couverte, marge du perp, liquidité du spot.
 
 **Données minimales :** spot/perp, funding horaire, BBO, profondeur, volume, OI,
-frais du compte et lifecycle point-in-time. La Phase 05 exige 30 jours, calcule
+grille de frais publique versionnée/hashée et lifecycle point-in-time. La Phase 05 exige 30 jours, calcule
 l'edge net à 8/24/72 h, simule maker puis hedge IOC, réserve une marge perp
 conservatrice et refuse la promotion si le pire stress ne bat pas le passif. Voir
 [`CASH_AND_CARRY_PHASE05.md`](CASH_AND_CARRY_PHASE05.md).

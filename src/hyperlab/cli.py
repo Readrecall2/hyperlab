@@ -7,11 +7,11 @@ import signal
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from types import FrameType
-from typing import Annotated, Any
+from types import FrameType, MappingProxyType
+from typing import TYPE_CHECKING, Annotated, Any
 
 import pandas as pd
 import typer
@@ -75,6 +75,11 @@ from hyperlab.strategies.market_making_l2 import (
 )
 from hyperlab.strategies.registry import STRATEGY_CATALOG, STRATEGY_FACTORIES, create_strategy
 
+if TYPE_CHECKING:
+    from hyperlab.paper.models import PaperRunConfig
+    from hyperlab.paper.runner import FrozenPaperStrategy
+    from hyperlab.paper.runtime import NormalizedPublicMarketSource
+
 app = typer.Typer(
     name="hyperlab",
     help="Laboratoire multi-stratégies Hyperliquid, en lecture seule dans cette version.",
@@ -91,6 +96,25 @@ SECRET_ENV_MARKERS = (
 )
 
 app.add_typer(data_app, name="data")
+paper_app = typer.Typer(
+    name="paper",
+    help="Supervision locale du moteur paper-only Phase 12.",
+    no_args_is_help=True,
+)
+app.add_typer(paper_app, name="paper")
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovedPaperRuntimeFactories:
+    config_hash: str
+    strategy_factory: Callable[[PaperRunConfig], FrozenPaperStrategy]
+    source_factory: Callable[[PaperRunConfig], NormalizedPublicMarketSource]
+
+
+# Deliberately empty until a frozen strategy artifact and a normalized public
+# source adapter have both passed an explicit review.  The CLI never imports a
+# user-supplied module or constructs a strategy from an arbitrary name.
+_APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = MappingProxyType({})
 
 
 def _settings() -> Settings:
@@ -1309,6 +1333,269 @@ def status() -> None:
                 "error": "runtime_status_binance_usdm.json illisible",
             }
     console.print_json(json.dumps(payload))
+
+
+def _paper_database_path(database: Path | None) -> Path:
+    return (
+        database
+        if database is not None
+        else _settings().app.data_dir / "paper" / "paper.sqlite3"
+    )
+
+
+def _load_frozen_paper_config(path: Path) -> PaperRunConfig:
+    from hyperlab.paper.models import PaperRunConfig
+
+    if not path.is_file():
+        raise typer.BadParameter(f"Artefact de configuration paper introuvable: {path.resolve()}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(f"Artefact paper illisible: {error}") from None
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("L'artefact paper doit contenir un objet JSON canonique")
+    try:
+        config = PaperRunConfig.from_dict(payload)
+    except (KeyError, TypeError, ValueError) as error:
+        raise typer.BadParameter(f"Artefact paper invalide: {error}") from None
+    if payload != config.to_dict():
+        raise typer.BadParameter(
+            "L'artefact paper n'est pas le snapshot canonique complet de PaperRunConfig"
+        )
+    return config
+
+
+def _load_stored_paper_config(database: Path, run_id: str) -> PaperRunConfig:
+    from hyperlab.paper.models import PaperRunConfig
+    from hyperlab.paper.store import PaperStore
+
+    if not database.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {database.resolve()}")
+    store = PaperStore(database, initialize=False)
+    run = store.get_run(run_id)
+    try:
+        config = PaperRunConfig.from_dict(run.config_snapshot)
+    except (KeyError, TypeError, ValueError) as error:
+        raise typer.BadParameter(f"Snapshot paper durable invalide: {error}") from None
+    if config.config_hash != run.config_hash or config.run_id != run.run_id:
+        raise typer.BadParameter("Le snapshot paper durable ne correspond pas à son run_id")
+    return config
+
+
+def _paper_as_of(value: str | None) -> datetime:
+    if value is None:
+        return datetime.now(tz=UTC)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise typer.BadParameter("as-of doit être un horodatage ISO 8601 UTC") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise typer.BadParameter("as-of doit être un horodatage UTC explicite")
+    return parsed.astimezone(UTC)
+
+
+@paper_app.command("status")
+def paper_status(
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    run_id: Annotated[str | None, typer.Option(help="Run déterministe à détailler")] = None,
+) -> None:
+    """Lit l'état paper durable sans créer ni modifier le store."""
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    if not resolved.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
+    store = PaperStore(resolved, initialize=False)
+    if run_id is not None:
+        run = store.get_run(run_id)
+        integrity = store.inspect_integrity_readonly(run_id)
+        if integrity.ok:
+            payload: dict[str, object] = dict(store.read_snapshot(run_id))
+            payload.update(
+                {"integrity": "VERIFIED_READONLY", "orders_enabled": False}
+            )
+        else:
+            payload = {
+                "alerts": [],
+                "commit_head_hash": run.commit_head_hash,
+                "commit_sequence": run.commit_sequence,
+                "config_hash": run.config_hash,
+                "event_head_hash": run.event_head_hash,
+                "event_sequence": run.event_sequence,
+                "integrity": "FAILED_READONLY",
+                "integrity_issue_codes": [issue.code for issue in integrity.issues],
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+                "projection": None,
+                "run_id": run.run_id,
+                "status": "MANUAL_REVIEW",
+            }
+    else:
+        runs: list[dict[str, object]] = []
+        for run in store.list_runs():
+            integrity = store.inspect_integrity_readonly(run.run_id)
+            runs.append(
+                {
+                    "commit_sequence": run.commit_sequence,
+                    "config_hash": run.config_hash,
+                    "event_sequence": run.event_sequence,
+                    "integrity": (
+                        "VERIFIED_READONLY" if integrity.ok else "FAILED_READONLY"
+                    ),
+                    "run_id": run.run_id,
+                    "status": run.status if integrity.ok else "MANUAL_REVIEW",
+                }
+            )
+        payload = {
+            "database": str(resolved.resolve()),
+            "mode": "PAPER_ONLY",
+            "orders_enabled": False,
+            "runs": runs,
+        }
+    console.print_json(json.dumps(payload))
+
+
+@paper_app.command("replay")
+def paper_replay(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+) -> None:
+    """Vérifie en lecture seule le replay exact de la projection durable."""
+    from hyperlab.paper.runtime import replay_paper_run
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    if not resolved.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
+    result = replay_paper_run(PaperStore(resolved, initialize=False), run_id)
+    console.print_json(json.dumps(result.to_dict()))
+
+
+@paper_app.command("reconcile")
+def paper_reconcile(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option(help="Horodatage logique UTC; défaut: horloge UTC courante"),
+    ] = None,
+) -> None:
+    """Restaure puis réconcilie le ledger paper avant toute nouvelle admission."""
+    from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    config = _load_stored_paper_config(resolved, run_id)
+    store = PaperStore(resolved, initialize=False)
+    projection = store.get_projection(run_id)
+    logical_time = _paper_as_of(as_of)
+    if projection.last_received_at is not None and logical_time < projection.last_received_at:
+        raise typer.BadParameter("as-of précède le dernier événement durable du run paper")
+    engine = PaperEngine(store, config)
+    engine.start()
+    result = engine.reconcile(as_of=logical_time)
+    console.print_json(
+        json.dumps(
+            {
+                "config_hash": config.config_hash,
+                "event_sequence": result.projection.last_sequence,
+                "idempotent": result.append.idempotent,
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+                "reconciled": result.projection.reconciled,
+                "run_id": config.run_id,
+                "state": result.projection.state.value,
+            }
+        )
+    )
+
+
+@paper_app.command("run")
+def paper_run(
+    config_artifact: Annotated[
+        Path,
+        typer.Argument(help="Snapshot JSON canonique et approuvé de PaperRunConfig"),
+    ],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    timer_interval_seconds: Annotated[
+        float,
+        typer.Option(min=0.001, help="Cadence des contrôles de timeout paper"),
+    ] = 1.0,
+    source_poll_timeout_seconds: Annotated[
+        float,
+        typer.Option(min=0.001, help="Attente maximale de la source publique normalisée"),
+    ] = 0.25,
+) -> None:
+    """Exécute exclusivement une liaison paper pré-approuvée et compilée dans ce checkout."""
+    from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.runtime import PaperRuntime, PaperRuntimeConfig
+    from hyperlab.paper.store import PaperStore
+
+    settings = _settings()
+    if settings.app.mode not in {"readonly", "research"}:
+        raise typer.BadParameter("Le runtime paper refuse tout HYPERLAB_MODE non readonly/research")
+    frozen = _load_frozen_paper_config(config_artifact)
+    approval = _APPROVED_PAPER_RUNTIMES.get(frozen.config_hash)
+    if approval is None or approval.config_hash != frozen.config_hash:
+        raise typer.BadParameter(
+            "Aucune liaison figée stratégie + source publique n'est approuvée pour ce config_hash"
+        )
+
+    strategy = approval.strategy_factory(frozen)
+    source = approval.source_factory(frozen)
+    resolved = _paper_database_path(database)
+    # Approval is checked before this point, so an unapproved invocation cannot
+    # create state.  An approved first run still needs the authoritative schema.
+    store = PaperStore(resolved)
+    runtime: PaperRuntime | None = None
+    try:
+        runtime = PaperRuntime(
+            PaperEngine(store, frozen),
+            strategy,
+            source,
+            config=PaperRuntimeConfig(
+                timer_interval_seconds=timer_interval_seconds,
+                source_poll_timeout_seconds=source_poll_timeout_seconds,
+                mode=settings.app.mode,
+            ),
+        )
+        with _cooperative_signal_handlers(runtime.stop):
+            projection = runtime.run_forever()
+    except KeyboardInterrupt:
+        if runtime is not None:
+            runtime.stop()
+        console.print("Arrêt demandé; fermeture propre du runtime paper-only.")
+        projection = store.get_projection(frozen.run_id)
+    finally:
+        if runtime is not None:
+            _close_preserving_active_exception(runtime.close)
+        else:
+            _close_preserving_active_exception(source.close)
+        _close_preserving_active_exception(store.close)
+    console.print_json(
+        json.dumps(
+            {
+                "config_hash": frozen.config_hash,
+                "event_sequence": projection.last_sequence,
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+                "run_id": frozen.run_id,
+                "state": projection.state.value,
+            }
+        )
+    )
 
 
 @app.command()

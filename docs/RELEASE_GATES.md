@@ -36,14 +36,54 @@ fermées quel que soit le rendement affiché.
 
 ## Gate D — paper
 
-- 6 à 8 semaines minimum ;
-- 30 à 50 cycles complets pour une stratégie lente, davantage pour une rapide ;
-- 14 jours sans incident critique ;
-- redémarrages, déconnexions et fills partiels testés ;
-- paramètres figés avant la période de validation.
+### Préconditions techniques
+
+- mode `PAPER ONLY` prouvé : aucune clé, signature, donnée privée de compte, client
+  d'exécution ou route d'ordre réel ;
+- toutes les stratégies passent par le même contrôle de risque et le même moteur de
+  simulation ;
+- configuration, paramètres, limites, seed et hashes de calibration figés avant la
+  période ; toute modification démarre un nouveau run ;
+- décisions, ordres, événements, fills et écritures de ledger ont des identifiants
+  déterministes et sont idempotents ;
+- journal persistant append-only, chaîne de hashes et replay déterministe vérifiés ;
+- réconciliation exacte de chaque ordre, position, cash, frais et composante de PnL ;
+- redémarrages, déconnexions, rejets, non-fills, fills partiels, cancels, IOC et
+  jambes retardées testés ;
+- snapshot et dashboard strictement read-only ; alertes critiques persistées ;
+- `ruff check .`, `mypy src/hyperlab` et la suite `pytest` complète passent.
+
+### Préconditions économiques
+
+- Gates B et C déjà satisfaites pour la stratégie inscrite, avec artefact SHA-256
+  figé dans le run ;
+- aucune hypothèse économique inachevée des Phases 10/11 réutilisée ;
+- modèles de coûts, latence et fills `CALIBRATED`, avec preuves auditées ;
+- frais issus d'un artefact public versionné et hashé, avec intervalles d'effet et
+  palier conservateur explicite, jamais d'une lecture privée du compte ;
+- cible de 6 à 8 semaines de fonctionnement forward continu, minimum dur 42 jours ;
+- 30 à 50 cycles complets pour une stratégie lente, davantage pour une rapide,
+  seuil préenregistré avant la fenêtre et impossible à abaisser sous 30 ;
+- 14 jours consécutifs sans incident critique ;
+- résultat net positif sous coûts stressés, sans exclusion des runs perdants ;
+- résultat stressé lié au head économique final, canaux de l'univers figé frais et
+  état opérationnel résolu (`FLAT` ou `HEDGED`) ;
+- rapport reproductible avec configuration, code, données, journal et preuves
+  identifiés par leurs hashes.
+
+Une fixture `SYNTHETIC`, une hypothèse `UNCALIBRATED` ou des tests accélérés ne
+comptent ni pour la durée, ni pour les cycles, ni pour les 14 jours. À la date de la
+Phase 12, ces observations n'existent pas encore : **Gate D économique `BLOCKED`**.
+Une durée supérieure à huit semaines reste recevable. Le gate est calculé depuis
+le store vérifié et des preuves persistées, jamais depuis des booléens ou une
+projection fournis par l'appelant. Dans ce checkout, le registre runtime stratégie
++ source publique est en outre vide et `paper run` reste
+`BLOCKED_PRECONDITIONS`. La conformité technique du moteur n'ouvre donc pas la
+Gate E.
 
 ## Gate E — testnet
 
+- revue humaine explicite de la Gate D et création d'un composant/version séparé ;
 - signatures, annulations et CLOID validés ;
 - réponses perdues et événements doublés gérés ;
 - dead-man switch ;

@@ -109,6 +109,7 @@ def create_app(*, data_dir: Path = Path("data")) -> FastAPI:
     database = data_dir / "hyperlab.sqlite3"
     runtime_file = data_dir / "runtime_status.json"
     report_file = data_dir / "reports" / "latest_summary.json"
+    paper_database = data_dir / "paper" / "paper.sqlite3"
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -123,6 +124,73 @@ def create_app(*, data_dir: Path = Path("data")) -> FastAPI:
             status["runtime"] = runtime
             status["runtime_status_stale"] = _runtime_status_is_stale(runtime)
         return JSONResponse(status)
+
+    @app.get("/api/paper")
+    def paper_status() -> JSONResponse:
+        """Expose paper projections through read-only SQLite connections only."""
+
+        if not paper_database.exists():
+            return JSONResponse(
+                {
+                    "mode": "paper-simulation-only",
+                    "orders_enabled": False,
+                    "runs": [],
+                    "status": "NOT_STARTED",
+                }
+            )
+        try:
+            from hyperlab.paper.store import PaperStore
+
+            store = PaperStore(paper_database, initialize=False)
+            runs = []
+            for run in store.list_runs():
+                integrity = store.inspect_integrity_readonly(run.run_id)
+                if not integrity.ok:
+                    runs.append(
+                        {
+                            "alerts": [],
+                            "commit_sequence": run.commit_sequence,
+                            "config_hash": run.config_hash,
+                            "event_sequence": run.event_sequence,
+                            "integrity": "FAILED_READONLY",
+                            "orders_enabled": False,
+                            "projection": None,
+                            "run_id": run.run_id,
+                            "status": "MANUAL_REVIEW",
+                        }
+                    )
+                    continue
+                runs.append(
+                    {
+                    "alerts": [alert.alert for alert in store.get_alerts(run.run_id)],
+                    "commit_sequence": run.commit_sequence,
+                    "config_hash": run.config_hash,
+                    "event_sequence": run.event_sequence,
+                    "integrity": "VERIFIED_READONLY",
+                    "orders_enabled": False,
+                    "projection": store.get_projection_payload(run.run_id),
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    }
+                )
+        except (OSError, RuntimeError, ValueError):
+            return JSONResponse(
+                {
+                    "mode": "paper-simulation-only",
+                    "orders_enabled": False,
+                    "runs": [],
+                    "status": "UNREADABLE_FAIL_CLOSED",
+                },
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "mode": "paper-simulation-only",
+                "orders_enabled": False,
+                "runs": runs,
+                "status": "AVAILABLE",
+            }
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:

@@ -1,6 +1,6 @@
 # HyperLab — guide complet Windows 11 + Umbrel + Codex
 
-**Version : 0.2.0 — 12 août 2026**
+**Version : 0.2.0 — 13 août 2026**
 
 Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un **laboratoire multi-stratégies** : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.
 
@@ -18,6 +18,7 @@ Le dépôt livré contient :
 - un générateur synthétique déterministe pour vérifier l'installation ;
 - un lecteur public Hyperliquid spot/perp ;
 - un stockage SQLite ;
+- un paper engine persistant qui simule localement le cycle complet des ordres ;
 - un dashboard local ;
 - Docker et un package Community App Store Umbrel ;
 - des tests ;
@@ -25,15 +26,20 @@ Le dépôt livré contient :
 - seize prompts Codex séquentiels ;
 - des portes de validation jusqu'au futur micro-mainnet.
 
-### Ce qu'il ne fait pas encore
+### Ce qu'il ne fait pas
 
-- aucun ordre ;
+- aucun ordre réel, testnet ou mainnet ;
 - aucune clé ;
 - aucun wallet ;
-- aucun paper engine événementiel complet ;
+- aucune donnée privée de compte ;
+- aucune signature ou route d'exécution ;
 - aucune validation économique L2 calibrée sur données réelles ;
 - aucune preuve qu'une stratégie est rentable ;
 - aucun passage automatique vers testnet ou mainnet.
+
+La Phase 12 ajoute seulement des ordres, acknowledgements, rejets, fills et cancels
+**simulés localement**. Son statut économique reste `BLOCKED` tant que la fenêtre
+forward, les cycles et les calibrations requis ne sont pas observés.
 
 C'est volontaire. La première version doit construire une base que l'on peut auditer, pas une boîte noire autorisée à risquer de l'argent.
 
@@ -53,15 +59,16 @@ C'est volontaire. La première version doit construire une base que l'on peut au
 ┌──────────────────────────────────────────────────────────────────┐
 │ MINI-PC UMBREL 24/24                                             │
 │                                                                  │
-│ Collecteur public → SQLite/Parquet → dashboard local             │
-│ Aucun secret, aucun ordre                                        │
+│ Collecteur public → SQLite/Parquet → dashboard read-only         │
+│ Aucun secret, aucun ordre réel                                   │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │ export des données
                                 ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ RECHERCHE                                                        │
 │                                                                  │
-│ Backtests → stress tests → forward paper → testnet → micro-live  │
+│ Backtests → stress tests → forward paper                         │
+│                  Gate humaine → testnet séparé → micro-live      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,7 +76,9 @@ C'est volontaire. La première version doit construire une base que l'on peut au
 
 **Windows 11** est plus confortable pour Codex, Git, les rapports, les notebooks et les backtests. Il évite aussi de développer directement sur un serveur qui héberge peut-être ton nœud Bitcoin.
 
-**Umbrel** est idéal pour la collecte publique 24/24 et le paper trading lent. Il accumule les données pendant que le code évolue sur Windows.
+**Umbrel** est réservé à la collecte publique 24/24 et au dashboard read-only. Le
+runtime paper local reste un service séparé, hors du paquet Umbrel 0.2.x. Umbrel
+accumule les données pendant que le code évolue sur Windows.
 
 Pour une stratégie sub-seconde, le mini-PC domestique pourra servir de laboratoire, mais le live nécessitera probablement une machine dédiée et une meilleure latence.
 
@@ -715,9 +724,11 @@ transferts inter-venues
 rendement passif abandonné
 ```
 
-Les frais de `config/research.toml` sont des placeholders `UNCALIBRATED`. La future
-phase paper doit récupérer les frais réels du compte. La Phase 04 recherche une
-règle par venue/instrument/période, fait croître l'impact avec
+Les frais de `config/research.toml` sont des placeholders `UNCALIBRATED`. La Phase
+12 doit utiliser une grille **publique**, versionnée et hashée, avec URL/date de
+collecte, intervalles d'effet et palier conservateur explicite. Elle ne consulte
+jamais un compte ou un endpoint privé ; sans preuve publique d'une remise, elle ne
+l'invente pas. La Phase 04 recherche une règle par venue/instrument/période, fait croître l'impact avec
 `taille / profondeur`, permet le non-fill maker, retarde les jambes et simule les IOC
 d'urgence sans aucune route d'ordre réelle. Déclarer les données, les coûts ou les
 fills maker `CALIBRATED` sans leur `calibration_evidence_hash` SHA-256 est refusé.
@@ -867,22 +878,79 @@ Ces deux modules ne doivent pas retarder le déploiement du collecteur lent : le
 
 ## 41. Paper live
 
-Après backtest :
+La Phase 12 fait tourner une stratégie figée sur les données publiques live sans
+accès privé à une venue. Chaque ordre, ack, rejet, cancel et fill est simulé
+localement ; il n'existe ni clé, ni wallet, ni signature, ni route d'ordre réel.
+
+Le parcours obligatoire est :
+
+```text
+décision figée
+→ contrôle de fraîcheur et de risque
+→ ordre simulé déterministe
+→ ack ou reject simulé
+→ non-fill, fill partiel/complet, cancel ou IOC simulé
+→ position, cash, frais et PnL
+→ réconciliation exacte et snapshot read-only
+```
+
+Le moteur persiste les onze états `FLAT`, `ENTRY_PLANNED`, `LEG_1_PENDING`,
+`HEDGE_PENDING`, `HEDGED`, `EXIT_PLANNED`, `EXIT_PENDING`, `PAUSED`,
+`REDUCE_ONLY`, `MANUAL_REVIEW` et `EMERGENCY_FLATTEN`. Le journal SQLite est
+append-only et chaîné par hashes ; les événements et IDs sont déterministes et
+idempotents. Au restart, la chaîne est vérifiée puis le run est rejoué et
+réconcilié avant toute nouvelle décision. Une divergence bloque les entrées et
+force `MANUAL_REVIEW`.
+
+La configuration figée couvre stratégie, paramètres, univers de canaux requis,
+limites, seed, hash de
+l'artefact Gates B/C et hashes des preuves de coûts/latence/fills ainsi que la
+version sémantique du moteur. Une
+configuration `CALIBRATED` inclut une grille de coûts point-in-time ; deux frais
+globaux restent une hypothèse de démo. Toute modification démarre un nouveau run. Toutes les
+stratégies passent par le contrôle de risque pré-acceptation et le simulateur Phase
+04 ; aucune ne peut écrire directement un fill ou une position. Un IOC, y compris
+d'urgence, peut rester partiel ou non rempli.
+
+Conditions d'un run de validation :
 
 - stratégie figée ;
 - décisions en temps réel ;
 - ordres simulés ;
-- modèle de fill réaliste ;
+- modèle de fill, latence et coûts calibré sur des artefacts audités ;
+- grille de frais publique versionnée et hashée, jamais lue depuis un compte ;
+- replay exact et ledger cash/positions/frais/PnL réconcilié ;
+- dashboard et alertes sans aucun canal de commande ;
 - aucun ajustement pendant la fenêtre de validation.
 
 Minimum recommandé :
 
 ```text
-6 à 8 semaines
-30 à 50 cycles pour les stratégies lentes
+6 à 8 semaines visées, avec minimum dur de 42 jours
+30 à 50 cycles pour les stratégies lentes (minimum logiciel dur : 30)
 beaucoup plus pour les rapides
 14 jours sans incident critique
+résultat net positif sous coûts stressés
 ```
+
+Le gate lit ces preuves dans le journal vérifié : seuil de cycles figé, incidents,
+couverture continue, artefact de stress et exercices restart/déconnexion/fill
+partiel/crash. Chaque canal requis doit rester frais, l'état doit être `FLAT` ou
+`HEDGED` et le stress doit référencer le dernier préfixe économique. Une projection
+fabriquée ou des booléens passés à la fonction ne peuvent pas produire `PASS`, et
+un run de plus de huit semaines n'expire pas.
+
+Le runtime et les commandes `paper status|replay|reconcile|run` sont présents,
+mais l'admission `config_hash → stratégie + source publique normalisée` est un
+registre statique volontairement vide dans ce checkout. Faute de stratégie et
+d'adaptateur approuvés, `paper run` échoue fermé avant de créer un store.
+
+Ces critères ne sont pas encore observés dans ce checkout. Les fixtures et démos
+`SYNTHETIC`, même entièrement vertes, ne comptent ni pour la durée, ni pour les
+cycles, ni pour les 14 jours. Le statut économique Phase 12 est donc
+**`BLOCKED`**. Les prérequis inachevés des Phases 10/11 ne peuvent pas être
+réutilisés comme s'ils étaient calibrés. Voir
+[`PAPER_ENGINE_PHASE12.md`](PAPER_ENGINE_PHASE12.md).
 
 ## 42. Testnet
 

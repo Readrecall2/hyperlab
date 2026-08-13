@@ -12,8 +12,15 @@ Les archives officielles sont utiles pour remonter dans le temps, mais leur publ
 - open interest ;
 - volumes ;
 - BBO et profondeur agrégée ;
-- frais du compte lors des phases paper/live ;
+- grilles de frais **publiques**, versionnées et hashées avec leurs intervalles
+  d'effet, URL/date de collecte, palier conservateur retenu et hypothèses ;
 - événements de connexion et trous de données.
+
+La Phase 12 paper-only n'interroge jamais un compte, un endpoint privé ou un wallet
+pour connaître ses frais. Une remise propre à un compte n'est utilisable que dans
+une future phase autorisée et avec un protocole séparé ; sans preuve publique, le
+paper engine retient le palier public conservateur. Un hash sans audit de contenu ne
+transforme pas un placeholder en calibration.
 
 ## Couche sub-seconde — seulement pour lead-lag et market making
 
@@ -31,6 +38,34 @@ Les archives officielles sont utiles pour remonter dans le temps, mais leur publ
 - Parquet partitionné par `venue/date/asset/type` pour la recherche ;
 - DuckDB pour les requêtes locales ;
 - fichiers immuables et manifestes de qualité des données.
+
+## État opérationnel paper Phase 12
+
+Le lake Parquet reste la source de vérité des observations de marché et preuves de
+recherche. Séparément, SQLite est l'autorité opérationnelle mutable du paper engine :
+
+```text
+data/paper/
+  <run_id>.sqlite       journal append-only, projections et ledger
+  <run_id>.snapshot.json  vue atomique read-only pour le dashboard
+```
+
+Le journal conserve la configuration figée, les décisions, contrôles de risque,
+ordres simulés, acknowledgements/rejets, fills partiels/complets, cancels,
+transitions d'état, écritures cash/positions/frais/PnL et alertes. Chaque événement
+a un identifiant déterministe, un hash de contenu et un lien au hash précédent. Le
+snapshot JSON est dérivé et reconstructible ; il ne doit jamais servir à restaurer
+ou corriger l'autorité SQLite.
+
+Au restart, les événements sont rejoués et réconciliés avant toute nouvelle entrée.
+Les inputs de replay référencent les hashes des partitions publiques, des artefacts
+de frais/latence/fill, de la configuration et du code. Une chaîne tronquée, une
+projection incohérente ou une donnée requise absente bloque le run en
+`MANUAL_REVIEW`.
+
+La rétention doit préserver l'intégralité des runs, y compris les runs perdants,
+interrompus, synthétiques ou invalides. La gate économique reste `BLOCKED` tant que
+la durée et les cycles forward requis ne sont pas réellement accumulés.
 
 SQLite reste une zone opérationnelle mutable. Il ne constitue ni l'archive de
 recherche ni une preuve d'intégrité. La racine du lake ne tolère qu'un writer

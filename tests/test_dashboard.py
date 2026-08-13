@@ -1,22 +1,85 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from hyperlab.dashboard.app import _runtime_summary, create_app
+from hyperlab.paper import (
+    PaperEngine,
+    PaperExecutionConfig,
+    PaperRiskLimits,
+    PaperRunConfig,
+    PaperStore,
+)
 
 
 def test_dashboard_is_explicitly_read_only(tmp_path: Path) -> None:
-    client = TestClient(create_app(data_dir=tmp_path))
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json() == {"ok": True, "mode": "readonly", "orders_enabled": False}
+    paper = client.get("/api/paper")
+    assert paper.status_code == 200
+    assert paper.json() == {
+        "mode": "paper-simulation-only",
+        "orders_enabled": False,
+        "runs": [],
+        "status": "NOT_STARTED",
+    }
+    for method in ("post", "put", "patch", "delete"):
+        assert getattr(client, method)("/api/paper").status_code == 405
+    paper_route = next(route for route in app.routes if getattr(route, "path", None) == "/api/paper")
+    assert paper_route.methods == {"GET"}
     page = client.get("/")
     assert page.status_code == 200
     assert "ORDRES IMPOSSIBLES" in page.text
+
+
+def test_dashboard_masks_a_corrupt_projection_without_mutating_the_database(
+    tmp_path: Path,
+) -> None:
+    paper_dir = tmp_path / "paper"
+    paper_dir.mkdir()
+    database = paper_dir / "paper.sqlite3"
+    config = PaperRunConfig(
+        strategy_name="dashboard_corruption_fixture",
+        strategy_hash="a" * 64,
+        parameters={"version": 1},
+        data_hash="b" * 64,
+        execution=PaperExecutionConfig(),
+        risk=PaperRiskLimits(),
+        seed=12,
+        initial_cash=Decimal("100000"),
+        validation_started_at=datetime(2026, 8, 13, tzinfo=UTC),
+    )
+    PaperEngine(PaperStore(database), config).start()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER paper_events_no_update")
+        connection.execute(
+            "UPDATE paper_events SET payload_json = ? WHERE run_id = ? AND sequence = 1",
+            ("{}", config.run_id),
+        )
+    corrupt_bytes = database.read_bytes()
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/api/paper")
+
+    assert response.status_code == 200
+    assert database.read_bytes() == corrupt_bytes
+    payload = response.json()
+    assert payload["status"] == "AVAILABLE"
+    assert len(payload["runs"]) == 1
+    run = payload["runs"][0]
+    assert run["run_id"] == config.run_id
+    assert run["integrity"] == "FAILED_READONLY"
+    assert run["status"] == "MANUAL_REVIEW"
+    assert run["projection"] is None
+    assert run["orders_enabled"] is False
 
 
 def test_dashboard_escapes_report_title(tmp_path: Path) -> None:

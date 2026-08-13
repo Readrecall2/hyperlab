@@ -33,8 +33,14 @@ Les archives officielles sont utiles pour remonter dans le temps, mais leur publ
 - fichiers immuables et manifestes de qualité des données.
 
 SQLite reste une zone opérationnelle mutable. Il ne constitue ni l'archive de
-recherche ni une preuve d'intégrité. La couche de recherche utilise cette
-arborescence :
+recherche ni une preuve d'intégrité. La racine du lake ne tolère qu'un writer
+actif : le root lock couvre aussi la récupération d'orphelins et l'index de
+déduplication dérivé. Une capture simultanée multi-venue doit donc partager un
+writer coordonné qui sérialise les publications ; elle ne doit jamais contourner
+le verrou. Les vues du writer refusent toute ligne dont la venue ne correspond
+pas à leur périmètre.
+
+La couche de recherche utilise cette
 
 ```text
 data/lake/

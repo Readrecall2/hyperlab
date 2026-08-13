@@ -196,7 +196,14 @@ class BinancePublicConnector:
         streams: list[str] = []
         for asset in assets:
             symbol = self.instrument_for_asset(asset).source_symbol.lower()
-            streams.extend((f"{symbol}@bookTicker", f"{symbol}@aggTrade", f"{symbol}@markPrice@1s"))
+            streams.extend(
+                (
+                    f"{symbol}@bookTicker",
+                    f"{symbol}@depth20@100ms",
+                    f"{symbol}@aggTrade",
+                    f"{symbol}@markPrice@1s",
+                )
+            )
             streams.extend(f"{symbol}@kline_{interval}" for interval in candle_intervals)
         return WS_BASE_URL + "/".join(streams)
 
@@ -308,6 +315,8 @@ def parse_binance_message(
         event = str(data.get("e", ""))
         if event == "bookTicker" or channel.endswith("@bookTicker"):
             records.append(_parse_bbo(data, envelope, normalized))
+        elif event == "depthUpdate" and "@depth20" in channel:
+            records.extend(_parse_l2_snapshot(data, envelope, normalized))
         elif event == "aggTrade" or channel.endswith("@aggTrade"):
             records.append(_parse_trade(data, envelope, normalized))
         elif event == "kline" or "@kline_" in channel:
@@ -347,6 +356,74 @@ def _parse_bbo(
         }
     )
     return ParsedRecord(RecordType.BBO, normalized.asset, row)
+
+
+def _parse_l2_snapshot(
+    data: Mapping[str, Any],
+    envelope: WireEnvelope,
+    normalized: NormalizedInstrument,
+) -> list[ParsedRecord]:
+    """Normalize one complete top-20 public book frame without delta inference."""
+
+    transaction_time = _datetime_ms(data.get("T", data["E"]))
+    exchange_time = _datetime_ms(data["E"])
+    last_sequence = int(str(data["u"]))
+    if last_sequence < 0:
+        raise ValueError("Binance L2 update sequence cannot be negative")
+    bids = _sequence(data["b"], label="partial depth bids")
+    asks = _sequence(data["a"], label="partial depth asks")
+    if len(bids) > 20 or len(asks) > 20:
+        raise ValueError("Binance partial depth frame exceeds its configured top-20 contract")
+
+    snapshot_id = (
+        f"ws:{envelope.connection_id}:{envelope.connection_epoch}:"
+        f"{envelope.arrival_sequence}:{normalized.source_symbol}:{last_sequence}"
+    )
+    book_epoch_id = f"{envelope.connection_id}:{envelope.connection_epoch}"
+    header = _common(
+        RecordType.L2_BOOK_STATE,
+        normalized.asset,
+        envelope,
+        event_time=transaction_time,
+        exchange_time=exchange_time,
+        source_sequence=None,
+    )
+    header.update(
+        {
+            "snapshot_id": snapshot_id,
+            "book_epoch_id": book_epoch_id,
+            "bid_level_count": len(bids),
+            "ask_level_count": len(asks),
+        }
+    )
+    records = [ParsedRecord(RecordType.L2_BOOK_STATE, normalized.asset, header)]
+    for side, raw_levels in (("bid", bids), ("ask", asks)):
+        for level_number, raw_level in enumerate(raw_levels):
+            level = _sequence(raw_level, label=f"partial depth {side} level")
+            if len(level) != 2:
+                raise ValueError("Binance partial depth level must contain price and quantity")
+            row = _common(
+                RecordType.L2_SNAPSHOT,
+                normalized.asset,
+                envelope,
+                event_time=transaction_time,
+                exchange_time=exchange_time,
+                source_sequence=None,
+            )
+            row.update(
+                {
+                    "snapshot_id": snapshot_id,
+                    "book_epoch_id": book_epoch_id,
+                    "last_sequence": last_sequence,
+                    "side": side,
+                    "level": level_number,
+                    "price": _required_decimal(level[0]),
+                    "quantity": normalized.normalize_quantity(level[1]),
+                    "order_count": None,
+                }
+            )
+            records.append(ParsedRecord(RecordType.L2_SNAPSHOT, normalized.asset, row))
+    return records
 
 
 def _parse_trade(

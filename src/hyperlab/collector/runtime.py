@@ -31,7 +31,7 @@ from hyperlab.collector.models import (
     WireEnvelope,
 )
 from hyperlab.collector.parser import parse_websocket_message
-from hyperlab.collector.storage import BatchingLakeSink
+from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError, LakeSink
 from hyperlab.collector.websocket import (
     PublicSocket,
     PublicSocketFactory,
@@ -119,7 +119,7 @@ class PublicCollector:
         *,
         rest: PublicRestClient,
         socket_factory: PublicSocketFactory,
-        sink: BatchingLakeSink,
+        sink: LakeSink,
         runtime_status_path: Path,
         clock: Callable[[], datetime] = _utc_now,
         monotonic: Callable[[], float] = time.monotonic,
@@ -174,21 +174,26 @@ class PublicCollector:
         data_dir: Path,
         request_timeout_seconds: float,
         socket_factory: PublicSocketFactory,
+        sink: LakeSink | None = None,
     ) -> PublicCollector:
         rest = HyperliquidPublicClient(
             network=config.network,
             timeout_seconds=request_timeout_seconds,
         )
-        sink = BatchingLakeSink(
-            data_dir / "lake",
-            batch_size=config.batch_size,
-            queue_capacity=config.queue_capacity,
+        resolved_sink = (
+            BatchingLakeSink(
+                data_dir / "lake",
+                batch_size=config.batch_size,
+                queue_capacity=config.queue_capacity,
+            )
+            if sink is None
+            else sink
         )
         return cls(
             config,
             rest=rest,
             socket_factory=socket_factory,
-            sink=sink,
+            sink=resolved_sink,
             runtime_status_path=data_dir / "runtime_status.json",
         )
 
@@ -461,6 +466,17 @@ class PublicCollector:
                 self._active_socket = None
                 self.metrics.connection_alive = False
                 socket = None
+            except CoordinatedWriterError as exc:
+                self.metrics.connection_alive = False
+                if socket is not None:
+                    self._close_socket(socket)
+                    self._active_socket = None
+                    socket = None
+                with suppress(Exception):
+                    self._publish_status(
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
             except Exception as exc:
                 if self._flush_failure is not None:
                     with suppress(Exception):

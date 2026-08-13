@@ -1006,6 +1006,120 @@ def collect_reference(
         _close_preserving_active_exception(collector.close)
     console.print_json(json.dumps(collector.metrics))
 
+@app.command("collect-multi-venue")
+def collect_multi_venue(
+    assets: Annotated[str, typer.Option(help="Actifs communs séparés par des virgules")] = "BTC,ETH",
+    candle_intervals: Annotated[
+        str,
+        typer.Option(help="Intervalles candle communs séparés par des virgules"),
+    ] = "1m",
+    duration_seconds: Annotated[
+        float,
+        typer.Option(min=0.0, help="Durée simultanée; 0 = boucle continue"),
+    ] = 86_400.0,
+    batch_size: Annotated[int, typer.Option(min=1, max=10_000)] = 500,
+    history_lookback_hours: Annotated[int, typer.Option(min=1, max=24)] = 24,
+) -> None:
+    """Collecte Hyperliquid + Binance ensemble via un unique writer coordonné."""
+    from hyperlab.collector.models import CollectorConfig
+    from hyperlab.collector.multivenue import MultiVenueCollector
+    from hyperlab.collector.runtime import PublicCollector
+    from hyperlab.collector.storage import CoordinatedLakeWriter
+    from hyperlab.collector.websocket import WebsocketClientFactory
+    from hyperlab.venues.runtime import BinanceReferenceCollector, ReferenceCollectorConfig
+
+    settings = _settings()
+    if settings.app.mode not in {"readonly", "research"}:
+        raise typer.BadParameter("La collecte multi-venue refuse tout mode non readonly/research")
+    try:
+        shared_assets = tuple(value.upper() for value in _csv_values(assets, label="assets"))
+        shared_intervals = _csv_values(candle_intervals, label="candle-intervals")
+        hyperliquid_config = CollectorConfig(
+            assets=shared_assets,
+            candle_intervals=shared_intervals,
+            batch_size=batch_size,
+            history_lookback_hours=history_lookback_hours,
+        )
+        binance_config = ReferenceCollectorConfig(
+            assets=shared_assets,
+            candle_intervals=shared_intervals,
+            batch_size=batch_size,
+            history_lookback_hours=history_lookback_hours,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    writer = CoordinatedLakeWriter(
+        settings.app.data_dir / "lake",
+        venues=("hyperliquid", "binance_usdm"),
+        batch_size=batch_size,
+        queue_capacity=(
+            hyperliquid_config.queue_capacity + binance_config.queue_capacity
+        ),
+    )
+    hyperliquid = None
+    binance = None
+    hyperliquid_sink = writer.client("hyperliquid")
+    binance_sink = writer.client("binance_usdm")
+    try:
+        hyperliquid = PublicCollector.create_default(
+            hyperliquid_config,
+            data_dir=settings.app.data_dir,
+            request_timeout_seconds=settings.app.request_timeout_seconds,
+            socket_factory=WebsocketClientFactory(
+                queue_capacity=hyperliquid_config.queue_capacity
+            ),
+            sink=hyperliquid_sink,
+        )
+        binance = BinanceReferenceCollector.create_default(
+            binance_config,
+            data_dir=settings.app.data_dir,
+            request_timeout_seconds=settings.app.request_timeout_seconds,
+            sink=binance_sink,
+        )
+    except BaseException:
+        if hyperliquid is not None:
+            _close_preserving_active_exception(hyperliquid.close)
+        else:
+            _close_preserving_active_exception(hyperliquid_sink.close)
+        if binance is not None:
+            _close_preserving_active_exception(binance.close)
+        else:
+            _close_preserving_active_exception(binance_sink.close)
+        _close_preserving_active_exception(writer.close)
+        raise
+
+    runtime = MultiVenueCollector(
+        hyperliquid=hyperliquid,
+        binance=binance,
+        writer=writer,
+    )
+    try:
+        with _cooperative_signal_handlers(runtime.stop):
+            runtime.run(
+                duration_seconds=None if duration_seconds == 0 else duration_seconds
+            )
+    except KeyboardInterrupt:
+        runtime.stop()
+        console.print("Arrêt demandé; fermeture coordonnée des deux venues et flush final.")
+    finally:
+        _close_preserving_active_exception(runtime.close)
+
+    now = datetime.now(tz=UTC)
+    console.print_json(
+        json.dumps(
+            {
+                "mode": "readonly",
+                "orders_enabled": False,
+                "lake": str((settings.app.data_dir / "lake").resolve()),
+                "venues": {
+                    "hyperliquid": hyperliquid.metrics.as_dict(now),
+                    "binance_usdm": dict(binance.metrics),
+                },
+            }
+        )
+    )
+
 
 @app.command()
 def replay(

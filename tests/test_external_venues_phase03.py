@@ -11,7 +11,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
-from hyperlab.collector.storage import BatchingLakeSink
+from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError
+from hyperlab.data.lake import inventory_partitions
 from hyperlab.data.schema import RecordType
 from hyperlab.venues.base import NormalizedInstrument, measure_clock
 from hyperlab.venues.binance import (
@@ -24,6 +25,7 @@ from hyperlab.venues.binance import (
     parse_funding_history,
 )
 from hyperlab.venues.replay import replay_synchronized
+from hyperlab.venues.runtime import BinanceReferenceCollector, ReferenceCollectorConfig
 
 BASE = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
@@ -85,7 +87,7 @@ def test_exchange_info_normalizes_symbol_identity_and_base_sizes_explicitly() ->
         normalize_exchange_info(inverse, ("BTC",))
 
 
-def test_binance_connector_collects_bbo_trade_candle_and_funding_context() -> None:
+def test_binance_connector_collects_bbo_l2_trade_candle_and_funding_context() -> None:
     connector = _connector()
     frames = [
         _combined(
@@ -100,6 +102,20 @@ def test_binance_connector_collects_bbo_trade_candle_and_funding_context() -> No
                 "B": "1.25",
                 "a": "60000.2",
                 "A": "2.5",
+            },
+        ),
+        _combined(
+            "btcusdt@depth20@100ms",
+            {
+                "e": "depthUpdate",
+                "E": 1_786_492_800_015,
+                "T": 1_786_492_800_014,
+                "s": "BTCUSDT",
+                "U": 40,
+                "u": 43,
+                "pu": 39,
+                "b": [["60000.1", "1.25"], ["59999.9", "3.0"]],
+                "a": [["60000.2", "2.5"], ["60000.4", "4.0"]],
             },
         ),
         _combined(
@@ -151,7 +167,8 @@ def test_binance_connector_collects_bbo_trade_candle_and_funding_context() -> No
         ),
     ]
     parsed = [connector.parse_message(_envelope(frame, sequence=index)) for index, frame in enumerate(frames, 1)]
-    normalized = [message.records[1] for message in parsed]
+    normalized = [message.records[1] for message in parsed if "@depth20" not in str(message.channel)]
+    depth = parsed[1]
 
     assert [record.record_type for record in normalized] == [
         RecordType.BBO,
@@ -165,7 +182,53 @@ def test_binance_connector_collects_bbo_trade_candle_and_funding_context() -> No
     assert normalized[2].row["is_final"] is False
     assert normalized[3].row["mark_price"] == Decimal("60002")
     assert normalized[3].row["oracle_price"] is None
-    assert '"i":"60001"' in parsed[3].records[0].row["raw_message"]
+    assert '"i":"60001"' in parsed[4].records[0].row["raw_message"]
+
+    assert [record.record_type for record in depth.records] == [
+        RecordType.WIRE_MESSAGE,
+        RecordType.L2_BOOK_STATE,
+        RecordType.L2_SNAPSHOT,
+        RecordType.L2_SNAPSHOT,
+        RecordType.L2_SNAPSHOT,
+        RecordType.L2_SNAPSHOT,
+    ]
+    header = depth.records[1]
+    levels = depth.records[2:]
+    assert header.row["venue"] == "binance_usdm"
+    assert header.row["received_time"] == BASE
+    assert header.row["bid_level_count"] == 2
+    assert header.row["ask_level_count"] == 2
+    assert {record.row["last_sequence"] for record in levels} == {43}
+    assert [(record.row["side"], record.row["level"]) for record in levels] == [
+        ("bid", 0),
+        ("bid", 1),
+        ("ask", 0),
+        ("ask", 1),
+    ]
+    assert levels[0].row["price"] == Decimal("60000.1")
+    assert levels[0].row["quantity"] == Decimal("1.25")
+
+def test_binance_websocket_url_includes_replayable_top_20_l2_for_every_asset() -> None:
+    connector = BinancePublicConnector.from_exchange_info(
+        {
+            "symbols": [
+                _exchange_info()["symbols"][0],  # type: ignore[index]
+                {
+                    **_exchange_info()["symbols"][0],  # type: ignore[index]
+                    "symbol": "ETHUSDT",
+                    "pair": "ETHUSDT",
+                    "baseAsset": "ETH",
+                },
+            ]
+        },
+        ("BTC", "ETH"),
+    )
+
+    url = connector.websocket_url(("BTC", "ETH"), ("1m",))
+
+    assert "btcusdt@depth20@100ms" in url
+    assert "ethusdt@depth20@100ms" in url
+
 
 
 def test_clock_midpoint_drift_latency_and_uncertainty_are_preserved(tmp_path: Path) -> None:
@@ -333,3 +396,226 @@ def test_sink_partitions_external_records_by_their_actual_venue(tmp_path: Path) 
     data_paths = [tmp_path / manifest.relative_data_path for manifest in result.manifests]
     assert all("venue=binance_usdm" in str(path) for path in data_paths)
     assert sum(pq.ParquetFile(path).metadata.num_rows for path in data_paths) == 2
+
+
+def _depth_frame(event_ms: int, *, last_sequence: int) -> dict[str, object]:
+    return _combined(
+        "btcusdt@depth20@100ms",
+        {
+            "e": "depthUpdate",
+            "E": event_ms,
+            "T": event_ms,
+            "s": "BTCUSDT",
+            "U": last_sequence,
+            "u": last_sequence,
+            "pu": last_sequence - 1,
+            "b": [["60000.1", "1.25"]],
+            "a": [["60000.2", "2.5"]],
+        },
+    )
+
+
+def _reference_collector(tmp_path: Path, sink: BatchingLakeSink) -> BinanceReferenceCollector:
+    return BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=BinancePublicRestClient(transport=FakeTransport()),
+        sink=sink,
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=lambda: BASE,
+    )
+
+
+def test_binance_complete_l2_snapshot_marks_each_connection_resync(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    sink = BatchingLakeSink(root, batch_size=100, queue_capacity=500)
+    collector = _reference_collector(tmp_path, sink)
+    connector = _connector()
+    base_ms = int(BASE.timestamp() * 1_000)
+    try:
+        for epoch, offset_ms in ((1, 0), (2, 1_000)):
+            connection_id = f"connection-{epoch}"
+            received_time = BASE + timedelta(milliseconds=offset_ms + 25)
+            envelope = WireEnvelope(
+                json.dumps(
+                    _depth_frame(base_ms + offset_ms, last_sequence=40 + epoch),
+                    separators=(",", ":"),
+                ),
+                received_time,
+                connection_id,
+                epoch,
+                1,
+            )
+            parsed = connector.parse_message(envelope)
+            pending = {"BTC"}
+            collector._record_l2_resync_if_needed(
+                parsed,
+                pending_assets=pending,
+                connection_id=connection_id,
+                connection_epoch=epoch,
+            )
+            assert pending == set()
+            for record in parsed.records:
+                collector._add(record)
+    finally:
+        collector.close()
+
+    report = inventory_partitions(root)
+    assert not [
+        gap
+        for partition, gap in report.cross_segment_gaps
+        if partition.record_type == RecordType.L2_SNAPSHOT
+        and gap.kind == "l2_resync_missing"
+    ]
+    events: list[dict[str, object]] = []
+    for manifest in report.partitions:
+        if manifest.partition.record_type != RecordType.CONNECTION_EVENT:
+            continue
+        events.extend(
+            pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
+        )
+    resyncs = [row for row in events if str(row["event_kind"]).startswith("resync_")]
+    assert [row["event_kind"] for row in resyncs].count("resync_start") == 2
+    assert [row["event_kind"] for row in resyncs].count("resync_complete") == 2
+    assert all(row["venue"] == "binance_usdm" for row in resyncs)
+    assert all(row["asset"] == "BTC" for row in resyncs)
+    assert all(row["received_time"] is not None for row in resyncs)
+    assert all(
+        row["resync_snapshot_id"] is not None
+        for row in resyncs
+        if row["event_kind"] == "resync_complete"
+    )
+
+
+def test_binance_staleness_is_checked_per_required_bbo_and_l2_stream(
+    tmp_path: Path,
+) -> None:
+    sink = BatchingLakeSink(tmp_path / "lake", batch_size=10, queue_capacity=20)
+    collector = _reference_collector(tmp_path, sink)
+    try:
+        collector._initialize_critical_streams(_connector(), at=BASE)
+        collector._critical_stream_last_received["btcusdt@bookTicker"] = BASE + timedelta(
+            seconds=29
+        )
+        assert collector._stale_critical_streams(at=BASE + timedelta(seconds=31)) == (
+            "btcusdt@depth20@100ms",
+        )
+    finally:
+        collector.close()
+
+
+class FatalWriterSink:
+    high_water = 0
+    pending_count = 0
+    should_flush = False
+
+    def add(self, record: ParsedRecord) -> bool:
+        del record
+        raise CoordinatedWriterError("simulated coordinated writer incompatibility")
+
+    def flush(self) -> object:
+        raise AssertionError("fatal writer must not be flushed and retried")
+
+    def close(self) -> None:
+        pass
+
+
+class NoMessageSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def receive(self, timeout_seconds: float) -> None:
+        del timeout_seconds
+        raise AssertionError("writer failed before the first socket receive")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FatalWriterSocketFactory:
+    socket = NoMessageSocket()
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def connect(self, network: str, timeout_seconds: float) -> NoMessageSocket:
+        del network, timeout_seconds
+        return self.socket
+
+
+def test_binance_coordinated_writer_error_is_fatal_without_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=BinancePublicRestClient(transport=FakeTransport()),
+        sink=FatalWriterSink(),  # type: ignore[arg-type]
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=lambda: BASE,
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        FatalWriterSocketFactory,
+    )
+    FatalWriterSocketFactory.socket = NoMessageSocket()
+
+    with pytest.raises(
+        CoordinatedWriterError,
+        match="simulated coordinated writer incompatibility",
+    ):
+        collector.run(max_messages=1)
+
+    assert collector.metrics["state"] == "failed"
+    assert collector.metrics["connections"] == 1
+    assert collector.metrics["reconnects"] == 0
+    assert FatalWriterSocketFactory.socket.closed is True
+
+
+class FailingTerminalFlushSink:
+    high_water = 0
+    pending_count = 1
+    should_flush = False
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def add(self, record: ParsedRecord) -> bool:
+        del record
+        return True
+
+    def flush(self) -> object:
+        raise CoordinatedWriterError("simulated terminal flush failure")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_binance_close_releases_sink_after_terminal_flush_failure(
+    tmp_path: Path,
+) -> None:
+    sink = FailingTerminalFlushSink()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=BinancePublicRestClient(transport=FakeTransport()),
+        sink=sink,  # type: ignore[arg-type]
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=lambda: BASE,
+    )
+
+    with pytest.raises(
+        CoordinatedWriterError,
+        match="simulated terminal flush failure",
+    ):
+        collector.close()
+
+    assert sink.closed is True
+    assert collector.metrics["state"] == "failed"
+    collector.close()

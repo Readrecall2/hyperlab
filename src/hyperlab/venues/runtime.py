@@ -3,12 +3,13 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from hyperlab.collector.models import ParsedRecord, WireEnvelope
-from hyperlab.collector.storage import BatchingLakeSink
+from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
+from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError, LakeSink
 from hyperlab.collector.websocket import PublicSocket, UrlWebsocketClientFactory
 from hyperlab.data.schema import RecordType
 from hyperlab.storage.sqlite import write_runtime_status
@@ -60,7 +61,7 @@ class BinanceReferenceCollector:
         config: ReferenceCollectorConfig,
         *,
         rest: BinancePublicRestClient,
-        sink: BatchingLakeSink,
+        sink: LakeSink,
         runtime_status_path: Path,
         clock: Callable[[], datetime] = _utc_now,
         monotonic: Callable[[], float] = time.monotonic,
@@ -72,8 +73,10 @@ class BinanceReferenceCollector:
         self.clock = clock
         self.monotonic = monotonic
         self._stop = False
+        self._closed = False
         self._socket: PublicSocket | None = None
         self._connector: BinancePublicConnector | None = None
+        self._critical_stream_last_received: dict[str, datetime] = {}
         self.metrics: dict[str, object] = {
             "venue": VENUE,
             "state": "stopped",
@@ -97,14 +100,19 @@ class BinanceReferenceCollector:
         *,
         data_dir: Path,
         request_timeout_seconds: float,
+        sink: LakeSink | None = None,
     ) -> BinanceReferenceCollector:
         return cls(
             config,
             rest=BinancePublicRestClient(timeout_seconds=request_timeout_seconds),
-            sink=BatchingLakeSink(
-                data_dir / "lake",
-                batch_size=config.batch_size,
-                queue_capacity=config.queue_capacity,
+            sink=(
+                BatchingLakeSink(
+                    data_dir / "lake",
+                    batch_size=config.batch_size,
+                    queue_capacity=config.queue_capacity,
+                )
+                if sink is None
+                else sink
             ),
             runtime_status_path=data_dir / "runtime_status_binance_usdm.json",
         )
@@ -114,13 +122,43 @@ class BinanceReferenceCollector:
         if self._socket is not None:
             self._socket.close()
 
+    def _interruptible_sleep(self, delay_seconds: float) -> None:
+        deadline = self.monotonic() + max(delay_seconds, 0.0)
+        while not self._stop:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
+
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.stop()
-        result = self.sink.flush()
-        self.metrics["rows_written"] = self._counter("rows_written") + result.row_count
-        self.sink.close()
-        self.metrics["state"] = "stopped"
-        self._publish()
+        errors: list[tuple[str, BaseException]] = []
+        try:
+            result = self.sink.flush()
+            self.metrics["rows_written"] = self._counter("rows_written") + result.row_count
+        except BaseException as exc:
+            errors.append(("terminal lake flush", exc))
+        try:
+            self.sink.close()
+        except BaseException as exc:
+            errors.append(("lake sink close", exc))
+        self.metrics["state"] = "failed" if errors else "stopped"
+        try:
+            self._publish()
+        except BaseException as exc:
+            errors.append(("runtime status publish", exc))
+        if not errors:
+            return
+        first_label, primary = errors[0]
+        primary.add_note(f"cleanup action: {first_label}")
+        for label, secondary in errors[1:]:
+            primary.add_note(
+                f"{label} also failed: {type(secondary).__name__}: {secondary}"
+            )
+        raise primary
 
     def _add(self, record: ParsedRecord) -> None:
         if self.sink.add(record):
@@ -134,29 +172,122 @@ class BinanceReferenceCollector:
         event_kind: str,
         *,
         connection_id: str,
+        asset: str = "GLOBAL",
+        channel: str = "combined_market_stream",
+        book_epoch_id: str | None = None,
         reason: str | None = None,
         at: datetime | None = None,
+        received_at: datetime | None = None,
+        resync_snapshot_id: str | None = None,
     ) -> None:
         event_time = self.clock() if at is None else at
+        received_time = event_time if received_at is None else received_at
         row = {
             "schema_version": 1,
             "record_type": RecordType.CONNECTION_EVENT.value,
             "venue": VENUE,
-            "asset": "GLOBAL",
+            "asset": asset,
             "event_time": event_time,
             "exchange_time": None,
-            "received_time": event_time,
+            "received_time": received_time,
             "source_sequence": None,
             "connection_id": connection_id,
             "event_kind": event_kind,
-            "channel": "combined_market_stream",
-            "book_epoch_id": None,
+            "channel": channel,
+            "book_epoch_id": book_epoch_id,
             "reason": reason,
             "expected_sequence": None,
             "observed_sequence": None,
-            "resync_snapshot_id": None,
+            "resync_snapshot_id": resync_snapshot_id,
         }
-        self._add(ParsedRecord(RecordType.CONNECTION_EVENT, "GLOBAL", row))
+        self._add(ParsedRecord(RecordType.CONNECTION_EVENT, asset, row))
+
+    def _initialize_critical_streams(
+        self,
+        connector: BinancePublicConnector,
+        *,
+        at: datetime,
+    ) -> None:
+        channels: list[str] = []
+        for asset in self.config.assets:
+            symbol = connector.instrument_for_asset(asset).source_symbol.lower()
+            channels.extend((f"{symbol}@bookTicker", f"{symbol}@depth20@100ms"))
+        self._critical_stream_last_received = {channel: at for channel in channels}
+
+    def _stale_critical_streams(self, *, at: datetime) -> tuple[str, ...]:
+        threshold = timedelta(seconds=self.config.stale_after_seconds)
+        return tuple(
+            channel
+            for channel, last_received in sorted(self._critical_stream_last_received.items())
+            if at - last_received > threshold
+        )
+
+    def _require_critical_streams_fresh(
+        self,
+        *,
+        at: datetime,
+        connection_id: str,
+    ) -> None:
+        stale_channels = self._stale_critical_streams(at=at)
+        if not stale_channels:
+            return
+        reason = "required Binance BBO/L2 streams stale: " + ", ".join(stale_channels)
+        self.metrics["maintenance_or_absence_detected"] = True
+        self.metrics["state"] = "stale"
+        self._connection_event(
+            "gap",
+            connection_id=connection_id,
+            channel=",".join(stale_channels),
+            reason=reason,
+            at=at,
+        )
+        self._publish()
+        raise TimeoutError(reason)
+
+    def _record_l2_resync_if_needed(
+        self,
+        parsed: ParsedMessage,
+        *,
+        pending_assets: set[str],
+        connection_id: str,
+        connection_epoch: int,
+    ) -> None:
+        states = [
+            record
+            for record in parsed.records
+            if record.record_type == RecordType.L2_BOOK_STATE and record.asset in pending_assets
+        ]
+        if not states:
+            return
+        if len(states) != 1:
+            raise RuntimeError("one Binance partial-depth frame produced multiple L2 states")
+        state = states[0]
+        expected_epoch = f"{connection_id}:{connection_epoch}"
+        observed_epoch = str(state.row["book_epoch_id"])
+        if observed_epoch != expected_epoch:
+            raise RuntimeError(
+                "Binance L2 book epoch is incompatible with the active connection: "
+                f"expected {expected_epoch!r}, observed {observed_epoch!r}"
+            )
+        event_time = state.row["event_time"]
+        received_time = state.row["received_time"]
+        snapshot_id = str(state.row["snapshot_id"])
+        if not isinstance(event_time, datetime) or not isinstance(received_time, datetime):
+            raise RuntimeError("Binance L2 state has invalid event or receive timestamps")
+        reason = "complete Binance top-20 snapshot received"
+        for event_kind in ("resync_start", "resync_complete"):
+            self._connection_event(
+                event_kind,
+                connection_id=connection_id,
+                asset=state.asset,
+                channel=str(parsed.channel),
+                book_epoch_id=expected_epoch,
+                reason=reason,
+                at=event_time,
+                received_at=received_time,
+                resync_snapshot_id=(snapshot_id if event_kind == "resync_complete" else None),
+            )
+        pending_assets.remove(state.asset)
 
     def _bootstrap(self) -> BinancePublicConnector:
         self.metrics["state"] = "bootstrapping"
@@ -240,7 +371,8 @@ class BinanceReferenceCollector:
                 self.metrics["state"] = "live"
                 self._connection_event("connect", connection_id=connection_id)
                 connection_started = self.clock()
-                last_received: datetime | None = None
+                self._initialize_critical_streams(connector, at=connection_started)
+                pending_l2_resync_assets = set(self.config.assets)
                 self._publish()
                 while not self._stop:
                     if duration_seconds is not None and self.monotonic() - started >= duration_seconds:
@@ -248,22 +380,11 @@ class BinanceReferenceCollector:
                     received = self._socket.receive(1.0)
                     now = self.clock()
                     if received is None:
-                        if (
-                            now - (last_received or connection_started)
-                            > timedelta(seconds=self.config.stale_after_seconds)
-                        ):
-                            self.metrics["maintenance_or_absence_detected"] = True
-                            self.metrics["state"] = "stale"
-                            self._connection_event(
-                                "gap",
-                                connection_id=connection_id,
-                                reason="all configured Binance public streams stale",
-                                at=now,
-                            )
-                            self._publish()
-                            raise TimeoutError("Binance public streams are stale")
+                        self._require_critical_streams_fresh(
+                            at=now,
+                            connection_id=connection_id,
+                        )
                         continue
-                    last_received = received.received_time
                     arrival_sequence += 1
                     envelope = WireEnvelope(
                         received.raw_message,
@@ -273,18 +394,37 @@ class BinanceReferenceCollector:
                         arrival_sequence,
                     )
                     parsed = connector.parse_message(envelope)
+                    if parsed.channel in self._critical_stream_last_received:
+                        self._critical_stream_last_received[parsed.channel] = received.received_time
                     self.metrics["messages_received"] = self._counter("messages_received") + 1
                     self.metrics["normalization_issues"] = self._counter(
                         "normalization_issues"
                     ) + len(parsed.issues)
+                    self._record_l2_resync_if_needed(
+                        parsed,
+                        pending_assets=pending_l2_resync_assets,
+                        connection_id=connection_id,
+                        connection_epoch=epoch,
+                    )
                     for record in parsed.records:
                         self._add(record)
+                    self._require_critical_streams_fresh(
+                        at=now,
+                        connection_id=connection_id,
+                    )
                     if max_messages is not None and self._counter("messages_received") >= max_messages:
                         break
                 if self._stop or (
                     duration_seconds is not None and self.monotonic() - started >= duration_seconds
                 ) or (max_messages is not None and self._counter("messages_received") >= max_messages):
                     break
+            except CoordinatedWriterError as exc:
+                self.metrics["last_error"] = f"{type(exc).__name__}: {exc}"
+                self.metrics["maintenance_or_absence_detected"] = True
+                self.metrics["state"] = "failed"
+                with suppress(Exception):
+                    self._publish()
+                raise
             except Exception as exc:
                 if self._stop:
                     break
@@ -297,7 +437,7 @@ class BinanceReferenceCollector:
                     reason=str(self.metrics["last_error"]),
                 )
                 self._publish()
-                time.sleep(min(2 ** min(epoch, 5), 30))
+                self._interruptible_sleep(min(2 ** min(epoch, 5), 30))
             finally:
                 if self._socket is not None:
                     self._socket.close()
@@ -306,7 +446,12 @@ class BinanceReferenceCollector:
         self._publish()
 
     def _publish(self) -> None:
+        now = self.clock()
+        self.metrics["critical_stream_lag_seconds"] = {
+            channel: max((now - received_at).total_seconds(), 0.0)
+            for channel, received_at in sorted(self._critical_stream_last_received.items())
+        }
         payload = dict(self.metrics)
-        payload["updated_at"] = self.clock().isoformat()
+        payload["updated_at"] = now.isoformat()
         payload["network_scope"] = "public market data only"
         write_runtime_status(self.runtime_status_path, payload)

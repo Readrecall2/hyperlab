@@ -103,6 +103,22 @@ def test_collect_help_exposes_phase_02_flags_and_removes_snapshot_loop_flags() -
         assert obsolete_flag not in result.output
 
 
+def test_collect_multi_venue_help_exposes_one_coordinated_duration_command() -> None:
+    result = runner.invoke(app, ["collect-multi-venue", "--help"], env={"COLUMNS": "160"})
+
+    assert result.exit_code == 0
+    for flag in (
+        "--assets",
+        "--candle-intervals",
+        "--duration-seconds",
+        "--batch-size",
+        "--history-lookback-hours",
+    ):
+        assert flag in result.output
+    assert "Hyperliquid" in result.output
+    assert "Binance" in result.output
+
+
 def test_cooperative_signal_handlers_request_stop_and_restore_on_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

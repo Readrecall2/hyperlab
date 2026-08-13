@@ -47,15 +47,22 @@ indisponible pour cette démo in-sample; il n'est publié que sur une série OOS
 ## Venue de référence publique
 
 ```powershell
-.\.venv\Scripts\python.exe -m hyperlab collect-reference `
+.\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
   --assets BTC,ETH `
+  --candle-intervals 1m `
   --duration-seconds 600
 ```
 
-Cette commande collecte uniquement les données publiques Binance USDⓈ-M
-(BBO, trades agrégés, funding et candles), sans clé et sans route de trading.
-Les différences de contrat, mark et index restent explicites. Voir
-[`docs/EXTERNAL_VENUES.md`](docs/EXTERNAL_VENUES.md).
+Cette commande lance Hyperliquid et Binance USD-M simultanément avec un unique
+writer coordonné sur `data/lake`. Elle conserve BBO, L2, trades, données de
+contexte/replay et timestamps de réception, sans clé et sans route de trading.
+`collect-reference` reste disponible pour une capture Binance seule, mais ne
+doit jamais être lancé en parallèle d'un autre collecteur sur le même lake.
+
+Voir [`docs/MULTI_VENUE_COLLECTION.md`](docs/MULTI_VENUE_COLLECTION.md) pour
+l'architecture, la commande longue Phase 10 et les contrôles post-capture, puis
+[`docs/EXTERNAL_VENUES.md`](docs/EXTERNAL_VENUES.md) pour les différences de
+contrat, mark et index.
 
 ## Docker local
 

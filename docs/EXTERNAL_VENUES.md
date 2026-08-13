@@ -1,6 +1,6 @@
 # Venue de référence publique — Binance USDⓈ-M Futures
 
-Dernière vérification documentaire : 12 août 2026.
+Dernière vérification documentaire : 13 août 2026.
 
 ## Choix et périmètre de sécurité
 
@@ -17,18 +17,25 @@ candles. Il ne possède aucun paramètre de clé, signature ou compte. Toute rou
 ordre, position, compte, listen key, transfert ou authentification est rejetée
 avant le transport. Le WebSocket utilise uniquement les market streams publics.
 
-Commande de collecte :
+Commande de collecte simultanée avec Hyperliquid :
 
 ```powershell
-.\.venv\Scripts\python.exe -m hyperlab collect-reference `
+.\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
   --assets BTC,ETH `
   --candle-intervals 1m `
   --duration-seconds 600
 ```
 
-Les données vont dans le même lake immuable, sous
-`venue=binance_usdm`. L'état séparé se trouve dans
-`data/runtime_status_binance_usdm.json` et apparaît aussi avec `hyperlab status`.
+Cette commande est la voie sûre pour capturer les deux venues dans le même lake :
+un seul writer détient le root lock et sérialise les deux producteurs. La
+commande `collect-reference` reste utilisable pour Binance seule, mais ne doit
+pas être exécutée en parallèle de `collect` sur la même racine.
+
+Les données Binance vont dans le lake immuable sous `venue=binance_usdm` et
+Hyperliquid sous `venue=hyperliquid`. L'état Binance séparé se trouve dans
+`data/runtime_status_binance_usdm.json` et apparaît aussi avec
+`hyperlab status`. Voir [`MULTI_VENUE_COLLECTION.md`](MULTI_VENUE_COLLECTION.md)
+pour l'audit du writer, la commande longue et les contrôles post-capture.
 
 ## Flux collectés
 
@@ -36,6 +43,7 @@ Les données vont dans le même lake immuable, sous
 |---|---|---|
 | identité et tailles | `GET /fapi/v1/exchangeInfo` | `BTCUSDT → BTC`, linéaire, quantité en BTC, tick/step conservés |
 | BBO | `<symbol>@bookTicker` | prix USDT par base, quantités en unité de base, `u` conservé |
+| L2 | `<symbol>@depth20@100ms` | snapshot top-20 complet, deux côtés, dernier update ID, epoch de carnet et niveaux ordonnés |
 | trades | `<symbol>@aggTrade` | ID agrégé, prix, quantité de base, côté agresseur dérivé de `m` |
 | funding courant | `<symbol>@markPrice@1s` | taux conservé ; index présent seulement dans le wire brut |
 | funding réalisé | `GET /fapi/v1/fundingRate` | règlement et mark Binance ; cadence ajustée issue de `fundingInfo`, sinon minimum observé sur au moins deux règlements |
@@ -47,6 +55,14 @@ connexion, epoch et séquence d'arrivée. Les lignes normalisées conservent aus
 le timestamp source lorsqu'il existe. La latence réseau corrigée est une
 **estimation** : `received - source + (local_midpoint - server)`. Elle reste
 signée et n'est jamais ramenée artificiellement à zéro.
+
+Le snapshot top-20 est enregistré sans fabriquer les niveaux absents et sans le
+transformer artificiellement en delta. Le premier snapshot de chaque actif après
+connexion produit `resync_start` et `resync_complete`, associés à son
+`book_epoch_id` et à son `snapshot_id`. Les flux BBO et L2 sont surveillés
+séparément pour chaque actif ; leur silence au-delà du seuil de staleness
+provoque un gap historique et une reconnexion, même si d'autres canaux continuent
+à recevoir des messages.
 
 ## Identité, mark, index et oracle
 
@@ -90,9 +106,11 @@ bootstrap et marque immédiatement la venue indisponible.
 - Les limites sont par IP et peuvent provoquer `429`, puis `418` si le client ne
   respecte pas le backoff. La commande limite volontairement son bootstrap.
 - Une connexion market stream peut être interrompue ; la reprise crée une
-  nouvelle epoch et ne prouve pas qu'aucun événement n'a été manqué.
+  nouvelle epoch et un resync L2 explicite, sans prouver qu'aucun trade ou
+  événement intermédiaire n'a été manqué.
 - Les trades sont **agrégés par ordre taker**, pas des fills individuels.
-- Le BBO n'est pas un carnet complet et ne prouve aucune possibilité de fill.
+- Le top-20 n'est pas le carnet complet au-delà de cette profondeur et ne prouve
+  aucune possibilité de fill.
 - Une candle REST en cours n'est pas déclarée finale avec l'horloge locale.
 - L'historique REST est borné et paginé ; un collecteur 24/24 reste nécessaire.
 - `fundingInfo` ne publie que les ajustements. Sans ajustement publié, la cadence
@@ -108,6 +126,7 @@ bootstrap et marque immédiatement la venue indisponible.
 
 - Catalogue USDⓈ-M : https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api
 - Market streams USDⓈ-M : https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams
+- Partial book depth : https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Partial-Book-Depth-Streams
 - Documentation développeur : https://developers.binance.com/en/docs/introduction
 - Conditions Binance : https://www.binance.com/en/terms
 - Données historiques publiques : https://data.binance.vision/

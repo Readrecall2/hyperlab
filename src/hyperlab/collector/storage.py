@@ -4,12 +4,13 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Protocol
 
 import pyarrow as pa
 
@@ -31,6 +32,29 @@ class FlushResult:
     manifests: tuple[PartitionManifest, ...]
     row_count: int
     duplicate_count: int
+
+
+class CoordinatedWriterError(RuntimeError):
+    """Fatal coordinated-writer incompatibility or storage failure."""
+
+
+class LakeSink(Protocol):
+    """Minimal collector sink contract, including coordinated venue views."""
+
+    @property
+    def high_water(self) -> int: ...
+
+    @property
+    def pending_count(self) -> int: ...
+
+    @property
+    def should_flush(self) -> bool: ...
+
+    def add(self, record: ParsedRecord) -> bool: ...
+
+    def flush(self) -> FlushResult: ...
+
+    def close(self) -> None: ...
 
 
 _GroupKey = tuple[str, RecordType, str, str, str]
@@ -189,9 +213,17 @@ def _recover_orphans(root: Path) -> None:
 class _PersistentObservationIndex:
     """Derived cache: immutable manifests remain the source of truth."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        serialized_cross_thread_access: bool = False,
+    ) -> None:
         root.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(root / ".collector-observations.sqlite3")
+        self._connection = sqlite3.connect(
+            root / ".collector-observations.sqlite3",
+            check_same_thread=not serialized_cross_thread_access,
+        )
         try:
             self._connection.execute("PRAGMA journal_mode=DELETE")
             self._connection.execute("PRAGMA synchronous=FULL")
@@ -384,6 +416,7 @@ class BatchingLakeSink:
         queue_capacity: int = 10_000,
         recent_key_capacity: int = 100_000,
         persistent_dedup: bool = True,
+        _serialized_cross_thread_access: bool = False,
     ) -> None:
         if batch_size <= 0 or queue_capacity < batch_size or recent_key_capacity <= 0:
             raise ValueError("invalid batch or queue capacity")
@@ -401,7 +434,10 @@ class BatchingLakeSink:
         try:
             _recover_orphans(root)
             if persistent_dedup:
-                self._observation_index = _PersistentObservationIndex(root)
+                self._observation_index = _PersistentObservationIndex(
+                    root,
+                    serialized_cross_thread_access=_serialized_cross_thread_access,
+                )
         except BaseException:
             self._writer_lock.close()
             raise
@@ -569,3 +605,201 @@ class BatchingLakeSink:
         else:
             stream = "default"
         return venue, record_type, asset, day, stream
+
+class CoordinatedLakeSink:
+    """Venue-scoped view over one process-wide, serialized lake writer."""
+
+    def __init__(self, owner: CoordinatedLakeWriter, venue: str) -> None:
+        self._owner = owner
+        self.venue = venue
+        self._closed = False
+
+    @property
+    def pending_count(self) -> int:
+        return self._owner._client_pending(self)
+
+    @property
+    def should_flush(self) -> bool:
+        return self._owner._client_should_flush(self)
+
+    @property
+    def high_water(self) -> int:
+        return self._owner._client_high_water(self)
+
+    def add(self, record: ParsedRecord) -> bool:
+        return self._owner._client_add(self, record)
+
+    def flush(self) -> FlushResult:
+        return self._owner._client_flush(self)
+
+    def close(self) -> None:
+        self._owner._close_client(self)
+
+
+class CoordinatedLakeWriter:
+    """Own exactly one root lock/index while serializing venue-scoped clients."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        venues: tuple[str, ...],
+        batch_size: int = 500,
+        queue_capacity: int = 10_000,
+        recent_key_capacity: int = 100_000,
+    ) -> None:
+        if not venues or len(venues) != len(set(venues)) or any(not venue for venue in venues):
+            raise ValueError("coordinated writer venues must be non-empty and unique")
+        self.root = root
+        self._venues = frozenset(venues)
+        self._lock = threading.RLock()
+        self._sink = BatchingLakeSink(
+            root,
+            batch_size=batch_size,
+            queue_capacity=queue_capacity,
+            recent_key_capacity=recent_key_capacity,
+            _serialized_cross_thread_access=True,
+        )
+        self._clients: dict[str, CoordinatedLakeSink] = {}
+        self._pending_by_venue = {venue: 0 for venue in venues}
+        self._high_water_by_venue = {venue: 0 for venue in venues}
+        self._duplicates_since_flush = {venue: 0 for venue in venues}
+        self._manifest_credit: dict[str, list[PartitionManifest]] = {
+            venue: [] for venue in venues
+        }
+        self._row_credit = {venue: 0 for venue in venues}
+        self._duplicate_credit = {venue: 0 for venue in venues}
+        self._closed = False
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return self._sink.pending_count
+
+    def client(self, venue: str) -> CoordinatedLakeSink:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("coordinated lake writer is closed")
+            if venue not in self._venues:
+                raise ValueError(f"venue {venue!r} is not configured for this coordinated writer")
+            if venue in self._clients:
+                raise RuntimeError(f"coordinated lake writer already has a client for venue {venue!r}")
+            client = CoordinatedLakeSink(self, venue)
+            self._clients[venue] = client
+            return client
+
+    def _require_active(self, client: CoordinatedLakeSink) -> None:
+        if self._closed:
+            raise CoordinatedWriterError("coordinated lake writer is closed")
+        if client._closed or self._clients.get(client.venue) is not client:
+            raise CoordinatedWriterError(
+                f"coordinated lake client for {client.venue!r} is closed"
+            )
+
+    def _client_pending(self, client: CoordinatedLakeSink) -> int:
+        with self._lock:
+            self._require_active(client)
+            return self._pending_by_venue[client.venue]
+
+    def _client_should_flush(self, client: CoordinatedLakeSink) -> bool:
+        with self._lock:
+            self._require_active(client)
+            return self._sink.should_flush
+
+    def _client_high_water(self, client: CoordinatedLakeSink) -> int:
+        with self._lock:
+            self._require_active(client)
+            return self._high_water_by_venue[client.venue]
+
+    def _client_add(self, client: CoordinatedLakeSink, record: ParsedRecord) -> bool:
+        with self._lock:
+            self._require_active(client)
+            row_venue = record.row.get("venue")
+            if row_venue != client.venue:
+                raise CoordinatedWriterError(
+                    "coordinated lake client venue mismatch: "
+                    f"expected {client.venue!r}, observed {row_venue!r}"
+                )
+            try:
+                accepted = self._sink.add(record)
+            except Exception as exc:
+                raise CoordinatedWriterError(
+                    f"coordinated lake add failed for venue {client.venue!r}"
+                ) from exc
+            if accepted:
+                pending = self._pending_by_venue[client.venue] + 1
+                self._pending_by_venue[client.venue] = pending
+                self._high_water_by_venue[client.venue] = max(
+                    self._high_water_by_venue[client.venue],
+                    pending,
+                )
+            else:
+                self._duplicates_since_flush[client.venue] += 1
+            return accepted
+
+    def _record_flush(self, result: FlushResult) -> None:
+        expected_duplicates = sum(self._duplicates_since_flush.values())
+        if result.duplicate_count != expected_duplicates:
+            raise CoordinatedWriterError(
+                "coordinated writer duplicate accounting mismatch: "
+                f"sink={result.duplicate_count}, clients={expected_duplicates}"
+            )
+        rows_by_venue = {venue: 0 for venue in self._venues}
+        for manifest in result.manifests:
+            venue = manifest.partition.venue
+            if venue not in self._venues:
+                raise CoordinatedWriterError(
+                    f"coordinated writer published an incompatible venue: {venue!r}"
+                )
+            rows_by_venue[venue] += manifest.row_count
+            self._manifest_credit[venue].append(manifest)
+        for venue in self._venues:
+            if rows_by_venue[venue] != self._pending_by_venue[venue]:
+                raise CoordinatedWriterError(
+                    "coordinated writer row accounting mismatch for "
+                    f"{venue}: manifests={rows_by_venue[venue]}, "
+                    f"pending={self._pending_by_venue[venue]}"
+                )
+            self._row_credit[venue] += rows_by_venue[venue]
+            self._duplicate_credit[venue] += self._duplicates_since_flush[venue]
+            self._pending_by_venue[venue] = 0
+            self._duplicates_since_flush[venue] = 0
+
+    def _client_flush(self, client: CoordinatedLakeSink) -> FlushResult:
+        with self._lock:
+            self._require_active(client)
+            try:
+                physical_result = self._sink.flush()
+            except Exception as exc:
+                raise CoordinatedWriterError(
+                    f"coordinated lake flush failed for venue {client.venue!r}"
+                ) from exc
+            self._record_flush(physical_result)
+            venue = client.venue
+            result = FlushResult(
+                tuple(self._manifest_credit[venue]),
+                self._row_credit[venue],
+                self._duplicate_credit[venue],
+            )
+            self._manifest_credit[venue].clear()
+            self._row_credit[venue] = 0
+            self._duplicate_credit[venue] = 0
+            return result
+
+    def _close_client(self, client: CoordinatedLakeSink) -> None:
+        with self._lock:
+            if client._closed:
+                return
+            if self._clients.get(client.venue) is not client:
+                raise RuntimeError("coordinated lake client does not belong to this writer")
+            client._closed = True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._record_flush(self._sink.flush())
+            finally:
+                self._sink.close()

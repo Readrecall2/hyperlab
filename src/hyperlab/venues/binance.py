@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Protocol
 
 import requests
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
 from hyperlab.data.schema import RecordType, instrument, latest_schema_for
-from hyperlab.venues.base import ClockMeasurement, NormalizedInstrument, measure_clock
+from hyperlab.venues.base import (
+    ClockMeasurement,
+    HttpRequestDiagnostics,
+    NormalizedInstrument,
+    measure_clock,
+)
 
 VENUE = "binance_usdm"
 REST_BASE_URL = "https://fapi.binance.com"
@@ -641,10 +647,72 @@ class JsonGetTransport(Protocol):
     def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any: ...
 
 
+@dataclass(slots=True)
+class _PendingHttpDiagnostics:
+    url: str
+    urllib3_counters_before: tuple[int, int] | None
+    counters_before_completion_sequence: int
+    requests_session_reused: bool
+    diagnostic_prepare_ms: float
+    counter_baseline_current: bool = False
+    lock_requested_at: float | None = None
+    lock_acquired_at: float | None = None
+    get_started_at: float | None = None
+    get_completed_at: float | None = None
+    decode_started_at: float | None = None
+    decode_completed_at: float | None = None
+    response: Any | None = None
+    outcome: str = "success"
+    failure_stage: str | None = None
+    exception_type: str | None = None
+    completion_sequence: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TransportIdentityEvidence:
+    urllib3_connection_identity: str | None
+    tls_socket_identity: str | None
+    tls_session_reused: bool | None
+
+
+class BinancePublicHttpRequestError(RuntimeError):
+    """Public HTTP failure carrying timings captured outside clock validity logic."""
+
+    def __init__(
+        self,
+        original_exception: Exception,
+        *,
+        request_sent_time: datetime,
+        response_received_time: datetime,
+        http_diagnostics: HttpRequestDiagnostics,
+    ) -> None:
+        self.original_exception = original_exception
+        self.request_sent_time = request_sent_time
+        self.response_received_time = response_received_time
+        self.http_diagnostics = http_diagnostics
+        detail = str(original_exception).strip()
+        reason = type(original_exception).__name__ if not detail else (
+            f"{type(original_exception).__name__}: {detail}"
+        )
+        super().__init__(f"Binance public HTTP request failed: {reason}")
+
+
+class _TransportDiagnosticsState(local):
+    value: _PendingHttpDiagnostics | None
+
+    def __init__(self) -> None:
+        self.value = None
+
+
 class RequestsJsonTransport:
     """Keyless GET transport with one reusable HTTPS connection pool."""
 
-    def __init__(self, *, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> None:
         self._session = session or requests.Session()
         self._session.trust_env = False
         self._session.auth = None
@@ -656,11 +724,175 @@ class RequestsJsonTransport:
         self._session.verify = True
         self._lock = Lock()
         self._closed = False
+        self._monotonic = monotonic
+        self._diagnostics = _TransportDiagnosticsState()
+        self._diagnostics_lock = Lock()
+        self._session_requests_prepared = 0
+        self._last_urllib3_connection_identity: str | None = None
+        self._last_tls_socket_identity: str | None = None
+        self._completed_request_sequence = 0
 
-    def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
+    def _pool_snapshot(self, url: str) -> tuple[int, int] | None:
+        """Return urllib3 connection-object-created and request-started counters."""
+        try:
+            adapter = self._session.get_adapter(url)
+            manager = getattr(adapter, "poolmanager", None)
+            pools = getattr(manager, "pools", None)
+            container = getattr(pools, "_container", None)
+            lock = getattr(pools, "lock", None)
+            if container is None or lock is None:
+                return None
+            with lock:
+                pool_values = tuple(container.values())
+            return (
+                sum(int(pool.num_connections) for pool in pool_values),
+                sum(int(pool.num_requests) for pool in pool_values),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _elapsed_ms(response: Any) -> float | None:
+        try:
+            elapsed = response.elapsed
+            value = float(elapsed.total_seconds()) * 1_000
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return value if value >= 0 else None
+
+    def prepare_diagnostics(self, url: str) -> None:
+        """Capture optional pool state before the authoritative request timestamp."""
+
+        prepare_started_at = self._monotonic()
         with self._lock:
-            if self._closed:
-                raise RuntimeError("Binance public HTTP transport is closed")
+            counters_before_completion_sequence = self._completed_request_sequence
+            counters_before = self._pool_snapshot(url)
+        with self._diagnostics_lock:
+            session_reused = self._session_requests_prepared > 0
+            self._session_requests_prepared += 1
+        prepare_completed_at = self._monotonic()
+        self._diagnostics.value = _PendingHttpDiagnostics(
+            url=url,
+            urllib3_counters_before=counters_before,
+            counters_before_completion_sequence=counters_before_completion_sequence,
+            requests_session_reused=session_reused,
+            diagnostic_prepare_ms=max(prepare_completed_at - prepare_started_at, 0.0) * 1_000,
+        )
+
+    @staticmethod
+    def _mark_failure(
+        pending: _PendingHttpDiagnostics,
+        *,
+        stage: str,
+        error: Exception,
+    ) -> None:
+        pending.outcome = "failure"
+        pending.failure_stage = stage
+        pending.exception_type = type(error).__name__
+
+    @staticmethod
+    def _duration_ms(started: float | None, completed: float | None) -> float | None:
+        if started is None or completed is None:
+            return None
+        return max(completed - started, 0.0) * 1_000
+
+    @staticmethod
+    def _opaque_identity(value: object | None) -> str | None:
+        if value is None:
+            return None
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}:{id(value):x}"
+
+    @staticmethod
+    def _connection_from_pool_queue(raw: Any) -> object | None:
+        """Read one unambiguous idle connection without removing it from the pool."""
+
+        try:
+            pool = getattr(raw, "_pool", None)
+            connection_queue = getattr(pool, "pool", None)
+            mutex = getattr(connection_queue, "mutex", None)
+            queue_values = getattr(connection_queue, "queue", None)
+            if mutex is None or queue_values is None:
+                return None
+            with mutex:
+                connections = tuple(
+                    connection for connection in queue_values if connection is not None
+                )
+            if len(connections) == 1:
+                return connections[0]
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _transport_identity_evidence(cls, response: Any | None) -> _TransportIdentityEvidence:
+        """Inspect retained response objects after the authoritative receive timestamp."""
+
+        try:
+            raw = getattr(response, "raw", None)
+            connection = cls._connection_from_pool_queue(raw)
+            if connection is None:
+                connection = getattr(raw, "connection", None)
+            if connection is None:
+                connection = getattr(raw, "_connection", None)
+            socket = getattr(connection, "sock", None)
+            if socket is None:
+                original_response = getattr(raw, "_original_response", None)
+                file_pointer = getattr(original_response, "fp", None)
+                raw_file_pointer = getattr(file_pointer, "raw", None)
+                socket = getattr(raw_file_pointer, "_sock", None)
+            session_reused = getattr(socket, "session_reused", None)
+            if not isinstance(session_reused, bool):
+                session_reused = None
+            return _TransportIdentityEvidence(
+                urllib3_connection_identity=cls._opaque_identity(connection),
+                tls_socket_identity=cls._opaque_identity(socket),
+                tls_session_reused=session_reused,
+            )
+        except Exception:
+            return _TransportIdentityEvidence(None, None, None)
+
+    def _connection_reuse_evidence(
+        self,
+        evidence: _TransportIdentityEvidence,
+    ) -> tuple[bool | None, bool | None]:
+        with self._diagnostics_lock:
+            connection_reused = (
+                None
+                if evidence.urllib3_connection_identity is None
+                or self._last_urllib3_connection_identity is None
+                else evidence.urllib3_connection_identity
+                == self._last_urllib3_connection_identity
+            )
+            socket_reused = (
+                None
+                if evidence.tls_socket_identity is None
+                or self._last_tls_socket_identity is None
+                else evidence.tls_socket_identity == self._last_tls_socket_identity
+            )
+            self._last_urllib3_connection_identity = evidence.urllib3_connection_identity
+            self._last_tls_socket_identity = evidence.tls_socket_identity
+        return connection_reused, socket_reused
+
+    def _get_json_under_transport_lock(
+        self,
+        pending: _PendingHttpDiagnostics,
+        url: str,
+        params: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> Any:
+        pending.lock_acquired_at = self._monotonic()
+        pending.counter_baseline_current = (
+            pending.counters_before_completion_sequence
+            == self._completed_request_sequence
+        )
+        if self._closed:
+            error = RuntimeError("Binance public HTTP transport is closed")
+            self._mark_failure(pending, stage="transport_lock", error=error)
+            raise error
+
+        pending.get_started_at = self._monotonic()
+        try:
             response = self._session.get(
                 url,
                 params={key: str(value) for key, value in params.items()},
@@ -668,16 +900,177 @@ class RequestsJsonTransport:
                 headers={"User-Agent": "HyperLab/0.2 public-market-data"},
                 allow_redirects=False,
             )
+        except Exception as exc:
+            pending.get_completed_at = self._monotonic()
+            self._mark_failure(pending, stage="session_get", error=exc)
+            raise
+        pending.get_completed_at = self._monotonic()
+        pending.response = response
+
+        try:
             if 300 <= response.status_code < 400:
-                raise RuntimeError(
+                error = RuntimeError(
                     f"Binance public HTTP redirect refused: {response.status_code}"
                 )
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                status = response.status_code
-                raise RuntimeError(f"Binance public HTTP error {status}") from exc
-            return response.json()
+                self._mark_failure(pending, stage="http_status", error=error)
+                raise error
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            error = RuntimeError(f"Binance public HTTP error {response.status_code}")
+            self._mark_failure(pending, stage="http_status", error=error)
+            raise error from exc
+        except Exception as exc:
+            if pending.outcome != "failure":
+                self._mark_failure(pending, stage="http_status", error=exc)
+            raise
+
+        pending.decode_started_at = self._monotonic()
+        try:
+            payload = response.json()
+        except Exception as exc:
+            pending.decode_completed_at = self._monotonic()
+            self._mark_failure(pending, stage="json_decode", error=exc)
+            raise
+        pending.decode_completed_at = self._monotonic()
+        return payload
+
+    def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
+        pending = self._diagnostics.value
+        if (
+            pending is None
+            or pending.url != url
+            or pending.lock_requested_at is not None
+        ):
+            # Direct transport callers have no authoritative clock boundary.
+            self.prepare_diagnostics(url)
+            pending = self._diagnostics.value
+        if pending is None:
+            raise RuntimeError("HTTP diagnostics preparation failed")
+
+        pending.lock_requested_at = self._monotonic()
+        try:
+            with self._lock:
+                try:
+                    return self._get_json_under_transport_lock(
+                        pending,
+                        url,
+                        params,
+                        timeout_seconds,
+                    )
+                finally:
+                    self._completed_request_sequence += 1
+                    pending.completion_sequence = self._completed_request_sequence
+        except Exception as exc:
+            if pending.outcome != "failure":
+                self._mark_failure(pending, stage="transport_lock", error=exc)
+            raise
+
+    def consume_diagnostics(self) -> HttpRequestDiagnostics | None:
+        """Finalize diagnostics after the authoritative receive timestamp."""
+
+        pending = self._diagnostics.value
+        self._diagnostics.value = None
+        if pending is None:
+            return None
+        finalize_started_at = self._monotonic()
+
+        with self._lock:
+            finalization_completion_sequence = self._completed_request_sequence
+            post_request_observation_current = (
+                pending.completion_sequence is not None
+                and pending.completion_sequence == finalization_completion_sequence
+            )
+            if post_request_observation_current:
+                counters_after = self._pool_snapshot(pending.url)
+                evidence = self._transport_identity_evidence(pending.response)
+                connection_reused, socket_reused = self._connection_reuse_evidence(
+                    evidence
+                )
+            else:
+                counters_after = None
+                evidence = _TransportIdentityEvidence(None, None, None)
+                connection_reused, socket_reused = None, None
+
+        counters_before = pending.urllib3_counters_before
+        counter_window_current = (
+            post_request_observation_current and pending.counter_baseline_current
+        )
+        connection_objects_created_delta = (
+            counters_after[0] - counters_before[0]
+            if counter_window_current
+            and counters_before is not None
+            and counters_after is not None
+            else None
+        )
+        requests_started_delta = (
+            counters_after[1] - counters_before[1]
+            if counter_window_current
+            and counters_before is not None
+            and counters_after is not None
+            else None
+        )
+        new_connection_object = (
+            None
+            if connection_objects_created_delta is None
+            or connection_objects_created_delta < 0
+            else connection_objects_created_delta > 0
+        )
+        tls_session_reused = (
+            evidence.tls_session_reused if socket_reused is not True else None
+        )
+        transport_lock_wait_ms = self._duration_ms(
+            pending.lock_requested_at,
+            pending.lock_acquired_at,
+        )
+        adapter_header_elapsed_ms = self._elapsed_ms(pending.response)
+        session_get_total_ms = self._duration_ms(
+            pending.get_started_at,
+            pending.get_completed_at,
+        )
+        json_decode_ms = self._duration_ms(
+            pending.decode_started_at,
+            pending.decode_completed_at,
+        )
+        finalize_completed_at = self._monotonic()
+        return HttpRequestDiagnostics(
+            transport_lock_wait_ms=transport_lock_wait_ms,
+            requests_adapter_header_elapsed_ms=adapter_header_elapsed_ms,
+            session_get_total_ms=session_get_total_ms,
+            json_decode_ms=json_decode_ms,
+            pool_connections_before=(
+                None if counters_before is None else counters_before[0]
+            ),
+            pool_connections_after=(
+                None if counters_after is None else counters_after[0]
+            ),
+            pool_connection_delta=connection_objects_created_delta,
+            pool_requests_before=(
+                None if counters_before is None else counters_before[1]
+            ),
+            pool_requests_after=(
+                None if counters_after is None else counters_after[1]
+            ),
+            pool_request_delta=requests_started_delta,
+            new_pool_connection_created=new_connection_object,
+            outcome=pending.outcome,
+            failure_stage=pending.failure_stage,
+            exception_type=pending.exception_type,
+            requests_session_reused=pending.requests_session_reused,
+            urllib3_connection_identity=evidence.urllib3_connection_identity,
+            urllib3_connection_reused=connection_reused,
+            tls_socket_identity=evidence.tls_socket_identity,
+            tls_socket_reused=socket_reused,
+            tls_session_reused=tls_session_reused,
+            diagnostic_prepare_ms=pending.diagnostic_prepare_ms,
+            diagnostic_finalize_ms=max(
+                finalize_completed_at - finalize_started_at,
+                0.0,
+            )
+            * 1_000,
+            request_completion_sequence=pending.completion_sequence,
+            finalization_completion_sequence=finalization_completion_sequence,
+            post_request_observation_current=post_request_observation_current,
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -692,6 +1085,7 @@ class TimedPayload:
     payload: Any
     request_sent_time: datetime
     response_received_time: datetime
+    http_diagnostics: HttpRequestDiagnostics | None = None
 
 
 class BinancePublicRestClient:
@@ -719,19 +1113,69 @@ class BinancePublicRestClient:
         if callable(close):
             close()
 
+    @staticmethod
+    def _attach_failure_diagnostics(
+        error: Exception,
+        *,
+        request_sent_time: datetime,
+        response_received_time: datetime,
+        http_diagnostics: HttpRequestDiagnostics,
+    ) -> bool:
+        """Preserve the transport exception type when it accepts annotations."""
+
+        try:
+            setattr(error, "request_sent_time", request_sent_time)  # noqa: B010
+            setattr(error, "response_received_time", response_received_time)  # noqa: B010
+            setattr(error, "http_diagnostics", http_diagnostics)  # noqa: B010
+        except Exception:
+            return False
+        return True
+
     def _get(self, path: str, params: Mapping[str, object] | None = None) -> TimedPayload:
         if self._closed:
             raise RuntimeError("Binance public REST client is closed")
         if path not in PUBLIC_GET_PATHS:
             raise ValueError(f"Binance endpoint is outside the public market-data allowlist: {path}")
+        url = REST_BASE_URL + path
+        prepare_diagnostics = getattr(self.transport, "prepare_diagnostics", None)
+        if callable(prepare_diagnostics):
+            prepare_diagnostics(url)
+
         sent = self.clock()
-        payload = self.transport.get_json(
-            REST_BASE_URL + path,
-            {} if params is None else params,
-            self.timeout_seconds,
-        )
+        try:
+            payload = self.transport.get_json(
+                url,
+                {} if params is None else params,
+                self.timeout_seconds,
+            )
+        except Exception as exc:
+            received = self.clock()
+            diagnostics = None
+            consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
+            if callable(consume_diagnostics):
+                diagnostics = consume_diagnostics()
+            if diagnostics is None:
+                raise
+            if self._attach_failure_diagnostics(
+                exc,
+                request_sent_time=sent,
+                response_received_time=received,
+                http_diagnostics=diagnostics,
+            ):
+                raise
+            raise BinancePublicHttpRequestError(
+                exc,
+                request_sent_time=sent,
+                response_received_time=received,
+                http_diagnostics=diagnostics,
+            ) from exc
+
         received = self.clock()
-        return TimedPayload(payload, sent, received)
+        diagnostics = None
+        consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
+        if callable(consume_diagnostics):
+            diagnostics = consume_diagnostics()
+        return TimedPayload(payload, sent, received, diagnostics)
 
     def exchange_info(self) -> TimedPayload:
         return self._get("/fapi/v1/exchangeInfo")
@@ -744,6 +1188,7 @@ class BinancePublicRestClient:
             request_sent_time=timed.request_sent_time,
             response_received_time=timed.response_received_time,
             server_time=_datetime_ms(server["serverTime"]),
+            http_diagnostics=timed.http_diagnostics,
         )
 
     def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> TimedPayload:

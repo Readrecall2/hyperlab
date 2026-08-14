@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Mapping
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,14 +14,23 @@ import pytest
 import requests
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
-from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError
-from hyperlab.collector.websocket import ReceivedWireMessage
+from hyperlab.collector.storage import (
+    BatchingLakeSink,
+    CoordinatedWriterError,
+    FlushResult,
+)
+from hyperlab.collector.websocket import (
+    ReceivedWireMessage,
+    WebsocketConsumerBackpressure,
+    WebsocketQueueOverflow,
+)
 from hyperlab.data.lake import inventory_partitions
 from hyperlab.data.schema import RecordType
-from hyperlab.venues.base import NormalizedInstrument, measure_clock
+from hyperlab.venues.base import HttpRequestDiagnostics, NormalizedInstrument, measure_clock
 from hyperlab.venues.binance import (
     PUBLIC_GET_PATHS,
     BinancePublicConnector,
+    BinancePublicHttpRequestError,
     BinancePublicRestClient,
     RequestsJsonTransport,
     clock_record,
@@ -29,7 +39,11 @@ from hyperlab.venues.binance import (
     parse_funding_history,
 )
 from hyperlab.venues.replay import replay_synchronized
-from hyperlab.venues.runtime import BinanceReferenceCollector, ReferenceCollectorConfig
+from hyperlab.venues.runtime import (
+    BinanceReferenceCollector,
+    ReferenceCollectorConfig,
+    _ClockFutureContext,
+)
 
 BASE = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
@@ -185,7 +199,9 @@ def test_binance_connector_collects_bbo_l2_trade_candle_and_funding_context() ->
             },
         ),
     ]
-    parsed = [connector.parse_message(_envelope(frame, sequence=index)) for index, frame in enumerate(frames, 1)]
+    parsed = [
+        connector.parse_message(_envelope(frame, sequence=index)) for index, frame in enumerate(frames, 1)
+    ]
     normalized = [message.records[1] for message in parsed if "@depth20" not in str(message.channel)]
     depth = parsed[1]
 
@@ -233,6 +249,7 @@ def test_binance_connector_collects_bbo_l2_trade_candle_and_funding_context() ->
     ]
     assert levels[0].row["price"] == Decimal("60000.1")
     assert levels[0].row["quantity"] == Decimal("1.25")
+
 
 def test_binance_connector_splits_book_and_market_streams_on_official_public_urls() -> None:
     connector = BinancePublicConnector.from_exchange_info(
@@ -401,13 +418,9 @@ def test_binance_invalid_agg_trade_values_remain_raw_only(
     data[field] = value
     raw_message = json.dumps(frame, separators=(",", ":"))
 
-    parsed = _connector().parse_message(
-        WireEnvelope(raw_message, BASE, "market-connection", 1, 1)
-    )
+    parsed = _connector().parse_message(WireEnvelope(raw_message, BASE, "market-connection", 1, 1))
 
-    assert [record.record_type for record in parsed.records] == [
-        RecordType.WIRE_MESSAGE
-    ]
+    assert [record.record_type for record in parsed.records] == [RecordType.WIRE_MESSAGE]
     assert parsed.records[0].row["raw_message"] == raw_message
     assert len(parsed.issues) == 1
     assert issue_fragment in parsed.issues[0]
@@ -444,9 +457,7 @@ def test_non_boolean_maker_flag_cannot_arm_or_refresh_trade_health(
 
     try:
         malformed = parsed_trade("false", seconds=10, sequence=1)
-        assert [record.record_type for record in malformed.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
+        assert [record.record_type for record in malformed.records] == [RecordType.WIRE_MESSAGE]
         collector._observe_critical_stream(
             malformed,
             received_time=BASE + timedelta(seconds=10),
@@ -462,9 +473,7 @@ def test_non_boolean_maker_flag_cannot_arm_or_refresh_trade_health(
             socket_role="market",
         )
         assert channel in collector._critical_stream_seen
-        assert collector._critical_stream_last_received[channel] == BASE + timedelta(
-            seconds=11
-        )
+        assert collector._critical_stream_last_received[channel] == BASE + timedelta(seconds=11)
 
         malformed_again = parsed_trade("false", seconds=12, sequence=3)
         collector._observe_critical_stream(
@@ -472,9 +481,7 @@ def test_non_boolean_maker_flag_cannot_arm_or_refresh_trade_health(
             received_time=BASE + timedelta(seconds=12),
             socket_role="market",
         )
-        assert collector._critical_stream_last_received[channel] == BASE + timedelta(
-            seconds=11
-        )
+        assert collector._critical_stream_last_received[channel] == BASE + timedelta(seconds=11)
     finally:
         collector.close()
 
@@ -503,9 +510,7 @@ def test_binance_usdm_stream_type_discriminator_is_fail_closed(
     data["st"] = stream_type
     raw_message = json.dumps(frame, separators=(",", ":"))
 
-    parsed = _connector().parse_message(
-        WireEnvelope(raw_message, BASE, "market-connection", 1, 1)
-    )
+    parsed = _connector().parse_message(WireEnvelope(raw_message, BASE, "market-connection", 1, 1))
 
     assert parsed.records[0].record_type == RecordType.WIRE_MESSAGE
     assert parsed.records[0].row["raw_message"] == raw_message
@@ -516,12 +521,8 @@ def test_binance_usdm_stream_type_discriminator_is_fail_closed(
             RecordType.TRADE,
         ]
     else:
-        assert [record.record_type for record in parsed.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
-        assert parsed.issues == (
-            f"invalid_stream_type:expected=1:data={stream_type!r}",
-        )
+        assert [record.record_type for record in parsed.records] == [RecordType.WIRE_MESSAGE]
+        assert parsed.issues == (f"invalid_stream_type:expected=1:data={stream_type!r}",)
 
 
 @pytest.mark.parametrize(
@@ -548,12 +549,9 @@ def test_binance_usdm_wrapper_and_payload_stream_type_conflicts_fail_closed(
         )
     )
 
-    assert [record.record_type for record in parsed.records] == [
-        RecordType.WIRE_MESSAGE
-    ]
+    assert [record.record_type for record in parsed.records] == [RecordType.WIRE_MESSAGE]
     assert parsed.issues == (
-        "invalid_stream_type:expected=1:"
-        f"wrapper={wrapper_stream_type!r},data={data_stream_type!r}",
+        f"invalid_stream_type:expected=1:wrapper={wrapper_stream_type!r},data={data_stream_type!r}",
     )
 
 
@@ -588,9 +586,7 @@ def test_non_usdm_stream_type_cannot_arm_or_refresh_trade_health(
 
     try:
         coin_m = parsed_trade(2, seconds=10, sequence=1)
-        assert [record.record_type for record in coin_m.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
+        assert [record.record_type for record in coin_m.records] == [RecordType.WIRE_MESSAGE]
         collector._observe_critical_stream(
             coin_m,
             received_time=BASE + timedelta(seconds=10),
@@ -606,22 +602,16 @@ def test_non_usdm_stream_type_cannot_arm_or_refresh_trade_health(
             socket_role="market",
         )
         assert channel in collector._critical_stream_seen
-        assert collector._critical_stream_last_received[channel] == BASE + timedelta(
-            seconds=11
-        )
+        assert collector._critical_stream_last_received[channel] == BASE + timedelta(seconds=11)
 
         malformed = parsed_trade(True, seconds=12, sequence=3)
-        assert [record.record_type for record in malformed.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
+        assert [record.record_type for record in malformed.records] == [RecordType.WIRE_MESSAGE]
         collector._observe_critical_stream(
             malformed,
             received_time=BASE + timedelta(seconds=12),
             socket_role="market",
         )
-        assert collector._critical_stream_last_received[channel] == BASE + timedelta(
-            seconds=11
-        )
+        assert collector._critical_stream_last_received[channel] == BASE + timedelta(seconds=11)
     finally:
         collector.close()
 
@@ -690,9 +680,7 @@ def test_malformed_agg_trade_cannot_arm_or_refresh_required_trade_health(
             socket_role="market",
         )
         assert channel in collector._critical_stream_seen
-        assert collector._critical_stream_last_received[channel] == BASE + timedelta(
-            seconds=11
-        )
+        assert collector._critical_stream_last_received[channel] == BASE + timedelta(seconds=11)
     finally:
         collector.close()
 
@@ -757,15 +745,9 @@ def test_stream_symbol_or_event_mismatch_cannot_arm_trade_health(
         )
     )
     try:
-        assert [record.record_type for record in symbol_mismatch.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
-        assert symbol_mismatch.issues == (
-            "stream_symbol_mismatch:channel=btcusdt:payload=ETHUSDT",
-        )
-        assert [record.record_type for record in event_mismatch.records] == [
-            RecordType.WIRE_MESSAGE
-        ]
+        assert [record.record_type for record in symbol_mismatch.records] == [RecordType.WIRE_MESSAGE]
+        assert symbol_mismatch.issues == ("stream_symbol_mismatch:channel=btcusdt:payload=ETHUSDT",)
+        assert [record.record_type for record in event_mismatch.records] == [RecordType.WIRE_MESSAGE]
         assert len(event_mismatch.issues) == 1
         assert "event/channel mismatch" in event_mismatch.issues[0]
 
@@ -885,6 +867,9 @@ class ControlledHttpClock:
     def advance(self, milliseconds: int) -> None:
         self.current += timedelta(milliseconds=milliseconds)
 
+    def monotonic(self) -> float:
+        return (self.current - BASE).total_seconds()
+
 
 class ColdThenWarmSession(FakeReusableSession):
     delays_ms: ClassVar[tuple[int, ...]] = (600, 84, 84)
@@ -919,6 +904,152 @@ class ColdThenWarmSession(FakeReusableSession):
         return response
 
 
+class TimedDiagnosticResponse(FakeHttpResponse):
+    def __init__(
+        self,
+        payload: object,
+        *,
+        clock: ControlledHttpClock,
+        decode_delay_ms: int,
+        adapter_header_elapsed_ms: int,
+    ) -> None:
+        super().__init__(payload)
+        self.clock = clock
+        self.decode_delay_ms = decode_delay_ms
+        self.elapsed = timedelta(milliseconds=adapter_header_elapsed_ms)
+
+    def json(self) -> object:
+        self.clock.advance(self.decode_delay_ms)
+        return super().json()
+
+
+class TimedDiagnosticSession(FakeReusableSession):
+    def __init__(
+        self,
+        *,
+        clock: ControlledHttpClock,
+        get_delay_ms: int,
+        decode_delay_ms: int,
+        adapter_header_elapsed_ms: int,
+        server_midpoint_ms: int,
+    ) -> None:
+        super().__init__()
+        self.clock = clock
+        self.get_delay_ms = get_delay_ms
+        self.decode_delay_ms = decode_delay_ms
+        self.adapter_header_elapsed_ms = adapter_header_elapsed_ms
+        self.server_midpoint_ms = server_midpoint_ms
+
+    def get(self, url: str, **kwargs: object) -> FakeHttpResponse:
+        self.clock.advance(self.get_delay_ms)
+        response = TimedDiagnosticResponse(
+            {"serverTime": int((BASE + timedelta(milliseconds=self.server_midpoint_ms)).timestamp() * 1_000)},
+            clock=self.clock,
+            decode_delay_ms=self.decode_delay_ms,
+            adapter_header_elapsed_ms=self.adapter_header_elapsed_ms,
+        )
+        self.calls.append({"url": url, **kwargs})
+        self.responses.append(response)
+        return response
+
+
+class AdvancingLock:
+    def __init__(self, clock: ControlledHttpClock, wait_ms: int) -> None:
+        self.clock = clock
+        self.wait_ms = wait_ms
+
+    def __enter__(self) -> AdvancingLock:
+        self.clock.advance(self.wait_ms)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc_value, traceback
+
+
+@pytest.mark.parametrize(
+    (
+        "get_delay_ms",
+        "adapter_header_elapsed_ms",
+        "server_midpoint_ms",
+        "expected_rtt_ms",
+        "expected_status",
+    ),
+    (
+        (67, 30, 42, Decimal("84"), "valid"),
+        (85, 20, 51, Decimal("102"), "invalid"),
+    ),
+)
+def test_http_diagnostics_are_separate_from_authoritative_clock_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    get_delay_ms: int,
+    adapter_header_elapsed_ms: int,
+    server_midpoint_ms: int,
+    expected_rtt_ms: Decimal,
+    expected_status: str,
+) -> None:
+    http_clock = ControlledHttpClock()
+    session = TimedDiagnosticSession(
+        clock=http_clock,
+        get_delay_ms=get_delay_ms,
+        decode_delay_ms=7,
+        adapter_header_elapsed_ms=adapter_header_elapsed_ms,
+        server_midpoint_ms=server_midpoint_ms,
+    )
+    transport = RequestsJsonTransport(
+        session=session,  # type: ignore[arg-type]
+        monotonic=http_clock.monotonic,
+    )
+    transport._lock = AdvancingLock(http_clock, 10)  # type: ignore[assignment]
+    pool_snapshots = iter(((3, 10), (4, 11)))
+    monkeypatch.setattr(
+        transport,
+        "_pool_snapshot",
+        lambda _url: next(pool_snapshots),
+    )
+    client = BinancePublicRestClient(
+        transport=transport,
+        clock=http_clock.now,
+    )
+
+    try:
+        measurement = client.clock_measurement()
+    finally:
+        client.close()
+
+    diagnostics = measurement.http_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.transport_lock_wait_ms == pytest.approx(10)
+    assert diagnostics.requests_adapter_header_elapsed_ms == pytest.approx(adapter_header_elapsed_ms)
+    assert diagnostics.session_get_total_ms == pytest.approx(get_delay_ms)
+    assert diagnostics.json_decode_ms == pytest.approx(7)
+    assert diagnostics.pool_connections_before == 3
+    assert diagnostics.pool_connections_after == 4
+    assert diagnostics.pool_connection_delta == 1
+    assert diagnostics.pool_requests_before == 10
+    assert diagnostics.pool_requests_after == 11
+    assert diagnostics.pool_request_delta == 1
+    assert diagnostics.new_pool_connection_created is True
+    assert measurement.round_trip_latency_ms == expected_rtt_ms
+    assert measurement.drift_uncertainty_ms == expected_rtt_ms / 2
+
+    record = clock_record(
+        measurement,
+        "diagnostic-clock",
+        connection_id="binance-public-1",
+        connection_epoch=1,
+        capture_epoch_id="binance-capture-1",
+    )
+    assert record.row["sample_status"] == expected_status
+    assert "http_diagnostics" not in record.row
+    if expected_status == "invalid":
+        assert record.row["invalid_reason"] == ("clock uncertainty exceeds threshold: 51.0ms > 50ms")
+
+
 def test_cold_bootstrap_warms_one_session_for_valid_clock_samples() -> None:
     http_clock = ControlledHttpClock()
     session = ColdThenWarmSession(http_clock)
@@ -943,14 +1074,10 @@ def test_cold_bootstrap_warms_one_session_for_valid_clock_samples() -> None:
     )
     client.close()
 
-    assert (
-        cold_bootstrap.response_received_time
-        - cold_bootstrap.request_sent_time
-    ) == timedelta(milliseconds=600)
-    assert [
-        str(call["url"]).rsplit("/", 1)[-1]
-        for call in session.calls
-    ] == ["exchangeInfo", "time", "time"]
+    assert (cold_bootstrap.response_received_time - cold_bootstrap.request_sent_time) == timedelta(
+        milliseconds=600
+    )
+    assert [str(call["url"]).rsplit("/", 1)[-1] for call in session.calls] == ["exchangeInfo", "time", "time"]
     assert session.close_calls == 1
     assert all(
         measurement.round_trip_latency_ms == Decimal("84")
@@ -983,16 +1110,11 @@ def test_rest_transport_reuses_one_http_session_for_clock_samples() -> None:
     assert first == {"serverTime": 1_786_492_800_000}
     assert second == {"serverTime": 1_786_492_800_001}
     assert len(session.calls) == 2
-    assert {call["url"] for call in session.calls} == {
-        "https://fapi.binance.com/fapi/v1/time"
-    }
+    assert {call["url"] for call in session.calls} == {"https://fapi.binance.com/fapi/v1/time"}
     assert all(call["timeout"] == 15.0 for call in session.calls)
     assert all(call["params"] == {} for call in session.calls)
     assert all(call["allow_redirects"] is False for call in session.calls)
-    assert all(
-        call["headers"] == {"User-Agent": "HyperLab/0.2 public-market-data"}
-        for call in session.calls
-    )
+    assert all(call["headers"] == {"User-Agent": "HyperLab/0.2 public-market-data"} for call in session.calls)
     assert all(response.raise_calls == 1 for response in session.responses)
     assert session.close_calls == 1
     assert session.trust_env is False
@@ -1024,9 +1146,7 @@ def test_rest_transport_cannot_inherit_credentials_or_redirect() -> None:
     session.verify = False
 
     transport = RequestsJsonTransport(session=session)
-    prepared = session.prepare_request(
-        requests.Request("GET", "https://fapi.binance.com/fapi/v1/time")
-    )
+    prepared = session.prepare_request(requests.Request("GET", "https://fapi.binance.com/fapi/v1/time"))
     try:
         assert session.trust_env is False
         assert session.auth is None
@@ -1035,9 +1155,9 @@ def test_rest_transport_cannot_inherit_credentials_or_redirect() -> None:
         assert session.cert is None
         assert session.verify is True
         assert not session.cookies
-        assert {
-            name.lower() for name in prepared.headers
-        }.isdisjoint({"authorization", "cookie", "x-mbx-apikey"})
+        assert {name.lower() for name in prepared.headers}.isdisjoint(
+            {"authorization", "cookie", "x-mbx-apikey"}
+        )
     finally:
         transport.close()
 
@@ -1088,8 +1208,7 @@ class KlinePagingTransport:
         self.starts.append(start)
         page_size = 1500 if len(self.starts) == 1 else 1
         return [
-            [start + index * 60_000, "1", "1", "1", "1", "1", start, "1", 1]
-            for index in range(page_size)
+            [start + index * 60_000, "1", "1", "1", "1", "1", start, "1", 1] for index in range(page_size)
         ]
 
 
@@ -1136,9 +1255,7 @@ class StubConnector:
         event_time = datetime.fromisoformat(root["event_time"])
         return ParsedMessage(
             channel="bbo",
-            records=(
-                ParsedRecord(RecordType.BBO, "BTC", {"event_time": event_time}),
-            ),
+            records=(ParsedRecord(RecordType.BBO, "BTC", {"event_time": event_time}),),
         )
 
 
@@ -1271,16 +1388,13 @@ def test_binance_complete_l2_snapshot_marks_each_connection_resync(
     assert not [
         gap
         for partition, gap in report.cross_segment_gaps
-        if partition.record_type == RecordType.L2_SNAPSHOT
-        and gap.kind == "l2_resync_missing"
+        if partition.record_type == RecordType.L2_SNAPSHOT and gap.kind == "l2_resync_missing"
     ]
     events: list[dict[str, object]] = []
     for manifest in report.partitions:
         if manifest.partition.record_type != RecordType.CONNECTION_EVENT:
             continue
-        events.extend(
-            pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
-        )
+        events.extend(pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist())
     resyncs = [row for row in events if str(row["event_kind"]).startswith("resync_")]
     assert [row["event_kind"] for row in resyncs].count("resync_start") == 2
     assert [row["event_kind"] for row in resyncs].count("resync_complete") == 2
@@ -1288,9 +1402,7 @@ def test_binance_complete_l2_snapshot_marks_each_connection_resync(
     assert all(row["asset"] == "BTC" for row in resyncs)
     assert all(row["received_time"] is not None for row in resyncs)
     assert all(
-        row["resync_snapshot_id"] is not None
-        for row in resyncs
-        if row["event_kind"] == "resync_complete"
+        row["resync_snapshot_id"] is not None for row in resyncs if row["event_kind"] == "resync_complete"
     )
 
 
@@ -1331,11 +1443,10 @@ def test_binance_depth_frame_is_the_single_required_public_book_stream(
         )
         collector._critical_stream_last_received["btcusdt@aggTrade"] = received
 
-        assert collector._stale_critical_streams(
-            at=BASE + timedelta(seconds=31)
-        ) == ()
+        assert collector._stale_critical_streams(at=BASE + timedelta(seconds=31)) == ()
     finally:
         collector.close()
+
 
 def test_binance_agg_trade_is_a_required_stream_for_each_asset(tmp_path: Path) -> None:
     sink = BatchingLakeSink(tmp_path / "lake", batch_size=10, queue_capacity=20)
@@ -1387,10 +1498,19 @@ class FatalWriterSink:
 
 
 class NoMessageSocket:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        queue_depth: int = 0,
+        oldest_message_age_ms: float | None = None,
+        latest_message_received_age_ms: float | None = None,
+    ) -> None:
         self.connected_at = BASE
         self.closed = False
         self.started = False
+        self.queue_depth = queue_depth
+        self.oldest_message_age_ms = oldest_message_age_ms
+        self.latest_message_received_age_ms = latest_message_received_age_ms
 
     def start_receiving(self) -> None:
         self.started = True
@@ -1399,6 +1519,18 @@ class NoMessageSocket:
         del timeout_seconds
         assert self.started
         raise AssertionError("writer failed before the first socket receive")
+
+    def telemetry_snapshot(self) -> dict[str, object]:
+        return {
+            "reader_alive": self.started and not self.closed,
+            "closed": self.closed,
+            "queue_depth": self.queue_depth,
+            "queue_high_water": self.queue_depth,
+            "oldest_message_age_ms": self.oldest_message_age_ms,
+            "latest_message_received_age_ms": self.latest_message_received_age_ms,
+            "terminal_exception_type": None,
+            "terminal_reason": None,
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -1429,6 +1561,18 @@ class OneFrameSocket:
         del timeout_seconds
         assert self.started
         return self.messages.pop(0) if self.messages else None
+
+    def telemetry_snapshot(self) -> dict[str, object]:
+        return {
+            "reader_alive": self.started and not self.closed,
+            "closed": self.closed,
+            "queue_depth": len(self.messages),
+            "queue_high_water": 1,
+            "oldest_message_age_ms": None,
+            "latest_message_received_age_ms": None,
+            "terminal_exception_type": None,
+            "terminal_reason": None,
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -1530,8 +1674,7 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
         if row["event_kind"] == "connect"
     }
     assert all(
-        connect_by_connection[str(row["connection_id"])]["received_time"]
-        <= row["received_time"]
+        connect_by_connection[str(row["connection_id"])]["received_time"] <= row["received_time"]
         for row in wire_rows
     )
     capture_ids = {row["capture_epoch_id"] for row in wire_rows}
@@ -1544,6 +1687,14 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
     clock = rows[RecordType.CLOCK_SYNC][0]
     assert clock["capture_epoch_id"] in capture_ids
     assert clock["sample_status"] == "valid"
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+    observability = status["observability"]
+    assert observability["sockets"] == {}
+    closed_sockets = observability["last_closed_sockets"]
+    assert closed_sockets["generation"] == 1
+    assert set(closed_sockets["telemetry_before_close"]) == {"public", "market"}
+    assert all(snapshot["closed"] is False for snapshot in closed_sockets["telemetry_before_close"].values())
+    assert all(snapshot["closed"] is True for snapshot in closed_sockets["telemetry_after_close"].values())
 
 
 class PartialHandshakeSocketFactory:
@@ -1598,19 +1749,36 @@ def test_partial_paired_handshake_closes_unstarted_peer_and_records_supervisor_g
     rows: list[dict[str, object]] = []
     for manifest in inventory_partitions(root).partitions:
         if manifest.partition.record_type == RecordType.CONNECTION_EVENT:
-            rows.extend(
-                pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
-            )
+            rows.extend(pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist())
     assert [row["event_kind"] for row in rows] == ["gap"]
     assert rows[0]["socket_role"] == "supervisor"
-    status = json.loads(
-        (tmp_path / "runtime-status.json").read_text(encoding="utf-8")
-    )
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
     assert status["capture_epoch_id"] == rows[0]["capture_epoch_id"]
     assert set(status["physical_connection_ids"]) == {
         "public",
         "market",
     }
+    observability = status["observability"]
+    failure = observability["reconnect_reasons_by_generation"][0]
+    assert failure["generation"] is None
+    assert failure["initiating_role"] == "public"
+    assert failure["connected_socket_roles"] == []
+    assert failure["opened_socket_roles"] == ["market"]
+    assert failure["collateral_socket_roles"] == ["market"]
+    assert "websocket handshake failed" in failure["reason"]
+    assert failure["paired_handshake_failures"] == [
+        {
+            "socket_role": "public",
+            "operation": "handshake",
+            "exception_type": "ConnectionError",
+            "reason": "ConnectionError: simulated public handshake failure",
+        }
+    ]
+    assert failure["socket_telemetry"]["market"]["closed"] is False
+    closed_sockets = observability["last_closed_sockets"]
+    assert closed_sockets["generation"] == 1
+    assert closed_sockets["telemetry_before_close"]["market"]["closed"] is False
+    assert closed_sockets["telemetry_after_close"]["market"]["closed"] is True
 
 
 class MutableHandshakeDeadline:
@@ -1678,6 +1846,7 @@ def test_deadline_during_paired_handshake_never_activates_a_clean_generation(
     }
     assert not list(root.rglob("*.parquet"))
 
+
 class ScriptedClockRest:
     def __init__(self, measurements: list[object]) -> None:
         self.measurements = measurements
@@ -1689,6 +1858,8 @@ class ScriptedClockRest:
         self.calls += 1
         measurement = self.measurements[index]
         self.ready[index].set()
+        if isinstance(measurement, BaseException):
+            raise measurement
         return measurement
 
 
@@ -1706,9 +1877,11 @@ class ScriptedSocket:
         self.ready = ready or [None] * len(actions)
         self.advance = advance
         self.receive_count = 0
+        self.initial_depth = len(actions)
         self.connected_at = clock()
         self.closed = False
         self.started = False
+        self.terminal_error: BaseException | None = None
 
     def start_receiving(self) -> None:
         self.started = True
@@ -1726,11 +1899,32 @@ class ScriptedSocket:
         if self.advance is not None:
             self.advance()
         if isinstance(action, BaseException):
+            self.terminal_error = action
             raise action
         return ReceivedWireMessage(
             json.dumps(action, separators=(",", ":")),
             self.clock(),
         )
+
+    def telemetry_snapshot(self) -> dict[str, object]:
+        error = self.terminal_error
+        detail = None if error is None else str(error).strip()
+        return {
+            "reader_alive": self.started and not self.closed,
+            "closed": self.closed,
+            "queue_depth": len(self.actions),
+            "queue_high_water": self.initial_depth,
+            "oldest_message_age_ms": None,
+            "latest_message_received_age_ms": None,
+            "terminal_exception_type": None if error is None else type(error).__name__,
+            "terminal_reason": (
+                None
+                if error is None
+                else type(error).__name__
+                if not detail
+                else f"{type(error).__name__}: {detail}"
+            ),
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -1804,10 +1998,9 @@ def test_market_socket_failure_closes_pair_and_reuses_warm_clock_session(
         clock=http_clock.now,
     )
     cold_bootstrap = rest.exchange_info()
-    assert (
-        cold_bootstrap.response_received_time
-        - cold_bootstrap.request_sent_time
-    ) == timedelta(milliseconds=600)
+    assert (cold_bootstrap.response_received_time - cold_bootstrap.request_sent_time) == timedelta(
+        milliseconds=600
+    )
 
     base_ms = int(BASE.timestamp() * 1_000)
     first_public = ScriptedSocket(
@@ -1867,12 +2060,34 @@ def test_market_socket_failure_closes_pair_and_reuses_warm_clock_session(
     assert collector.metrics["connections"] == 2
     assert collector.metrics["physical_connections"] == 4
     assert collector.metrics["reconnects"] == 1
-    assert [
-        str(call["url"]).rsplit("/", 1)[-1]
-        for call in session.calls
-    ] == ["exchangeInfo", "time", "time"]
+    assert [str(call["url"]).rsplit("/", 1)[-1] for call in session.calls] == ["exchangeInfo", "time", "time"]
     assert session.time_calls == 2
     assert session.close_calls == 1
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+    observability = status["observability"]
+    assert "process_cpu" in observability["process"]
+    failures = observability["reconnect_reasons_by_generation"]
+    assert len(failures) == 1
+    assert failures[0]["generation"] == 1
+    assert failures[0]["initiating_role"] == "market"
+    assert failures[0]["collateral_socket_roles"] == ["public"]
+    assert failures[0]["connected_socket_roles"] == ["public", "market"]
+    assert failures[0]["opened_socket_roles"] == ["market", "public"]
+    assert failures[0]["will_reconnect"] is True
+    assert observability["generation_reason_history"] == {
+        "capacity": 32,
+        "seen": 1,
+        "retained": 1,
+        "truncated": 0,
+    }
+    assert observability["last_closed_sockets"]["generation"] == 2
+    assert (
+        failures[0]["reason"] == "_SocketRoleFailure: Binance market websocket receive failed: "
+        "ConnectionError: simulated market socket failure"
+    )
+    worker_phases = observability["worker_phases"]
+    assert worker_phases["normalization_ms"]["count"] > 0
+    assert worker_phases["sink_enqueue_ms"]["count"] > 0
 
     rows: dict[RecordType, list[dict[str, object]]] = {}
     for manifest in inventory_partitions(root).partitions:
@@ -1884,49 +2099,36 @@ def test_market_socket_failure_closes_pair_and_reuses_warm_clock_session(
         wire_by_epoch.setdefault(int(str(row["connection_epoch"])), []).append(row)
     assert set(wire_by_epoch) == {1, 2}
     assert all(
-        row["channel"] != "btcusdt@bookTicker"
-        for epoch_rows in wire_by_epoch.values()
-        for row in epoch_rows
+        row["channel"] != "btcusdt@bookTicker" for epoch_rows in wire_by_epoch.values() for row in epoch_rows
     )
-    assert {
-        row["connection_id"] for row in wire_by_epoch[1]
-    }.isdisjoint({row["connection_id"] for row in wire_by_epoch[2]})
+    assert {row["connection_id"] for row in wire_by_epoch[1]}.isdisjoint(
+        {row["connection_id"] for row in wire_by_epoch[2]}
+    )
     assert all(
         sorted(
             int(str(row["arrival_sequence"]))
             for row in epoch_rows
             if row["channel"] == "btcusdt@depth20@100ms"
         )
-        == list(range(1, 1 + sum(
-            row["channel"] == "btcusdt@depth20@100ms"
-            for row in epoch_rows
-        )))
+        == list(range(1, 1 + sum(row["channel"] == "btcusdt@depth20@100ms" for row in epoch_rows)))
         for epoch_rows in wire_by_epoch.values()
     )
 
-    clock_by_epoch = {
-        int(str(row["connection_epoch"])): row
-        for row in rows[RecordType.CLOCK_SYNC]
-    }
+    clock_by_epoch = {int(str(row["connection_epoch"])): row for row in rows[RecordType.CLOCK_SYNC]}
     assert set(clock_by_epoch) == {1, 2}
     for epoch, clock_row in clock_by_epoch.items():
         assert clock_row["round_trip_latency_ms"] == Decimal("84")
         assert clock_row["drift_uncertainty_ms"] == Decimal("42")
         assert clock_row["sample_status"] == "valid"
         assert clock_row["invalid_reason"] is None
-        assert {
-            row["capture_epoch_id"] for row in wire_by_epoch[epoch]
-        } == {clock_row["capture_epoch_id"]}
-    assert (
-        clock_by_epoch[1]["capture_epoch_id"]
-        != clock_by_epoch[2]["capture_epoch_id"]
-    )
+        assert {row["capture_epoch_id"] for row in wire_by_epoch[epoch]} == {clock_row["capture_epoch_id"]}
+    assert clock_by_epoch[1]["capture_epoch_id"] != clock_by_epoch[2]["capture_epoch_id"]
     second_capture = clock_by_epoch[2]["capture_epoch_id"]
     assert any(
-        row["event_kind"] == "resync_complete"
-        and row["capture_epoch_id"] == second_capture
+        row["event_kind"] == "resync_complete" and row["capture_epoch_id"] == second_capture
         for row in rows[RecordType.CONNECTION_EVENT]
     )
+
 
 class ManualTime:
     def __init__(self) -> None:
@@ -1940,6 +2142,36 @@ class ManualTime:
 
     def advance(self) -> None:
         self.seconds += 2.5
+
+
+class BlockingClockRest:
+    def __init__(self, measurement: object) -> None:
+        self.measurement = measurement
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    def clock_measurement(self) -> object:
+        with self._lock:
+            self.calls += 1
+            call_number = self.calls
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if call_number == 1:
+                self.first_started.set()
+                assert self.release_first.wait(timeout=2)
+            return self.measurement
+        finally:
+            with self._lock:
+                self.active -= 1
+
+    def counts(self) -> tuple[int, int, int]:
+        with self._lock:
+            return self.calls, self.active, self.max_active
 
 
 class TimedSocketFactory:
@@ -1961,6 +2193,306 @@ def test_reference_clock_sampling_default_is_five_seconds() -> None:
     assert config.clock_max_age_seconds == 15.0
 
 
+def _runtime_http_measurement() -> object:
+    return measure_clock(
+        "binance_usdm",
+        request_sent_time=BASE,
+        response_received_time=BASE + timedelta(milliseconds=20),
+        server_time=BASE + timedelta(milliseconds=10),
+        http_diagnostics=HttpRequestDiagnostics(
+            transport_lock_wait_ms=2.0,
+            requests_adapter_header_elapsed_ms=30.0,
+            session_get_total_ms=40.0,
+            json_decode_ms=3.0,
+            pool_connections_before=1,
+            pool_connections_after=1,
+            pool_connection_delta=0,
+            pool_requests_before=5,
+            pool_requests_after=6,
+            pool_request_delta=1,
+            new_pool_connection_created=False,
+            diagnostic_prepare_ms=1.5,
+            diagnostic_finalize_ms=2.5,
+            requests_session_reused=True,
+            urllib3_connection_identity="urllib3-connection-1",
+            urllib3_connection_reused=True,
+            tls_socket_identity="tls-socket-1",
+            tls_socket_reused=True,
+            tls_session_reused=None,
+            request_completion_sequence=7,
+            finalization_completion_sequence=7,
+            post_request_observation_current=True,
+        ),
+    )
+
+
+class CompletionCreditSink:
+    high_water = 4
+    pending_count = 1
+    should_flush = False
+
+    def __init__(self) -> None:
+        self.collect_calls = 0
+        self.flush_calls = 0
+        self.closed = False
+        self.fail_collection = False
+        self.completed = FlushResult((), 3, 0)
+
+    def add(self, record: ParsedRecord) -> bool:
+        del record
+        return True
+
+    def add_many(self, records: Any) -> int:
+        return len(tuple(records))
+
+    def collect_completed(self) -> FlushResult:
+        self.collect_calls += 1
+        if self.fail_collection:
+            raise CoordinatedWriterError("simulated background writer failure")
+        result = self.completed
+        self.completed = FlushResult((), 0, 0)
+        return result
+
+    def flush(self) -> FlushResult:
+        self.flush_calls += 1
+        result = self.completed
+        self.completed = FlushResult((), 0, 0)
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_binance_add_paths_collect_writer_credits_and_propagate_failure(
+    tmp_path: Path,
+) -> None:
+    sink = CompletionCreditSink()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=ScriptedClockRest([]),  # type: ignore[arg-type]
+        sink=sink,  # type: ignore[arg-type]
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=lambda: BASE,
+    )
+    record = clock_record(
+        _runtime_http_measurement(),  # type: ignore[arg-type]
+        "writer-credit-clock",
+        connection_id="public-1",
+        connection_epoch=1,
+        capture_epoch_id="capture-1",
+    )
+
+    try:
+        collector._add_many((record,))
+        assert collector.metrics["records_parsed"] == 1
+        assert collector.metrics["rows_written"] == 3
+        assert sink.collect_calls == 1
+        assert sink.flush_calls == 0
+
+        sink.fail_collection = True
+        with pytest.raises(
+            CoordinatedWriterError,
+            match="simulated background writer failure",
+        ):
+            collector._add(record)
+        assert sink.collect_calls == 2
+    finally:
+        sink.fail_collection = False
+        collector.close()
+
+    assert sink.flush_calls == 1
+    assert sink.closed is True
+
+
+def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    rest = ScriptedClockRest([_runtime_http_measurement()])
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "scheduler-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+
+    def occupy_clock_worker() -> None:
+        blocker_started.set()
+        assert release_blocker.wait(timeout=2)
+
+    try:
+        blocker = collector._clock_executor.submit(occupy_clock_worker)
+        assert blocker_started.wait(timeout=1)
+        collector._schedule_clock_sample(
+            connection_id="public-1",
+            connection_epoch=1,
+            capture_epoch_id="capture-1",
+        )
+        manual.seconds = 0.025
+        release_blocker.set()
+        blocker.result(timeout=1)
+        assert rest.ready[0].wait(timeout=1)
+        future = collector._clock_future
+        assert future is not None
+        future.result(timeout=1)
+        manual.seconds = 0.040
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-1",
+            wait=True,
+        )
+
+        observability = collector.metrics["clock_observability"]
+        assert isinstance(observability, dict)
+        assert observability["samples_seen"] == 1
+        assert observability["samples_retained"] == 1
+        latest = observability["latest"]
+        assert isinstance(latest, dict)
+        assert latest["executor_submit_to_worker_start_ms"] == pytest.approx(25)
+        assert latest["worker_completion_to_supervisor_drain_ms"] == pytest.approx(15)
+        assert latest["authoritative_clock_round_trip_ms"] == pytest.approx(20)
+        assert latest["transport_lock_wait_ms"] == pytest.approx(2)
+        assert latest["requests_adapter_header_elapsed_ms"] == pytest.approx(30)
+        assert latest["session_get_total_ms"] == pytest.approx(40)
+        assert latest["json_decode_ms"] == pytest.approx(3)
+        assert latest["diagnostic_prepare_ms"] == pytest.approx(1.5)
+        assert latest["diagnostic_finalize_ms"] == pytest.approx(2.5)
+        assert latest["outcome"] == "success"
+        assert latest["failed_request_boundary_duration_ms"] is None
+        assert latest["urllib3_connection_objects_created_total_before"] == 1
+        assert latest["urllib3_connection_objects_created_total_after"] == 1
+        assert latest["urllib3_connection_objects_created_delta"] == 0
+        assert latest["new_urllib3_connection_object_created"] is False
+        assert latest["urllib3_requests_started_total_before"] == 5
+        assert latest["urllib3_requests_started_total_after"] == 6
+        assert latest["urllib3_requests_started_delta"] == 1
+        assert latest["request_completion_sequence"] == 7
+        assert latest["finalization_completion_sequence"] == 7
+        assert latest["post_request_observation_current"] is True
+        assert latest["requests_session_reused"] is True
+        assert latest["urllib3_connection_reused"] is True
+        assert latest["tls_socket_reused"] is True
+        assert latest["tls_session_reused"] is None
+        for legacy_name in (
+            "urllib3_pool_object_delta",
+            "urllib3_pool_request_delta",
+            "new_urllib3_pool_object_created",
+            "pool_connection_delta",
+            "pool_request_delta",
+            "new_pool_connection_created",
+        ):
+            assert legacy_name not in latest
+        latency = observability["latency_ms"]
+        assert isinstance(latency, dict)
+        assert latency["executor_submit_to_worker_start"]["median"] == pytest.approx(25)
+        assert latency["worker_completion_to_supervisor_drain"]["median"] == pytest.approx(15)
+        assert latency["diagnostic_prepare"]["median"] == pytest.approx(1.5)
+        assert latency["diagnostic_finalize"]["median"] == pytest.approx(2.5)
+        assert observability["in_flight"]["state"] == "idle"
+        pool = observability["http_pool"]
+        assert isinstance(pool, dict)
+        assert pool["urllib3_connection_objects_created_delta_total"] == 0
+        assert pool["urllib3_requests_started_delta_total"] == 1
+        assert pool["no_new_urllib3_connection_object_created_samples"] == 1
+        assert pool["post_request_observation_current_samples"] == 1
+    finally:
+        release_blocker.set()
+        collector.close()
+
+
+def test_running_clock_request_remains_single_flight_across_rapid_reconnects(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    rest = BlockingClockRest(_runtime_http_measurement())
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "single-flight-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+
+    try:
+        collector._schedule_clock_sample(
+            connection_id="public-old",
+            connection_epoch=1,
+            capture_epoch_id="capture-old",
+        )
+        assert rest.first_started.wait(timeout=1)
+        old_future = collector._clock_future
+        assert old_future is not None
+
+        for _ in range(25):
+            collector._abandon_clock_sample()
+            collector._schedule_clock_sample(
+                connection_id="public-new",
+                connection_epoch=2,
+                capture_epoch_id="capture-new",
+            )
+            assert collector._clock_future is old_future
+
+        assert rest.counts() == (1, 1, 1)
+        rest.release_first.set()
+        old_future.result(timeout=1)
+        manual.seconds = 0.010
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-new",
+            wait=True,
+        )
+        assert collector._clock_future is None
+        assert collector.metrics["clock_sample_failures"] == 1
+        assert collector.metrics["capture_ready"] is False
+        assert collector.metrics["clock_sync_valid"] is False
+
+        collector._schedule_clock_sample(
+            connection_id="public-new",
+            connection_epoch=2,
+            capture_epoch_id="capture-new",
+        )
+        new_future = collector._clock_future
+        assert new_future is not None
+        new_future.result(timeout=1)
+        manual.seconds = 0.020
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-new",
+            wait=True,
+        )
+        assert rest.counts() == (2, 0, 1)
+        assert collector.metrics["clock_samples"] == 1
+        assert collector.metrics["clock_samples_valid"] == 1
+    finally:
+        rest.release_first.set()
+        collector.close()
+
+
 def test_clock_sampling_continues_and_invalid_sample_breaks_readiness_and_coverage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1978,15 +2510,9 @@ def test_clock_sampling_continues_and_invalid_sample_breaks_readiness_and_covera
     base_ms = int(BASE.timestamp() * 1_000)
     public_actions = [
         _depth_frame(base_ms, last_sequence=1),
-        *[
-            _bbo_frame(base_ms + index, sequence=index)
-            for index in range(2, 6)
-        ],
+        *[_bbo_frame(base_ms + index, sequence=index) for index in range(2, 6)],
     ]
-    market_actions = [
-        _trade_frame(base_ms + index, sequence=index)
-        for index in range(1, 6)
-    ]
+    market_actions = [_trade_frame(base_ms + index, sequence=index) for index in range(1, 6)]
     public = ScriptedSocket(
         public_actions,
         clock=manual.now,
@@ -2034,9 +2560,7 @@ def test_clock_sampling_continues_and_invalid_sample_breaks_readiness_and_covera
     clock_rows: list[dict[str, object]] = []
     for manifest in inventory_partitions(root).partitions:
         if manifest.partition.record_type == RecordType.CLOCK_SYNC:
-            clock_rows.extend(
-                pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
-            )
+            clock_rows.extend(pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist())
     clock_rows.sort(key=lambda row: row["response_received_time"])
     assert [row["sample_status"] for row in clock_rows] == [
         "valid",
@@ -2123,3 +2647,591 @@ def test_binance_close_releases_sink_after_terminal_flush_failure(
     assert transport.close_calls == 1
     assert collector.metrics["state"] == "failed"
     collector.close()
+
+
+def test_binance_fresh_unrelated_backlog_does_not_defer_required_stream_timeout(
+    tmp_path: Path,
+) -> None:
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(tmp_path / "backlog-lake", batch_size=100, queue_capacity=200),
+    )
+    connector = _connector()
+    public = NoMessageSocket(
+        queue_depth=3,
+        oldest_message_age_ms=1_000.0,
+        latest_message_received_age_ms=100.0,
+    )
+    market = NoMessageSocket(
+        queue_depth=2,
+        oldest_message_age_ms=1_500.0,
+        latest_message_received_age_ms=100.0,
+    )
+    public.start_receiving()
+    market.start_receiving()
+    collector._sockets = {"public": public, "market": market}
+    collector._initialize_critical_streams(connector, at=BASE)
+
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="required Binance depth-derived BBO/L2 or trade streams stale",
+        ):
+            collector._require_critical_streams_fresh(at=BASE + timedelta(seconds=31))
+        assert collector.metrics["capture_ready"] is False
+        assert collector.metrics["state"] == "stale"
+        assert collector._backlog_liveness_deferrals == 0
+
+        public.oldest_message_age_ms = 31_001.0
+        with pytest.raises(ConnectionError, match="local consumer capacity exhausted") as failure:
+            collector._require_critical_streams_fresh(at=BASE + timedelta(seconds=31))
+        assert failure.value.socket_role == "public"  # type: ignore[attr-defined]
+        assert isinstance(
+            failure.value.original_error,  # type: ignore[attr-defined]
+            WebsocketConsumerBackpressure,
+        )
+        assert collector._is_fatal_local_capacity_error(failure.value) is True
+    finally:
+        collector.close()
+
+
+def test_binance_terminal_overflow_is_fatal_without_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rest = ScriptedClockRest([_clock_measurement_at(0, 20)])
+    base_ms = int(BASE.timestamp() * 1_000)
+    public = ScriptedSocket(
+        [
+            _depth_frame(base_ms, last_sequence=1),
+            WebsocketQueueOverflow("bounded public websocket queue is full; local capacity exhausted"),
+        ],
+        clock=lambda: BASE,
+    )
+    market = ScriptedSocket(
+        [
+            _trade_frame(base_ms, sequence=1),
+            _trade_frame(base_ms + 1, sequence=2),
+        ],
+        clock=lambda: BASE,
+    )
+    ReconnectingSocketFactory.runs = {"public": [public], "market": [market]}
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(tmp_path / "overflow-lake", batch_size=100, queue_capacity=500),
+        runtime_status_path=tmp_path / "overflow-status.json",
+        clock=lambda: BASE,
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        ReconnectingSocketFactory,
+    )
+
+    try:
+        with pytest.raises(ConnectionError, match="local capacity exhausted"):
+            collector.run()
+    finally:
+        collector.close()
+
+    assert collector.metrics["connections"] == 1
+    assert collector.metrics["reconnects"] == 0
+    status = json.loads((tmp_path / "overflow-status.json").read_text(encoding="utf-8"))
+    observability = status["observability"]
+    failure = observability["reconnect_reasons_by_generation"][0]
+    assert failure["initiating_role"] == "public"
+    assert failure["will_reconnect"] is False
+    assert failure["socket_telemetry"]["public"]["terminal_exception_type"] == "WebsocketQueueOverflow"
+    assert observability["last_closed_sockets"]["generation"] == 1
+
+
+def test_binance_generation_reason_history_reports_truncation(tmp_path: Path) -> None:
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(tmp_path / "history-lake", batch_size=100, queue_capacity=200),
+    )
+    try:
+        for generation in range(1, 36):
+            collector._record_generation_failure(
+                connection_epoch=generation,
+                capture_epoch_id=f"capture-{generation}",
+                connected_roles=("public", "market"),
+                error=ConnectionError(f"failure-{generation}"),
+                will_reconnect=True,
+            )
+        collector._publish()
+        status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+        observability = status["observability"]
+        assert observability["generation_reason_history"] == {
+            "capacity": 32,
+            "seen": 35,
+            "retained": 32,
+            "truncated": 3,
+        }
+        retained = observability["reconnect_reasons_by_generation"]
+        assert retained[0]["generation"] == 4
+        assert retained[-1]["generation"] == 35
+    finally:
+        collector.close()
+
+
+def test_clock_schedule_attributes_single_flight_separately_from_worker_lag(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=ScriptedClockRest([]),  # type: ignore[arg-type]
+        sink=BatchingLakeSink(tmp_path / "cadence-lake", batch_size=100, queue_capacity=200),
+        runtime_status_path=tmp_path / "cadence-status.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+    context = _ClockFutureContext(
+        capture_epoch_id="capture-1",
+        connection_id="public-1",
+        connection_epoch=1,
+        submitted_at=0.0,
+        worker_started_at=0.5,
+        worker_completed_at=8.0,
+    )
+
+    try:
+        collector._observe_clock_schedule(
+            expected_at=5.0,
+            observed_at=12.0,
+            prior_context=context,
+        )
+        observability = collector.metrics["clock_observability"]
+        assert isinstance(observability, dict)
+        assert observability["clock_schedule_overdue_ms"]["p99_ms"] == pytest.approx(7_000)
+        assert observability["single_flight_blocked_ms"]["p99_ms"] == pytest.approx(3_000)
+        process = collector._runtime_telemetry.snapshot()
+        assert process["scheduling"]["worker_lag_ms"]["p99_ms"] == pytest.approx(4_000)
+    finally:
+        collector.close()
+
+
+def test_failed_clock_request_retains_partial_http_diagnostics(tmp_path: Path) -> None:
+    diagnostics = HttpRequestDiagnostics(
+        transport_lock_wait_ms=2.0,
+        requests_adapter_header_elapsed_ms=None,
+        session_get_total_ms=750.0,
+        json_decode_ms=None,
+        pool_connections_before=1,
+        pool_connections_after=2,
+        pool_connection_delta=1,
+        pool_requests_before=5,
+        pool_requests_after=6,
+        pool_request_delta=1,
+        new_pool_connection_created=True,
+        outcome="failure",
+        failure_stage="session_get",
+        exception_type="TimeoutError",
+        requests_session_reused=True,
+        request_completion_sequence=11,
+        finalization_completion_sequence=11,
+        post_request_observation_current=True,
+    )
+    error = BinancePublicHttpRequestError(
+        TimeoutError("clock request timed out"),
+        request_sent_time=BASE,
+        response_received_time=BASE + timedelta(milliseconds=750),
+        http_diagnostics=diagnostics,
+    )
+    rest = ScriptedClockRest([error])
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(tmp_path / "clock-error-lake", batch_size=100, queue_capacity=200),
+        runtime_status_path=tmp_path / "clock-error-status.json",
+        clock=lambda: BASE,
+    )
+
+    try:
+        collector._schedule_clock_sample(
+            connection_id="public-1",
+            connection_epoch=1,
+            capture_epoch_id="capture-1",
+        )
+        assert rest.ready[0].wait(timeout=1)
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-1",
+            wait=True,
+        )
+        observability = collector.metrics["clock_observability"]
+        assert isinstance(observability, dict)
+        latest = observability["latest"]
+        assert isinstance(latest, dict)
+        assert latest["outcome"] == "error"
+        assert latest["exception_type"] == "BinancePublicHttpRequestError"
+        assert "clock request timed out" in latest["exception_message"]
+        assert latest["http_outcome"] == "failure"
+        assert latest["http_failure_stage"] == "session_get"
+        assert latest["http_exception_type"] == "TimeoutError"
+        assert latest["session_get_total_ms"] == pytest.approx(750)
+        assert latest["failed_request_boundary_duration_ms"] == pytest.approx(750)
+        assert latest["urllib3_connection_objects_created_delta"] == 1
+        assert latest["urllib3_requests_started_delta"] == 1
+        assert latest["request_completion_sequence"] == 11
+        assert latest["finalization_completion_sequence"] == 11
+        assert latest["post_request_observation_current"] is True
+        assert observability["outcomes"] == {
+            "success": 0,
+            "error": 1,
+            "discarded_after_generation_close": 0,
+        }
+        assert observability["latency_ms"]["failed_request_boundary_duration"]["median"] == pytest.approx(750)
+    finally:
+        collector.close()
+
+
+class DualHandshakeFailureSocketFactory:
+    def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
+        self.role = "public" if "/public/" in url else "market"
+
+    def connect_paused(
+        self,
+        network: str,
+        timeout_seconds: float,
+    ) -> NoMessageSocket:
+        assert network == "public"
+        assert timeout_seconds > 0
+        if self.role == "public":
+            raise TimeoutError("public TLS timeout")
+        raise ConnectionError("market DNS failure")
+
+
+def test_paired_handshake_serializes_all_failures_in_role_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(
+            tmp_path / "dual-handshake-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        DualHandshakeFailureSocketFactory,
+    )
+    monkeypatch.setattr(
+        collector,
+        "_interruptible_sleep",
+        lambda _delay: collector.stop(),
+    )
+
+    try:
+        collector.run()
+    finally:
+        collector.close()
+
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert failure["initiating_role"] == "public"
+    assert failure["opened_socket_roles"] == []
+    assert failure["paired_handshake_failures"] == [
+        {
+            "socket_role": "public",
+            "operation": "handshake",
+            "exception_type": "TimeoutError",
+            "reason": "TimeoutError: public TLS timeout",
+        },
+        {
+            "socket_role": "market",
+            "operation": "handshake",
+            "exception_type": "ConnectionError",
+            "reason": "ConnectionError: market DNS failure",
+        },
+    ]
+    assert failure["reason"].index("public=") < failure["reason"].index("market=")
+
+
+def _prepare_one_frame_pair() -> dict[str, OneFrameSocket]:
+    base_ms = int(BASE.timestamp() * 1_000)
+    sockets = {
+        "public": OneFrameSocket(
+            json.dumps(
+                _depth_frame(base_ms, last_sequence=1),
+                separators=(",", ":"),
+            )
+        ),
+        "market": OneFrameSocket(
+            json.dumps(
+                _trade_frame(base_ms, sequence=1),
+                separators=(",", ":"),
+            )
+        ),
+    }
+    SplitSocketFactory.sockets = sockets
+    SplitSocketFactory.urls = {}
+    SplitSocketFactory.public_handshake_complete = threading.Event()
+    SplitSocketFactory.market_observed_public_paused = False
+    return sockets
+
+
+def test_binance_normalization_failure_is_attributed_to_socket_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sockets = _prepare_one_frame_pair()
+    connector = _connector()
+    original_parse = BinancePublicConnector.parse_message
+
+    def fail_market_parse(
+        self: BinancePublicConnector,
+        envelope: WireEnvelope,
+    ) -> ParsedMessage:
+        if "aggTrade" in envelope.raw_message:
+            raise ValueError("simulated market normalization failure")
+        return original_parse(self, envelope)
+
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(
+            tmp_path / "normalization-role-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+    )
+    monkeypatch.setattr(collector, "_bootstrap", lambda: connector)
+    monkeypatch.setattr(BinancePublicConnector, "parse_message", fail_market_parse)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        SplitSocketFactory,
+    )
+    monkeypatch.setattr(
+        collector,
+        "_interruptible_sleep",
+        lambda _delay: collector.stop(),
+    )
+
+    try:
+        collector.run()
+    finally:
+        collector.close()
+
+    assert all(socket.closed for socket in sockets.values())
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert failure["initiating_role"] == "market"
+    assert failure["will_reconnect"] is True
+    assert "market websocket normalization failed" in failure["reason"]
+
+
+@pytest.mark.parametrize(
+    ("error", "initiating_role", "will_reconnect"),
+    (
+        (ValueError("simulated public L2 state failure"), "public", True),
+        (
+            CoordinatedWriterError("simulated coordinated writer failure"),
+            "writer",
+            False,
+        ),
+    ),
+)
+def test_binance_l2_processing_preserves_role_and_writer_attribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    initiating_role: str,
+    will_reconnect: bool,
+) -> None:
+    sockets = _prepare_one_frame_pair()
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(
+            tmp_path / f"l2-role-{initiating_role}-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        SplitSocketFactory,
+    )
+
+    def fail_l2(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(collector, "_record_l2_resync_if_needed", fail_l2)
+    if will_reconnect:
+        monkeypatch.setattr(
+            collector,
+            "_interruptible_sleep",
+            lambda _delay: collector.stop(),
+        )
+
+    try:
+        if will_reconnect:
+            collector.run()
+        else:
+            with pytest.raises(
+                CoordinatedWriterError,
+                match="simulated coordinated writer failure",
+            ):
+                collector.run()
+    finally:
+        collector.close()
+
+    assert all(socket.closed for socket in sockets.values())
+    status = json.loads((tmp_path / "runtime-status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert failure["initiating_role"] == initiating_role
+    assert failure["will_reconnect"] is will_reconnect
+    if will_reconnect:
+        assert "public websocket l2_resync failed" in failure["reason"]
+    else:
+        assert failure["reason"].startswith("CoordinatedWriterError:")
+
+
+def test_clock_in_flight_snapshot_distinguishes_queue_run_and_drain_ages(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=ScriptedClockRest([]),  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "in-flight-clock-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "in-flight-clock-status.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+    future: Future[object] = Future()
+    context = _ClockFutureContext(
+        capture_epoch_id="capture-in-flight",
+        connection_id="public-in-flight",
+        connection_epoch=9,
+        submitted_at=0.0,
+    )
+    collector._clock_future = future  # type: ignore[assignment]
+    collector._clock_future_context = context
+
+    try:
+        manual.seconds = 5.0
+        collector._publish()
+        status = json.loads((tmp_path / "in-flight-clock-status.json").read_text(encoding="utf-8"))
+        queued = status["clock_observability"]["in_flight"]
+        assert queued == {
+            "pending": True,
+            "state": "queued_not_started",
+            "future_done": False,
+            "future_cancelled": False,
+            "pending_age_ms": pytest.approx(5_000),
+            "queued_not_started_age_ms": pytest.approx(5_000),
+            "running_age_ms": None,
+            "completed_awaiting_drain_age_ms": None,
+            "capture_epoch_id": "capture-in-flight",
+            "connection_id": "public-in-flight",
+            "connection_epoch": 9,
+        }
+
+        context.worker_started_at = 2.0
+        running = collector._clock_observability_payload()["in_flight"]
+        assert running["state"] == "running"
+        assert running["pending_age_ms"] == pytest.approx(5_000)
+        assert running["queued_not_started_age_ms"] is None
+        assert running["running_age_ms"] == pytest.approx(3_000)
+
+        context.worker_completed_at = 4.0
+        future.set_result(_runtime_http_measurement())
+        completed = collector._clock_observability_payload()["in_flight"]
+        assert completed["state"] == "completed_awaiting_drain"
+        assert completed["future_done"] is True
+        assert completed["completed_awaiting_drain_age_ms"] == pytest.approx(1_000)
+    finally:
+        collector._clock_future = None
+        collector._clock_future_context = None
+        collector.close()
+
+
+def test_close_discards_completed_clock_sample_and_clears_in_flight_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manual = ManualTime()
+    rest = BlockingClockRest(_runtime_http_measurement())
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "close-clock-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "close-clock-status.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+    shutdown_started = threading.Event()
+    release_errors: list[BaseException] = []
+    original_shutdown = collector._clock_executor.shutdown
+
+    def observed_shutdown(
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
+        shutdown_started.set()
+        original_shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(collector._clock_executor, "shutdown", observed_shutdown)
+
+    collector._schedule_clock_sample(
+        connection_id="public-close",
+        connection_epoch=4,
+        capture_epoch_id="capture-close",
+    )
+    assert rest.first_started.wait(timeout=1)
+
+    def release_during_shutdown() -> None:
+        try:
+            assert shutdown_started.wait(timeout=1)
+            manual.seconds = 0.125
+        except BaseException as exc:
+            release_errors.append(exc)
+        finally:
+            rest.release_first.set()
+
+    releaser = threading.Thread(target=release_during_shutdown)
+    releaser.start()
+    try:
+        collector.close()
+    finally:
+        rest.release_first.set()
+        releaser.join(timeout=2)
+
+    assert not releaser.is_alive()
+    assert release_errors == []
+    assert collector._clock_future is None
+    assert collector._clock_future_context is None
+    status = json.loads((tmp_path / "close-clock-status.json").read_text(encoding="utf-8"))
+    clock_observability = status["clock_observability"]
+    assert clock_observability["in_flight"]["pending"] is False
+    assert clock_observability["in_flight"]["state"] == "idle"
+    assert clock_observability["outcomes"] == {
+        "success": 0,
+        "error": 0,
+        "discarded_after_generation_close": 1,
+    }
+    latest = clock_observability["latest"]
+    assert latest["outcome"] == "discarded_after_generation_close"
+    assert latest["capture_epoch_id"] == "capture-close"
+    assert latest["connection_id"] == "public-close"
+    assert latest["connection_epoch"] == 4
+    assert latest["authoritative_clock_round_trip_ms"] == pytest.approx(20)
+    assert latest["transport_lock_wait_ms"] == pytest.approx(2)
+    assert latest["urllib3_requests_started_delta"] == 1
+    assert latest["worker_completion_to_supervisor_drain_ms"] == pytest.approx(0)
+    assert collector.metrics["clock_samples"] == 0
+    assert not list((tmp_path / "close-clock-lake").rglob("*.parquet"))

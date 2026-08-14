@@ -69,6 +69,47 @@ def test_background_reader_accepts_text_and_decodes_bytes() -> None:
         socket.close()
 
 
+def test_socket_telemetry_reports_labeled_queue_timing_without_changing_wire_time() -> None:
+    connected_at = datetime(2026, 8, 12, 11, 59, 59, tzinfo=UTC)
+    received_at = connected_at + timedelta(seconds=1)
+    wall_times = iter((connected_at, received_at))
+    monotonic_times = iter((100_000_000, 102_000_000, 110_000_000, 120_000_000))
+    socket = WebsocketClientSocket(
+        FakeConnection(iter(("wire",))),
+        queue_capacity=2,
+        clock=lambda: next(wall_times),
+        monotonic_ns=lambda: next(monotonic_times),
+        venue="binance_usdm",
+        socket_role="market",
+        reader_name="test-binance-market-reader",
+    )
+    try:
+        received = socket.receive(0.2)
+        assert received == ReceivedWireMessage("wire", received_at)
+        assert received is not None
+        assert received.received_monotonic_ns == 100_000_000
+
+        telemetry = socket.telemetry_snapshot()
+
+        assert telemetry["venue"] == "binance_usdm"
+        assert telemetry["socket_role"] == "market"
+        assert telemetry["reader_name"] == "test-binance-market-reader"
+        assert telemetry["queue_depth"] == 0
+        assert telemetry["queue_high_water"] == 1
+        assert telemetry["oldest_message_age_ms"] is None
+        assert telemetry["latest_message_received_age_ms"] == 20.0
+        assert telemetry["overflow_count"] == 0
+        assert telemetry["terminal_reason"] is None
+        enqueue = telemetry["enqueue_delay_ms"]
+        residence = telemetry["dequeue_residence_ms"]
+        assert isinstance(enqueue, dict)
+        assert isinstance(residence, dict)
+        assert enqueue["p99_ms"] == 2.0
+        assert residence["p99_ms"] == 10.0
+    finally:
+        socket.close()
+
+
 def test_paused_reader_captures_connection_time_before_first_wire() -> None:
     connected_at = datetime(2026, 8, 12, 11, 59, 59, 999000, tzinfo=UTC)
     first_received_at = connected_at + timedelta(milliseconds=1)
@@ -106,6 +147,32 @@ def test_paused_reader_can_close_before_start_without_joining() -> None:
     assert not socket._reader.is_alive()
     with pytest.raises(RuntimeError, match="cannot start a closed"):
         socket.start_receiving()
+
+
+def test_default_reader_names_are_unique_and_include_venue_and_role() -> None:
+    first = WebsocketClientSocket(
+        FakeConnection(),
+        queue_capacity=1,
+        venue="binance_usdm",
+        socket_role="market",
+        start_immediately=False,
+    )
+    second = WebsocketClientSocket(
+        FakeConnection(),
+        queue_capacity=1,
+        venue="binance_usdm",
+        socket_role="market",
+        start_immediately=False,
+    )
+    try:
+        assert first.reader_name.startswith("hyperlab-ws-binance_usdm-market-")
+        assert second.reader_name.startswith("hyperlab-ws-binance_usdm-market-")
+        assert first.reader_name != second.reader_name
+        assert first._reader.name == first.reader_name
+        assert second._reader.name == second.reader_name
+    finally:
+        first.close()
+        second.close()
 
 
 def test_receive_timeout_and_invalid_timeout_are_explicit() -> None:
@@ -180,6 +247,13 @@ def test_bounded_queue_saturation_fails_before_processing_the_backlog() -> None:
             socket.receive(0.2)
         assert socket._messages.qsize() == 1
         assert connection.close_calls == 1
+        telemetry = socket.telemetry_snapshot()
+        assert telemetry["queue_depth"] == 1
+        assert telemetry["queue_high_water"] == 1
+        assert telemetry["overflow_count"] == 1
+        assert telemetry["terminal_exception_type"] == "WebsocketQueueOverflow"
+        assert "local capacity exhausted" in str(telemetry["terminal_reason"])
+        assert telemetry["oldest_message_age_ms"] is not None
     finally:
         socket.close()
 

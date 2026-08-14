@@ -4,13 +4,15 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import date as Date
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import quote, unquote
 
 import pyarrow as pa
@@ -1212,6 +1214,56 @@ def _publish_exclusive(temporary: Path, target: Path, *, expected_bytes: bytes |
         temporary.unlink(missing_ok=True)
 
 
+def _flush_and_fsync(stream: BinaryIO) -> None:
+    """Flush Python buffers and force one regular file to stable storage."""
+
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def _fsync_file(path: Path) -> None:
+    """Force a closed producer's file contents and metadata to stable storage."""
+
+    with path.open("r+b") as stream:
+        _flush_and_fsync(stream)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes where directory fsync is supported."""
+
+    if os.name == "nt":
+        # Python cannot portably open a Windows directory for os.fsync(). The
+        # regular files are still fsynced; Linux production additionally gets
+        # the directory durability barrier below.
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _missing_directories(root: Path, leaf: Path) -> tuple[Path, ...]:
+    """Return missing directories from leaf upward, bounded by root."""
+
+    missing: list[Path] = []
+    current = leaf
+    while True:
+        if not current.exists():
+            missing.append(current)
+        if current == root:
+            return tuple(missing)
+        current = current.parent
+
+
+def _fsync_created_directory_entries(created: tuple[Path, ...]) -> None:
+    """Persist each newly created directory entry in its parent directory."""
+
+    for directory in created:
+        _fsync_directory(directory.parent)
+
+
 def _schema_spec_for_write(key: PartitionKey, table: pa.Table) -> SchemaSpec:
     raw_version = (table.schema.metadata or {}).get(SCHEMA_VERSION_METADATA)
     if raw_version is None:
@@ -1228,46 +1280,118 @@ def _schema_spec_for_write(key: PartitionKey, table: pa.Table) -> SchemaSpec:
         raise PartitionValidationError(str(exc)) from None
 
 
+_TimingObserver = Callable[[str, int], None]
+
+
+def _observe_timing(
+    observer: _TimingObserver | None,
+    stage: str,
+    started_ns: int,
+    monotonic_ns: Callable[[], int],
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(stage, max(monotonic_ns() - started_ns, 0))
+    except Exception:
+        # Storage observability must never change immutable publication semantics.
+        return
+
+
 def write_partition(
     root: Path,
     key: PartitionKey,
     table: pa.Table,
     expected_interval: timedelta | None = None,
+    *,
+    _timing_observer: _TimingObserver | None = None,
+    _monotonic_ns: Callable[[], int] = time.monotonic_ns,
 ) -> PartitionManifest:
     """Validate and atomically publish one immutable, content-addressed Parquet file."""
 
-    spec = _schema_spec_for_write(key, table)
-    expected_interval_ns, stream_key = _stream_definition(
-        table,
-        key,
-        _interval_ns(expected_interval),
-    )
-    analysis = _analyze_table(
-        table,
-        key,
-        spec,
-        expected_interval_ns=expected_interval_ns,
-    )
+    analysis_started_ns = _monotonic_ns()
+    try:
+        spec = _schema_spec_for_write(key, table)
+        expected_interval_ns, stream_key = _stream_definition(
+            table,
+            key,
+            _interval_ns(expected_interval),
+        )
+        analysis = _analyze_table(
+            table,
+            key,
+            spec,
+            expected_interval_ns=expected_interval_ns,
+        )
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "partition_analysis",
+            analysis_started_ns,
+            _monotonic_ns,
+        )
     canonical_root = root.resolve()
-    leaf = key.path(root)
-    _require_under_root(canonical_root, leaf, label="partition leaf")
+    leaf = _require_under_root(
+        canonical_root,
+        key.path(root),
+        label="partition leaf",
+    )
+    missing_directories = _missing_directories(canonical_root, leaf)
     leaf.mkdir(parents=True, exist_ok=True)
-    _require_under_root(canonical_root, leaf, label="partition leaf")
+    leaf = _require_under_root(canonical_root, leaf, label="partition leaf")
+    directory_fsync_started_ns = _monotonic_ns()
+    try:
+        _fsync_created_directory_entries(missing_directories)
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "partition_directory_fsync",
+            directory_fsync_started_ns,
+            _monotonic_ns,
+        )
     temporary = leaf / f".{uuid.uuid4().hex}.parquet.tmp"
     _require_under_root(canonical_root, temporary, label="temporary Parquet")
     try:
-        pq.write_table(
-            table.combine_chunks(),
-            temporary,
-            compression="zstd",
-            version="2.6",
-            data_page_version="2.0",
-            use_dictionary=False,
-            write_statistics=True,
-            row_group_size=65_536,
-            store_schema=True,
-        )
-        digest = _sha256(temporary)
+        parquet_started_ns = _monotonic_ns()
+        try:
+            pq.write_table(
+                table.combine_chunks(),
+                temporary,
+                compression="zstd",
+                version="2.6",
+                data_page_version="2.0",
+                use_dictionary=False,
+                write_statistics=True,
+                row_group_size=65_536,
+                store_schema=True,
+            )
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_write",
+                parquet_started_ns,
+                _monotonic_ns,
+            )
+        parquet_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_file(temporary)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_fsync",
+                parquet_fsync_started_ns,
+                _monotonic_ns,
+            )
+        hash_started_ns = _monotonic_ns()
+        try:
+            digest = _sha256(temporary)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_hash",
+                hash_started_ns,
+                _monotonic_ns,
+            )
         data_file = f"part-{digest}.parquet"
         data_path = leaf / data_file
         _require_under_root(canonical_root, data_path, label="partition data")
@@ -1283,7 +1407,26 @@ def write_partition(
             expected_interval_ns=expected_interval_ns,
             stream_key=stream_key,
         )
-        _publish_exclusive(temporary, data_path)
+        publish_started_ns = _monotonic_ns()
+        try:
+            _publish_exclusive(temporary, data_path)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "partition_publish",
+                publish_started_ns,
+                _monotonic_ns,
+            )
+        directory_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_directory(leaf)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "data_directory_fsync",
+                directory_fsync_started_ns,
+                _monotonic_ns,
+            )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1295,16 +1438,52 @@ def write_partition(
     try:
         with manifest_temporary.open("xb") as stream:
             stream.write(manifest_bytes)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _publish_exclusive(
-            manifest_temporary,
-            manifest_path,
-            expected_bytes=manifest_bytes,
-        )
+            fsync_started_ns = _monotonic_ns()
+            try:
+                _flush_and_fsync(stream)
+            finally:
+                _observe_timing(
+                    _timing_observer,
+                    "manifest_fsync",
+                    fsync_started_ns,
+                    _monotonic_ns,
+                )
+        publish_started_ns = _monotonic_ns()
+        try:
+            _publish_exclusive(
+                manifest_temporary,
+                manifest_path,
+                expected_bytes=manifest_bytes,
+            )
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "partition_publish",
+                publish_started_ns,
+                _monotonic_ns,
+            )
+        directory_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_directory(leaf)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "manifest_directory_fsync",
+                directory_fsync_started_ns,
+                _monotonic_ns,
+            )
     finally:
         manifest_temporary.unlink(missing_ok=True)
-    return validate_partition(manifest_path)
+    validation_started_ns = _monotonic_ns()
+    try:
+        return validate_partition(manifest_path)
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "immediate_validation",
+            validation_started_ns,
+            _monotonic_ns,
+        )
 
 
 def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest:
@@ -1320,7 +1499,9 @@ def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest
         raise PartitionValidationError(f"invalid orphan Parquet path: {data_path.name}")
     manifest_path = resolved_data_path.with_name(f"{resolved_data_path.stem}.manifest.json")
     if manifest_path.exists():
-        return validate_partition(manifest_path)
+        existing = validate_partition(manifest_path)
+        _fsync_directory(manifest_path.parent)
+        return existing
 
     payload = resolved_data_path.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
@@ -1362,9 +1543,9 @@ def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest
     try:
         with temporary.open("xb") as stream:
             stream.write(manifest_bytes)
-            stream.flush()
-            os.fsync(stream.fileno())
+            _flush_and_fsync(stream)
         _publish_exclusive(temporary, manifest_path, expected_bytes=manifest_bytes)
+        _fsync_directory(manifest_path.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return validate_partition(manifest_path)

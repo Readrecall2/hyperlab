@@ -21,7 +21,16 @@ from hyperlab.collector.models import (
 )
 from hyperlab.collector.parser import parse_websocket_message
 from hyperlab.collector.runtime import PublicCollector
-from hyperlab.collector.storage import BatchingLakeSink, FlushResult
+from hyperlab.collector.storage import (
+    BatchingLakeSink,
+    CoordinatedWriterError,
+    FlushResult,
+)
+from hyperlab.collector.websocket import (
+    ReceivedWireMessage,
+    WebsocketConsumerBackpressure,
+    WebsocketQueueOverflow,
+)
 from hyperlab.data.lake import PartitionValidationError
 from hyperlab.data.schema import RecordType
 
@@ -139,29 +148,63 @@ class FakeRest:
         self.close_calls += 1
 
 
-SocketItem = tuple[str | BaseException | None, float]
+SocketItem = tuple[str | ReceivedWireMessage | BaseException | None, float]
 
 
 class FakeSocket:
-    def __init__(self, timer: ControlledTime, items: list[SocketItem]) -> None:
+    def __init__(
+        self,
+        timer: ControlledTime,
+        items: list[SocketItem],
+        *,
+        telemetry_queue_depth: int = 0,
+        telemetry_oldest_age_ms: float | None = None,
+        telemetry_latest_age_ms: float | None = None,
+    ) -> None:
         self.timer = timer
         self.connected_at = timer.now()
         self.items = list(items)
         self.sent: list[dict[str, object]] = []
         self.closed = False
+        self.telemetry_queue_depth = telemetry_queue_depth
+        self.telemetry_oldest_age_ms = telemetry_oldest_age_ms
+        self.telemetry_latest_age_ms = telemetry_latest_age_ms
+        self.terminal_error: BaseException | None = None
 
     def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
 
-    def receive(self, timeout_seconds: float) -> str | None:
+    def receive(self, timeout_seconds: float) -> str | ReceivedWireMessage | None:
         assert timeout_seconds == 1.0
         if not self.items:
             raise AssertionError("fake socket script exhausted")
         item, advance_seconds = self.items.pop(0)
         self.timer.advance(advance_seconds)
         if isinstance(item, BaseException):
+            self.terminal_error = item
             raise item
         return item
+
+    def telemetry_snapshot(self) -> dict[str, object]:
+        error = self.terminal_error
+        detail = None if error is None else str(error).strip()
+        return {
+            "reader_alive": not self.closed,
+            "closed": self.closed,
+            "queue_capacity": 2_000,
+            "queue_depth": self.telemetry_queue_depth,
+            "queue_high_water": self.telemetry_queue_depth,
+            "oldest_message_age_ms": self.telemetry_oldest_age_ms,
+            "latest_message_received_age_ms": self.telemetry_latest_age_ms,
+            "terminal_exception_type": None if error is None else type(error).__name__,
+            "terminal_reason": (
+                None
+                if error is None
+                else type(error).__name__
+                if not detail
+                else f"{type(error).__name__}: {detail}"
+            ),
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -189,6 +232,19 @@ class StateRecordingSink(BatchingLakeSink):
         if self.state_provider is not None:
             self.flush_states.append(self.state_provider())
         return super().flush()
+
+
+class AsyncFlushRequestRecordingSink(StateRecordingSink):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.flush_requests = 0
+
+    def collect_completed(self) -> FlushResult:
+        return FlushResult((), 0, 0)
+
+    def request_flush(self) -> bool:
+        self.flush_requests += 1
+        return True
 
 
 def _ack_messages(config: CollectorConfig) -> list[SocketItem]:
@@ -331,9 +387,7 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     assert len(l2_headers) == 1
     assert len(l2_levels) == 2
     rest_snapshot_id = str(l2_headers[0]["snapshot_id"])
-    assert rest_snapshot_id.startswith(
-        f"rest:{l2_headers[0]['connection_id']}:1:"
-    )
+    assert rest_snapshot_id.startswith(f"rest:{l2_headers[0]['connection_id']}:1:")
     assert {str(row["snapshot_id"]) for row in l2_levels} == {rest_snapshot_id}
     assert CollectorState.BOOTSTRAPPING in sink.flush_states
     assert CollectorState.LIVE in sink.flush_states
@@ -353,6 +407,20 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     assert status["mode"] == "readonly"
     assert status["orders_enabled"] is False
     assert status["metrics"]["state"] == "stopped"
+    observability = status["observability"]
+    assert "socket" not in observability
+    assert observability["generation_reason_history"] == {
+        "capacity": 32,
+        "seen": 0,
+        "retained": 0,
+        "truncated": 0,
+    }
+    closed_socket = observability["last_closed_socket"]
+    assert closed_socket["generation"] == 1
+    assert closed_socket["connection_id"] == "ws-1-first"
+    assert closed_socket["telemetry_before_close"]["closed"] is False
+    assert closed_socket["telemetry_after_close"]["closed"] is True
+    assert "queue_high_water" in closed_socket["telemetry_before_close"]
 
 
 def test_heartbeat_ping_and_pong_are_observed_without_real_time(tmp_path: Path) -> None:
@@ -417,6 +485,26 @@ def test_disconnect_records_unknown_coverage_then_reconnects_with_bounded_backof
     reasons = [str(row["reason"]) for row in _parquet_rows(sink.root, "connection_event")]
     assert any(reason.startswith("coverage_unknown:no public server sequence") for reason in reasons)
     _assert_all_source_sequences_are_null(sink.root)
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    observability = status["observability"]
+    assert "process_cpu" in observability["process"]
+    failures = observability["reconnect_reasons_by_generation"]
+    assert len(failures) == 1
+    assert failures[0]["generation"] == 1
+    assert failures[0]["connected"] is True
+    assert failures[0]["reason"] == "ConnectionError: wire cut"
+    assert failures[0]["socket"]["terminal_exception_type"] == "ConnectionError"
+    assert failures[0]["will_reconnect"] is True
+    assert observability["generation_reason_history"] == {
+        "capacity": 32,
+        "seen": 1,
+        "retained": 1,
+        "truncated": 0,
+    }
+    assert observability["last_closed_socket"]["generation"] == 2
+    worker_phases = observability["worker_phases"]
+    assert worker_phases["normalization_ms"]["count"] > 0
+    assert worker_phases["sink_enqueue_ms"]["count"] > 0
 
 
 def test_backoff_resets_only_after_a_stable_live_window(tmp_path: Path) -> None:
@@ -542,9 +630,7 @@ def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
         stale_after_seconds=2.0,
     )
     fixture_root = Path(__file__).parent / "fixtures" / "hyperliquid"
-    active_context = (fixture_root / "ws_active_asset_ctx.json").read_text(
-        encoding="utf-8"
-    )
+    active_context = (fixture_root / "ws_active_asset_ctx.json").read_text(encoding="utf-8")
     bbo = (fixture_root / "ws_bbo.json").read_text(encoding="utf-8")
     l2_book = (fixture_root / "ws_l2_book.json").read_text(encoding="utf-8")
     trade = (fixture_root / "ws_trades.json").read_text(encoding="utf-8")
@@ -574,10 +660,7 @@ def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
     assert metrics.gaps == 1
     assert metrics.stale_channels == ("trades:BTC",)
     assert socket.closed is True
-    reasons = [
-        str(row["reason"])
-        for row in _parquet_rows(sink.root, "connection_event")
-    ]
+    reasons = [str(row["reason"]) for row in _parquet_rows(sink.root, "connection_event")]
     assert any("trades:BTC" in reason for reason in reasons)
     collector.close()
 
@@ -824,7 +907,6 @@ def test_candle_subscription_key_is_canonical(
     assert PublicCollector._subscription_key(subscription.payload()) == expected_key
 
 
-
 def test_subscription_key_rejects_ambiguous_components() -> None:
     with pytest.raises(ValueError, match="stream key separator"):
         PublicSubscription(channel="candle", coin="BTC:1m", interval="1m")
@@ -912,3 +994,401 @@ def test_duration_stop_and_cleanup_are_normal_with_multiple_candle_streams(tmp_p
                 if not key.startswith("candle:") or key.count(":") == 2
             }
             collector.close()
+
+
+def test_fresh_unrelated_reader_backlog_does_not_defer_stale_disconnect(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=10.0,
+        pong_timeout_seconds=20.0,
+        stale_after_seconds=2.0,
+    )
+    socket = FakeSocket(
+        timer,
+        [*_ack_messages(config), (None, 3.0)],
+        telemetry_queue_depth=2,
+        telemetry_oldest_age_ms=1_000.0,
+        telemetry_latest_age_ms=100.0,
+    )
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    metrics = collector.run(duration_seconds=2.5)
+
+    assert metrics.connections == 1
+    assert metrics.reconnects == 0
+    assert metrics.gaps == 1
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    assert status["ok"] is False
+    assert status["observability"]["liveness"] == {
+        "fresh_backlog_deferrals": 0,
+        "fresh_backlog_active": False,
+        "wire_monotonic_legacy_fallbacks": 0,
+        "wire_monotonic_domain_fallbacks": 0,
+    }
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert "stale critical public streams" in failure["reason"]
+
+
+def test_aged_reader_backlog_is_fatal_local_capacity_without_reconnect(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=10.0,
+        pong_timeout_seconds=20.0,
+        stale_after_seconds=2.0,
+    )
+    socket = FakeSocket(
+        timer,
+        [*_ack_messages(config), (None, 3.0)],
+        telemetry_queue_depth=2,
+        telemetry_oldest_age_ms=2_500.0,
+        telemetry_latest_age_ms=100.0,
+    )
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    try:
+        with pytest.raises(
+            WebsocketConsumerBackpressure,
+            match="local consumer capacity exhausted",
+        ):
+            collector.run(duration_seconds=30.0)
+    finally:
+        collector.close()
+
+    assert collector.metrics.connections == 1
+    assert collector.metrics.reconnects == 0
+    assert collector.metrics.gaps == 1
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert failure["will_reconnect"] is False
+    assert failure["reason"].startswith("WebsocketConsumerBackpressure:")
+
+
+def test_terminal_websocket_overflow_is_fatal_without_reconnect(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    config = _config()
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config),
+            (
+                WebsocketQueueOverflow("bounded public websocket queue is full; local capacity exhausted"),
+                0.0,
+            ),
+        ],
+        telemetry_queue_depth=config.queue_capacity,
+        telemetry_oldest_age_ms=1.0,
+        telemetry_latest_age_ms=0.0,
+    )
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    try:
+        with pytest.raises(WebsocketQueueOverflow, match="local capacity exhausted"):
+            collector.run(duration_seconds=30.0)
+    finally:
+        collector.close()
+
+    assert collector.metrics.connections == 1
+    assert collector.metrics.reconnects == 0
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    observability = status["observability"]
+    failure = observability["reconnect_reasons_by_generation"][0]
+    assert failure["will_reconnect"] is False
+    assert failure["socket"]["terminal_exception_type"] == "WebsocketQueueOverflow"
+    assert (
+        observability["last_closed_socket"]["telemetry_before_close"]["terminal_exception_type"]
+        == "WebsocketQueueOverflow"
+    )
+
+
+def test_generation_reason_history_reports_truncation(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    collector, _rest, _factory, _sink = _collector(tmp_path, _config(), timer, [])
+    try:
+        for generation in range(1, 36):
+            collector._record_generation_failure(
+                socket=None,
+                connection_id=f"connection-{generation}",
+                generation=generation,
+                connected=True,
+                error=ConnectionError(f"failure-{generation}"),
+                will_reconnect=True,
+            )
+        collector._publish_status()
+        status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+        observability = status["observability"]
+        assert observability["generation_reason_history"] == {
+            "capacity": 32,
+            "seen": 35,
+            "retained": 32,
+            "truncated": 3,
+        }
+        retained = observability["reconnect_reasons_by_generation"]
+        assert retained[0]["generation"] == 4
+        assert retained[-1]["generation"] == 35
+    finally:
+        collector.close()
+
+
+def test_pong_liveness_uses_wire_receive_monotonic_not_consumer_time(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=2.0,
+        pong_timeout_seconds=5.0,
+        stale_after_seconds=1_000.0,
+    )
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config),
+            (
+                ReceivedWireMessage(
+                    '{"channel":"pong"}',
+                    BASE_TIME,
+                    received_monotonic_ns=0,
+                ),
+                6.0,
+            ),
+        ],
+        telemetry_queue_depth=3,
+        telemetry_oldest_age_ms=1_000.0,
+        telemetry_latest_age_ms=50.0,
+    )
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    metrics = collector.run(duration_seconds=5.5)
+
+    assert metrics.pongs_received == 1
+    assert metrics.gaps == 1
+    assert metrics.reconnects == 0
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert "Hyperliquid pong deadline exceeded" in failure["reason"]
+
+
+def test_wire_receive_monotonic_has_safe_legacy_and_foreign_domain_fallbacks(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime(elapsed=6.0)
+    collector, _rest, _factory, _sink = _collector(tmp_path, _config(), timer, [])
+    try:
+        legacy = ReceivedWireMessage('{"channel":"pong"}', BASE_TIME)
+        assert collector._wire_received_monotonic_seconds(
+            legacy,
+            observed_monotonic=timer.monotonic(),
+            observed_at=timer.now(),
+        ) == pytest.approx(0.0)
+
+        foreign_domain = ReceivedWireMessage(
+            '{"channel":"pong"}',
+            timer.now(),
+            received_monotonic_ns=1_000_000_000_000,
+        )
+        assert collector._wire_received_monotonic_seconds(
+            foreign_domain,
+            observed_monotonic=timer.monotonic(),
+            observed_at=timer.now(),
+        ) == pytest.approx(6.0)
+        assert collector._wire_monotonic_legacy_fallbacks == 1
+        assert collector._wire_monotonic_domain_fallbacks == 1
+    finally:
+        collector.close()
+
+
+@pytest.mark.parametrize(
+    ("oldest_age_ms", "expect_fatal"),
+    (
+        (1_000.0, False),
+        (2_500.0, True),
+    ),
+)
+def test_subscription_ack_timeout_distinguishes_fresh_and_aged_backlog(
+    tmp_path: Path,
+    oldest_age_ms: float,
+    expect_fatal: bool,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=1.0,
+        pong_timeout_seconds=2.0,
+        stale_after_seconds=1_000.0,
+    )
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config)[:-1],
+            (
+                ReceivedWireMessage(
+                    '{"channel":"pong"}',
+                    BASE_TIME + timedelta(seconds=3),
+                    received_monotonic_ns=3_000_000_000,
+                ),
+                3.0,
+            ),
+        ],
+        telemetry_queue_depth=1,
+        telemetry_oldest_age_ms=oldest_age_ms,
+        telemetry_latest_age_ms=100.0,
+    )
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    try:
+        if expect_fatal:
+            with pytest.raises(
+                WebsocketConsumerBackpressure,
+                match="subscription acknowledgement deadline",
+            ):
+                collector.run(duration_seconds=2.5)
+        else:
+            metrics = collector.run(duration_seconds=2.5)
+            assert metrics.gaps == 1
+            assert collector._backlog_liveness_deferrals == 0
+            status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+            failure = status["observability"]["reconnect_reasons_by_generation"][0]
+            assert "subscription acknowledgements missing" in failure["reason"]
+    finally:
+        collector.close()
+
+    assert collector.metrics.reconnects == 0
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    if expect_fatal:
+        status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+        failure = status["observability"]["reconnect_reasons_by_generation"][0]
+        assert failure["will_reconnect"] is False
+
+
+def test_duration_expiry_during_connect_creates_no_spurious_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    config = _config()
+    socket = FakeSocket(timer, [])
+    collector, _rest, factory, sink = _collector(tmp_path, config, timer, [socket])
+    original_connect = factory.connect
+
+    def connect_after_deadline(network: str, timeout_seconds: float) -> FakeSocket:
+        connected = original_connect(network, timeout_seconds)
+        timer.advance(2.0)
+        return connected
+
+    monkeypatch.setattr(factory, "connect", connect_after_deadline)
+
+    metrics = collector.run(duration_seconds=1.0)
+
+    assert metrics.connections == 0
+    assert metrics.connection_epoch == 0
+    assert socket.sent == []
+    assert socket.closed is True
+    assert _parquet_rows(sink.root, "connection_event") == []
+
+
+def test_writer_failure_records_generation_reason_without_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    config = _config()
+    socket = FakeSocket(timer, [])
+    collector, _rest, factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    def fail_connection_event(*_args: object, **_kwargs: object) -> None:
+        raise CoordinatedWriterError("simulated coordinated writer failure")
+
+    monkeypatch.setattr(collector, "_add_connection_event", fail_connection_event)
+    try:
+        with pytest.raises(
+            CoordinatedWriterError,
+            match="simulated coordinated writer failure",
+        ):
+            collector.run(duration_seconds=30.0)
+    finally:
+        collector.close()
+
+    assert collector.metrics.connections == 1
+    assert collector.metrics.reconnects == 0
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    assert failure["generation"] == 1
+    assert failure["will_reconnect"] is False
+    assert failure["reason"].startswith("CoordinatedWriterError:")
+
+
+def test_rest_refresh_is_materialized_off_supervisor_and_applied_as_one_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    collector, _rest, _factory, sink = _collector(tmp_path, _config(), timer, [])
+    batch_sizes: list[int] = []
+    original_add_many = sink.add_many
+
+    def record_batch(records: Any) -> int:
+        batch = tuple(records)
+        batch_sizes.append(len(batch))
+        return original_add_many(batch)
+
+    monkeypatch.setattr(sink, "add_many", record_batch)
+    try:
+        collector._schedule_rest_refresh(
+            "refresh-connection",
+            1,
+            timer.now(),
+        )
+        collector._drain_rest_refresh(wait=True)
+        collector._publish_status()
+
+        assert len(batch_sizes) == 1
+        assert batch_sizes[0] > 1
+        status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+        rest_metrics = status["observability"]["worker_phases"]["rest"]
+        assert rest_metrics["refresh_worker_materialization_ms"]["count"] == 1
+        assert rest_metrics["refresh_supervisor_apply_ms"]["count"] == 1
+        assert rest_metrics["last_refresh_rows_materialized"] == batch_sizes[0]
+        assert rest_metrics["last_refresh_rows_applied"] == batch_sizes[0]
+        assert rest_metrics["refresh_rows_materialized_total"] == batch_sizes[0]
+        assert rest_metrics["refresh_rows_applied_total"] == batch_sizes[0]
+    finally:
+        collector.close()
+
+
+def test_periodic_flush_requests_async_durability_without_blocking_runtime(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(flush_interval_seconds=5.0)
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config),
+            (_candle_message("BTC", "1m"), 6.0),
+        ],
+    )
+    collector, _rest, _factory, original_sink = _collector(
+        tmp_path,
+        config,
+        timer,
+        [socket],
+    )
+    original_sink.close()
+    sink = AsyncFlushRequestRecordingSink(tmp_path / "async-lake")
+    collector.sink = sink
+    sink.state_provider = lambda: collector.metrics.state
+    try:
+        metrics = collector.run(
+            max_messages=config.subscription_count + 1,
+        )
+        assert metrics.state == CollectorState.STOPPED
+        assert sink.flush_requests == 1
+    finally:
+        collector.close()

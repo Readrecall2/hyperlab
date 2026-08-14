@@ -1006,6 +1006,7 @@ def collect_reference(
         _close_preserving_active_exception(collector.close)
     console.print_json(json.dumps(collector.metrics))
 
+
 @app.command("collect-multi-venue")
 def collect_multi_venue(
     assets: Annotated[str, typer.Option(help="Actifs communs séparés par des virgules")] = "BTC,ETH",
@@ -1024,8 +1025,8 @@ def collect_multi_venue(
     from hyperlab.collector.models import CollectorConfig
     from hyperlab.collector.multivenue import MultiVenueCollector
     from hyperlab.collector.runtime import PublicCollector
-    from hyperlab.collector.storage import CoordinatedLakeWriter
     from hyperlab.collector.websocket import WebsocketClientFactory
+    from hyperlab.collector.writer_process import CoordinatedWriterProcess
     from hyperlab.venues.runtime import BinanceReferenceCollector, ReferenceCollectorConfig
 
     settings = _settings()
@@ -1049,13 +1050,15 @@ def collect_multi_venue(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
 
-    writer = CoordinatedLakeWriter(
+    writer = CoordinatedWriterProcess(
         settings.app.data_dir / "lake",
         venues=("hyperliquid", "binance_usdm"),
         batch_size=batch_size,
-        queue_capacity=(
-            hyperliquid_config.queue_capacity + binance_config.queue_capacity
-        ),
+        queue_capacity=(hyperliquid_config.queue_capacity + binance_config.queue_capacity),
+        venue_capacity_rows={
+            "hyperliquid": hyperliquid_config.queue_capacity,
+            "binance_usdm": binance_config.queue_capacity,
+        },
     )
     hyperliquid = None
     binance = None
@@ -1066,9 +1069,7 @@ def collect_multi_venue(
             hyperliquid_config,
             data_dir=settings.app.data_dir,
             request_timeout_seconds=settings.app.request_timeout_seconds,
-            socket_factory=WebsocketClientFactory(
-                queue_capacity=hyperliquid_config.queue_capacity
-            ),
+            socket_factory=WebsocketClientFactory(queue_capacity=hyperliquid_config.queue_capacity),
             sink=hyperliquid_sink,
         )
         binance = BinanceReferenceCollector.create_default(
@@ -1096,9 +1097,7 @@ def collect_multi_venue(
     )
     try:
         with _cooperative_signal_handlers(runtime.stop):
-            runtime.run(
-                duration_seconds=None if duration_seconds == 0 else duration_seconds
-            )
+            runtime.run(duration_seconds=None if duration_seconds == 0 else duration_seconds)
     except KeyboardInterrupt:
         runtime.stop()
         console.print("Arrêt demandé; fermeture coordonnée des deux venues et flush final.")
@@ -1115,6 +1114,9 @@ def collect_multi_venue(
                 "venues": {
                     "hyperliquid": hyperliquid.metrics.as_dict(now),
                     "binance_usdm": dict(binance.metrics),
+                },
+                "observability": {
+                    "writer": writer.metrics_snapshot(),
                 },
             }
         )

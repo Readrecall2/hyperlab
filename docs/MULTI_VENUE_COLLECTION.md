@@ -78,7 +78,7 @@ dépassé par un seul message atomique, sans perte et dans la limite stricte de
 
 ## Writer coordonné
 
-`collect-multi-venue` construit un unique `CoordinatedLakeWriter`. Celui-ci
+`collect-multi-venue` construit un unique `CoordinatedWriterProcess`. Celui-ci
 possède exactement un `BatchingLakeSink`, donc un root lock, une récupération
 d'orphelins et un index SQLite. Il expose deux vues sérialisées :
 
@@ -91,6 +91,67 @@ publiées par venue. Une venue inconnue, un deuxième client pour la même venue
 une ligne attribuée à la mauvaise venue ou un désaccord de comptage arrête le
 run. Un processus externe qui ouvre le même lake reste rejeté par
 `_RootWriterLock`.
+
+The spawned writer process owns the sole `CoordinatedLakeWriter` and root lock. During
+live message handling, venue supervisors enqueue complete immutable logical
+frames into one exact bounded row budget, partitioned into the unchanged
+per-venue capacities; they do not wait for Parquet, SQLite, hashing, validation,
+or `fsync`. Explicit bootstrap, reconnect, shutdown, and caller-requested flush
+barriers still wait for publication and validation.
+Hyperliquid's unchanged `flush_interval_seconds` cadence submits a nonblocking
+FIFO durability barrier. It is coalesced only when an earlier barrier follows
+every frame already admitted, preserving the crash-loss bound without blocking
+liveness processing. Capacity includes queued,
+in-flight, and accepted-but-not-yet-published rows. A frame that does not fit is
+rejected in full with a fatal coordinated writer error: no partial frame is
+exposed and no reconnect loop is used to hide storage saturation. Every Phase
+10 gate remains unchanged.
+
+`BatchingLakeSink.add_many` now journals only mutations caused by the current
+logical frame. It no longer copies all pending groups and the historical
+100,000-key recent cache before every frame. Rollback remains exact, including
+deduplication-cache order, observations, counters, and pending primary keys.
+
+## Singapore load diagnosis (2026-08-14)
+
+The isolated Singapore path measured RTT median 76.05 ms, RTT p99 84.19 ms,
+and uncertainty p99 42.10 ms. Under the previous collector workload, persisted
+clock RTT rose to 429.685 ms median and 761.069 ms p99, making all 70 samples
+invalid only on the unchanged 50 ms uncertainty gate.
+
+The strongest measured code defect was per-frame work proportional to history:
+copying a 100,000-entry `OrderedDict` took about 6.87 ms median locally. At
+twenty depth frames per second that copy alone consumed about 13.7% of one CPU
+core, before JSON, Decimal and L2 allocation. A representative 9,320-row L2
+analysis took about 439 ms; the old publication path then immediately reread
+and reanalysed it. Both venue supervisors also held one shared writer lock
+across sorting, Arrow conversion, Parquet compression/hash/publication,
+manifest `fsync`, immediate validation, and SQLite `FULL` commit.
+
+There is no asyncio event loop. The collector parent has two venue supervisor
+threads, three WebSocket reader threads, one Binance clock executor worker, one
+Hyperliquid REST worker, and a temporary two-worker Binance handshake pool. A
+spawned child owns batching, deduplication, SQLite, Parquet publication,
+validation and every storage `fsync`. Frames are frozen and serialized before
+their exact parent-side row reservation; ordered acknowledgements release
+capacity without collector polling. Abrupt child death is fatal and leaves
+unresolved accounting marked indeterminate. Executor sizes, stale limits,
+reconnect tolerances, and queue bounds were not increased.
+
+Normalization remains in each venue supervisor; its p50/p95/p99 and
+sink-admission time are reported separately. If Singapore telemetry still shows
+parent scheduling starvation, evaluate ingress-process isolation based on those
+measurements. Clock and continuity gates remain unchanged.
+
+This explains the load-only feedback loop: supervisor/GIL/storage delay aged or
+filled the already bounded socket queues; stale-stream, pong-deadline, or queue
+errors then reopened sockets; reconnect restoration and connection-event
+flushes added more CPU, IO, DNS and TLS work. Historic aggregates cannot prove
+which terminal exception initiated each generation, because those reasons were
+not retained in the earlier report. The 16 Binance disconnects and 16 gaps are
+fan-out from eight paired generation failures (one event per physical role),
+not evidence of sixteen independent network failures. Hyperliquid's five
+generations mean four handled failures followed by the final generation.
 
 ## Flux simultanés BTC/ETH
 
@@ -164,12 +225,112 @@ Les statuts restent séparés :
 - `data/runtime_status.json` pour Hyperliquid ;
 - `data/runtime_status_binance_usdm.json` pour Binance USD-M.
 
+## Runtime observability
+
+Each status path is relative to the isolated `HYPERLAB_DATA_DIR`. The final
+status retains both active and terminal socket-generation snapshots, so a clean
+one-generation run does not lose its queue high-water evidence.
+
+- `observability.process` reports process CPU, RSS/peak RSS, Python allocation
+  and GC pause summaries, context switches, thread counts, watchdog/worker lag,
+  and Linux `/proc` scheduler, cgroup CPU throttle/quota, PSI, iowait and steal
+  counters when available.
+- `observability.worker_phases` separates normalization time from bounded writer
+  admission time, plus Hyperliquid REST worker materialization and batched apply.
+- socket telemetry reports reader identity/state, queue depth/capacity/high-water,
+  enqueue delay, dequeue residence/oldest age, overflow count, and terminal reason.
+- Binance `clock_observability` separates executor dispatch, authoritative clock
+  RTT, HTTP adapter/header and request/decode phases, future drain delay, and
+  best-effort HTTP keep-alive/TLS evidence. It reports urllib3 connection objects
+  created and requests started with precise names; post-request connection/socket
+  identity is sampled without removing it from the pool, and ambiguous concurrent
+  observations remain null. Only the authoritative persisted RTT still feeds
+  uncertainty and the unchanged 50 ms gate.
+- writer telemetry reports exact outstanding/high-water/rejected rows by venue,
+  queue residence/admission/write time, child PID/start method/cache age,
+  child CPU/RSS/GC/scheduling, active phase, flush latency, and storage stages
+  for sort, Arrow, analysis, Parquet write/hash/fsync/publication, directory fsync,
+  immediate validation, and SQLite commit.
+- `reconnect_reasons_by_generation` distinguishes the initiating socket role,
+  collateral closes, exact exception/reason, queue/writer/clock state, and whether
+  a reconnect was attempted. The continuity report persists corresponding
+  `failure_events_by_capture_generation` evidence.
+
 ## Smoke test causal de 10 minutes
 
 Une racine additive propre rend l'audit rapide et laisse le lake historique
 intact. Ne supprimez pas cette racine après le test : elle reste un artefact
 reproductible. N'exécutez aucun autre collecteur ou inventaire sur cette racine
 pendant les dix minutes.
+
+### Linux Singapore VPS
+
+Run this in a fresh shell from the repository root. It uses the existing
+`batch_size=500` default and does not increase any queue or relax any gate.
+
+```bash
+set -uo pipefail
+PHASE10_SMOKE_DIR="$PWD/data/phase10-singapore-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p -- "$PHASE10_SMOKE_DIR"
+printf 'smoke_root=%s\n' "$PHASE10_SMOKE_DIR"
+SMOKE_START="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+HYPERLAB_DATA_DIR="$PHASE10_SMOKE_DIR" \
+  .venv/bin/python -m hyperlab collect-multi-venue \
+    --assets BTC,ETH \
+    --candle-intervals 1m \
+    --duration-seconds 600 \
+    --batch-size 500 \
+    --history-lookback-hours 1 \
+  2>&1 | tee "$PHASE10_SMOKE_DIR/collector.log"
+COLLECTOR_EXIT="${PIPESTATUS[0]}"
+SMOKE_END="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+printf 'start=%s\nend=%s\n' "$SMOKE_START" "$SMOKE_END" | \
+  tee "$PHASE10_SMOKE_DIR/smoke-window.txt"
+.venv/bin/python -m hyperlab data continuity \
+  "$PHASE10_SMOKE_DIR/lake" \
+  --assets BTC,ETH \
+  --start "$SMOKE_START" \
+  --end "$SMOKE_END" \
+  --json | tee "$PHASE10_SMOKE_DIR/phase10-continuity.json"
+CONTINUITY_EXIT="${PIPESTATUS[0]}"
+printf 'collector_exit=%s\ncontinuity_exit=%s\n' \
+  "$COLLECTOR_EXIT" "$CONTINUITY_EXIT" | \
+  tee "$PHASE10_SMOKE_DIR/exit-status.txt"
+if (( COLLECTOR_EXIT != 0 )); then
+  exit "$COLLECTOR_EXIT"
+fi
+exit "$CONTINUITY_EXIT"
+```
+
+In a second SSH session, this concise sampler captures Linux CPU/thread, memory,
+IO and scheduling evidence without modifying the lake:
+
+```bash
+PHASE10_SMOKE_DIR="/absolute/path/printed-by-the-first-command"
+COLLECTOR_PID="$(pgrep -n -f '[p]ython.*hyperlab collect-multi-venue')"
+WRITER_PID="$(pgrep -P "$COLLECTOR_PID" -f 'multiprocessing-fork' | head -n 1)"
+PID_LIST="$COLLECTOR_PID${WRITER_PID:+,$WRITER_PID}"
+pidstat -h -u -r -d -w -t -p "$PID_LIST" 1 | \
+  tee "$PHASE10_SMOKE_DIR/pidstat.txt"
+```
+
+After collection, print only the decision and diagnostic surfaces:
+
+```bash
+jq -s '{
+  hyperliquid: {state: .[0].metrics.state, observability: .[0].observability},
+  binance: {state: .[1].state, clock: .[1].clock_observability,
+            observability: .[1].observability}
+}' "$PHASE10_SMOKE_DIR/runtime_status.json" \
+   "$PHASE10_SMOKE_DIR/runtime_status_binance_usdm.json"
+jq '{technical_capture_gate, failure_reasons, binance_trades,
+    connection_lineage, connection_events, clock_sync, requested_window,
+    strict_phase_10_overlap,
+    validation: {relevant_gap_count: .validation.relevant_gap_count}}' \
+  "$PHASE10_SMOKE_DIR/phase10-continuity.json"
+```
+
+### PowerShell alternative
 
 ```powershell
 $Phase10SmokeDir = Join-Path (Get-Location) `
@@ -186,7 +347,7 @@ try {
     --assets "BTC,ETH" `
     --candle-intervals 1m `
     --duration-seconds 600 `
-    --batch-size 10000 `
+    --batch-size 500 `
     --history-lookback-hours 1
   $CollectorExit = $LASTEXITCODE
   $SmokeEnd = [DateTimeOffset]::UtcNow.ToString("o")

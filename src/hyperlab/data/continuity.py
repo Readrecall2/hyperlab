@@ -116,6 +116,7 @@ class _EventOutageAudit:
     in_window_gap_events: int
     unclean_in_window_disconnect_events: int
     clean_terminal_roles: Mapping[str, frozenset[str]]
+    failure_events_by_capture: Mapping[str, tuple[Mapping[str, object], ...]]
 
 
 def _utc(value: datetime) -> datetime:
@@ -2109,6 +2110,9 @@ def _event_outages(
     unclean_in_window_disconnect_events = 0
     clean_terminal_roles: dict[str, set[str]] = defaultdict(set)
     active_event_captures: set[str] = set()
+    failure_events_by_capture: dict[
+        str, list[dict[str, object]]
+    ] = defaultdict(list)
     resync_events: dict[
         tuple[str, str, str, int, str],
         dict[str, list[tuple[datetime, str]]],
@@ -2290,11 +2294,30 @@ def _event_outages(
             if len(capture_candidates) == 1:
                 tags.update(capture_candidates)
         for tag in tags:
-            if (
-                start <= at < end
-                and event_kind in _FAIL_CLOSED_EVENTS
-            ):
+            if start <= at < end and event_kind in _FAIL_CLOSED_EVENTS:
                 active_event_captures.add(tag)
+                if not clean_stop:
+                    raw_reason = row.get("reason")
+                    failure_events_by_capture[tag].append(
+                        {
+                            "received_time": _iso(at),
+                            "event_kind": event_kind,
+                            "socket_role": (
+                                str(row["socket_role"])
+                                if row.get("socket_role") is not None
+                                else None
+                            ),
+                            "channel": (
+                                str(row["channel"])
+                                if row.get("channel") is not None
+                                else None
+                            ),
+                            "connection_id": str(connection_id or "") or None,
+                            "reason": (
+                                str(raw_reason) if raw_reason is not None else None
+                            ),
+                        }
+                    )
             connection_epoch = row.get("connection_epoch")
             book_epoch = str(row.get("book_epoch_id") or "")
             resync_key = (
@@ -2456,6 +2479,15 @@ def _event_outages(
         unclean_in_window_disconnect_events=(
             unclean_in_window_disconnect_events
         ),
+        failure_events_by_capture={
+            capture: tuple(
+                sorted(
+                    events,
+                    key=lambda event: str(event["received_time"]),
+                )
+            )
+            for capture, events in sorted(failure_events_by_capture.items())
+        },
         clean_terminal_roles={
             capture: frozenset(roles)
             for capture, roles in sorted(clean_terminal_roles.items())
@@ -3760,6 +3792,9 @@ def audit_phase10_continuity(
                 "event_active_capture_generations": sorted(
                     binance_outage_audit.active_event_captures
                 ),
+                "failure_events_by_capture_generation": (
+                    binance_outage_audit.failure_events_by_capture
+                ),
             },
             HYPERLIQUID: {
                 "unbound_gap_or_disconnect_events": (
@@ -3776,6 +3811,9 @@ def audit_phase10_continuity(
                 ),
                 "event_active_capture_generations": sorted(
                     hyperliquid_outage_audit.active_event_captures
+                ),
+                "failure_events_by_capture_generation": (
+                    hyperliquid_outage_audit.failure_events_by_capture
                 ),
             },
         },

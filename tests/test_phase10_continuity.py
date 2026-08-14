@@ -2057,6 +2057,37 @@ def test_real_lake_audit_never_hides_explicit_failures_in_tail_margin(
     assert overlap["duration_seconds"] == 0.0
 
 
+def test_real_lake_audit_reports_failure_reason_by_capture_generation(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    failure_at = BASE + timedelta(seconds=25)
+    _write_continuity_lake(
+        lake,
+        bound_gap_at=failure_at,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    events = payload["connection_events"]
+    assert isinstance(events, dict)
+    binance_events = events["binance_usdm"]
+    assert isinstance(binance_events, dict)
+    failures = binance_events["failure_events_by_capture_generation"]
+    assert isinstance(failures, dict)
+    [event] = failures["binance-capture-1"]
+    assert event["event_kind"] == "gap"
+    assert event["socket_role"] == "public"
+    assert event["reason"] == "coverage_unknown:clock_sync request failed"
+
+
+
+
 @pytest.mark.parametrize(
     "event_kind",
     ("resync_start", "resync_complete"),

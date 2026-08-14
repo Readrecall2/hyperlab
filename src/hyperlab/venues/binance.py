@@ -21,6 +21,12 @@ from hyperlab.venues.base import (
     NormalizedInstrument,
     measure_clock,
 )
+from hyperlab.venues.http_observability import (
+    HttpPathObservation,
+    HttpPeerPathObserver,
+    Resolver,
+    diagnose_http_paths,
+)
 
 VENUE = "binance_usdm"
 REST_BASE_URL = "https://fapi.binance.com"
@@ -666,6 +672,7 @@ class _PendingHttpDiagnostics:
     failure_stage: str | None = None
     exception_type: str | None = None
     completion_sequence: int | None = None
+    path_observation: HttpPathObservation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,6 +738,7 @@ class RequestsJsonTransport:
         self._last_urllib3_connection_identity: str | None = None
         self._last_tls_socket_identity: str | None = None
         self._completed_request_sequence = 0
+        self._peer_path_observer = HttpPeerPathObserver()
 
     def _pool_snapshot(self, url: str) -> tuple[int, int] | None:
         """Return urllib3 connection-object-created and request-started counters."""
@@ -874,6 +882,27 @@ class RequestsJsonTransport:
             self._last_tls_socket_identity = evidence.tls_socket_identity
         return connection_reused, socket_reused
 
+    def _capture_response_path(
+        self,
+        pending: _PendingHttpDiagnostics,
+        response: Any,
+    ) -> Any:
+        try:
+            observation = self._peer_path_observer.observe_response(response)
+        except Exception:
+            return response
+        pending.path_observation = observation
+        return response
+
+    def _response_hook(
+        self,
+        pending: _PendingHttpDiagnostics,
+    ) -> Callable[..., Any]:
+        def observe(response: Any, *_args: Any, **_kwargs: Any) -> Any:
+            return self._capture_response_path(pending, response)
+
+        return observe
+
     def _get_json_under_transport_lock(
         self,
         pending: _PendingHttpDiagnostics,
@@ -899,12 +928,15 @@ class RequestsJsonTransport:
                 timeout=timeout_seconds,
                 headers={"User-Agent": "HyperLab/0.2 public-market-data"},
                 allow_redirects=False,
+                hooks={'response': [self._response_hook(pending)]},
             )
         except Exception as exc:
             pending.get_completed_at = self._monotonic()
             self._mark_failure(pending, stage="session_get", error=exc)
             raise
         pending.get_completed_at = self._monotonic()
+        if pending.path_observation is None:
+            response = self._capture_response_path(pending, response)
         pending.response = response
 
         try:
@@ -982,7 +1014,26 @@ class RequestsJsonTransport:
             )
             if post_request_observation_current:
                 counters_after = self._pool_snapshot(pending.url)
-                evidence = self._transport_identity_evidence(pending.response)
+                path_observation = pending.path_observation
+                fallback_evidence = self._transport_identity_evidence(pending.response)
+                if path_observation is None:
+                    evidence = fallback_evidence
+                else:
+                    evidence = _TransportIdentityEvidence(
+                        urllib3_connection_identity=(
+                            path_observation.urllib3_connection_identity
+                            or fallback_evidence.urllib3_connection_identity
+                        ),
+                        tls_socket_identity=(
+                            path_observation.tls_socket_identity
+                            or fallback_evidence.tls_socket_identity
+                        ),
+                        tls_session_reused=(
+                            path_observation.tls_session_reused
+                            if path_observation.tls_session_reused is not None
+                            else fallback_evidence.tls_session_reused
+                        ),
+                    )
                 connection_reused, socket_reused = self._connection_reuse_evidence(
                     evidence
                 )
@@ -1031,6 +1082,7 @@ class RequestsJsonTransport:
             pending.decode_started_at,
             pending.decode_completed_at,
         )
+        path_observation = pending.path_observation
         finalize_completed_at = self._monotonic()
         return HttpRequestDiagnostics(
             transport_lock_wait_ms=transport_lock_wait_ms,
@@ -1070,6 +1122,19 @@ class RequestsJsonTransport:
             request_completion_sequence=pending.completion_sequence,
             finalization_completion_sequence=finalization_completion_sequence,
             post_request_observation_current=post_request_observation_current,
+            peer_ip=None if path_observation is None else path_observation.peer_ip,
+            peer_port=None if path_observation is None else path_observation.peer_port,
+            socket_family=(
+                None if path_observation is None else path_observation.socket_family
+            ),
+            response_cloudfront_pop=(
+                None
+                if path_observation is None
+                else path_observation.response_cloudfront_pop
+            ),
+            response_cache=(
+                None if path_observation is None else path_observation.response_cache
+            ),
         )
 
     def close(self) -> None:
@@ -1245,6 +1310,37 @@ class BinancePublicRestClient:
             "/fapi/v1/aggTrades",
             {"symbol": symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
         )
+
+
+def diagnose_binance_http_paths(
+    *,
+    samples: int = 10,
+    fresh_sample_count: int = 1,
+    interval_seconds: float = 1.0,
+    timeout_seconds: float = 15.0,
+    client_factory: Callable[[], Any] | None = None,
+    resolver: Resolver | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    runtime_status: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    if client_factory is None:
+
+        def factory() -> BinancePublicRestClient:
+            return BinancePublicRestClient(timeout_seconds=timeout_seconds)
+
+    else:
+        factory = client_factory
+    arguments: dict[str, Any] = {
+        "samples": samples,
+        "fresh_sample_count": fresh_sample_count,
+        "interval_seconds": interval_seconds,
+        "client_factory": factory,
+        "sleeper": sleeper,
+        "runtime_status": runtime_status,
+    }
+    if resolver is not None:
+        arguments["resolver"] = resolver
+    return diagnose_http_paths(**arguments)
 
 
 def _positive_milliseconds(value: timedelta, *, label: str) -> int:

@@ -92,66 +92,102 @@ une ligne attribuée à la mauvaise venue ou un désaccord de comptage arrête l
 run. Un processus externe qui ouvre le même lake reste rejeté par
 `_RootWriterLock`.
 
-The spawned writer process owns the sole `CoordinatedLakeWriter` and root lock. During
-live message handling, venue supervisors enqueue complete immutable logical
-frames into one exact bounded row budget, partitioned into the unchanged
-per-venue capacities; they do not wait for Parquet, SQLite, hashing, validation,
-or `fsync`. Explicit bootstrap, reconnect, shutdown, and caller-requested flush
-barriers still wait for publication and validation.
-Hyperliquid's unchanged `flush_interval_seconds` cadence submits a nonblocking
-FIFO durability barrier. It is coalesced only when an earlier barrier follows
-every frame already admitted, preserving the crash-loss bound without blocking
-liveness processing. Capacity includes queued,
-in-flight, and accepted-but-not-yet-published rows. A frame that does not fit is
-rejected in full with a fatal coordinated writer error: no partial frame is
-exposed and no reconnect loop is used to hide storage saturation. Every Phase
-10 gate remains unchanged.
+Le processus writer possède le seul `CoordinatedLakeWriter` et le seul root
+lock. Les superviseurs lui soumettent des frames logiques complètes dans un
+budget exact de lignes : les capacités par venue restent 10 000 lignes et la
+capacité totale reste 20 000. Ces réservations couvrent les frames en file, en
+cours et acceptées mais pas encore publiées. Une frame qui ne tient pas est
+refusée intégralement par une erreur fatale ; aucune capacité, aucun timeout et
+aucune politique de reconnexion n'ont été augmentés pour absorber un backlog.
+
+La disponibilité d'un auto-flush est maintenant calculée par groupe exact
+`(venue, record_type, asset, date UTC, stream)`, et non par la somme de tous les
+groupes clairsemés. Lorsqu'un groupe publiable atteint `batch_size`, seuls les
+groupes prêts sont publiés ; les groupes clairsemés, ainsi que les candles et le
+funding volontairement réservés aux barrières, restent en mémoire jusqu'à la
+barrière FIFO de durabilité inchangée. Les barrières explicites de bootstrap,
+reconnexion, arrêt et flush demandé, ainsi que la cadence Hyperliquid
+`flush_interval_seconds`, publient toujours tout ce qui les précède et attendent
+Parquet, manifeste, validation et `fsync`.
+
+Une publication partielle rend immédiatement au parent les crédits durables
+exacts par venue et libère exactement le même nombre de réservations ; les
+crédits des groupes clairsemés et les caps restent inchangés. `add_many` demeure
+atomique à l'admission d'une frame : refus ou exception restaure toutes ses
+mutations. La publication n'est toutefois pas une transaction globale entre
+plusieurs fichiers. Chaque Parquet immuable et son manifeste gardent leur contrat
+atomique, adressé par contenu et récupérable après crash ; toute lignée de frame
+incomplète entre fichiers est visible et fait échouer l'audit fermé, jamais
+réparée ou masquée.
 
 `BatchingLakeSink.add_many` now journals only mutations caused by the current
 logical frame. It no longer copies all pending groups and the historical
 100,000-key recent cache before every frame. Rollback remains exact, including
 deduplication-cache order, observations, counters, and pending primary keys.
 
-## Singapore load diagnosis (2026-08-14)
+## Diagnostic writer Singapore (2026-08-14)
 
-The isolated Singapore path measured RTT median 76.05 ms, RTT p99 84.19 ms,
-and uncertainty p99 42.10 ms. Under the previous collector workload, persisted
-clock RTT rose to 429.685 ms median and 761.069 ms p99, making all 70 samples
-invalid only on the unchanged 50 ms uncertainty gate.
+Le smoke après isolation du writer a traité 452/452 frames, persisté 10 080
+lignes durables et conservé zéro gap ou déconnexion non propre sur les deux
+venues, avec la lignée `aggTrade` exacte, jusqu'à l'échec de capacité Binance.
+La high-water était 9 958/10 000 avec un rejet ; la résidence en file mesurait
+environ 7 779 ms en médiane, 14 436 ms au p95 et 15 064 ms au p99.
 
-The strongest measured code defect was per-frame work proportional to history:
-copying a 100,000-entry `OrderedDict` took about 6.87 ms median locally. At
-twenty depth frames per second that copy alone consumed about 13.7% of one CPU
-core, before JSON, Decimal and L2 allocation. A representative 9,320-row L2
-analysis took about 439 ms; the old publication path then immediately reread
-and reanalysed it. Both venue supervisors also held one shared writer lock
-across sorting, Arrow conversion, Parquet compression/hash/publication,
-manifest `fsync`, immediate validation, and SQLite `FULL` commit.
+Pour environ 11 398 lignes écrites, l'ancien seuil global a déclenché 1 342
+partitions immuables. Le flush était à environ 142 ms au p50 mais atteignait
+15 078 ms, alors que l'écriture Parquet et chaque `fsync` pris isolément
+restaient de l'ordre de quelques millisecondes. La cause mesurée est donc le
+fan-out de publications : chaque petit groupe déclenchait tri, Arrow, analyse,
+Parquet, hash, publication et `fsync`, puis manifeste, `fsync`, relecture et
+validation. La disponibilité par groupe exact coalesce ces mêmes lignes avant
+publication ; le critère recherché est un débit durable confortablement supérieur
+au pic Binance avec une résidence bornée, pas une file plus grande.
 
-There is no asyncio event loop. The collector parent has two venue supervisor
-threads, three WebSocket reader threads, one Binance clock executor worker, one
-Hyperliquid REST worker, and a temporary two-worker Binance handshake pool. A
-spawned child owns batching, deduplication, SQLite, Parquet publication,
-validation and every storage `fsync`. Frames are frozen and serialized before
-their exact parent-side row reservation; ordered acknowledgements release
-capacity without collector polling. Abrupt child death is fatal and leaves
-unresolved accounting marked indeterminate. Executor sizes, stale limits,
-reconnect tolerances, and queue bounds were not increased.
+Le stress de référence validé reproduit maintenant le chemin de production :
+452 frames Binance `depth20@100ms`, alternées BTC/ETH et cadencées à cinq fois
+le débit nominal, sont ingérées avec 452 trades Hyperliquid simultanés. Cinq
+lignes `clock_sync` valides sont ajoutées pendant le flux (RTT 80 ms,
+incertitude 40 ms, donc sous le seuil inchangé de 50 ms). Les barrières complètes
+FIFO sont demandées tous les 100 frames, soit toutes les cinq secondes au débit
+nominal, puis une barrière finale publie le reliquat.
 
-Normalization remains in each venue supervisor; its p50/p95/p99 and
-sink-admission time are reported separately. If Singapore telemetry still shows
-parent scheduling starvation, evaluate ingress-process isolation based on those
-measurements. Clock and continuity gates remain unchanged.
+Le résultat est 19 441 lignes Binance et 452 lignes Hyperliquid, soit 19 893
+lignes durables dans 71 partitions validées. Ces 71 partitions incluent
+explicitement le fan-out des barrières de durabilité et remplacent le résultat
+idéalisé antérieur sans barrières, qui n'est pas une référence de production.
+Les capacités restent 10 000 lignes par venue et 20 000 au total : zéro rejet
+de capacité sur les deux venues, high-water totale strictement inférieure à
+8 000, high-water Binance strictement inférieure à 7 000 et résidence maximale
+Binance strictement inférieure à 5 000 ms. Ces bornes sont des assertions du
+stress, pas une augmentation des caps ni un relâchement de la cadence FIFO.
 
-This explains the load-only feedback loop: supervisor/GIL/storage delay aged or
-filled the already bounded socket queues; stale-stream, pong-deadline, or queue
-errors then reopened sockets; reconnect restoration and connection-event
-flushes added more CPU, IO, DNS and TLS work. Historic aggregates cannot prove
-which terminal exception initiated each generation, because those reasons were
-not retained in the earlier report. The 16 Binance disconnects and 16 gaps are
-fan-out from eight paired generation failures (one event per physical role),
-not evidence of sixteen independent network failures. Hyperliquid's five
-generations mean four handled failures followed by the final generation.
+## Diagnostic réseau REST Singapore (2026-08-14)
+
+Le benchmark autonome initial avait mesuré un RTT médian de 76,05 ms, un p99 de
+84,19 ms et une incertitude p99 de 42,10 ms. Après le smoke, collecteur
+complètement arrêté, le même benchmark de 120 requêtes a mesuré 394,48 ms au
+minimum, 399,74 ms en médiane, 404,81 ms au p95 et 822,89 ms au p99
+(incertitude p99 411,44 ms, offset médian 21,67 ms). Cette reproduction hors
+HyperLab exclut le scheduling Python comme cause de ce changement.
+
+Le DNS système sélectionnait alors des POP CloudFront européens, Amsterdam ou
+Marseille, avec TCP autour de 137--178 ms. D'autres résolveurs retournaient des
+adresses Singapore, notamment `13.35.36.x` (`sin2`) et `65.8.76.x` (`sin3`),
+avec TCP autour de 1 ms. Un forçage opérateur temporaire de
+`13.35.36.9 fapi.binance.com`, utilisé uniquement pour diagnostiquer la route,
+a ramené 120 requêtes à 72,49 ms au minimum, 74,28 ms en médiane et 78,32 ms au
+p95, mais avec 213,78 ms au p99 et 106,89 ms d'incertitude p99. L'application
+ne contient et ne doit contenir ni IP CloudFront codée en dur, ni substitution
+DNS, ni rotation de session destinée à améliorer artificiellement les chiffres.
+
+Sur 180 requêtes persistantes à une seconde, les 180 réponses sont restées sur
+`SIN2-P11` avec `x-cache: Miss from cloudfront`. La latence normale était stable
+autour de 72--76 ms ; seulement cinq requêtes (2,78 %) ont atteint 208,22,
+209,15, 211,26, 212,50 et 212,64 ms. Le temps `requests` jusqu'aux headers était
+essentiellement égal au temps total et le POP n'a pas changé : ces pointes sont
+des observations réseau réelles, mais ne prouvent pas un épinglage à un mauvais
+edge. Le diagnostic conserve donc seulement des preuves passives DNS, famille,
+pair effectivement sélectionné, POP/cache et identité de connexion.
 
 ## Flux simultanés BTC/ETH
 
@@ -196,9 +232,30 @@ les 5 secondes. Chaque mesure persiste le RTT, l'offset estimé et l'incertitude
 `RTT / 2`. Une mesure est valide uniquement si son incertitude est au plus de
 50 ms ; sa validité causale est alors l'intervalle semi-ouvert
 `[response_received_time, response_received_time + 15 s)`. Une mesure trop
-incertaine est persistée comme invalide sans intervalle. Une déconnexion, une
-génération différente ou une mesure devenue stale coupe la couverture : aucun
-point n'est interpolé à travers cette période.
+incertaine reste persistée `INVALID`, avec son RTT et sa raison, et ne crée aucun
+intervalle valide. Elle n'annule toutefois pas rétroactivement un intervalle
+accepté antérieur qui couvre encore causalement cet instant. L'audit utilise
+uniquement l'union des intervalles acceptés de la même génération éligible.
+
+Au plus une rejection haute-RTT consécutive peut être franchie dans une
+génération active, uniquement si les observations acceptées maintiennent une
+couverture continue bornée à 50 ms. Une observation valide suivante remet cette
+série à zéro. La deuxième probe rejetée consécutive révoque la couverture à
+partir de son propre `response_received_time`, même si l'intervalle valide
+antérieur de 15 secondes n'a pas encore expiré. Cette outage reste ouverte
+jusqu'à la prochaine probe acceptée dans la même génération ; celle-ci peut
+rétablir la couverture pour les données marché ultérieures, sans rendre valide
+la période révoquée.
+
+Le gate échoue seulement si l'intervalle causal effectivement évalué pour cette
+génération intersecte cette outage, ou pour les autres causes fermées déjà
+définies : absence de récupération, expiration après une seule rejection,
+cadence valide supérieure à 10 secondes, absence de mesure valide, discontinuité
+des bandes d'offset, identité/policy invalide, événement d'échec, déconnexion ou
+changement de génération. Une outage pré-fenêtre ou antérieure à l'activité
+évaluée reste comptée et publiée même si sa récupération précède l'assessment ;
+elle ne condamne pas les données marché causalement postérieures. Aucun point
+invalide n'est interpolé, promu ou silencieusement supprimé.
 
 Le transport REST réutilise une session HTTPS afin de ne pas inclure une nouvelle
 négociation DNS/TCP/TLS dans chaque échantillon. Le RTT de chaque requête reste
@@ -243,14 +300,21 @@ one-generation run does not lose its queue high-water evidence.
   RTT, HTTP adapter/header and request/decode phases, future drain delay, and
   best-effort HTTP keep-alive/TLS evidence. It reports urllib3 connection objects
   created and requests started with precise names; post-request connection/socket
-  identity is sampled without removing it from the pool, and ambiguous concurrent
-  observations remain null. Only the authoritative persisted RTT still feeds
-  uncertainty and the unchanged 50 ms gate.
+  identity is sampled without removing it from the pool, together with the
+  selected peer IP/port, socket family and allowlisted `X-Amz-Cf-Pop`/`X-Cache`
+  response headers. Ambiguous observations remain null. Only the authoritative
+  persisted RTT still feeds uncertainty and the unchanged 50 ms gate.
+- `diagnose-binance-http` takes one passive system DNS snapshot, a bounded number
+  of fresh connections and one persistent session. It compares their actual
+  peers/POP with `clock_observability.latest` from the isolated runtime status.
+  It never injects a resolver result into the collector, overrides an address,
+  changes keepalive policy or rotates the runtime session.
 - writer telemetry reports exact outstanding/high-water/rejected rows by venue,
   queue residence/admission/write time, child PID/start method/cache age,
   child CPU/RSS/GC/scheduling, active phase, flush latency, and storage stages
   for sort, Arrow, analysis, Parquet write/hash/fsync/publication, directory fsync,
-  immediate validation, and SQLite commit.
+  immediate validation, and SQLite commit. `storage.coalescing` exposes le nombre
+  de groupes en attente/prêts et la taille maximale d'un groupe exact.
 - `reconnect_reasons_by_generation` distinguishes the initiating socket role,
   collateral closes, exact exception/reason, queue/writer/clock state, and whether
   a reconnect was attempted. The continuity report persists corresponding
@@ -266,7 +330,9 @@ pendant les dix minutes.
 ### Linux Singapore VPS
 
 Run this in a fresh shell from the repository root. It uses the existing
-`batch_size=500` default and does not increase any queue or relax any gate.
+`batch_size=500`, the unchanged 10 000/20 000 row capacities and every existing
+gate. The bounded HTTP probe runs concurrently but uses its own sessions; it
+only observes the current DNS/peer/POP path and never changes the collector.
 
 ```bash
 set -uo pipefail
@@ -281,9 +347,31 @@ HYPERLAB_DATA_DIR="$PHASE10_SMOKE_DIR" \
     --duration-seconds 600 \
     --batch-size 500 \
     --history-lookback-hours 1 \
-  2>&1 | tee "$PHASE10_SMOKE_DIR/collector.log"
-COLLECTOR_EXIT="${PIPESTATUS[0]}"
+  >"$PHASE10_SMOKE_DIR/collector.log" 2>&1 &
+COLLECTOR_PID="$!"
+BINANCE_STATUS="$PHASE10_SMOKE_DIR/runtime_status_binance_usdm.json"
+for _ in $(seq 1 30); do
+  if [[ -s "$BINANCE_STATUS" ]] && \
+      jq -e '.clock_observability.latest.peer_ip? != null' \
+        "$BINANCE_STATUS" >/dev/null 2>&1; then
+    break
+  fi
+  kill -0 "$COLLECTOR_PID" 2>/dev/null || break
+  sleep 1
+done
+HYPERLAB_DATA_DIR="$PHASE10_SMOKE_DIR" \
+  .venv/bin/python -m hyperlab diagnose-binance-http \
+    --persistent-samples 10 \
+    --fresh-samples 1 \
+    --interval-seconds 1 \
+  >"$PHASE10_SMOKE_DIR/binance-http-path.json" \
+  2>"$PHASE10_SMOKE_DIR/binance-http-path.stderr.log" &
+HTTP_DIAG_PID="$!"
+wait "$COLLECTOR_PID"
+COLLECTOR_EXIT="$?"
 SMOKE_END="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+wait "$HTTP_DIAG_PID"
+HTTP_DIAG_EXIT="$?"
 printf 'start=%s\nend=%s\n' "$SMOKE_START" "$SMOKE_END" | \
   tee "$PHASE10_SMOKE_DIR/smoke-window.txt"
 .venv/bin/python -m hyperlab data continuity \
@@ -293,11 +381,14 @@ printf 'start=%s\nend=%s\n' "$SMOKE_START" "$SMOKE_END" | \
   --end "$SMOKE_END" \
   --json | tee "$PHASE10_SMOKE_DIR/phase10-continuity.json"
 CONTINUITY_EXIT="${PIPESTATUS[0]}"
-printf 'collector_exit=%s\ncontinuity_exit=%s\n' \
-  "$COLLECTOR_EXIT" "$CONTINUITY_EXIT" | \
+printf 'collector_exit=%s\nhttp_diagnostic_exit=%s\ncontinuity_exit=%s\n' \
+  "$COLLECTOR_EXIT" "$HTTP_DIAG_EXIT" "$CONTINUITY_EXIT" | \
   tee "$PHASE10_SMOKE_DIR/exit-status.txt"
 if (( COLLECTOR_EXIT != 0 )); then
   exit "$COLLECTOR_EXIT"
+fi
+if (( HTTP_DIAG_EXIT != 0 )); then
+  exit "$HTTP_DIAG_EXIT"
 fi
 exit "$CONTINUITY_EXIT"
 ```
@@ -314,17 +405,45 @@ pidstat -h -u -r -d -w -t -p "$PID_LIST" 1 | \
   tee "$PHASE10_SMOKE_DIR/pidstat.txt"
 ```
 
-After collection, print only the decision and diagnostic surfaces:
+After collection, print the selected DNS/peer/POP path, writer pressure and the
+technical decision without dumping every runtime field:
 
 ```bash
+jq '{dns, comparison,
+     fresh: [.fresh_samples[] |
+       {outcome, round_trip_latency_ms, drift_uncertainty_ms, peer_ip,
+        socket_family, response_cloudfront_pop, response_cache}],
+     persistent: [.persistent_samples[] |
+       {outcome, round_trip_latency_ms, drift_uncertainty_ms, peer_ip,
+        socket_family, response_cloudfront_pop, response_cache}]}' \
+  "$PHASE10_SMOKE_DIR/binance-http-path.json"
 jq -s '{
-  hyperliquid: {state: .[0].metrics.state, observability: .[0].observability},
-  binance: {state: .[1].state, clock: .[1].clock_observability,
-            observability: .[1].observability}
+  hyperliquid: {state: .[0].metrics.state},
+  binance: {state: .[1].state,
+            clock_latest: .[1].clock_observability.latest,
+            writer: .[1].observability.writer}
 }' "$PHASE10_SMOKE_DIR/runtime_status.json" \
    "$PHASE10_SMOKE_DIR/runtime_status_binance_usdm.json"
 jq '{technical_capture_gate, failure_reasons, binance_trades,
-    connection_lineage, connection_events, clock_sync, requested_window,
+    connection_lineage, connection_events, clock_sync,
+    clock_rejection_policy: {
+      rejected_probe_samples: .clock_sync.rejected_probe_samples,
+      consecutive_rejection_violations:
+        .clock_sync.consecutive_rejection_violations,
+      consecutive_rejection_violation_capture_generations:
+        .clock_sync.consecutive_rejection_violation_capture_generations,
+      consecutive_rejection_outages:
+        .clock_sync.consecutive_rejection_outages,
+      max_consecutive_rejected_probes:
+        .clock_sync.max_consecutive_rejected_probes,
+      strict_max_consecutive_rejected_probes:
+        .clock_sync.strict_max_consecutive_rejected_probes,
+      assessed_capture_generations:
+        .clock_sync.assessed_capture_generations,
+      market_ready_at_by_capture:
+        .clock_sync.market_ready_at_by_capture,
+      assessed_span: .clock_sync.assessed_span},
+    requested_window,
     strict_phase_10_overlap,
     validation: {relevant_gap_count: .validation.relevant_gap_count}}' \
   "$PHASE10_SMOKE_DIR/phase10-continuity.json"
@@ -410,10 +529,22 @@ Les critères de PASS sont cumulatifs et exacts :
   `required_wire_lineage.orphan_required_wire_total == 0`,
   `normalized_l2_level_lineage.orphan_level_total == 0` et
   `binance_l2_resync.missing_count == 0` ;
-- `clock_sync.valid_v2_samples > 0`, tous ses compteurs d'échantillons invalides,
-  d'échec, de policy/identity rejection, de cadence et de discontinuité valent
-  zéro, `market_active_without_valid_clock == []` et
-  `clock_sync.coverage_continuous == true` ; la limite reste 50 ms ;
+- `clock_sync.valid_v2_samples > 0`,
+  `clock_sync.hard_invalid_v2_samples == 0`, les
+  compteurs d'échec, de policy/identity rejection, de cadence et de
+  discontinuité valent zéro, `market_active_without_valid_clock == []`,
+  `clock_sync.coverage_continuous == true`,
+  `clock_sync.uncovered_seconds == 0`,
+  `clock_sync.strict_max_consecutive_rejected_probes == 1` et
+  `clock_sync.consecutive_rejection_violation_capture_generations == []` ;
+  `clock_sync.rejected_probe_samples` peut être positif, mais chacune de ces
+  lignes reste `INVALID`, ne fournit aucune preuve et n'est tolérée que comme
+  rejection isolée couverte ; la limite reste 50 ms. Sur cette racine fraîche,
+  le critère pratique exact est l'absence de génération dont l'assessment
+  intersecte une `consecutive_rejection_outage`, plus la couverture continue
+  sans secondes découvertes. `consecutive_rejection_violations`,
+  `max_consecutive_rejected_probes` et `consecutive_rejection_outages` peuvent
+  rester non nuls si toute outage historique a récupéré avant l'assessment ;
 - `requested_window.leading_margin_within_limit == true`,
   `requested_window.trailing_margin_within_limit == true` et
   `requested_window.trailing_terminal_roles_complete == true` ;
@@ -427,14 +558,15 @@ la venue. Aucun PASS technique ne lance ni ne débloque l'analyse économique de
 Phase 10.
 ## Commande longue destinée à la Phase 10
 
-Capture simultanée de 24 heures, BTC/ETH, avec le batch maximal exposé par la CLI :
+Après un PASS réel du smoke isolé seulement, la capture de 24 heures conserve le
+même `batch_size=500` et les mêmes capacités :
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
   --assets "BTC,ETH" `
   --candle-intervals 1m `
   --duration-seconds 86400 `
-  --batch-size 10000 `
+  --batch-size 500 `
   --history-lookback-hours 24
 ```
 

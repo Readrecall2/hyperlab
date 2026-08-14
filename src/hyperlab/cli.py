@@ -964,6 +964,64 @@ def collect(
     console.print_json(json.dumps(collector.metrics.as_dict(datetime.now(tz=UTC))))
 
 
+@app.command("diagnose-binance-http")
+def diagnose_binance_http(
+    persistent_samples: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=240,
+            help="Mesures successives sur une seule session persistante",
+        ),
+    ] = 10,
+    fresh_samples: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=3,
+            help="Connexions neuves séparées, bornées indépendamment",
+        ),
+    ] = 1,
+    interval_seconds: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            max=10.0,
+            help="Pause entre mesures persistantes",
+        ),
+    ] = 1.0,
+) -> None:
+    """Compare DNS, pair/POP et timings fresh/persistants sans modifier le runtime."""
+    from hyperlab.venues.binance import diagnose_binance_http_paths
+
+    settings = _settings()
+    if settings.app.mode not in {"readonly", "research"}:
+        raise typer.BadParameter("Le diagnostic HTTP refuse tout mode non readonly/research")
+    runtime_path = settings.app.data_dir / "runtime_status_binance_usdm.json"
+    runtime_status: Mapping[str, object] | None = None
+    runtime_status_error: str | None = None
+    if runtime_path.exists():
+        try:
+            loaded = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            runtime_status_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if isinstance(loaded, dict):
+                runtime_status = loaded
+            else:
+                runtime_status_error = "runtime status root is not an object"
+    payload = diagnose_binance_http_paths(
+        samples=persistent_samples,
+        fresh_sample_count=fresh_samples,
+        interval_seconds=interval_seconds,
+        timeout_seconds=settings.app.request_timeout_seconds,
+        runtime_status=runtime_status,
+    )
+    payload["runtime_status_path"] = str(runtime_path.resolve())
+    payload["runtime_status_read_error"] = runtime_status_error
+    console.print_json(json.dumps(payload))
+
+
 @app.command("collect-reference")
 def collect_reference(
     assets: Annotated[str, typer.Option(help="Actifs de base séparés par des virgules")] = "BTC,ETH",

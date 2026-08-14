@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import multiprocessing as mp
 import os
 import signal
 import threading
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +16,7 @@ from typing import Any
 import pyarrow.parquet as pq
 import pytest
 
-from hyperlab.collector.models import ParsedRecord
+from hyperlab.collector.models import ParsedRecord, WireEnvelope
 from hyperlab.collector.storage import BatchingLakeSink, FlushResult
 from hyperlab.collector.writer_process import (
     CoordinatedWriterProcess,
@@ -23,9 +25,12 @@ from hyperlab.collector.writer_process import (
 from hyperlab.collector.writer_worker import WriterQueueCapacityError
 from hyperlab.data.lake import discover_partitions, validate_partition
 from hyperlab.data.schema import RecordType
+from hyperlab.venues.base import measure_clock
+from hyperlab.venues.binance import BinancePublicConnector, clock_record
 
 BASE = datetime(2026, 8, 14, tzinfo=UTC)
 VENUES = ("hyperliquid", "binance_usdm")
+BINANCE_STRESS_CAPTURE = "binance-stress-capture-1"
 
 
 def _parent_holding_writer(root: str, ready_queue: Any) -> None:
@@ -46,6 +51,7 @@ def _l2_frame(
     venue: str,
     snapshot_index: int,
     *,
+    asset: str = "BTC",
     levels_per_side: int = 20,
 ) -> tuple[ParsedRecord, ...]:
     event_time = BASE + timedelta(microseconds=snapshot_index)
@@ -58,12 +64,12 @@ def _l2_frame(
             records.append(
                 ParsedRecord(
                     RecordType.L2_SNAPSHOT,
-                    "BTC",
+                    asset,
                     {
                         "schema_version": 1,
                         "record_type": RecordType.L2_SNAPSHOT.value,
                         "venue": venue,
-                        "asset": "BTC",
+                        "asset": asset,
                         "event_time": event_time,
                         "exchange_time": event_time,
                         "received_time": event_time + timedelta(milliseconds=1),
@@ -81,6 +87,291 @@ def _l2_frame(
                 )
             )
     return tuple(records)
+
+
+def _trade(venue: str, sequence: int) -> ParsedRecord:
+    event_time = BASE + timedelta(microseconds=sequence)
+    return ParsedRecord(
+        RecordType.TRADE,
+        "BTC",
+        {
+            "schema_version": 2,
+            "record_type": RecordType.TRADE.value,
+            "venue": venue,
+            "asset": "BTC",
+            "event_time": event_time,
+            "exchange_time": event_time,
+            "received_time": event_time + timedelta(milliseconds=1),
+            "source_sequence": sequence,
+            "connection_id": f"{venue}-trade-connection",
+            "trade_id": f"{venue}-trade-{sequence}",
+            "aggressor_side": "buy",
+            "price": Decimal("60000"),
+            "quantity": Decimal("0.001"),
+            "quote_quantity": Decimal("60"),
+            "is_liquidation": None,
+            "connection_epoch": 1,
+            "arrival_sequence": sequence + 1,
+        },
+    )
+
+
+def _binance_connector() -> BinancePublicConnector:
+    symbols = []
+    for asset in ("BTC", "ETH"):
+        symbols.append(
+            {
+                "symbol": f"{asset}USDT",
+                "pair": f"{asset}USDT",
+                "contractType": "PERPETUAL",
+                "status": "TRADING",
+                "baseAsset": asset,
+                "quoteAsset": "USDT",
+                "marginAsset": "USDT",
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                    {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                ],
+            }
+        )
+    return BinancePublicConnector.from_exchange_info({"symbols": symbols}, ("BTC", "ETH"))
+
+
+def _binance_depth_frame(
+    connector: BinancePublicConnector,
+    snapshot_index: int,
+    asset: str,
+) -> tuple[ParsedRecord, ...]:
+    symbol = f"{asset}USDT"
+    event_ms = int(BASE.timestamp() * 1_000) + snapshot_index
+    last_sequence = 10_000 + snapshot_index
+    payload = {
+        "stream": f"{asset.lower()}usdt@depth20@100ms",
+        "data": {
+            "e": "depthUpdate",
+            "E": event_ms,
+            "T": event_ms,
+            "s": symbol,
+            "U": last_sequence,
+            "u": last_sequence,
+            "pu": last_sequence - 1,
+            "b": [[str(60_000 - level), "1.25"] for level in range(20)],
+            "a": [[str(60_001 + level), "1.25"] for level in range(20)],
+        },
+    }
+    received_time = BASE + timedelta(microseconds=snapshot_index)
+    envelope = WireEnvelope(
+        json.dumps(payload, separators=(",", ":")),
+        received_time,
+        "binance-public-depth-stress",
+        1,
+        snapshot_index + 1,
+        BINANCE_STRESS_CAPTURE,
+    )
+    parsed = connector.parse_message(envelope)
+    assert len(parsed.records) == 43
+    return parsed.records
+
+
+def _binance_clock_sample(sample_index: int) -> ParsedRecord:
+    request_sent_time = BASE + timedelta(seconds=sample_index * 5)
+    response_received_time = request_sent_time + timedelta(milliseconds=80)
+    measurement = measure_clock(
+        "binance_usdm",
+        request_sent_time=request_sent_time,
+        response_received_time=response_received_time,
+        server_time=request_sent_time + timedelta(milliseconds=40),
+    )
+    return clock_record(
+        measurement,
+        f"binance-clock-{sample_index}",
+        connection_id="binance-public-depth-stress",
+        connection_epoch=1,
+        capture_epoch_id=BINANCE_STRESS_CAPTURE,
+        sampling_interval=timedelta(seconds=5),
+    )
+
+
+def test_process_writer_coalesces_sustained_multi_group_frames_before_publication(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    worker = CoordinatedWriterProcess(
+        root,
+        venues=VENUES,
+        batch_size=500,
+        queue_capacity=20_000,
+        venue_capacity_rows={
+            "hyperliquid": 10_000,
+            "binance_usdm": 10_000,
+        },
+    )
+    hyperliquid = worker.client("hyperliquid")
+    binance = worker.client("binance_usdm")
+    assert hyperliquid.should_flush is False
+    assert binance.should_flush is False
+    connector = _binance_connector()
+    try:
+        for snapshot_index in range(452):
+            asset = "BTC" if snapshot_index % 2 == 0 else "ETH"
+            assert hyperliquid.add(_trade("hyperliquid", snapshot_index)) is True
+            assert (
+                binance.add_many(
+                    _binance_depth_frame(
+                        connector,
+                        snapshot_index,
+                        asset,
+                    )
+                )
+                == 43
+            )
+            if snapshot_index % 100 == 0:
+                assert binance.add(_binance_clock_sample(snapshot_index // 100)) is True
+            if (snapshot_index + 1) % 100 == 0:
+                # At the nominal two-symbol depth20@100ms rate, 100 frames are
+                # five seconds. Exercise the live collector's unchanged FIFO
+                # durability barrier while keeping test ingress accelerated.
+                assert binance.request_flush() is True
+            # Two depth20@100ms symbols nominally produce 20 logical frames/s;
+            # 10 ms pacing sustains five times that ingress rate.
+            time.sleep(0.01)
+
+        result = binance.flush()
+        peer_result = hyperliquid.collect_completed()
+        assert result.row_count == 19_441
+        assert peer_result.row_count == 452
+
+        snapshot = worker.metrics_snapshot()
+        assert snapshot["failure"] is None
+        assert snapshot["outstanding_rows"] == 0
+        assert snapshot["outstanding_high_water_rows"] < 8_000
+        venues = snapshot["venues"]
+        assert isinstance(venues, dict)
+        assert venues["binance_usdm"]["capacity_rows"] == 10_000
+        assert venues["binance_usdm"]["capacity_rejections"] == 0
+        assert venues["binance_usdm"]["high_water_rows"] < 7_000
+        assert venues["binance_usdm"]["frames_processed"] == 457
+        assert venues["binance_usdm"]["durable_rows"] == 19_441
+        assert venues["binance_usdm"]["queue_residence_ms"]["count"] == 457
+        assert venues["binance_usdm"]["queue_residence_ms"]["max_ms"] < 5_000
+        assert venues["hyperliquid"]["capacity_rows"] == 10_000
+        assert venues["hyperliquid"]["capacity_rejections"] == 0
+        assert venues["hyperliquid"]["frames_processed"] == 452
+        assert venues["hyperliquid"]["durable_rows"] == 452
+        storage = snapshot["storage"]
+        assert isinstance(storage, dict)
+        assert storage["coalescing"] == {
+            "readiness": "exact_group",
+            "pending_groups": 0,
+            "ready_groups": 0,
+            "max_group_rows": 0,
+        }
+        assert storage["written"] == {
+            "rows": 19_893,
+            "partitions": 71,
+        }
+    finally:
+        hyperliquid.close()
+        binance.close()
+        worker.close()
+
+    manifests = [validate_partition(path) for path in discover_partitions(root)]
+    assert len(manifests) == 71
+    assert sum(manifest.row_count for manifest in manifests) == 19_893
+    manifest_groups = Counter(
+        (
+            manifest.partition.venue,
+            manifest.partition.record_type,
+            manifest.partition.asset,
+        )
+        for manifest in manifests
+    )
+    assert manifest_groups == Counter(
+        {
+            ("binance_usdm", RecordType.L2_SNAPSHOT, "BTC"): 18,
+            ("binance_usdm", RecordType.L2_SNAPSHOT, "ETH"): 18,
+            ("binance_usdm", RecordType.WIRE_MESSAGE, "GLOBAL"): 5,
+            ("binance_usdm", RecordType.BBO, "BTC"): 5,
+            ("binance_usdm", RecordType.BBO, "ETH"): 5,
+            ("binance_usdm", RecordType.L2_BOOK_STATE, "BTC"): 5,
+            ("binance_usdm", RecordType.L2_BOOK_STATE, "ETH"): 5,
+            ("binance_usdm", RecordType.CLOCK_SYNC, "GLOBAL"): 5,
+            ("hyperliquid", RecordType.TRADE, "BTC"): 5,
+        }
+    )
+
+    rows_by_type: dict[RecordType, list[dict[str, object]]] = {}
+    for manifest in manifests:
+        rows_by_type.setdefault(manifest.partition.record_type, []).extend(
+            pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
+        )
+    assert {record_type: len(rows) for record_type, rows in rows_by_type.items()} == {
+        RecordType.WIRE_MESSAGE: 452,
+        RecordType.BBO: 452,
+        RecordType.L2_BOOK_STATE: 452,
+        RecordType.L2_SNAPSHOT: 18_080,
+        RecordType.TRADE: 452,
+        RecordType.CLOCK_SYNC: 5,
+    }
+
+    clock_rows = rows_by_type[RecordType.CLOCK_SYNC]
+    expected_binance_lineage = {
+        ("binance-public-depth-stress", 1, BINANCE_STRESS_CAPTURE)
+    }
+    assert {
+        (row["connection_id"], row["connection_epoch"], row["capture_epoch_id"])
+        for row in rows_by_type[RecordType.WIRE_MESSAGE]
+    } == expected_binance_lineage
+    assert {
+        (row["connection_id"], row["connection_epoch"], row["capture_epoch_id"])
+        for row in clock_rows
+    } == expected_binance_lineage
+    assert {row["observation_id"] for row in clock_rows} == {
+        f"binance-clock-{sample_index}" for sample_index in range(5)
+    }
+    assert {row["sample_status"] for row in clock_rows} == {"valid"}
+    assert {row["drift_uncertainty_ms"] for row in clock_rows} == {Decimal("40")}
+    assert all(
+        row["causal_valid_from"] == row["response_received_time"]
+        and row["causal_valid_until"]
+        == row["response_received_time"] + timedelta(seconds=15)
+        for row in clock_rows
+    )
+
+    def lineage(row: dict[str, object]) -> tuple[object, object]:
+        return (
+            row["connection_id"],
+            row["received_time"],
+        )
+
+    wire_asset_by_lineage = {
+        lineage(row): row["message_asset"] for row in rows_by_type[RecordType.WIRE_MESSAGE]
+    }
+    assert len(wire_asset_by_lineage) == 452
+    assert {row["arrival_sequence"] for row in rows_by_type[RecordType.WIRE_MESSAGE]} == set(range(1, 453))
+    assert {
+        key: row["asset"]
+        for record_type in (RecordType.BBO, RecordType.L2_BOOK_STATE)
+        for row in rows_by_type[record_type]
+        for key in (lineage(row),)
+    } == wire_asset_by_lineage
+    assert {
+        lineage(row): row["asset"] for row in rows_by_type[RecordType.L2_SNAPSHOT]
+    } == wire_asset_by_lineage
+
+    state_snapshot_ids = {str(row["snapshot_id"]) for row in rows_by_type[RecordType.L2_BOOK_STATE]}
+    level_counts = Counter(str(row["snapshot_id"]) for row in rows_by_type[RecordType.L2_SNAPSHOT])
+    side_counts = Counter(
+        (str(row["snapshot_id"]), str(row["side"])) for row in rows_by_type[RecordType.L2_SNAPSHOT]
+    )
+    assert set(level_counts) == state_snapshot_ids
+    assert set(level_counts.values()) == {40}
+    assert set(side_counts.values()) == {20}
+    bbo_sequence_by_lineage = {lineage(row): row["source_sequence"] for row in rows_by_type[RecordType.BBO]}
+    level_sequence_by_lineage = {
+        lineage(row): row["last_sequence"] for row in rows_by_type[RecordType.L2_SNAPSHOT]
+    }
+    assert level_sequence_by_lineage == bbo_sequence_by_lineage
 
 
 def test_process_writer_owns_root_lock_and_preserves_multi_venue_l2_frames(

@@ -69,6 +69,12 @@ _ObservationHeadKey = tuple[str, str]
 _StablePrimaryKey = tuple[str, str]
 _OBSERVATION_INDEX_VERSION = 4
 _PERSISTENT_PRIMARY_KEY_TYPES = frozenset({RecordType.TRADE})
+_PARTIAL_FLUSH_BARRIER_ONLY_TYPES = frozenset(
+    {
+        RecordType.CANDLE,
+        RecordType.FUNDING,
+    }
+)
 _RecentKey = tuple[RecordType, tuple[object, ...]]
 _STORAGE_TIMING_WINDOW = 4_096
 _STORAGE_TIMING_STAGES = (
@@ -135,6 +141,9 @@ class _StorageMetrics:
         queue_capacity: int,
         pending_count: int,
         high_water: int,
+        pending_group_count: int,
+        ready_group_count: int,
+        max_group_rows: int,
     ) -> dict[str, object]:
         with self._lock:
             attempts = self._flush_attempts
@@ -149,6 +158,12 @@ class _StorageMetrics:
                 "capacity_rows": queue_capacity,
                 "pending_rows": pending_count,
                 "high_water_rows": high_water,
+            },
+            "coalescing": {
+                "readiness": "exact_group",
+                "pending_groups": pending_group_count,
+                "ready_groups": ready_group_count,
+                "max_group_rows": max_group_rows,
             },
             "flushes": {
                 "attempted": attempts,
@@ -776,14 +791,24 @@ class BatchingLakeSink:
 
     @property
     def should_flush(self) -> bool:
-        return self._pending_count >= self.batch_size
+        return any(
+            group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+            for group_key, group in self._groups.items()
+        )
 
     def metrics_snapshot(self) -> dict[str, object]:
+        group_sizes = tuple(len(group) for group in self._groups.values())
         return self._metrics.snapshot(
             batch_size=self.batch_size,
             queue_capacity=self.queue_capacity,
             pending_count=self._pending_count,
             high_water=self.high_water,
+            pending_group_count=len(group_sizes),
+            ready_group_count=sum(
+                group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+                for group_key, group in self._groups.items()
+            ),
+            max_group_rows=max(group_sizes, default=0),
         )
 
     def add(self, record: ParsedRecord) -> bool:
@@ -938,18 +963,38 @@ class BatchingLakeSink:
         return accepted
 
     @_instrument_flush
+    def flush_ready(self) -> FlushResult:
+        ready = tuple(
+            group_key
+            for group_key, group in self._groups.items()
+            if group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+        )
+        return self._flush_groups(ready, final_barrier=False)
+
+    @_instrument_flush
     def flush(self) -> FlushResult:
-        if not self._groups:
+        return self._flush_groups(tuple(self._groups), final_barrier=True)
+
+    def _flush_groups(
+        self,
+        selected_group_keys: tuple[_GroupKey, ...],
+        *,
+        final_barrier: bool,
+    ) -> FlushResult:
+        if not selected_group_keys:
+            if not final_barrier:
+                return FlushResult((), 0, 0)
             duplicates = self._duplicate_count
             self._duplicate_count = 0
             return FlushResult((), 0, duplicates)
 
         manifests: list[PartitionManifest] = []
+        selected_stable_primary_keys: set[_StablePrimaryKey] = set()
         written = 0
         sort_started_ns = self._monotonic_ns()
         try:
             group_keys = sorted(
-                self._groups,
+                selected_group_keys,
                 key=lambda item: (item[3], item[2], item[0], item[1].value, item[4]),
             )
         finally:
@@ -961,6 +1006,15 @@ class BatchingLakeSink:
             venue, record_type, asset, day, _stream = group_key
             spec = latest_schema_for(record_type)
             rows = list(self._groups[group_key].values())
+            if not final_barrier and record_type in _PERSISTENT_PRIMARY_KEY_TYPES:
+                for row in rows:
+                    stable = _stable_primary_key(
+                        record_type,
+                        spec.version,
+                        self._primary_key(spec, row),
+                    )
+                    if stable is not None:
+                        selected_stable_primary_keys.add(stable)
             sort_started_ns = self._monotonic_ns()
             try:
                 rows.sort(key=lambda row: self._order_key(spec, row))
@@ -992,12 +1046,19 @@ class BatchingLakeSink:
             manifests.append(manifest)
             written += len(rows)
 
-        if self._observation_index is not None:
+        if not selected_stable_primary_keys.issubset(self._pending_stable_primary_keys):
+            raise RuntimeError("partial flush selected an untracked stable primary key")
+        should_commit_index = final_barrier or bool(selected_stable_primary_keys)
+        if self._observation_index is not None and should_commit_index:
             sqlite_started_ns = self._monotonic_ns()
             try:
                 self._observation_index.commit(
-                    list(self._pending_observations.values()),
-                    sorted(self._pending_stable_primary_keys),
+                    list(self._pending_observations.values()) if final_barrier else [],
+                    (
+                        sorted(self._pending_stable_primary_keys)
+                        if final_barrier
+                        else sorted(selected_stable_primary_keys)
+                    ),
                     manifests,
                 )
             finally:
@@ -1005,12 +1066,23 @@ class BatchingLakeSink:
                     "sqlite_commit",
                     self._monotonic_ns() - sqlite_started_ns,
                 )
-        self._pending_observations.clear()
-        self._pending_stable_primary_keys.clear()
-        duplicates = self._duplicate_count
-        self._groups.clear()
-        self._pending_count = 0
-        self._duplicate_count = 0
+
+        for group_key in group_keys:
+            del self._groups[group_key]
+        self._pending_count -= written
+        if self._pending_count < 0:
+            raise RuntimeError("partial flush produced negative pending-row accounting")
+
+        if final_barrier:
+            self._pending_observations.clear()
+            self._pending_stable_primary_keys.clear()
+            duplicates = self._duplicate_count
+            self._duplicate_count = 0
+            if self._groups or self._pending_count:
+                raise RuntimeError("full flush left pending groups or rows")
+        else:
+            self._pending_stable_primary_keys.difference_update(selected_stable_primary_keys)
+            duplicates = 0
         return FlushResult(tuple(manifests), written, duplicates)
 
     def close(self) -> None:
@@ -1133,6 +1205,11 @@ class CoordinatedLakeWriter:
         with self._lock:
             return self._sink.pending_count
 
+    @property
+    def should_flush(self) -> bool:
+        with self._lock:
+            return self._sink.should_flush
+
     def metrics_snapshot(self) -> dict[str, object]:
         return self._sink.metrics_snapshot()
 
@@ -1213,7 +1290,7 @@ class CoordinatedLakeWriter:
                 )
             try:
                 if batch and self._sink.should_flush:
-                    self._record_flush(self._sink.flush())
+                    self._record_flush(self._sink.flush_ready(), full_barrier=False)
                 accepted = self._sink.add_many(batch)
             except Exception as exc:
                 raise CoordinatedWriterError(
@@ -1229,13 +1306,15 @@ class CoordinatedLakeWriter:
             self._duplicates_since_flush[client.venue] += duplicates
             return accepted
 
-    def _record_flush(self, result: FlushResult) -> None:
+    def _record_flush(self, result: FlushResult, *, full_barrier: bool) -> None:
         expected_duplicates = sum(self._duplicates_since_flush.values())
-        if result.duplicate_count != expected_duplicates:
+        if full_barrier and result.duplicate_count != expected_duplicates:
             raise CoordinatedWriterError(
                 "coordinated writer duplicate accounting mismatch: "
                 f"sink={result.duplicate_count}, clients={expected_duplicates}"
             )
+        if not full_barrier and result.duplicate_count != 0:
+            raise CoordinatedWriterError("coordinated writer partial flush returned duplicate credit")
         rows_by_venue = {venue: 0 for venue in self._venues}
         manifests_by_venue: dict[str, list[PartitionManifest]] = {venue: [] for venue in self._venues}
         for manifest in result.manifests:
@@ -1250,19 +1329,53 @@ class CoordinatedLakeWriter:
                 f"manifests={sum(rows_by_venue.values())}, result={result.row_count}"
             )
         for venue in self._venues:
-            if rows_by_venue[venue] != self._pending_by_venue[venue]:
+            pending = self._pending_by_venue[venue]
+            if (full_barrier and rows_by_venue[venue] != pending) or (
+                not full_barrier and rows_by_venue[venue] > pending
+            ):
                 raise CoordinatedWriterError(
                     "coordinated writer row accounting mismatch for "
                     f"{venue}: manifests={rows_by_venue[venue]}, "
-                    f"pending={self._pending_by_venue[venue]}"
+                    f"pending={pending}, full_barrier={full_barrier}"
                 )
 
         for venue in self._venues:
             self._manifest_credit[venue].extend(manifests_by_venue[venue])
             self._row_credit[venue] += rows_by_venue[venue]
-            self._duplicate_credit[venue] += self._duplicates_since_flush[venue]
-            self._pending_by_venue[venue] = 0
-            self._duplicates_since_flush[venue] = 0
+            self._pending_by_venue[venue] -= rows_by_venue[venue]
+            if full_barrier:
+                self._duplicate_credit[venue] += self._duplicates_since_flush[venue]
+                self._duplicates_since_flush[venue] = 0
+
+    def _drain_all_credits(self) -> dict[str, FlushResult]:
+        results = {
+            venue: FlushResult(
+                tuple(self._manifest_credit[venue]),
+                self._row_credit[venue],
+                self._duplicate_credit[venue],
+            )
+            for venue in self._venue_order
+        }
+        for venue in self._venue_order:
+            self._manifest_credit[venue].clear()
+            self._row_credit[venue] = 0
+            self._duplicate_credit[venue] = 0
+        return results
+
+    def flush_ready_all(self) -> dict[str, FlushResult]:
+        """Publish ready exact groups and retain sparse groups for a full barrier."""
+
+        with self._lock:
+            if self._closed:
+                raise CoordinatedWriterError("coordinated lake writer is closed")
+            try:
+                physical_result = self._sink.flush_ready()
+            except Exception as exc:
+                raise CoordinatedWriterError(
+                    "coordinated lake ready-group flush failed for all venues"
+                ) from exc
+            self._record_flush(physical_result, full_barrier=False)
+            return self._drain_all_credits()
 
     def flush_all(self) -> dict[str, FlushResult]:
         """Physically flush once and atomically drain credits for every venue."""
@@ -1273,24 +1386,9 @@ class CoordinatedLakeWriter:
             try:
                 physical_result = self._sink.flush()
             except Exception as exc:
-                raise CoordinatedWriterError(
-                    "coordinated lake flush failed for all venues"
-                ) from exc
-            self._record_flush(physical_result)
-            results = {
-                venue: FlushResult(
-                    tuple(self._manifest_credit[venue]),
-                    self._row_credit[venue],
-                    self._duplicate_credit[venue],
-                )
-                for venue in self._venue_order
-            }
-            for venue in self._venue_order:
-                self._manifest_credit[venue].clear()
-                self._row_credit[venue] = 0
-                self._duplicate_credit[venue] = 0
-            return results
-
+                raise CoordinatedWriterError("coordinated lake flush failed for all venues") from exc
+            self._record_flush(physical_result, full_barrier=True)
+            return self._drain_all_credits()
 
     def _client_flush(self, client: CoordinatedLakeSink) -> FlushResult:
         with self._lock:
@@ -1301,7 +1399,7 @@ class CoordinatedLakeWriter:
                 raise CoordinatedWriterError(
                     f"coordinated lake flush failed for venue {client.venue!r}"
                 ) from exc
-            self._record_flush(physical_result)
+            self._record_flush(physical_result, full_barrier=True)
             venue = client.venue
             result = FlushResult(
                 tuple(self._manifest_credit[venue]),
@@ -1327,6 +1425,6 @@ class CoordinatedLakeWriter:
                 return
             self._closed = True
             try:
-                self._record_flush(self._sink.flush())
+                self._record_flush(self._sink.flush(), full_barrier=True)
             finally:
                 self._sink.close()

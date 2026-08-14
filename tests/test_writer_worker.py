@@ -58,6 +58,111 @@ def _trade(venue: str, sequence: int) -> ParsedRecord:
     )
 
 
+def test_batch_readiness_uses_one_exact_group_instead_of_global_pending_rows(
+    tmp_path: Path,
+) -> None:
+    sink = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=3,
+        queue_capacity=12,
+    )
+    try:
+        assert sink.add(_trade("hyperliquid", 1)) is True
+        assert sink.add(_trade("binance_usdm", 2)) is True
+        assert sink.add(_trade("hyperliquid", 3)) is True
+        assert sink.add(_trade("binance_usdm", 4)) is True
+
+        assert sink.pending_count == 4
+        assert sink.should_flush is False
+        assert sink.metrics_snapshot()["coalescing"] == {
+            "readiness": "exact_group",
+            "pending_groups": 2,
+            "ready_groups": 0,
+            "max_group_rows": 2,
+        }
+
+        assert sink.add(_trade("hyperliquid", 5)) is True
+        assert sink.pending_count == 5
+        assert sink.should_flush is True
+        assert sink.metrics_snapshot()["coalescing"] == {
+            "readiness": "exact_group",
+            "pending_groups": 2,
+            "ready_groups": 1,
+            "max_group_rows": 3,
+        }
+
+        ready = sink.flush_ready()
+        assert ready.row_count == 3
+        assert ready.duplicate_count == 0
+        assert len(ready.manifests) == 1
+        assert ready.manifests[0].partition.venue == "hyperliquid"
+        assert sink.pending_count == 2
+        assert sink.should_flush is False
+
+        residual = sink.flush()
+        assert residual.row_count == 2
+        assert residual.duplicate_count == 0
+        assert len(residual.manifests) == 1
+        assert residual.manifests[0].partition.venue == "binance_usdm"
+    finally:
+        sink.close()
+
+    reopened = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=3,
+        queue_capacity=12,
+    )
+    try:
+        assert reopened.add(_trade("hyperliquid", 1)) is False
+        assert reopened.add(_trade("binance_usdm", 2)) is False
+        duplicates = reopened.flush()
+        assert duplicates.row_count == 0
+        assert duplicates.duplicate_count == 2
+    finally:
+        reopened.close()
+
+
+def test_coordinated_writer_exposes_physical_exact_group_readiness(
+    tmp_path: Path,
+) -> None:
+    writer = CoordinatedLakeWriter(
+        tmp_path / "lake",
+        venues=VENUES,
+        batch_size=3,
+        queue_capacity=12,
+    )
+    hyperliquid = writer.client("hyperliquid")
+    binance = writer.client("binance_usdm")
+    try:
+        assert hyperliquid.add_many((_trade("hyperliquid", 1), _trade("hyperliquid", 2))) == 2
+        assert binance.add_many((_trade("binance_usdm", 3), _trade("binance_usdm", 4))) == 2
+
+        assert writer.pending_count == 4
+        assert writer.should_flush is False
+
+        assert hyperliquid.add(_trade("hyperliquid", 5)) is True
+        assert writer.should_flush is True
+
+        ready = writer.flush_ready_all()
+        assert ready["hyperliquid"].row_count == 3
+        assert ready["hyperliquid"].duplicate_count == 0
+        assert len(ready["hyperliquid"].manifests) == 1
+        assert ready["binance_usdm"] == FlushResult((), 0, 0)
+        assert writer.pending_count == 2
+        assert writer.should_flush is False
+
+        residual = writer.flush_all()
+        assert residual["hyperliquid"] == FlushResult((), 0, 0)
+        assert residual["binance_usdm"].row_count == 2
+        assert residual["binance_usdm"].duplicate_count == 0
+        assert len(residual["binance_usdm"].manifests) == 1
+        assert writer.pending_count == 0
+    finally:
+        hyperliquid.close()
+        binance.close()
+        writer.close()
+
+
 def test_blocked_physical_flush_keeps_enqueue_nonblocking_and_capacity_exact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -71,8 +176,10 @@ def test_blocked_physical_flush_keeps_enqueue_nonblocking_and_capacity_exact(
     )
     hyperliquid = worker.client("hyperliquid")
     binance = worker.client("binance_usdm")
+    assert hyperliquid.should_flush is False
+    assert binance.should_flush is False
     physical_sink = worker._writer._sink
-    original_flush = physical_sink.flush
+    original_flush = physical_sink.flush_ready
     flush_entered = threading.Event()
     allow_flush = threading.Event()
 
@@ -81,7 +188,7 @@ def test_blocked_physical_flush_keeps_enqueue_nonblocking_and_capacity_exact(
         assert allow_flush.wait(timeout=5), "test did not release the physical flush"
         return original_flush()
 
-    monkeypatch.setattr(physical_sink, "flush", blocked_flush)
+    monkeypatch.setattr(physical_sink, "flush_ready", blocked_flush)
     enqueue_completed = threading.Event()
     enqueue_errors: list[BaseException] = []
 
@@ -181,6 +288,7 @@ def test_async_flush_failure_surfaces_and_releases_the_single_root_writer(
         flush_failed.set()
         raise OSError("simulated fsync failure")
 
+    monkeypatch.setattr(worker._writer._sink, "flush_ready", fail_flush)
     monkeypatch.setattr(worker._writer._sink, "flush", fail_flush)
 
     assert hyperliquid.add(_trade("hyperliquid", 1)) is True
@@ -214,7 +322,7 @@ def test_async_flush_failure_surfaces_and_releases_the_single_root_writer(
     assert snapshot["failure"] == {
         "phase": "auto_flush",
         "type": "CoordinatedWriterError",
-        "message": "coordinated lake flush failed for all venues",
+        "message": "coordinated lake ready-group flush failed for all venues",
     }
     assert snapshot["outstanding_rows"] == 1
     assert snapshot["flush_ms"]["count"] >= 1
@@ -253,6 +361,7 @@ def test_async_failure_landing_during_freeze_wins_over_venue_validation(
         assert allow_failure.wait(timeout=5), "test did not release the failed flush"
         raise OSError("simulated fsync race")
 
+    monkeypatch.setattr(worker._writer._sink, "flush_ready", fail_flush)
     monkeypatch.setattr(worker._writer._sink, "flush", fail_flush)
     assert hyperliquid.add(_trade("hyperliquid", 1)) is True
     assert flush_entered.wait(timeout=5), "worker never entered automatic flush"
@@ -347,7 +456,8 @@ def test_record_flush_validation_is_atomic_before_credit_mutation(
                     (valid_manifest, incompatible_manifest),
                     row_count=2,
                     duplicate_count=0,
-                )
+                ),
+                full_barrier=True,
             )
 
         assert {
@@ -442,18 +552,7 @@ def test_default_venue_budgets_reserve_peer_capacity_and_report_high_water(
             == 2
         )
 
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            snapshot = worker.metrics_snapshot()
-            venues = snapshot["venues"]
-            assert isinstance(venues, dict)
-            if sum(venues[venue]["durable_rows"] for venue in VENUES) == 4:
-                break
-            time.sleep(0.001)
-        else:
-            raise AssertionError("worker did not durably flush the reserved venue rows")
-
-        hyperliquid_result = hyperliquid.collect_completed()
+        hyperliquid_result = hyperliquid.flush()
         binance_result = binance.collect_completed()
         assert hyperliquid_result.row_count == 2
         assert binance_result.row_count == 2

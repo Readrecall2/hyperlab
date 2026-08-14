@@ -291,11 +291,13 @@ def _write_continuity_lake(
     mutate_binance_trade_received: bool = False,
     mutate_binance_trade_quote: bool = False,
     invalid_clock_at: datetime | None = None,
+    invalid_clock_times: tuple[datetime, ...] = (),
     clock_failure_at: datetime | None = None,
     loose_clock_at: datetime | None = None,
     wrong_clock_identity_at: datetime | None = None,
     clock_sample_seconds: tuple[float, ...] = (0.5, 10.5, 20.5),
     prewindow_clock_invalid: bool = False,
+    prewindow_clock_rejection_count: int = 0,
     prewindow_clock_failure: bool = False,
     prewindow_disconnect: bool = False,
     prewindow_conflicting_capture_event: bool = False,
@@ -1134,11 +1136,21 @@ def _write_continuity_lake(
                 )
             )
 
-    if prewindow_clock_invalid:
-        for observation_id, response, delay_ms in (
-            ("clock-pre-valid", BASE + timedelta(milliseconds=50), 20),
-            ("clock-pre-invalid", BASE + timedelta(milliseconds=100), 102),
-        ):
+    prewindow_rejections = max(
+        prewindow_clock_rejection_count,
+        int(prewindow_clock_invalid),
+    )
+    if prewindow_rejections:
+        samples = [("clock-pre-valid", BASE + timedelta(milliseconds=50), 20)]
+        samples.extend(
+            (
+                f"clock-pre-invalid-{index}",
+                BASE + timedelta(milliseconds=100 * index),
+                102,
+            )
+            for index in range(1, prewindow_rejections + 1)
+        )
+        for observation_id, response, delay_ms in samples:
             sent = response - timedelta(milliseconds=delay_ms)
             records.append(
                 clock_record(
@@ -1185,16 +1197,20 @@ def _write_continuity_lake(
                 capture_epoch_id=binance_capture,
             )
         )
-    if invalid_clock_at is not None:
+    rejected_clock_times = (
+        (() if invalid_clock_at is None else (invalid_clock_at,))
+        + invalid_clock_times
+    )
+    for rejected_index, rejected_at in enumerate(rejected_clock_times, start=1):
         records.append(
             clock_record(
                 measure_clock(
                     "binance_usdm",
-                    request_sent_time=invalid_clock_at - timedelta(milliseconds=102),
-                    response_received_time=invalid_clock_at,
-                    server_time=invalid_clock_at - timedelta(milliseconds=51),
+                    request_sent_time=rejected_at - timedelta(milliseconds=102),
+                    response_received_time=rejected_at,
+                    server_time=rejected_at - timedelta(milliseconds=51),
                 ),
-                "clock-invalid",
+                f"clock-invalid-{rejected_index}",
                 connection_id="binance-public-1",
                 connection_epoch=1,
                 capture_epoch_id=binance_capture,
@@ -1593,12 +1609,12 @@ def test_real_lake_audit_requires_binance_v2_resync_complete(
     }.issubset(reasons)
 
 
-def test_real_lake_audit_never_bridges_an_invalid_clock_sample(
+def test_real_lake_audit_keeps_isolated_high_rtt_probe_non_covering_without_revocation(
     tmp_path: Path,
 ) -> None:
     lake = tmp_path / "lake"
-    invalid_at = BASE + timedelta(seconds=12.6)
-    _write_continuity_lake(lake, invalid_clock_at=invalid_at)
+    rejected_at = BASE + timedelta(seconds=5.5)
+    _write_continuity_lake(lake, invalid_clock_at=rejected_at)
 
     payload = data_cli.phase10_continuity_report(
         lake,
@@ -1607,22 +1623,127 @@ def test_real_lake_audit_never_bridges_an_invalid_clock_sample(
         end=BASE + timedelta(seconds=30),
     )
 
-    assert payload["technical_capture_gate"] == "FAIL"
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
     clock = payload["clock_sync"]
     assert isinstance(clock, dict)
     assert clock["invalid_v2_samples"] == 1
-    assert clock["coverage_continuous"] is False
-    intervals = clock["intervals"]
-    assert isinstance(intervals, list)
-    assert all(
-        not (
-            datetime.fromisoformat(str(item["start"]).replace("Z", "+00:00"))
-            < invalid_at
-            < datetime.fromisoformat(str(item["end"]).replace("Z", "+00:00"))
-        )
-        for item in intervals
+    assert clock["rejected_probe_samples"] == 1
+    assert clock["hard_invalid_v2_samples"] == 0
+    assert clock["in_window_invalid_events"] == 1
+    assert clock["in_window_rejected_probe_events"] == 1
+    assert clock["in_window_hard_invalid_events"] == 0
+    assert clock["coverage_continuous"] is True
+    assert "clock_sync_in_window_invalid_sample" not in payload["failure_reasons"]
+    assert any(
+        datetime.fromisoformat(str(item["start"]).replace("Z", "+00:00"))
+        < rejected_at
+        < datetime.fromisoformat(str(item["end"]).replace("Z", "+00:00"))
+        for item in clock["intervals"]
         if isinstance(item, dict)
     )
+
+
+def test_real_lake_audit_rejects_consecutive_high_rtt_probes_before_coverage_expires(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5,),
+        invalid_clock_times=(
+            BASE + timedelta(seconds=5.5),
+            BASE + timedelta(seconds=10.5),
+        ),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=12),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["rejected_probe_samples"] == 2
+    assert clock["hard_invalid_v2_samples"] == 0
+    assert clock["sample_spacing_violations"] == 0
+    assert clock["consecutive_rejection_violations"] == 1
+    assert clock["max_consecutive_rejected_probes"] == 2
+    assert clock["strict_max_consecutive_rejected_probes"] == 1
+    assert clock["coverage_continuous"] is False
+    assert "clock_sync_consecutive_rejected_probes" in payload["failure_reasons"]
+
+
+def test_real_lake_audit_cuts_coverage_until_valid_recovery_after_second_rejection(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    second_rejection = BASE + timedelta(seconds=7.5)
+    recovery = BASE + timedelta(seconds=9.5)
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5, 9.5, 19.5, 29.5),
+        invalid_clock_times=(
+            BASE + timedelta(seconds=5.5),
+            second_rejection,
+        ),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["sample_spacing_violations"] == 0
+    assert clock[
+        "consecutive_rejection_violation_capture_generations"
+    ] == ["binance-capture-1"]
+    assert clock["consecutive_rejection_outages"] == [
+        {
+            "capture_epoch_id": "binance-capture-1",
+            "start": second_rejection.isoformat().replace("+00:00", "Z"),
+            "end": recovery.isoformat().replace("+00:00", "Z"),
+            "duration_seconds": 2.0,
+        }
+    ]
+    assert clock["coverage_continuous"] is False
+    assert "clock_sync_consecutive_rejected_probes" in payload["failure_reasons"]
+
+
+def test_real_lake_audit_rejects_high_rtt_run_after_last_valid_interval_expires(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5,),
+        invalid_clock_times=tuple(
+            BASE + timedelta(seconds=seconds)
+            for seconds in (5.5, 10.5, 15.5, 20.5)
+        ),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["rejected_probe_samples"] == 4
+    assert clock["hard_invalid_v2_samples"] == 0
+    assert clock["coverage_continuous"] is False
+    assert "clock_sync_not_continuous" in payload["failure_reasons"]
 
 
 def test_real_lake_audit_clock_failure_event_cuts_only_clock_coverage(
@@ -2011,10 +2132,6 @@ def test_real_lake_audit_rejects_clock_offset_discontinuity(
             "in_window_capture_gap_event",
         ),
         (
-            {"invalid_clock_at": BASE + timedelta(seconds=25.6)},
-            "clock_sync_in_window_invalid_sample",
-        ),
-        (
             {"clock_failure_at": BASE + timedelta(seconds=25.6)},
             "clock_sync_in_window_failure_event",
         ),
@@ -2029,7 +2146,6 @@ def test_real_lake_audit_rejects_clock_offset_discontinuity(
     ),
     ids=(
         "bound-gap-near-tail",
-        "invalid-clock-near-tail",
         "clock-failure-near-tail",
         "disconnect-without-clean-stop",
         "unbound-gap",
@@ -2214,16 +2330,17 @@ def test_real_lake_audit_rejects_incomplete_or_unbound_clean_shutdown(
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    ("mutation", "expect_covered_before_recovery"),
     (
-        {"prewindow_clock_invalid": True},
-        {"prewindow_clock_failure": True},
+        ({"prewindow_clock_invalid": True}, True),
+        ({"prewindow_clock_failure": True}, False),
     ),
     ids=("invalid-sample", "clock-gap"),
 )
-def test_real_lake_audit_truncates_pre_window_clock_until_recovery(
+def test_real_lake_audit_distinguishes_pre_window_rejection_from_failure(
     tmp_path: Path,
     mutation: dict[str, object],
+    expect_covered_before_recovery: bool,
 ) -> None:
     lake = tmp_path / "lake"
     _write_continuity_lake(
@@ -2245,8 +2362,8 @@ def test_real_lake_audit_truncates_pre_window_clock_until_recovery(
     assert clock["coverage_continuous"] is True
     intervals = clock["intervals"]
     assert isinstance(intervals, list)
-    assert all(
-        not (
+    covered_before_recovery = any(
+        (
             datetime.fromisoformat(str(item["start"]).replace("Z", "+00:00"))
             <= BASE + timedelta(seconds=1)
             < datetime.fromisoformat(str(item["end"]).replace("Z", "+00:00"))
@@ -2254,6 +2371,40 @@ def test_real_lake_audit_truncates_pre_window_clock_until_recovery(
         for item in intervals
         if isinstance(item, dict)
     )
+    assert covered_before_recovery is expect_covered_before_recovery
+
+
+def test_real_lake_audit_retains_consecutive_pre_window_rejection_state(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(4.5, 14.5, 24.5),
+        prewindow_clock_rejection_count=2,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE + timedelta(milliseconds=250),
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
+    assert clock["rejected_probe_samples"] == 2
+    assert clock["max_consecutive_rejected_probes"] == 2
+    assert clock["consecutive_rejection_violations"] == 1
+    assert clock[
+        "consecutive_rejection_violation_capture_generations"
+    ] == []
+    outages = clock["consecutive_rejection_outages"]
+    assert isinstance(outages, list)
+    assert len(outages) == 1
+    assert outages[0]["capture_epoch_id"] == "binance-capture-1"
+    assert "clock_sync_consecutive_rejected_probes" not in payload["failure_reasons"]
 
 
 def test_real_lake_audit_rejects_retained_pre_window_unbound_clock(

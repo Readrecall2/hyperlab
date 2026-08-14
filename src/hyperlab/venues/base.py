@@ -76,6 +76,11 @@ class HttpRequestDiagnostics:
     request_completion_sequence: int | None = None
     finalization_completion_sequence: int | None = None
     post_request_observation_current: bool | None = None
+    peer_ip: str | None = None
+    peer_port: int | None = None
+    socket_family: str | None = None
+    response_cloudfront_pop: str | None = None
+    response_cache: str | None = None
 
     def __post_init__(self) -> None:
         timings = (
@@ -116,6 +121,17 @@ class HttpRequestDiagnostics:
             self.urllib3_connection_identity,
             self.tls_socket_identity,
         )
+        ports = (self.peer_port,)
+        if any(value is not None and not 0 <= value <= 65_535 for value in ports):
+            raise ValueError("HTTP transport ports must be between 0 and 65535")
+        labels = (
+            self.peer_ip,
+            self.socket_family,
+            self.response_cloudfront_pop,
+            self.response_cache,
+        )
+        if any(value is not None and not value for value in labels):
+            raise ValueError("HTTP transport labels must not be empty")
         if any(value is not None and not value for value in identities):
             raise ValueError("HTTP transport identities must not be empty")
 

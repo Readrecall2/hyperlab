@@ -452,6 +452,9 @@ def test_local_http_keepalive_exposes_real_urllib3_connection_reuse() -> None:
     assert first.urllib3_connection_identity is not None
     assert first.urllib3_connection_reused is None
     assert first.tls_session_reused is None
+    assert first.peer_ip == "127.0.0.1"
+    assert first.peer_port == server.server_address[1]
+    assert first.socket_family == "AF_INET"
     assert second.urllib3_connection_objects_created_delta == 0
     assert second.urllib3_requests_started_delta == 1
     assert second.urllib3_connection_identity == first.urllib3_connection_identity
@@ -459,6 +462,9 @@ def test_local_http_keepalive_exposes_real_urllib3_connection_reuse() -> None:
     assert second.tls_socket_identity == first.tls_socket_identity
     assert second.tls_socket_reused is True
     assert second.tls_session_reused is None
+    assert second.peer_ip == first.peer_ip
+    assert second.peer_port == first.peer_port
+    assert second.socket_family == first.socket_family
 
 
 def test_later_request_completion_makes_post_request_evidence_indeterminate(

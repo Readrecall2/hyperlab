@@ -26,6 +26,7 @@ DEFAULT_STATE_TTL = timedelta(seconds=30)
 MAX_CLOCK_SAMPLING_INTERVAL_MS = 10_000
 MAX_CLOCK_AGE_MS = 15_000
 MAX_CLOCK_UNCERTAINTY_MS = Decimal("50")
+MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES = 1
 
 _REQUIRED_TYPES = frozenset(
     {
@@ -94,12 +95,20 @@ class _ClockAudit:
     legacy_samples: int
     valid_samples: int
     invalid_samples: int
+    rejected_probe_samples: int
+    hard_invalid_samples: int
     failure_events: int
     policy_rejections: int
     identity_rejections: int
     unbound_invalid_events: int
     in_window_invalid_events: int
+    in_window_rejected_probe_events: int
+    in_window_hard_invalid_events: int
     in_window_failure_events: int
+    consecutive_rejection_violations: int
+    consecutive_rejection_violation_captures: frozenset[str]
+    consecutive_rejection_outages: Mapping[str, tuple[Interval, ...]]
+    max_consecutive_rejected_probes: int
     spacing_violations: int
     spacing_violation_captures: frozenset[str]
     offset_discontinuities: int
@@ -289,7 +298,13 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
                 venue,
                 record_type,
                 str(row.get("capture_epoch_id") or ""),
-                "invalid",
+                connection,
+                int(str(row.get("connection_epoch") or 0)),
+                str(row.get("observation_id") or ""),
+                _timestamp(
+                    row["received_time"],
+                    label="clock boundary received_time",
+                ),
             )
         if record_type == RecordType.CONNECTION_EVENT:
             return (
@@ -376,11 +391,13 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
             if token is None:
                 continue
             if received < start:
-                if (
-                    record_type == RecordType.CLOCK_SYNC
-                    and row.get("sample_status") == "valid"
-                ):
-                    continue
+                if record_type == RecordType.CLOCK_SYNC:
+                    if row.get("sample_status") == "valid":
+                        continue
+                    if received < start - timedelta(
+                        milliseconds=MAX_CLOCK_AGE_MS
+                    ):
+                        continue
                 retain_boundary(
                     predecessors,
                     ("predecessor", *token),
@@ -2563,12 +2580,19 @@ def _clock_intervals(
     legacy = 0
     valid = 0
     invalid = 0
+    rejected_probes = 0
+    hard_invalid = 0
     failure_events = 0
     strict_policy_rejections = 0
     identity_rejections = 0
     unbound_invalid_events = 0
     in_window_invalid_events = 0
+    in_window_rejected_probe_events = 0
+    in_window_hard_invalid_events = 0
     in_window_failure_events = 0
+    consecutive_rejection_violations = 0
+    consecutive_rejection_violation_captures: set[str] = set()
+    max_consecutive_rejected_probes = 0
     spacing_violations = 0
     spacing_violation_captures: set[str] = set()
     offset_discontinuities = 0
@@ -2576,6 +2600,67 @@ def _clock_intervals(
     max_sample_gap_ms: float | None = None
     valid_by_capture: dict[str, list[_ClockSample]] = defaultdict(list)
     invalid_times: dict[str, list[datetime]] = defaultdict(list)
+    consecutive_rejection_times: dict[str, list[datetime]] = defaultdict(list)
+    rejection_streak_by_capture: dict[str, int] = defaultdict(int)
+
+    def strict_policy_values(
+        row: Mapping[str, object],
+    ) -> tuple[int, int, Decimal, Decimal, Decimal] | None:
+        try:
+            sampling_interval_ms = int(str(row.get('sampling_interval_ms')))
+            max_age_ms = int(str(row.get('max_age_ms')))
+            declared_uncertainty = Decimal(str(row.get('max_uncertainty_ms')))
+            measured_uncertainty = Decimal(str(row.get('drift_uncertainty_ms')))
+            estimated_drift = Decimal(str(row.get('estimated_clock_drift_ms')))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            sampling_interval_ms <= 0
+            or sampling_interval_ms > MAX_CLOCK_SAMPLING_INTERVAL_MS
+            or max_age_ms < sampling_interval_ms
+            or max_age_ms > MAX_CLOCK_AGE_MS
+            or not declared_uncertainty.is_finite()
+            or declared_uncertainty < 0
+            or declared_uncertainty > MAX_CLOCK_UNCERTAINTY_MS
+            or not measured_uncertainty.is_finite()
+            or measured_uncertainty < 0
+            or not estimated_drift.is_finite()
+        ):
+            return None
+        return (
+            sampling_interval_ms,
+            max_age_ms,
+            declared_uncertainty,
+            measured_uncertainty,
+            estimated_drift,
+        )
+
+    def is_expected_high_uncertainty_rejection(
+        row: Mapping[str, object],
+        received: datetime,
+        policy: tuple[int, int, Decimal, Decimal, Decimal] | None,
+    ) -> bool:
+        if policy is None or row.get('sample_status') != 'invalid':
+            return False
+        measured_uncertainty = policy[3]
+        invalid_reason = row.get('invalid_reason')
+        response_received = row.get('response_received_time')
+        try:
+            round_trip_ms = Decimal(str(row.get('round_trip_latency_ms')))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return (
+            measured_uncertainty > MAX_CLOCK_UNCERTAINTY_MS
+            and round_trip_ms.is_finite()
+            and round_trip_ms >= 0
+            and measured_uncertainty == round_trip_ms / 2
+            and isinstance(response_received, datetime)
+            and _utc(response_received) == received
+            and row.get('causal_valid_from') is None
+            and row.get('causal_valid_until') is None
+            and isinstance(invalid_reason, str)
+            and invalid_reason.startswith('clock uncertainty exceeds threshold:')
+        )
     for row in _rows_with_boundaries(
         loaded,
         BINANCE,
@@ -2589,8 +2674,10 @@ def _clock_intervals(
         capture = row.get("capture_epoch_id")
         if not isinstance(capture, str) or not capture:
             invalid += 1
+            hard_invalid += 1
             if start <= received < end:
                 in_window_invalid_events += 1
+                in_window_hard_invalid_events += 1
             if start - timedelta(milliseconds=MAX_CLOCK_AGE_MS) <= received < end:
                 unbound_invalid_events += 1
             continue
@@ -2611,45 +2698,42 @@ def _clock_intervals(
         )
         if not identity_valid:
             invalid += 1
+            hard_invalid += 1
             identity_rejections += 1
             if start <= received < end:
                 in_window_invalid_events += 1
+                in_window_hard_invalid_events += 1
             invalid_times[capture].append(received)
             if start - timedelta(milliseconds=MAX_CLOCK_AGE_MS) <= received < end:
                 unbound_invalid_events += 1
             continue
         status = row.get("sample_status")
+        policy = strict_policy_values(row)
         if status == "valid":
-            sampling_interval_ms = row.get("sampling_interval_ms")
-            max_age_ms = row.get("max_age_ms")
-            declared_uncertainty = row.get("max_uncertainty_ms")
-            measured_uncertainty = row.get("drift_uncertainty_ms")
-            estimated_drift = row.get("estimated_clock_drift_ms")
             strict_policy_valid = (
-                sampling_interval_ms is not None
-                and int(str(sampling_interval_ms)) <= MAX_CLOCK_SAMPLING_INTERVAL_MS
-                and max_age_ms is not None
-                and int(str(max_age_ms)) <= MAX_CLOCK_AGE_MS
-                and declared_uncertainty is not None
-                and Decimal(str(declared_uncertainty)) <= MAX_CLOCK_UNCERTAINTY_MS
-                and measured_uncertainty is not None
-                and Decimal(str(measured_uncertainty)) <= MAX_CLOCK_UNCERTAINTY_MS
-                and estimated_drift is not None
-                and Decimal(str(estimated_drift)).is_finite()
+                policy is not None
+                and policy[3] <= MAX_CLOCK_UNCERTAINTY_MS
             )
             if not strict_policy_valid:
                 invalid += 1
+                hard_invalid += 1
                 strict_policy_rejections += 1
                 if start <= received < end:
                     in_window_invalid_events += 1
+                    in_window_hard_invalid_events += 1
                 invalid_times[capture].append(received)
                 continue
+            assert policy is not None
+            measured_uncertainty = policy[3]
+            estimated_drift = policy[4]
             left = row.get("causal_valid_from")
             right = row.get("causal_valid_until")
             if not isinstance(left, datetime) or not isinstance(right, datetime):
                 invalid += 1
+                hard_invalid += 1
                 if start <= received < end:
                     in_window_invalid_events += 1
+                    in_window_hard_invalid_events += 1
                 invalid_times[capture].append(received)
                 continue
             left_utc = _utc(left)
@@ -2658,20 +2742,41 @@ def _clock_intervals(
                 valid_by_capture[capture].append(
                     _ClockSample(
                         Interval(left_utc, right_utc, capture),
-                        Decimal(str(estimated_drift)),
-                        Decimal(str(measured_uncertainty)),
+                        estimated_drift,
+                        measured_uncertainty,
                     )
                 )
                 valid += 1
+                rejection_streak_by_capture[capture] = 0
             else:
                 invalid += 1
+                hard_invalid += 1
                 if start <= received < end:
                     in_window_invalid_events += 1
+                    in_window_hard_invalid_events += 1
                 invalid_times[capture].append(received)
         else:
             invalid += 1
             if start <= received < end:
                 in_window_invalid_events += 1
+            if is_expected_high_uncertainty_rejection(row, received, policy):
+                rejected_probes += 1
+                rejection_streak = rejection_streak_by_capture[capture] + 1
+                rejection_streak_by_capture[capture] = rejection_streak
+                max_consecutive_rejected_probes = max(
+                    max_consecutive_rejected_probes,
+                    rejection_streak,
+                )
+                if start <= received < end:
+                    in_window_rejected_probe_events += 1
+                if rejection_streak == MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES + 1:
+                    consecutive_rejection_violations += 1
+                    consecutive_rejection_violation_captures.add(capture)
+                    consecutive_rejection_times[capture].append(received)
+                continue
+            hard_invalid += 1
+            if start <= received < end:
+                in_window_hard_invalid_events += 1
             invalid_times[capture].append(received)
 
     for row in _rows_with_boundaries(
@@ -2720,12 +2825,16 @@ def _clock_intervals(
     for outage in event_outages:
         outages_by_tag[outage.tag].append(outage)
     result: dict[str, tuple[Interval, ...]] = {}
-    for capture in sorted(set(valid_by_capture) | set(invalid_times)):
+    consecutive_rejection_outages: dict[str, tuple[Interval, ...]] = {}
+    for capture in sorted(
+        set(valid_by_capture) | set(invalid_times) | set(consecutive_rejection_times)
+    ):
         samples = sorted(
             valid_by_capture.get(capture, ()),
             key=lambda item: item.interval.start,
         )
         invalid_outages: list[Interval] = []
+        rejection_outages: list[Interval] = []
         cadence_outages: list[Interval] = []
         offset_outages: list[Interval] = []
         for previous, current in pairwise(samples):
@@ -2801,12 +2910,29 @@ def _clock_intervals(
                 invalid_outages.append(
                     Interval(max(invalid_at, start), min(recovery, end), capture)
                 )
+        for rejection_at in sorted(consecutive_rejection_times.get(capture, ())):
+            recovery = next(
+                (
+                    sample.interval.start
+                    for sample in samples
+                    if sample.interval.start > rejection_at
+                ),
+                end,
+            )
+            outage_start = max(rejection_at, start)
+            outage_end = min(recovery, end)
+            if outage_start < outage_end:
+                rejection_outages.append(
+                    Interval(outage_start, outage_end, capture)
+                )
+        consecutive_rejection_outages[capture] = tuple(rejection_outages)
         result[capture] = _clip(
             _subtract(
                 effective_samples,
                 (
                     *outages_by_tag.get(capture, ()),
                     *invalid_outages,
+                    *rejection_outages,
                     *cadence_outages,
                     *offset_outages,
                 ),
@@ -2819,12 +2945,22 @@ def _clock_intervals(
         legacy_samples=legacy,
         valid_samples=valid,
         invalid_samples=invalid,
+        rejected_probe_samples=rejected_probes,
+        hard_invalid_samples=hard_invalid,
         failure_events=failure_events,
         policy_rejections=strict_policy_rejections,
         identity_rejections=identity_rejections,
         unbound_invalid_events=unbound_invalid_events,
         in_window_invalid_events=in_window_invalid_events,
+        in_window_rejected_probe_events=in_window_rejected_probe_events,
+        in_window_hard_invalid_events=in_window_hard_invalid_events,
         in_window_failure_events=in_window_failure_events,
+        consecutive_rejection_violations=consecutive_rejection_violations,
+        consecutive_rejection_violation_captures=frozenset(
+            consecutive_rejection_violation_captures
+        ),
+        consecutive_rejection_outages=consecutive_rejection_outages,
+        max_consecutive_rejected_probes=max_consecutive_rejected_probes,
         spacing_violations=spacing_violations,
         spacing_violation_captures=frozenset(spacing_violation_captures),
         offset_discontinuities=offset_discontinuities,
@@ -3402,6 +3538,7 @@ def audit_phase10_continuity(
         or binance_lineage_rejections
         or hyperliquid_lineage_rejections
         or clock_audit.unbound_invalid_events
+        or captures_without_valid_clock
         or relevant_spacing_captures
         or relevant_offset_discontinuity_captures
         or binance_market_incomplete_captures
@@ -3419,7 +3556,7 @@ def audit_phase10_continuity(
         or hyperliquid_outage_audit.in_window_gap_events
         or binance_outage_audit.unclean_in_window_disconnect_events
         or hyperliquid_outage_audit.unclean_in_window_disconnect_events
-        or clock_audit.in_window_invalid_events
+        or clock_audit.in_window_hard_invalid_events
         or clock_audit.in_window_failure_events
     ):
         strict_all = []
@@ -3468,6 +3605,20 @@ def audit_phase10_continuity(
                 assessed_end,
             )
 
+    relevant_consecutive_rejection_captures = tuple(
+        sorted(
+            capture
+            for capture, (assessed_start, assessed_end) in assessed_by_capture.items()
+            if any(
+                outage.start < assessed_end and outage.end > assessed_start
+                for outage in clock_audit.consecutive_rejection_outages.get(
+                    capture,
+                    (),
+                )
+            )
+        )
+    )
+
     assessed_span: tuple[datetime, datetime] | None = None
     internal_gap_count = 0
     uncovered = timedelta()
@@ -3480,7 +3631,7 @@ def audit_phase10_continuity(
             (
                 interval
                 for capture in assessed_by_capture
-                for interval in clock_by_capture[capture]
+                for interval in clock_by_capture.get(capture, ())
             ),
             assessed_start,
             assessed_end,
@@ -3498,6 +3649,7 @@ def audit_phase10_continuity(
             and not hyperliquid_market_incomplete_captures
             and not multiple_hyperliquid_active_captures
             and not relevant_spacing_captures
+            and not relevant_consecutive_rejection_captures
             and not relevant_offset_discontinuity_captures
             and clock_audit.unbound_invalid_events == 0
             and not initial_clock_delay_violations
@@ -3513,7 +3665,7 @@ def audit_phase10_continuity(
             and hyperliquid_outage_audit.in_window_gap_events == 0
             and binance_outage_audit.unclean_in_window_disconnect_events == 0
             and hyperliquid_outage_audit.unclean_in_window_disconnect_events == 0
-            and clock_audit.in_window_invalid_events == 0
+            and clock_audit.in_window_hard_invalid_events == 0
             and clock_audit.in_window_failure_events == 0
         )
 
@@ -3642,11 +3794,13 @@ def audit_phase10_continuity(
     )
     if relevant_spacing_captures:
         reasons.append("clock_sync_sample_spacing_exceeded")
+    if relevant_consecutive_rejection_captures:
+        reasons.append("clock_sync_consecutive_rejected_probes")
     if relevant_offset_discontinuity_captures:
         reasons.append("clock_sync_offset_discontinuity")
     if clock_audit.unbound_invalid_events:
         reasons.append("clock_sync_invalid_event_unbound")
-    if clock_audit.in_window_invalid_events:
+    if clock_audit.in_window_hard_invalid_events:
         reasons.append("clock_sync_in_window_invalid_sample")
     if clock_audit.in_window_failure_events:
         reasons.append("clock_sync_in_window_failure_event")
@@ -3842,12 +3996,39 @@ def audit_phase10_continuity(
             "legacy_v1_ignored": clock_audit.legacy_samples,
             "valid_v2_samples": clock_audit.valid_samples,
             "invalid_v2_samples": clock_audit.invalid_samples,
+            "rejected_probe_samples": clock_audit.rejected_probe_samples,
+            "hard_invalid_v2_samples": clock_audit.hard_invalid_samples,
             "failure_events": clock_audit.failure_events,
             "strict_policy_rejections": clock_audit.policy_rejections,
             "wire_identity_rejections": clock_audit.identity_rejections,
             "unbound_invalid_events": clock_audit.unbound_invalid_events,
             "in_window_invalid_events": clock_audit.in_window_invalid_events,
+            "in_window_rejected_probe_events": (
+                clock_audit.in_window_rejected_probe_events
+            ),
+            "in_window_hard_invalid_events": (
+                clock_audit.in_window_hard_invalid_events
+            ),
             "in_window_failure_events": clock_audit.in_window_failure_events,
+            "consecutive_rejection_violations": (
+                clock_audit.consecutive_rejection_violations
+            ),
+            "consecutive_rejection_violation_capture_generations": list(
+                relevant_consecutive_rejection_captures
+            ),
+            "consecutive_rejection_outages": _interval_payload(
+                tuple(
+                    outage
+                    for capture in sorted(clock_audit.consecutive_rejection_outages)
+                    for outage in clock_audit.consecutive_rejection_outages[capture]
+                )
+            ),
+            "max_consecutive_rejected_probes": (
+                clock_audit.max_consecutive_rejected_probes
+            ),
+            "strict_max_consecutive_rejected_probes": (
+                MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES
+            ),
             "sample_spacing_violations": clock_audit.spacing_violations,
             "sample_spacing_violation_capture_generations": list(
                 relevant_spacing_captures

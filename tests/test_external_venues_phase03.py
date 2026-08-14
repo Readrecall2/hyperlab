@@ -2222,6 +2222,11 @@ def _runtime_http_measurement() -> object:
             request_completion_sequence=7,
             finalization_completion_sequence=7,
             post_request_observation_current=True,
+            peer_ip="192.0.2.9",
+            peer_port=443,
+            socket_family="AF_INET",
+            response_cloudfront_pop="SIN2-P11",
+            response_cache="Miss from cloudfront",
         ),
     )
 
@@ -2390,6 +2395,11 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latest["urllib3_connection_reused"] is True
         assert latest["tls_socket_reused"] is True
         assert latest["tls_session_reused"] is None
+        assert latest["peer_ip"] == "192.0.2.9"
+        assert latest["peer_port"] == 443
+        assert latest["socket_family"] == "AF_INET"
+        assert latest["response_cloudfront_pop"] == "SIN2-P11"
+        assert latest["response_cache"] == "Miss from cloudfront"
         for legacy_name in (
             "urllib3_pool_object_delta",
             "urllib3_pool_request_delta",
@@ -2572,6 +2582,210 @@ def test_clock_sampling_continues_and_invalid_sample_breaks_readiness_and_covera
     assert clock_rows[1]["causal_valid_from"] is None
     assert clock_rows[1]["causal_valid_until"] is None
     assert clock_rows[0]["causal_valid_until"] < clock_rows[4]["causal_valid_from"]
+
+
+@pytest.mark.parametrize(
+    ("rejected_at_seconds", "expected_still_valid"),
+    ((5, True), (16, False)),
+    ids=("before-prior-expiry", "after-prior-expiry"),
+)
+def test_high_rtt_probe_never_extends_and_only_preserves_live_prior_clock_interval(
+    tmp_path: Path,
+    rejected_at_seconds: int,
+    expected_still_valid: bool,
+) -> None:
+    manual = ManualTime()
+    rest = ScriptedClockRest(
+        [
+            _clock_measurement_at(0, 20),
+            _clock_measurement_at(rejected_at_seconds, 102),
+        ]
+    )
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / f"clock-rejection-{rejected_at_seconds}",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / f"clock-rejection-{rejected_at_seconds}.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+
+    try:
+        collector._schedule_clock_sample(
+            connection_id="public-1",
+            connection_epoch=1,
+            capture_epoch_id="capture-1",
+        )
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-1",
+            wait=True,
+        )
+        accepted_until = collector._valid_clock_until
+        assert accepted_until is not None
+        collector._refresh_capture_readiness(
+            at=manual.now(),
+            pending_l2_resync_assets=set(),
+        )
+        assert collector.metrics["capture_ready"] is True
+
+        manual.seconds = rejected_at_seconds + 0.102
+        collector._schedule_clock_sample(
+            connection_id="public-1",
+            connection_epoch=1,
+            capture_epoch_id="capture-1",
+        )
+        assert collector._drain_clock_sample(
+            active_capture_epoch_id="capture-1",
+            wait=True,
+        )
+
+        assert collector.metrics["clock_samples_invalid"] == 1
+        assert collector._valid_clock_until == (
+            accepted_until if expected_still_valid else None
+        )
+        assert collector.metrics["clock_sync_valid"] is expected_still_valid
+        assert collector.metrics["capture_ready"] is expected_still_valid
+    finally:
+        collector.close()
+
+
+def test_second_consecutive_high_rtt_probe_revokes_live_runtime_clock_interval(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    rest = ScriptedClockRest(
+        [
+            _clock_measurement_at(0, 20),
+            _clock_measurement_at(5, 102),
+            _clock_measurement_at(10, 102),
+        ]
+    )
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        rest=rest,  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "clock-consecutive-rejections",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "clock-consecutive-rejections.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+
+    try:
+        for index, seconds in enumerate((0.02, 5.102, 10.102)):
+            manual.seconds = seconds
+            collector._schedule_clock_sample(
+                connection_id="public-1",
+                connection_epoch=1,
+                capture_epoch_id="capture-1",
+            )
+            assert collector._drain_clock_sample(
+                active_capture_epoch_id="capture-1",
+                wait=True,
+            )
+            if index == 0:
+                collector._refresh_capture_readiness(
+                    at=manual.now(),
+                    pending_l2_resync_assets=set(),
+                )
+                assert collector.metrics["capture_ready"] is True
+            elif index == 1:
+                assert collector.metrics["clock_sync_valid"] is True
+                assert collector.metrics["capture_ready"] is True
+
+        assert collector.metrics["clock_samples_valid"] == 1
+        assert collector.metrics["clock_samples_invalid"] == 2
+        assert collector.metrics["clock_consecutive_rejected_probes"] == 2
+        assert collector.metrics["clock_rejected_probe_streak_high_water"] == 2
+        assert collector._valid_clock_until is None
+        assert collector.metrics["clock_sync_valid"] is False
+        assert collector.metrics["capture_ready"] is False
+    finally:
+        collector.close()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        (
+            {"clock_sampling_interval_seconds": 10.001},
+            "strict 10 second gate",
+        ),
+        ({"clock_max_age_seconds": 15.001}, "strict 15 second gate"),
+        (
+            {"clock_max_uncertainty_ms": Decimal("50.001")},
+            "strict 50 ms gate",
+        ),
+    ),
+)
+def test_reference_collector_config_cannot_loosen_strict_clock_gates(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ReferenceCollectorConfig(**overrides)  # type: ignore[arg-type]
+
+
+def test_stricter_runtime_threshold_rejection_is_not_bridgeable_as_over_50_ms(
+    tmp_path: Path,
+) -> None:
+    manual = ManualTime()
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(
+            assets=("BTC",),
+            candle_intervals=("1m",),
+            batch_size=100,
+            queue_capacity=200,
+            clock_max_uncertainty_ms=Decimal("25"),
+        ),
+        rest=ScriptedClockRest(
+            [_clock_measurement_at(0, 20), _clock_measurement_at(5, 60)]
+        ),  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "clock-stricter-threshold",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "clock-stricter-threshold.json",
+        clock=manual.now,
+        monotonic=manual.monotonic,
+    )
+
+    try:
+        for seconds in (0.02, 5.06):
+            manual.seconds = seconds
+            collector._schedule_clock_sample(
+                connection_id="public-1",
+                connection_epoch=1,
+                capture_epoch_id="capture-1",
+            )
+            assert collector._drain_clock_sample(
+                active_capture_epoch_id="capture-1",
+                wait=True,
+            )
+
+        assert collector.metrics["clock_samples_invalid"] == 1
+        assert collector.metrics["clock_consecutive_rejected_probes"] == 0
+        assert collector._valid_clock_until is None
+        assert collector.metrics["clock_sync_valid"] is False
+    finally:
+        collector.close()
 
 
 def test_binance_coordinated_writer_error_is_fatal_without_reconnect(

@@ -41,6 +41,10 @@ from hyperlab.venues.binance import (
 _CLOCK_OBSERVABILITY_CAPACITY = 256
 _GENERATION_REASON_HISTORY_CAPACITY = 32
 _OBSERVABILITY_ERROR_MESSAGE_LIMIT = 512
+_MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES = 1
+_STRICT_MAX_CLOCK_SAMPLING_INTERVAL_SECONDS = 10.0
+_STRICT_MAX_CLOCK_AGE_SECONDS = 15.0
+_STRICT_MAX_CLOCK_UNCERTAINTY_MS = Decimal("50")
 
 
 @dataclass(slots=True)
@@ -88,8 +92,14 @@ class ReferenceCollectorConfig:
             raise ValueError("reference collector timeouts must be positive")
         if self.clock_max_age_seconds < self.clock_sampling_interval_seconds:
             raise ValueError("clock maximum age cannot be shorter than its sampling interval")
+        if self.clock_sampling_interval_seconds > _STRICT_MAX_CLOCK_SAMPLING_INTERVAL_SECONDS:
+            raise ValueError("clock sampling interval cannot exceed the strict 10 second gate")
+        if self.clock_max_age_seconds > _STRICT_MAX_CLOCK_AGE_SECONDS:
+            raise ValueError("clock maximum age cannot exceed the strict 15 second gate")
         if not self.clock_max_uncertainty_ms.is_finite() or self.clock_max_uncertainty_ms < 0:
             raise ValueError("clock maximum uncertainty must be finite and non-negative")
+        if self.clock_max_uncertainty_ms > _STRICT_MAX_CLOCK_UNCERTAINTY_MS:
+            raise ValueError("clock maximum uncertainty cannot exceed the strict 50 ms gate")
 
 
 class _SocketRoleFailure(ConnectionError):
@@ -165,6 +175,7 @@ class BinanceReferenceCollector:
         ] = {}
         self._critical_stream_seen: set[str] = set()
         self._valid_clock_until: datetime | None = None
+        self._clock_rejection_streak = 0
         self._clock_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="binance-public-clock",
@@ -199,6 +210,8 @@ class BinanceReferenceCollector:
             "clock_samples": 0,
             "clock_samples_valid": 0,
             "clock_samples_invalid": 0,
+            "clock_consecutive_rejected_probes": 0,
+            "clock_rejected_probe_streak_high_water": 0,
             "clock_sample_failures": 0,
             "capture_ready": False,
             "missing_required_streams": [],
@@ -907,6 +920,13 @@ class BinanceReferenceCollector:
             "tls_socket_identity": (None if diagnostics is None else diagnostics.tls_socket_identity),
             "tls_socket_reused": (None if diagnostics is None else diagnostics.tls_socket_reused),
             "tls_session_reused": (None if diagnostics is None else diagnostics.tls_session_reused),
+            "peer_ip": None if diagnostics is None else diagnostics.peer_ip,
+            "peer_port": None if diagnostics is None else diagnostics.peer_port,
+            "socket_family": None if diagnostics is None else diagnostics.socket_family,
+            "response_cloudfront_pop": (
+                None if diagnostics is None else diagnostics.response_cloudfront_pop
+            ),
+            "response_cache": None if diagnostics is None else diagnostics.response_cache,
         }
         self._clock_observations.append(observation)
         self._clock_observations_seen += 1
@@ -1045,12 +1065,43 @@ class BinanceReferenceCollector:
         self.metrics[counter] = self._counter(counter) + 1
         valid_until = record.row["causal_valid_until"]
         if status == "valid" and isinstance(valid_until, datetime):
+            self._clock_rejection_streak = 0
+            self.metrics["clock_consecutive_rejected_probes"] = 0
             self._valid_clock_until = valid_until
             self.metrics["clock_sync_valid"] = True
         else:
-            self._valid_clock_until = None
-            self.metrics["capture_ready"] = False
-            self.metrics["clock_sync_valid"] = False
+            invalid_reason = record.row["invalid_reason"]
+            measured_uncertainty = Decimal(
+                str(record.row["drift_uncertainty_ms"])
+            )
+            expected_high_uncertainty_rejection = (
+                isinstance(invalid_reason, str)
+                and measured_uncertainty > _STRICT_MAX_CLOCK_UNCERTAINTY_MS
+                and invalid_reason.startswith("clock uncertainty exceeds threshold:")
+            )
+            if expected_high_uncertainty_rejection:
+                self._clock_rejection_streak += 1
+                self.metrics["clock_consecutive_rejected_probes"] = (
+                    self._clock_rejection_streak
+                )
+                self.metrics["clock_rejected_probe_streak_high_water"] = max(
+                    self._counter("clock_rejected_probe_streak_high_water"),
+                    self._clock_rejection_streak,
+                )
+            else:
+                self._clock_rejection_streak = 0
+                self.metrics["clock_consecutive_rejected_probes"] = 0
+            prior_interval_live = (
+                expected_high_uncertainty_rejection
+                and self._clock_rejection_streak
+                <= _MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES
+                and self._valid_clock_until is not None
+                and self.clock() < self._valid_clock_until
+            )
+            if not prior_interval_live:
+                self._valid_clock_until = None
+                self.metrics["capture_ready"] = False
+            self.metrics["clock_sync_valid"] = prior_interval_live
             self.metrics["maintenance_or_absence_detected"] = True
         return True
 
@@ -1187,6 +1238,8 @@ class BinanceReferenceCollector:
                 self.metrics["capture_ready"] = False
                 self.metrics["clock_sync_valid"] = False
                 self._valid_clock_until = None
+                self._clock_rejection_streak = 0
+                self.metrics["clock_consecutive_rejected_probes"] = 0
                 self.metrics["capture_epoch_id"] = capture_epoch_id
                 self.metrics["physical_connection_ids"] = dict(connection_ids)
                 open_errors: dict[str, _SocketRoleFailure] = {}

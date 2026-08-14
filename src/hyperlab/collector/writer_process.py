@@ -100,22 +100,28 @@ def _validate_child_flush(
     venues: tuple[str, ...],
     accepted_pending: Mapping[str, int],
     duplicates_pending: Mapping[str, int],
+    full_barrier: bool,
 ) -> None:
     if frozenset(results) != frozenset(venues):
         raise CoordinatedWriterError("process writer coordinated flush returned incompatible venues")
     for venue in venues:
         result = results[venue]
-        if result.row_count != accepted_pending[venue]:
+        accepted = accepted_pending[venue]
+        duplicates = duplicates_pending[venue]
+        if (full_barrier and result.row_count != accepted) or (
+            not full_barrier and result.row_count > accepted
+        ):
             raise CoordinatedWriterError(
-                "process writer durable-row accounting did not match accepted "
+                "process writer durable-row accounting was incompatible with accepted "
                 f"pending rows for {venue}: durable={result.row_count}, "
-                f"pending={accepted_pending[venue]}"
+                f"pending={accepted}, full_barrier={full_barrier}"
             )
-        if result.duplicate_count != duplicates_pending[venue]:
+        expected_duplicates = duplicates if full_barrier else 0
+        if result.duplicate_count != expected_duplicates:
             raise CoordinatedWriterError(
-                "process writer duplicate accounting did not match pending "
+                "process writer duplicate accounting was incompatible with pending "
                 f"duplicates for {venue}: durable={result.duplicate_count}, "
-                f"pending={duplicates_pending[venue]}"
+                f"pending={duplicates}, full_barrier={full_barrier}"
             )
 
 
@@ -204,26 +210,34 @@ def _writer_process_main(
         phase = value
         emit("phase", {"phase": phase})
 
-    def flush_payload(command_id: int | None, reason: str) -> dict[str, object]:
+    def flush_payload(
+        command_id: int | None,
+        reason: str,
+        *,
+        full_barrier: bool = True,
+    ) -> dict[str, object]:
         nonlocal phase
         phase = f"{reason}_flush"
         emit_phase(phase)
         started_ns = time.monotonic_ns()
         assert writer is not None
-        results = writer.flush_all()
+        results = writer.flush_all() if full_barrier else writer.flush_ready_all()
         ended_ns = time.monotonic_ns()
         _validate_child_flush(
             results,
             venues=venues,
             accepted_pending=accepted_pending,
             duplicates_pending=duplicates_pending,
+            full_barrier=full_barrier,
         )
         for venue in venues:
-            accepted_pending[venue] = 0
-            duplicates_pending[venue] = 0
+            result = results[venue]
+            accepted_pending[venue] -= result.row_count
+            duplicates_pending[venue] -= result.duplicate_count
         return {
             "command_id": command_id,
             "reason": reason,
+            "full_barrier": full_barrier,
             "results": results,
             "flush_duration_ns": max(ended_ns - started_ns, 0),
             "snapshot": snapshot_if_due(
@@ -338,8 +352,8 @@ def _writer_process_main(
                         "snapshot": snapshot_if_due(snapshot_phase=phase),
                     },
                 )
-                if sum(accepted_pending.values()) >= batch_size:
-                    emit("flush", flush_payload(None, "auto"))
+                if writer.should_flush:
+                    emit("flush", flush_payload(None, "auto", full_barrier=False))
                 current_command_id = None
                 continue
 
@@ -1146,10 +1160,18 @@ class CoordinatedWriterProcess:
         expected_kind: str,
     ) -> None:
         command_id = payload.get("command_id")
+        full_barrier_value = payload.get("full_barrier")
         results_value = payload.get("results")
         duration_ns = payload.get("flush_duration_ns")
         if command_id is not None and (isinstance(command_id, bool) or not isinstance(command_id, int)):
             raise CoordinatedWriterError("process writer flush command id is invalid")
+        if not isinstance(full_barrier_value, bool):
+            raise CoordinatedWriterError("process writer flush barrier classification is invalid")
+        full_barrier = full_barrier_value
+        if full_barrier != (command_id is not None):
+            raise CoordinatedWriterError(
+                "process writer flush barrier classification did not match its command id"
+            )
         if not isinstance(results_value, Mapping):
             raise CoordinatedWriterError("process writer flush results are not a mapping")
         if isinstance(duration_ns, bool) or not isinstance(duration_ns, int) or duration_ns < 0:
@@ -1162,13 +1184,22 @@ class CoordinatedWriterProcess:
             result = results_value[venue]
             if not isinstance(result, FlushResult):
                 raise CoordinatedWriterError("process writer flush result has an invalid type")
-            if result.row_count != self._accepted_pending_by_venue[venue]:
+            accepted_pending = self._accepted_pending_by_venue[venue]
+            duplicates_pending = self._duplicates_pending_by_venue[venue]
+            if (full_barrier and result.row_count != accepted_pending) or (
+                not full_barrier and result.row_count > accepted_pending
+            ):
                 raise CoordinatedWriterError(
-                    f"process writer durable-row accounting did not match accepted pending rows for {venue}"
+                    "process writer durable-row accounting was incompatible with accepted "
+                    f"pending rows for {venue}: durable={result.row_count}, "
+                    f"pending={accepted_pending}, full_barrier={full_barrier}"
                 )
-            if result.duplicate_count != self._duplicates_pending_by_venue[venue]:
+            expected_duplicates = duplicates_pending if full_barrier else 0
+            if result.duplicate_count != expected_duplicates:
                 raise CoordinatedWriterError(
-                    f"process writer duplicate accounting did not match pending duplicates for {venue}"
+                    "process writer duplicate accounting was incompatible with pending "
+                    f"duplicates for {venue}: durable={result.duplicate_count}, "
+                    f"pending={duplicates_pending}, full_barrier={full_barrier}"
                 )
             results[venue] = result
 
@@ -1182,8 +1213,8 @@ class CoordinatedWriterProcess:
 
         for venue in self._venues:
             result = results[venue]
-            self._accepted_pending_by_venue[venue] = 0
-            self._duplicates_pending_by_venue[venue] = 0
+            self._accepted_pending_by_venue[venue] -= result.row_count
+            self._duplicates_pending_by_venue[venue] -= result.duplicate_count
             self._outstanding_rows -= result.row_count
             self._durable_rows_by_venue[venue] += result.row_count
             self._completed[venue].add(result)

@@ -613,6 +613,7 @@ class CoordinatedWriterWorker:
             with self._condition:
                 self._add_timing[frame.venue].add(self._milliseconds(add_ended_ns - add_started_ns))
 
+        should_flush = self._writer.should_flush
         with self._condition:
             row_count = len(frame.records)
             duplicates = row_count - accepted
@@ -621,16 +622,45 @@ class CoordinatedWriterWorker:
             self._outstanding_rows -= duplicates
             self._frames_processed_by_venue[frame.venue] += 1
             self._last_processed_frame_sequence = frame.sequence
-            should_flush = sum(self._accepted_pending_by_venue.values()) >= self.batch_size
             self._check_accounting_locked()
         try:
             if should_flush:
                 self._set_phase("auto_flush")
-                self._flush_all()
+                self._flush_ready()
         finally:
             frame_ended_ns = self._monotonic_ns()
             with self._condition:
                 self._write_timing[frame.venue].add(self._milliseconds(frame_ended_ns - frame_started_ns))
+
+    def _flush_ready(self) -> None:
+        started_ns = self._monotonic_ns()
+        try:
+            results = self._writer.flush_ready_all()
+        finally:
+            ended_ns = self._monotonic_ns()
+            with self._condition:
+                self._flush_timing.add(self._milliseconds(ended_ns - started_ns))
+
+        with self._condition:
+            if frozenset(results) != self._venue_set:
+                raise CoordinatedWriterError("writer worker partial flush returned incompatible venues")
+            for venue in self._venues:
+                result = results[venue]
+                pending = self._accepted_pending_by_venue[venue]
+                if result.row_count > pending or result.duplicate_count != 0:
+                    raise CoordinatedWriterError(
+                        "writer worker partial durable-row accounting exceeded accepted "
+                        f"pending rows for {venue}: durable={result.row_count}, "
+                        f"pending={pending}, duplicates={result.duplicate_count}"
+                    )
+
+            for venue in self._venues:
+                result = results[venue]
+                self._accepted_pending_by_venue[venue] -= result.row_count
+                self._outstanding_rows -= result.row_count
+                self._durable_rows_by_venue[venue] += result.row_count
+                self._completed[venue].add(result)
+            self._check_accounting_locked()
 
     def _flush_all(self) -> None:
         started_ns = self._monotonic_ns()

@@ -131,6 +131,18 @@ incertaine est persistée comme invalide sans intervalle. Une déconnexion, une
 génération différente ou une mesure devenue stale coupe la couverture : aucun
 point n'est interpolé à travers cette période.
 
+Le transport REST réutilise une session HTTPS afin de ne pas inclure une nouvelle
+négociation DNS/TCP/TLS dans chaque échantillon. Le RTT de chaque requête reste
+mesuré en entier : cette optimisation ne réduit ni ne contourne le seuil de
+50 ms. Avant toute étude économique, le plus court horizon `H_min` devra être
+préenregistré. Sa politique d'acceptation sera
+`U_budget = min(50 ms, H_min / 10)`, avec l'incertitude effective comprenant
+`RTT / 2`, une allocation conservatrice de 1 ms pour la quantification du temps
+serveur Binance et toute erreur locale mesurée séparément. Une calibration
+indépendante devra satisfaire ce budget au p99 global et horaire ; sinon la
+Phase 10 reste bloquée ou l'horizon minimal est restreint prospectivement,
+jamais après lecture des résultats économiques.
+
 ## Démarrage, panne et arrêt
 
 Les deux workers attendent la même barrière de départ. Dès qu'un worker termine,
@@ -144,31 +156,52 @@ Les statuts restent séparés :
 - `data/runtime_status.json` pour Hyperliquid ;
 - `data/runtime_status_binance_usdm.json` pour Binance USD-M.
 
-## Smoke test causal de 15 minutes
+## Smoke test causal de 10 minutes
 
-Les bornes explicites isolent les lignes de la nouvelle collecte sans supprimer
-ni réécrire les données déjà présentes dans le lake :
+Une racine additive propre rend l'audit rapide et laisse le lake historique
+intact. Ne supprimez pas cette racine après le test : elle reste un artefact
+reproductible.
 
 ```powershell
-$SmokeStart = [DateTimeOffset]::UtcNow.ToString("o")
-.\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
-  --assets "BTC,ETH" `
-  --candle-intervals 1m `
-  --duration-seconds 900 `
-  --batch-size 10000 `
-  --history-lookback-hours 1
-$SmokeEnd = [DateTimeOffset]::UtcNow.ToString("o")
+$Phase10SmokeDir = Join-Path "data" `
+  ("phase10-smoke-" + [DateTimeOffset]::UtcNow.ToString("yyyyMMddTHHmmssZ"))
+$PreviousDataDir = $env:HYPERLAB_DATA_DIR
+try {
+  $env:HYPERLAB_DATA_DIR = $Phase10SmokeDir
+  $SmokeStart = [DateTimeOffset]::UtcNow.ToString("o")
+  .\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
+    --assets "BTC,ETH" `
+    --candle-intervals 1m `
+    --duration-seconds 600 `
+    --batch-size 10000 `
+    --history-lookback-hours 1
+  $SmokeEnd = [DateTimeOffset]::UtcNow.ToString("o")
+}
+finally {
+  if ($null -eq $PreviousDataDir) {
+    Remove-Item Env:HYPERLAB_DATA_DIR -ErrorAction SilentlyContinue
+  }
+  else {
+    $env:HYPERLAB_DATA_DIR = $PreviousDataDir
+  }
+}
 ```
 
 Après l'arrêt propre, l'audit exact est :
 
 ```powershell
-.\.venv\Scripts\python.exe -m hyperlab data continuity data\lake `
+.\.venv\Scripts\python.exe -m hyperlab data continuity `
+  (Join-Path $Phase10SmokeDir "lake") `
   --assets "BTC,ETH" `
   --start $SmokeStart `
   --end $SmokeEnd `
   --json
 ```
+
+Cette commande n'inventorie que la nouvelle racine. Sur `data\lake`, les bornes
+`--start` / `--end` sont exactes mais l'implémentation actuelle inventorie encore
+toutes les partitions requises avant de filtrer les lignes ; elle n'est donc pas
+un fast path physique pour le lake historique.
 
 Le code de sortie est `0` uniquement si, pour BTC et ETH, les trades normalisés
 et les wires `aggTrade` sont non nuls et reliés exactement. Le premier état L2

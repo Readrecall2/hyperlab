@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
+from threading import Lock
 from typing import Any, Protocol
+
+import requests
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
 from hyperlab.data.schema import RecordType, instrument, latest_schema_for
@@ -605,20 +605,50 @@ class JsonGetTransport(Protocol):
     def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any: ...
 
 
-class UrllibJsonTransport:
+class RequestsJsonTransport:
+    """Keyless GET transport with one reusable HTTPS connection pool."""
+
+    def __init__(self, *, session: requests.Session | None = None) -> None:
+        self._session = session or requests.Session()
+        self._session.trust_env = False
+        self._session.auth = None
+        self._session.headers.clear()
+        self._session.cookies.clear()
+        self._session.params.clear()
+        self._session.proxies.clear()
+        self._session.cert = None
+        self._session.verify = True
+        self._lock = Lock()
+        self._closed = False
+
     def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
-        query = urllib.parse.urlencode({key: str(value) for key, value in params.items()})
-        request_url = url if not query else f"{url}?{query}"
-        request = urllib.request.Request(
-            request_url,
-            method="GET",
-            headers={"User-Agent": "HyperLab/0.2 public-market-data"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Binance public HTTP error {exc.code}") from exc
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Binance public HTTP transport is closed")
+            response = self._session.get(
+                url,
+                params={key: str(value) for key, value in params.items()},
+                timeout=timeout_seconds,
+                headers={"User-Agent": "HyperLab/0.2 public-market-data"},
+                allow_redirects=False,
+            )
+            if 300 <= response.status_code < 400:
+                raise RuntimeError(
+                    f"Binance public HTTP redirect refused: {response.status_code}"
+                )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status = response.status_code
+                raise RuntimeError(f"Binance public HTTP error {status}") from exc
+            return response.json()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._session.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,10 +671,21 @@ class BinancePublicRestClient:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self.timeout_seconds = timeout_seconds
-        self.transport = transport or UrllibJsonTransport()
+        self.transport = transport or RequestsJsonTransport()
+        self._closed = False
         self.clock = clock
 
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.transport, "close", None)
+        if callable(close):
+            close()
+
     def _get(self, path: str, params: Mapping[str, object] | None = None) -> TimedPayload:
+        if self._closed:
+            raise RuntimeError("Binance public REST client is closed")
         if path not in PUBLIC_GET_PATHS:
             raise ValueError(f"Binance endpoint is outside the public market-data allowlist: {path}")
         sent = self.clock()

@@ -57,7 +57,7 @@ connexion physique, epoch, séquence d'arrivée et génération de capture. Chaq
 trade normalisé conserve les temps `T`/`E`, le temps de réception et la lignée
 physique de son wire brut. Les autres lignes normalisées conservent aussi le
 timestamp source lorsqu'il existe. La latence réseau corrigée est une
-**estimation** : `received - source + (local_midpoint - server)`. Elle reste
+**estimation** : `received - source - (local_midpoint - server)`. Elle reste
 signée et n'est jamais ramenée artificiellement à zéro.
 
 Le snapshot top-20 est enregistré sans fabriquer les niveaux absents et sans le
@@ -77,7 +77,10 @@ défaut, `drift_uncertainty_ms <= 50` produit l'intervalle semi-ouvert
 forte, une mesure stale, une déconnexion ou un changement de génération coupe la
 couverture ; aucune interpolation ne relie ces périodes. Les anciennes lignes
 `clock_sync` v1 restent lisibles mais ne fournissent aucune couverture causale à
-l'audit strict.
+l'audit strict. Le client REST réutilise une session HTTPS dédiée afin de ne pas
+rejouer DNS/TCP/TLS à chaque échantillon ; il ignore les identifiants, cookies,
+proxies et certificats ambiants, et refuse les redirections. Le RTT observé reste
+mesuré en entier et le seuil de 50 ms n'est pas relâché.
 
 ## Identité, mark, index et oracle
 

@@ -13,6 +13,7 @@ authors = [{ name = "Jj" }]
 dependencies = [
   "hyperliquid-python-sdk==0.24.0",
   "numpy>=2.0,<2.5",
+  "requests>=2.32,<3",
   "websocket-client==1.9.0",
   "pandas>=2.2,<3",
   "rich>=13.9,<15",

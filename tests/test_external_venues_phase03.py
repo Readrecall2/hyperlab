@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 import pyarrow.parquet as pq
 import pytest
+import requests
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
 from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError
@@ -21,6 +22,7 @@ from hyperlab.venues.binance import (
     PUBLIC_GET_PATHS,
     BinancePublicConnector,
     BinancePublicRestClient,
+    RequestsJsonTransport,
     clock_record,
     funding_intervals,
     normalize_exchange_info,
@@ -789,6 +791,16 @@ def test_clock_midpoint_drift_latency_and_uncertainty_are_preserved(tmp_path: Pa
     assert measurement.drift_uncertainty_ms == Decimal("20.0")
     assert measurement.adjusted_one_way_latency_ms(
         BASE + timedelta(milliseconds=100), BASE + timedelta(milliseconds=125)
+    ) == Decimal("20.0")
+    negative_drift = measure_clock(
+        "binance_usdm",
+        request_sent_time=BASE,
+        response_received_time=BASE + timedelta(milliseconds=40),
+        server_time=BASE + timedelta(milliseconds=25),
+    )
+    assert negative_drift.estimated_clock_drift_ms == Decimal("-5.0")
+    assert negative_drift.adjusted_one_way_latency_ms(
+        BASE + timedelta(milliseconds=100), BASE + timedelta(milliseconds=125)
     ) == Decimal("30.0")
     record = clock_record(measurement, "clock-1")
     assert record.record_type == RecordType.CLOCK_SYNC
@@ -804,10 +816,154 @@ def test_clock_midpoint_drift_latency_and_uncertainty_are_preserved(tmp_path: Pa
 class FakeTransport:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object], float]] = []
+        self.close_calls = 0
 
     def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
         self.calls.append((url, dict(params), timeout_seconds))
         return {"serverTime": 1_786_492_800_000}
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: object, *, status_code: int = 200) -> None:
+        self.payload = payload
+        self.raise_calls = 0
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        self.raise_calls += 1
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self) -> object:
+        return self.payload
+
+
+class FakeReusableSession:
+    def __init__(self, *, status_code: int = 200) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.responses: list[FakeHttpResponse] = []
+        self.close_calls = 0
+        self.trust_env = True
+        self.auth: object = ("ambient-user", "must-not-leak")
+        self.headers = {"X-MBX-APIKEY": "must-not-leak"}
+        self.cookies = {"session": "must-not-leak"}
+        self.params = {"apiKey": "must-not-leak"}
+        self.proxies = {"https": "https://ambient.invalid"}
+        self.cert: object = "ambient-client-cert"
+        self.verify = False
+        self.status_code = status_code
+
+    def get(self, url: str, **kwargs: object) -> FakeHttpResponse:
+        response = FakeHttpResponse(
+            {"serverTime": 1_786_492_800_000 + len(self.calls)},
+            status_code=self.status_code,
+        )
+        self.calls.append({"url": url, **kwargs})
+        self.responses.append(response)
+        return response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_rest_transport_reuses_one_http_session_for_clock_samples() -> None:
+    session = FakeReusableSession()
+    transport = RequestsJsonTransport(session=session)  # type: ignore[arg-type]
+
+    first = transport.get_json(
+        "https://fapi.binance.com/fapi/v1/time",
+        {},
+        15.0,
+    )
+    second = transport.get_json(
+        "https://fapi.binance.com/fapi/v1/time",
+        {},
+        15.0,
+    )
+    transport.close()
+    transport.close()
+
+    assert first == {"serverTime": 1_786_492_800_000}
+    assert second == {"serverTime": 1_786_492_800_001}
+    assert len(session.calls) == 2
+    assert {call["url"] for call in session.calls} == {
+        "https://fapi.binance.com/fapi/v1/time"
+    }
+    assert all(call["timeout"] == 15.0 for call in session.calls)
+    assert all(call["params"] == {} for call in session.calls)
+    assert all(call["allow_redirects"] is False for call in session.calls)
+    assert all(
+        call["headers"] == {"User-Agent": "HyperLab/0.2 public-market-data"}
+        for call in session.calls
+    )
+    assert all(response.raise_calls == 1 for response in session.responses)
+    assert session.close_calls == 1
+    assert session.trust_env is False
+    assert session.auth is None
+    assert session.headers == {}
+    assert session.cookies == {}
+    assert session.params == {}
+    assert session.proxies == {}
+    assert session.cert is None
+    assert session.verify is True
+    with pytest.raises(RuntimeError, match="transport is closed"):
+        transport.get_json("https://fapi.binance.com/fapi/v1/time", {}, 15.0)
+
+
+def test_rest_transport_cannot_inherit_credentials_or_redirect() -> None:
+    session = requests.Session()
+    session.auth = ("ambient-user", "must-not-leak")
+    session.headers.update(
+        {
+            "Authorization": "Bearer must-not-leak",
+            "Cookie": "session=must-not-leak",
+            "X-MBX-APIKEY": "must-not-leak",
+        }
+    )
+    session.cookies.set("session", "must-not-leak")
+    session.params["apiKey"] = "must-not-leak"
+    session.proxies["https"] = "https://ambient.invalid"
+    session.cert = "ambient-client-cert"
+    session.verify = False
+
+    transport = RequestsJsonTransport(session=session)
+    prepared = session.prepare_request(
+        requests.Request("GET", "https://fapi.binance.com/fapi/v1/time")
+    )
+    try:
+        assert session.trust_env is False
+        assert session.auth is None
+        assert session.params == {}
+        assert session.proxies == {}
+        assert session.cert is None
+        assert session.verify is True
+        assert not session.cookies
+        assert {
+            name.lower() for name in prepared.headers
+        }.isdisjoint({"authorization", "cookie", "x-mbx-apikey"})
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    ((302, "redirect refused: 302"), (429, "HTTP error 429")),
+)
+def test_rest_transport_fails_closed_on_redirects_and_http_errors(
+    status_code: int,
+    message: str,
+) -> None:
+    transport = RequestsJsonTransport(
+        session=FakeReusableSession(status_code=status_code),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(RuntimeError, match=message):
+            transport.get_json("https://fapi.binance.com/fapi/v1/time", {}, 15.0)
+    finally:
+        transport.close()
 
 
 def test_rest_client_is_get_only_keyless_and_rejects_every_unlisted_path() -> None:
@@ -820,6 +976,12 @@ def test_rest_client_is_get_only_keyless_and_rejects_every_unlisted_path() -> No
     assert all("order" not in path.lower() and "account" not in path.lower() for path in PUBLIC_GET_PATHS)
     with pytest.raises(ValueError, match="outside the public market-data allowlist"):
         client._get("/fapi/v1/order")
+    client.close()
+    client.close()
+
+    assert transport.close_calls == 1
+    with pytest.raises(RuntimeError, match="REST client is closed"):
+        client.clock_measurement()
 
 
 class KlinePagingTransport:
@@ -1620,9 +1782,10 @@ def test_binance_close_releases_sink_after_terminal_flush_failure(
     tmp_path: Path,
 ) -> None:
     sink = FailingTerminalFlushSink()
+    transport = FakeTransport()
     collector = BinanceReferenceCollector(
         ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
-        rest=BinancePublicRestClient(transport=FakeTransport()),
+        rest=BinancePublicRestClient(transport=transport),
         sink=sink,  # type: ignore[arg-type]
         runtime_status_path=tmp_path / "runtime-status.json",
         clock=lambda: BASE,
@@ -1635,5 +1798,6 @@ def test_binance_close_releases_sink_after_terminal_flush_failure(
         collector.close()
 
     assert sink.closed is True
+    assert transport.close_calls == 1
     assert collector.metrics["state"] == "failed"
     collector.close()

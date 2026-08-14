@@ -61,7 +61,7 @@ class ClockMeasurement:
         _utc(source_time, label="source_time")
         _utc(received_time, label="received_time")
         apparent = Decimal(str((received_time - source_time).total_seconds() * 1_000))
-        return apparent + self.estimated_clock_drift_ms
+        return apparent - self.estimated_clock_drift_ms
 
 
 def measure_clock(

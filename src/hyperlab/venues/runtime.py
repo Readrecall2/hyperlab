@@ -185,6 +185,12 @@ class BinanceReferenceCollector:
             self._clock_executor.shutdown(wait=True, cancel_futures=True)
         except BaseException as exc:
             errors.append(("clock sampler shutdown", exc))
+        close_rest = getattr(self.rest, "close", None)
+        if callable(close_rest):
+            try:
+                close_rest()
+            except BaseException as exc:
+                errors.append(("Binance REST transport close", exc))
         try:
             result = self.sink.flush()
             self.metrics["rows_written"] = self._counter("rows_written") + result.row_count

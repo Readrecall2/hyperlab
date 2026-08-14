@@ -15,13 +15,15 @@ juridictions.
 allowlist fermée : heure serveur, métadonnées, BBO, trades agrégés, funding et
 candles. Il ne possède aucun paramètre de clé, signature ou compte. Toute route
 ordre, position, compte, listen key, transfert ou authentification est rejetée
-avant le transport. Le WebSocket utilise uniquement les market streams publics.
+avant le transport. Le WebSocket utilise uniquement les flux publics Binance :
+`/public/stream` pour BBO/L2 et `/market/stream` pour `aggTrade`, mark et
+candles. Ces deux sockets sont supervisés comme une seule génération de capture.
 
 Commande de collecte simultanée avec Hyperliquid :
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
-  --assets BTC,ETH `
+  --assets "BTC,ETH" `
   --candle-intervals 1m `
   --duration-seconds 600
 ```
@@ -42,27 +44,40 @@ pour l'audit du writer, la commande longue et les contrôles post-capture.
 | Besoin | Surface publique | Normalisation |
 |---|---|---|
 | identité et tailles | `GET /fapi/v1/exchangeInfo` | `BTCUSDT → BTC`, linéaire, quantité en BTC, tick/step conservés |
-| BBO | `<symbol>@bookTicker` | prix USDT par base, quantités en unité de base, `u` conservé |
-| L2 | `<symbol>@depth20@100ms` | snapshot top-20 complet, deux côtés, dernier update ID, epoch de carnet et niveaux ordonnés |
-| trades | `<symbol>@aggTrade` | ID agrégé, prix, quantité de base, côté agresseur dérivé de `m` |
+| BBO | `/public/stream` : `<symbol>@bookTicker` | prix USDT par base, quantités en unité de base, `u` conservé |
+| L2 | `/public/stream` : `<symbol>@depth20@100ms` | snapshot top-20 complet, deux côtés, dernier update ID, epoch de carnet et niveaux ordonnés |
+| trades | `/market/stream` : `<symbol>@aggTrade` | ID agrégé, prix, quantité de base, côté agresseur dérivé de `m` |
 | funding courant | `<symbol>@markPrice@1s` | taux conservé ; index présent seulement dans le wire brut |
 | funding réalisé | `GET /fapi/v1/fundingRate` | règlement et mark Binance ; cadence ajustée issue de `fundingInfo`, sinon minimum observé sur au moins deux règlements |
 | candles | REST `klines` + `<symbol>@kline_<interval>` | OHLCV, révisions et finalité source WebSocket |
-| horloge | `GET /fapi/v1/time` | RTT, drift par midpoint et incertitude `RTT / 2` |
+| horloge | `GET /fapi/v1/time`, toutes les 5 s | RTT, drift par midpoint, incertitude `RTT / 2` et validité causale bornée |
 
 Les payloads WebSocket bruts sont conservés avec horodatage de réception,
-connexion, epoch et séquence d'arrivée. Les lignes normalisées conservent aussi
-le timestamp source lorsqu'il existe. La latence réseau corrigée est une
+connexion physique, epoch, séquence d'arrivée et génération de capture. Chaque
+trade normalisé conserve les temps `T`/`E`, le temps de réception et la lignée
+physique de son wire brut. Les autres lignes normalisées conservent aussi le
+timestamp source lorsqu'il existe. La latence réseau corrigée est une
 **estimation** : `received - source + (local_midpoint - server)`. Elle reste
 signée et n'est jamais ramenée artificiellement à zéro.
 
 Le snapshot top-20 est enregistré sans fabriquer les niveaux absents et sans le
 transformer artificiellement en delta. Le premier snapshot de chaque actif après
-connexion produit `resync_start` et `resync_complete`, associés à son
-`book_epoch_id` et à son `snapshot_id`. Les flux BBO et L2 sont surveillés
-séparément pour chaque actif ; leur silence au-delà du seuil de staleness
-provoque un gap historique et une reconnexion, même si d'autres canaux continuent
-à recevoir des messages.
+génération produit `resync_start` et `resync_complete`, associés à son
+`book_epoch_id` et à son `snapshot_id`. Les snapshots exacts suivants ne
+rafraîchissent la couverture que dans cette même connexion publique, epoch et
+carnet déjà armés. Les flux BBO et L2 sont surveillés
+séparément pour chaque actif, tout comme `aggTrade` ; leur silence au-delà du
+seuil de staleness provoque un gap historique, la fermeture des deux sockets et
+une reconnexion commune, même si d'autres canaux continuent à recevoir des
+messages.
+
+Une mesure d'horloge ne devient causale qu'à sa réception. Avec les seuils par
+défaut, `drift_uncertainty_ms <= 50` produit l'intervalle semi-ouvert
+`[response_received_time, response_received_time + 15 s)`. Une incertitude plus
+forte, une mesure stale, une déconnexion ou un changement de génération coupe la
+couverture ; aucune interpolation ne relie ces périodes. Les anciennes lignes
+`clock_sync` v1 restent lisibles mais ne fournissent aucune couverture causale à
+l'audit strict.
 
 ## Identité, mark, index et oracle
 

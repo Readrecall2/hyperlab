@@ -149,6 +149,7 @@ _V1_SPECS = (
             _field("raw_message", pa.string()),
             _field("is_json", pa.bool_()),
             _field("payload_sha256", pa.string()),
+            _field("capture_epoch_id", pa.string(), nullable=True),
         ],
         primary_key=(
             "venue",
@@ -162,6 +163,7 @@ _V1_SPECS = (
             "connection_epoch",
             "arrival_sequence",
         ),
+        version=2,
     ),
     _make_spec(
         RecordType.CANDLE,
@@ -260,9 +262,12 @@ _V1_SPECS = (
             _field("quantity", MARKET_DECIMAL),
             _field("quote_quantity", MARKET_DECIMAL, nullable=True),
             _field("is_liquidation", pa.bool_(), nullable=True),
+            _field("connection_epoch", pa.uint64(), nullable=True),
+            _field("arrival_sequence", pa.uint64(), nullable=True),
         ],
         primary_key=("venue", "asset", "trade_id"),
         order_key=("event_time", "received_time", "source_sequence", "trade_id"),
+        version=2,
     ),
     _make_spec(
         RecordType.FUNDING,
@@ -314,9 +319,13 @@ _V1_SPECS = (
             _field("expected_sequence", pa.uint64(), nullable=True),
             _field("observed_sequence", pa.uint64(), nullable=True),
             _field("resync_snapshot_id", pa.string(), nullable=True),
+            _field("connection_epoch", pa.uint64(), nullable=True),
+            _field("capture_epoch_id", pa.string(), nullable=True),
+            _field("socket_role", pa.string(), nullable=True),
         ],
         primary_key=("venue", "asset", "connection_id", "event_time", "event_kind"),
         order_key=("event_time", "received_time", "source_sequence", "event_kind"),
+        version=2,
     ),
     _make_spec(
         RecordType.INSTRUMENT_LIFECYCLE,
@@ -341,13 +350,47 @@ _V1_SPECS = (
             _field("estimated_clock_drift_ms", MARKET_DECIMAL),
             _field("drift_uncertainty_ms", MARKET_DECIMAL),
             _field("observation_id", pa.string()),
+            _field("connection_epoch", pa.uint64(), nullable=True),
+            _field("capture_epoch_id", pa.string(), nullable=True),
+            _field("causal_valid_from", UTC_TIMESTAMP, nullable=True),
+            _field("causal_valid_until", UTC_TIMESTAMP, nullable=True),
+            _field("sample_status", pa.string(), nullable=True),
+            _field("invalid_reason", pa.string(), nullable=True),
+            _field("sampling_interval_ms", pa.uint64(), nullable=True),
+            _field("max_age_ms", pa.uint64(), nullable=True),
+            _field("max_uncertainty_ms", MARKET_DECIMAL, nullable=True),
         ],
         primary_key=("venue", "observation_id"),
         order_key=("event_time", "received_time", "observation_id"),
+        version=2,
     ),
 )
 
 _LEGACY_V1_SPECS = (
+    _make_spec(
+        RecordType.WIRE_MESSAGE,
+        [
+            _field("connection_epoch", pa.uint64()),
+            _field("arrival_sequence", pa.uint64()),
+            _field("channel", pa.string(), nullable=True),
+            _field("message_asset", pa.string(), nullable=True),
+            _field("raw_message", pa.string()),
+            _field("is_json", pa.bool_()),
+            _field("payload_sha256", pa.string()),
+        ],
+        primary_key=(
+            "venue",
+            "connection_id",
+            "connection_epoch",
+            "arrival_sequence",
+        ),
+        order_key=(
+            "event_time",
+            "received_time",
+            "connection_epoch",
+            "arrival_sequence",
+        ),
+    ),
     _make_spec(
         RecordType.CANDLE,
         [
@@ -390,6 +433,47 @@ _LEGACY_V1_SPECS = (
         ],
         primary_key=("venue", "asset", "funding_time", "rate_kind"),
         order_key=("event_time", "received_time", "source_sequence", "funding_time"),
+    ),
+    _make_spec(
+        RecordType.TRADE,
+        [
+            _field("trade_id", pa.string()),
+            _field("aggressor_side", pa.string()),
+            _field("price", MARKET_DECIMAL),
+            _field("quantity", MARKET_DECIMAL),
+            _field("quote_quantity", MARKET_DECIMAL, nullable=True),
+            _field("is_liquidation", pa.bool_(), nullable=True),
+        ],
+        primary_key=("venue", "asset", "trade_id"),
+        order_key=("event_time", "received_time", "source_sequence", "trade_id"),
+    ),
+    _make_spec(
+        RecordType.CONNECTION_EVENT,
+        [
+            _field("event_kind", pa.string()),
+            _field("channel", pa.string(), nullable=True),
+            _field("book_epoch_id", pa.string(), nullable=True),
+            _field("reason", pa.string(), nullable=True),
+            _field("expected_sequence", pa.uint64(), nullable=True),
+            _field("observed_sequence", pa.uint64(), nullable=True),
+            _field("resync_snapshot_id", pa.string(), nullable=True),
+        ],
+        primary_key=("venue", "asset", "connection_id", "event_time", "event_kind"),
+        order_key=("event_time", "received_time", "source_sequence", "event_kind"),
+    ),
+    _make_spec(
+        RecordType.CLOCK_SYNC,
+        [
+            _field("request_sent_time", UTC_TIMESTAMP),
+            _field("response_received_time", UTC_TIMESTAMP),
+            _field("server_time", UTC_TIMESTAMP),
+            _field("round_trip_latency_ms", MARKET_DECIMAL),
+            _field("estimated_clock_drift_ms", MARKET_DECIMAL),
+            _field("drift_uncertainty_ms", MARKET_DECIMAL),
+            _field("observation_id", pa.string()),
+        ],
+        primary_key=("venue", "observation_id"),
+        order_key=("event_time", "received_time", "observation_id"),
     ),
 )
 

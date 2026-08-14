@@ -3,16 +3,19 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
 from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError, LakeSink
 from hyperlab.collector.websocket import PublicSocket, UrlWebsocketClientFactory
-from hyperlab.data.schema import RecordType
+from hyperlab.data.schema import RecordType, latest_schema_for
 from hyperlab.storage.sqlite import write_runtime_status
+from hyperlab.venues.base import ClockMeasurement
 from hyperlab.venues.binance import (
     VENUE,
     BinancePublicConnector,
@@ -37,6 +40,9 @@ class ReferenceCollectorConfig:
     queue_capacity: int = 10_000
     connect_timeout_seconds: float = 15.0
     stale_after_seconds: float = 30.0
+    clock_sampling_interval_seconds: float = 5.0
+    clock_max_age_seconds: float = 15.0
+    clock_max_uncertainty_ms: Decimal = Decimal("50")
 
     def __post_init__(self) -> None:
         if not self.assets or len(self.assets) != len(set(self.assets)):
@@ -47,8 +53,20 @@ class ReferenceCollectorConfig:
             raise ValueError("reference collector limits must be positive")
         if self.queue_capacity < self.batch_size:
             raise ValueError("queue capacity cannot be smaller than batch size")
-        if self.connect_timeout_seconds <= 0 or self.stale_after_seconds <= 0:
+        if (
+            self.connect_timeout_seconds <= 0
+            or self.stale_after_seconds <= 0
+            or self.clock_sampling_interval_seconds <= 0
+            or self.clock_max_age_seconds <= 0
+        ):
             raise ValueError("reference collector timeouts must be positive")
+        if self.clock_max_age_seconds < self.clock_sampling_interval_seconds:
+            raise ValueError("clock maximum age cannot be shorter than its sampling interval")
+        if (
+            not self.clock_max_uncertainty_ms.is_finite()
+            or self.clock_max_uncertainty_ms < 0
+        ):
+            raise ValueError("clock maximum uncertainty must be finite and non-negative")
 
 
 class BinanceReferenceCollector:
@@ -72,9 +90,21 @@ class BinanceReferenceCollector:
         self.monotonic = monotonic
         self._stop = False
         self._closed = False
-        self._socket: PublicSocket | None = None
+        self._sockets: dict[str, PublicSocket] = {}
         self._connector: BinancePublicConnector | None = None
         self._critical_stream_last_received: dict[str, datetime] = {}
+        self._critical_stream_expectations: dict[
+            str,
+            tuple[str, RecordType, str],
+        ] = {}
+        self._critical_stream_seen: set[str] = set()
+        self._valid_clock_until: datetime | None = None
+        self._clock_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="binance-public-clock",
+        )
+        self._clock_future: Future[ClockMeasurement] | None = None
+        self._clock_future_context: tuple[str, str, int] | None = None
         self.metrics: dict[str, object] = {
             "venue": VENUE,
             "state": "stopped",
@@ -83,7 +113,16 @@ class BinanceReferenceCollector:
             "rows_written": 0,
             "normalization_issues": 0,
             "connections": 0,
+            "physical_connections": 0,
             "reconnects": 0,
+            "clock_samples": 0,
+            "clock_samples_valid": 0,
+            "clock_samples_invalid": 0,
+            "clock_sample_failures": 0,
+            "capture_ready": False,
+            "missing_required_streams": [],
+            "pending_l2_resync_assets": list(config.assets),
+            "clock_sync_valid": False,
             "maintenance_or_absence_detected": False,
             "last_error": None,
         }
@@ -117,8 +156,16 @@ class BinanceReferenceCollector:
 
     def stop(self) -> None:
         self._stop = True
-        if self._socket is not None:
-            self._socket.close()
+        for socket in tuple(self._sockets.values()):
+            with suppress(Exception):
+                socket.close()
+
+    def _close_sockets(self) -> None:
+        sockets = tuple(self._sockets.values())
+        self._sockets.clear()
+        for socket in sockets:
+            with suppress(Exception):
+                socket.close()
 
     def _interruptible_sleep(self, delay_seconds: float) -> None:
         deadline = self.monotonic() + max(delay_seconds, 0.0)
@@ -134,6 +181,10 @@ class BinanceReferenceCollector:
         self._closed = True
         self.stop()
         errors: list[tuple[str, BaseException]] = []
+        try:
+            self._clock_executor.shutdown(wait=True, cancel_futures=True)
+        except BaseException as exc:
+            errors.append(("clock sampler shutdown", exc))
         try:
             result = self.sink.flush()
             self.metrics["rows_written"] = self._counter("rows_written") + result.row_count
@@ -175,8 +226,11 @@ class BinanceReferenceCollector:
         event_kind: str,
         *,
         connection_id: str,
+        connection_epoch: int | None = None,
+        capture_epoch_id: str | None = None,
+        socket_role: str | None = None,
         asset: str = "GLOBAL",
-        channel: str = "combined_market_stream",
+        channel: str | None = None,
         book_epoch_id: str | None = None,
         reason: str | None = None,
         at: datetime | None = None,
@@ -186,7 +240,7 @@ class BinanceReferenceCollector:
         event_time = self.clock() if at is None else at
         received_time = event_time if received_at is None else received_at
         row = {
-            "schema_version": 1,
+            "schema_version": latest_schema_for(RecordType.CONNECTION_EVENT).version,
             "record_type": RecordType.CONNECTION_EVENT.value,
             "venue": VENUE,
             "asset": asset,
@@ -202,6 +256,9 @@ class BinanceReferenceCollector:
             "expected_sequence": None,
             "observed_sequence": None,
             "resync_snapshot_id": resync_snapshot_id,
+            "connection_epoch": connection_epoch,
+            "capture_epoch_id": capture_epoch_id,
+            "socket_role": socket_role,
         }
         self._add(ParsedRecord(RecordType.CONNECTION_EVENT, asset, row))
 
@@ -212,10 +269,61 @@ class BinanceReferenceCollector:
         at: datetime,
     ) -> None:
         channels: list[str] = []
+        expectations: dict[str, tuple[str, RecordType, str]] = {}
         for asset in self.config.assets:
             symbol = connector.instrument_for_asset(asset).source_symbol.lower()
-            channels.extend((f"{symbol}@bookTicker", f"{symbol}@depth20@100ms"))
+            for channel, record_type, socket_role in (
+                (f"{symbol}@bookTicker", RecordType.BBO, "public"),
+                (f"{symbol}@depth20@100ms", RecordType.L2_BOOK_STATE, "public"),
+                (f"{symbol}@aggTrade", RecordType.TRADE, "market"),
+            ):
+                channels.append(channel)
+                expectations[channel] = (asset, record_type, socket_role)
         self._critical_stream_last_received = {channel: at for channel in channels}
+        self._critical_stream_expectations = expectations
+        self._critical_stream_seen = set()
+
+    def _refresh_capture_readiness(
+        self,
+        *,
+        at: datetime,
+        pending_l2_resync_assets: set[str],
+    ) -> None:
+        before = (
+            self.metrics["state"],
+            self.metrics["capture_ready"],
+            self.metrics["missing_required_streams"],
+            self.metrics["pending_l2_resync_assets"],
+            self.metrics["clock_sync_valid"],
+        )
+        missing_streams = sorted(
+            set(self._critical_stream_last_received) - self._critical_stream_seen
+        )
+        clock_valid = self._valid_clock_until is not None and at < self._valid_clock_until
+        stale_streams = self._stale_critical_streams(at=at)
+        ready = (
+            not missing_streams
+            and not pending_l2_resync_assets
+            and not stale_streams
+            and clock_valid
+        )
+        self.metrics["capture_ready"] = ready
+        self.metrics["missing_required_streams"] = missing_streams
+        self.metrics["pending_l2_resync_assets"] = sorted(pending_l2_resync_assets)
+        self.metrics["clock_sync_valid"] = clock_valid
+        if ready:
+            self.metrics["state"] = "live"
+        elif self.metrics["state"] not in {"stale", "backoff", "failed"}:
+            self.metrics["state"] = "warming"
+        after = (
+            self.metrics["state"],
+            self.metrics["capture_ready"],
+            self.metrics["missing_required_streams"],
+            self.metrics["pending_l2_resync_assets"],
+            self.metrics["clock_sync_valid"],
+        )
+        if after != before:
+            self._publish()
 
     def _stale_critical_streams(self, *, at: datetime) -> tuple[str, ...]:
         threshold = timedelta(seconds=self.config.stale_after_seconds)
@@ -225,25 +333,42 @@ class BinanceReferenceCollector:
             if at - last_received > threshold
         )
 
+    def _observe_critical_stream(
+        self,
+        parsed: ParsedMessage,
+        *,
+        received_time: datetime,
+        socket_role: str,
+    ) -> None:
+        channel = parsed.channel
+        if channel not in self._critical_stream_last_received:
+            return
+        assert channel is not None
+        expected_asset, expected_type, expected_role = self._critical_stream_expectations[
+            channel
+        ]
+        if socket_role != expected_role:
+            return
+        if not any(
+            record.record_type == expected_type and record.asset == expected_asset
+            for record in parsed.records
+        ):
+            return
+        self._critical_stream_last_received[channel] = received_time
+        self._critical_stream_seen.add(channel)
+
     def _require_critical_streams_fresh(
         self,
         *,
         at: datetime,
-        connection_id: str,
     ) -> None:
         stale_channels = self._stale_critical_streams(at=at)
         if not stale_channels:
             return
-        reason = "required Binance BBO/L2 streams stale: " + ", ".join(stale_channels)
+        reason = "required Binance BBO/L2/trade streams stale: " + ", ".join(stale_channels)
         self.metrics["maintenance_or_absence_detected"] = True
+        self.metrics["capture_ready"] = False
         self.metrics["state"] = "stale"
-        self._connection_event(
-            "gap",
-            connection_id=connection_id,
-            channel=",".join(stale_channels),
-            reason=reason,
-            at=at,
-        )
         self._publish()
         raise TimeoutError(reason)
 
@@ -254,6 +379,7 @@ class BinanceReferenceCollector:
         pending_assets: set[str],
         connection_id: str,
         connection_epoch: int,
+        capture_epoch_id: str | None = None,
     ) -> None:
         states = [
             record
@@ -282,6 +408,9 @@ class BinanceReferenceCollector:
             self._connection_event(
                 event_kind,
                 connection_id=connection_id,
+                connection_epoch=connection_epoch,
+                capture_epoch_id=capture_epoch_id,
+                socket_role="public",
                 asset=state.asset,
                 channel=str(parsed.channel),
                 book_epoch_id=expected_epoch,
@@ -314,8 +443,6 @@ class BinanceReferenceCollector:
             )
             self._publish()
             raise RuntimeError(str(self.metrics["last_error"]))
-        clock_sample = self.rest.clock_measurement()
-        self._add(clock_record(clock_sample, f"clock:{uuid.uuid4().hex}"))
         raw_schedule = self.rest.funding_info()
         schedules = funding_intervals(raw_schedule.payload)
         end_ms = int(self.clock().timestamp() * 1_000)
@@ -344,17 +471,174 @@ class BinanceReferenceCollector:
         self._connector = connector
         return connector
 
+    def _schedule_clock_sample(
+        self,
+        *,
+        connection_id: str,
+        connection_epoch: int,
+        capture_epoch_id: str,
+    ) -> None:
+        if self._clock_future is not None:
+            return
+        self._clock_future_context = (
+            capture_epoch_id,
+            connection_id,
+            connection_epoch,
+        )
+        self._clock_future = self._clock_executor.submit(self.rest.clock_measurement)
+
+    def _drain_clock_sample(
+        self,
+        *,
+        active_capture_epoch_id: str | None,
+        wait: bool,
+    ) -> bool:
+        future = self._clock_future
+        context = self._clock_future_context
+        if future is None:
+            return False
+        if not wait and not future.done():
+            return False
+        self._clock_future = None
+        self._clock_future_context = None
+        if context is None:
+            raise RuntimeError("clock future is missing its capture identity")
+        capture_epoch_id, connection_id, connection_epoch = context
+        try:
+            measurement = future.result()
+        except Exception as exc:
+            reason = f"clock_sync request failed: {type(exc).__name__}: {exc}"
+            self.metrics["clock_sample_failures"] = self._counter(
+                "clock_sample_failures"
+            ) + 1
+            self.metrics["maintenance_or_absence_detected"] = True
+            self._valid_clock_until = None
+            self.metrics["capture_ready"] = False
+            self.metrics["clock_sync_valid"] = False
+            self._connection_event(
+                "gap",
+                connection_id=f"{connection_id}:clock",
+                connection_epoch=connection_epoch,
+                capture_epoch_id=capture_epoch_id,
+                socket_role="clock",
+                channel="clock_sync",
+                reason=f"coverage_unknown:{reason}",
+            )
+            return True
+        if active_capture_epoch_id != capture_epoch_id:
+            self.metrics["clock_sample_failures"] = self._counter(
+                "clock_sample_failures"
+            ) + 1
+            self._valid_clock_until = None
+            self.metrics["capture_ready"] = False
+            self.metrics["clock_sync_valid"] = False
+            return True
+        record = clock_record(
+            measurement,
+            f"clock:{capture_epoch_id}:{uuid.uuid4().hex}",
+            connection_id=connection_id,
+            connection_epoch=connection_epoch,
+            capture_epoch_id=capture_epoch_id,
+            sampling_interval=timedelta(
+                seconds=self.config.clock_sampling_interval_seconds
+            ),
+            max_age=timedelta(seconds=self.config.clock_max_age_seconds),
+            max_uncertainty_ms=self.config.clock_max_uncertainty_ms,
+        )
+        self._add(record)
+        self.metrics["clock_samples"] = self._counter("clock_samples") + 1
+        status = str(record.row["sample_status"])
+        counter = (
+            "clock_samples_valid" if status == "valid" else "clock_samples_invalid"
+        )
+        self.metrics[counter] = self._counter(counter) + 1
+        valid_until = record.row["causal_valid_until"]
+        if status == "valid" and isinstance(valid_until, datetime):
+            self._valid_clock_until = valid_until
+            self.metrics["clock_sync_valid"] = True
+        else:
+            self._valid_clock_until = None
+            self.metrics["capture_ready"] = False
+            self.metrics["clock_sync_valid"] = False
+            self.metrics["maintenance_or_absence_detected"] = True
+        return True
+
+    def _abandon_clock_sample(self) -> None:
+        future = self._clock_future
+        self._clock_future = None
+        self._clock_future_context = None
+        if future is not None:
+            future.cancel()
+
+    def _record_generation_end(
+        self,
+        *,
+        connection_ids: dict[str, str],
+        connected_roles: Iterable[str],
+        connection_epoch: int,
+        capture_epoch_id: str,
+        reason: str,
+        include_gap: bool,
+    ) -> None:
+        roles = tuple(connected_roles)
+        for role in roles:
+            self._connection_event(
+                "disconnect",
+                connection_id=connection_ids[role],
+                connection_epoch=connection_epoch,
+                capture_epoch_id=capture_epoch_id,
+                socket_role=role,
+                channel=role,
+                reason=reason,
+            )
+            if include_gap:
+                self._connection_event(
+                    "gap",
+                    connection_id=connection_ids[role],
+                    connection_epoch=connection_epoch,
+                    capture_epoch_id=capture_epoch_id,
+                    socket_role=role,
+                    channel=role,
+                    reason=f"coverage_unknown:{reason}",
+                )
+        if include_gap and set(roles) != {"public", "market"}:
+            self._connection_event(
+                "gap",
+                connection_id=f"{capture_epoch_id}:supervisor",
+                connection_epoch=connection_epoch,
+                capture_epoch_id=capture_epoch_id,
+                socket_role="supervisor",
+                channel="capture_generation",
+                reason=(
+                    "coverage_unknown:required Binance socket pair was incomplete;"
+                    f" connected_roles={','.join(roles) or 'none'}; failure={reason}"
+                ),
+            )
+        self._valid_clock_until = None
+        self.metrics["capture_ready"] = False
+        self.metrics["clock_sync_valid"] = False
+
     def run(self, *, duration_seconds: float | None = None, max_messages: int | None = None) -> None:
         if duration_seconds is not None and duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive when provided")
         if max_messages is not None and max_messages <= 0:
             raise ValueError("max_messages must be positive when provided")
         connector = self._bootstrap()
-        factory = UrlWebsocketClientFactory(
-            connector.websocket_url(self.config.assets, self.config.candle_intervals),
-            queue_capacity=self.config.queue_capacity,
-            clock=self.clock,
+        websocket_urls = connector.websocket_urls(
+            self.config.assets,
+            self.config.candle_intervals,
         )
+        required_roles = ("public", "market")
+        if set(websocket_urls) != set(required_roles):
+            raise RuntimeError("Binance connector must provide public and market websocket URLs")
+        factories = {
+            role: UrlWebsocketClientFactory(
+                websocket_urls[role],
+                queue_capacity=self.config.queue_capacity,
+                clock=self.clock,
+            )
+            for role in required_roles
+        }
         started = self.monotonic()
         epoch = 0
         while not self._stop:
@@ -363,89 +647,191 @@ class BinanceReferenceCollector:
             if max_messages is not None and self._counter("messages_received") >= max_messages:
                 break
             epoch += 1
-            connection_id = uuid.uuid4().hex
-            arrival_sequence = 0
+            capture_epoch_id = f"binance-capture-{epoch}-{uuid.uuid4().hex}"
+            connection_ids = {
+                role: f"binance-{role}-{uuid.uuid4().hex}" for role in required_roles
+            }
+            arrival_sequences = {role: 0 for role in required_roles}
+            connected_roles: list[str] = []
             if epoch > 1:
                 self.metrics["reconnects"] = self._counter("reconnects") + 1
             try:
                 self.metrics["state"] = "connecting"
-                self._socket = factory.connect("public", self.config.connect_timeout_seconds)
-                self.metrics["connections"] = self._counter("connections") + 1
-                self.metrics["state"] = "live"
-                self._connection_event("connect", connection_id=connection_id)
+                for role in required_roles:
+                    self._sockets[role] = factories[role].connect(
+                        "public",
+                        self.config.connect_timeout_seconds,
+                    )
+                    connected_roles.append(role)
+                    self.metrics["physical_connections"] = self._counter(
+                        "physical_connections"
+                    ) + 1
+                    if len(connected_roles) == 1:
+                        self.metrics["connections"] = self._counter("connections") + 1
+                    self._connection_event(
+                        "connect",
+                        connection_id=connection_ids[role],
+                        connection_epoch=epoch,
+                        capture_epoch_id=capture_epoch_id,
+                        socket_role=role,
+                        channel=role,
+                    )
+                self.metrics["state"] = "warming"
+                self.metrics["capture_ready"] = False
+                self.metrics["clock_sync_valid"] = False
+                self._valid_clock_until = None
+                self.metrics["capture_epoch_id"] = capture_epoch_id
+                self.metrics["physical_connection_ids"] = dict(connection_ids)
                 connection_started = self.clock()
                 self._initialize_critical_streams(connector, at=connection_started)
                 pending_l2_resync_assets = set(self.config.assets)
+                next_clock_sample_at = self.monotonic()
+                self._drain_clock_sample(
+                    active_capture_epoch_id=capture_epoch_id,
+                    wait=False,
+                )
+                if self._clock_future is None:
+                    self._schedule_clock_sample(
+                        connection_id=connection_ids["public"],
+                        connection_epoch=epoch,
+                        capture_epoch_id=capture_epoch_id,
+                    )
+                    next_clock_sample_at += self.config.clock_sampling_interval_seconds
                 self._publish()
                 while not self._stop:
                     if duration_seconds is not None and self.monotonic() - started >= duration_seconds:
                         break
-                    received = self._socket.receive(1.0)
-                    now = self.clock()
-                    if received is None:
-                        self._require_critical_streams_fresh(
-                            at=now,
-                            connection_id=connection_id,
+                    if max_messages is not None and (
+                        self._counter("messages_received") >= max_messages
+                    ):
+                        break
+                    observed_mono = self.monotonic()
+                    self._drain_clock_sample(
+                        active_capture_epoch_id=capture_epoch_id,
+                        wait=False,
+                    )
+                    self._refresh_capture_readiness(
+                        at=self.clock(),
+                        pending_l2_resync_assets=pending_l2_resync_assets,
+                    )
+                    if (
+                        self._clock_future is None
+                        and observed_mono >= next_clock_sample_at
+                    ):
+                        self._schedule_clock_sample(
+                            connection_id=connection_ids["public"],
+                            connection_epoch=epoch,
+                            capture_epoch_id=capture_epoch_id,
                         )
-                        continue
-                    arrival_sequence += 1
-                    envelope = WireEnvelope(
-                        received.raw_message,
-                        received.received_time,
-                        connection_id,
-                        epoch,
-                        arrival_sequence,
-                    )
-                    parsed = connector.parse_message(envelope)
-                    if parsed.channel in self._critical_stream_last_received:
-                        self._critical_stream_last_received[parsed.channel] = received.received_time
-                    self.metrics["messages_received"] = self._counter("messages_received") + 1
-                    self.metrics["normalization_issues"] = self._counter("normalization_issues") + len(
-                        parsed.issues
-                    )
-                    self._record_l2_resync_if_needed(
-                        parsed,
-                        pending_assets=pending_l2_resync_assets,
-                        connection_id=connection_id,
-                        connection_epoch=epoch,
-                    )
-                    self._add_many(parsed.records)
+                        next_clock_sample_at = (
+                            observed_mono
+                            + self.config.clock_sampling_interval_seconds
+                        )
+                    for role in required_roles:
+                        received = self._sockets[role].receive(0.01)
+                        if received is None:
+                            continue
+                        arrival_sequences[role] += 1
+                        envelope = WireEnvelope(
+                            received.raw_message,
+                            received.received_time,
+                            connection_ids[role],
+                            epoch,
+                            arrival_sequences[role],
+                            capture_epoch_id,
+                        )
+                        parsed = connector.parse_message(envelope)
+                        self._observe_critical_stream(
+                            parsed,
+                            received_time=received.received_time,
+                            socket_role=role,
+                        )
+                        self.metrics["messages_received"] = self._counter(
+                            "messages_received"
+                        ) + 1
+                        self.metrics["normalization_issues"] = self._counter(
+                            "normalization_issues"
+                        ) + len(parsed.issues)
+                        if role == "public":
+                            self._record_l2_resync_if_needed(
+                                parsed,
+                                pending_assets=pending_l2_resync_assets,
+                                connection_id=connection_ids[role],
+                                connection_epoch=epoch,
+                                capture_epoch_id=capture_epoch_id,
+                            )
+                        self._add_many(parsed.records)
+                        if max_messages is not None and (
+                            self._counter("messages_received") >= max_messages
+                        ):
+                            break
+                    now = self.clock()
                     self._require_critical_streams_fresh(
                         at=now,
-                        connection_id=connection_id,
                     )
-                    if max_messages is not None and self._counter("messages_received") >= max_messages:
-                        break
-                if (
-                    self._stop
-                    or (duration_seconds is not None and self.monotonic() - started >= duration_seconds)
-                    or (max_messages is not None and self._counter("messages_received") >= max_messages)
-                ):
-                    break
+                    self._refresh_capture_readiness(
+                        at=now,
+                        pending_l2_resync_assets=pending_l2_resync_assets,
+                    )
+                self._drain_clock_sample(
+                    active_capture_epoch_id=capture_epoch_id,
+                    wait=False,
+                )
+                self._close_sockets()
+                self._record_generation_end(
+                    connection_ids=connection_ids,
+                    connected_roles=connected_roles,
+                    connection_epoch=epoch,
+                    capture_epoch_id=capture_epoch_id,
+                    reason="collector stop requested or bounded run completed",
+                    include_gap=False,
+                )
+                self._abandon_clock_sample()
+                break
             except CoordinatedWriterError as exc:
+                self._abandon_clock_sample()
                 self.metrics["last_error"] = f"{type(exc).__name__}: {exc}"
                 self.metrics["maintenance_or_absence_detected"] = True
+                self.metrics["capture_ready"] = False
                 self.metrics["state"] = "failed"
                 with suppress(Exception):
                     self._publish()
                 raise
             except Exception as exc:
+                self._close_sockets()
+                self._abandon_clock_sample()
                 if self._stop:
+                    self._record_generation_end(
+                        connection_ids=connection_ids,
+                        connected_roles=connected_roles,
+                        connection_epoch=epoch,
+                        capture_epoch_id=capture_epoch_id,
+                        reason="collector stop requested",
+                        include_gap=False,
+                    )
                     break
                 self.metrics["last_error"] = f"{type(exc).__name__}: {exc}"
                 self.metrics["maintenance_or_absence_detected"] = True
+                self.metrics["capture_ready"] = False
                 self.metrics["state"] = "backoff"
-                self._connection_event(
-                    "disconnect",
-                    connection_id=connection_id,
-                    reason=str(self.metrics["last_error"]),
-                )
+                try:
+                    self._record_generation_end(
+                        connection_ids=connection_ids,
+                        connected_roles=connected_roles,
+                        connection_epoch=epoch,
+                        capture_epoch_id=capture_epoch_id,
+                        reason=str(self.metrics["last_error"]),
+                        include_gap=True,
+                    )
+                except CoordinatedWriterError:
+                    self.metrics["state"] = "failed"
+                    with suppress(Exception):
+                        self._publish()
+                    raise
                 self._publish()
                 self._interruptible_sleep(min(2 ** min(epoch, 5), 30))
             finally:
-                if self._socket is not None:
-                    self._socket.close()
-                    self._socket = None
+                self._close_sockets()
         self.metrics["state"] = "stopped"
         self._publish()
 
@@ -456,6 +842,9 @@ class BinanceReferenceCollector:
             for channel, received_at in sorted(self._critical_stream_last_received.items())
         }
         payload = dict(self.metrics)
+        payload["ok"] = bool(
+            self.metrics["state"] == "live" and self.metrics["capture_ready"]
+        )
         payload["updated_at"] = now.isoformat()
         payload["network_scope"] = "public market data only"
         write_runtime_status(self.runtime_status_path, payload)

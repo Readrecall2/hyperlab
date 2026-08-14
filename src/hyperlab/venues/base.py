@@ -92,11 +92,9 @@ def measure_clock(
 
 
 class PublicVenueConnector(Protocol):
-    """Common, market-data-only boundary implemented by every venue adapter."""
+    """Replay-safe parsing boundary implemented by every public venue adapter."""
 
     venue: str
-
-    def websocket_url(self, assets: tuple[str, ...], candle_intervals: tuple[str, ...]) -> str: ...
 
     def parse_message(self, envelope: WireEnvelope) -> ParsedMessage: ...
 

@@ -63,7 +63,7 @@ _GroupKey = tuple[str, RecordType, str, str, str]
 _ObservationSignature = tuple[str, str, str]
 _ObservationHeadKey = tuple[str, str]
 _StablePrimaryKey = tuple[str, str]
-_OBSERVATION_INDEX_VERSION = 3
+_OBSERVATION_INDEX_VERSION = 4
 _PERSISTENT_PRIMARY_KEY_TYPES = frozenset({RecordType.TRADE})
 
 
@@ -136,9 +136,10 @@ def _stable_primary_key(
 ) -> _StablePrimaryKey | None:
     if record_type not in _PERSISTENT_PRIMARY_KEY_TYPES:
         return None
+    del schema_version
     canonical = _canonical_json(primary_key)
     return (
-        f"{record_type.value}:v{schema_version}",
+        f"{record_type.value}:compatible-primary-key",
         hashlib.sha256(canonical.encode()).hexdigest(),
     )
 

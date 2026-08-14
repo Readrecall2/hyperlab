@@ -111,6 +111,7 @@ def _wire_record(
         {
             "connection_epoch": envelope.connection_epoch,
             "arrival_sequence": envelope.arrival_sequence,
+            "capture_epoch_id": envelope.capture_epoch_id,
             "channel": channel,
             "message_asset": message_asset,
             "raw_message": envelope.raw_message,
@@ -294,6 +295,8 @@ def _parse_trades(data: object, envelope: WireEnvelope) -> list[ParsedRecord]:
                 "quantity": quantity,
                 "quote_quantity": price * quantity,
                 "is_liquidation": None,
+                "connection_epoch": envelope.connection_epoch,
+                "arrival_sequence": envelope.arrival_sequence,
             }
         )
         records.append(ParsedRecord(RecordType.TRADE, coin, row))

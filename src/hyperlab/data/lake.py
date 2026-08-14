@@ -18,6 +18,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from hyperlab.data.schema import (
+    BREAKING_SCHEMA_TRANSITIONS,
     SCHEMA_VERSION_METADATA,
     RecordType,
     SchemaSpec,
@@ -703,6 +704,12 @@ def _require_non_negative(table: pa.Table, *names: str) -> None:
             raise PartitionValidationError(f"{name} must be non-negative")
 
 
+def _require_positive_when_present(table: pa.Table, *names: str) -> None:
+    for name in names:
+        if any(value is not None and value <= 0 for value in table.column(name).to_pylist()):
+            raise PartitionValidationError(f"{name} must be positive when present")
+
+
 def _require_closed_vocabulary(table: pa.Table, name: str, allowed: frozenset[str]) -> None:
     observed = {str(value) for value in table.column(name).to_pylist()}
     invalid = sorted(observed - allowed)
@@ -777,7 +784,7 @@ def _validate_l2_metadata(table: pa.Table, key: PartitionKey) -> None:
             )
 
 
-def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
+def _validate_semantics(table: pa.Table, key: PartitionKey, spec: SchemaSpec) -> None:
     record_type = key.record_type
     if record_type == RecordType.INSTRUMENT_METADATA:
         _require_closed_vocabulary(
@@ -832,6 +839,13 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
             "payload_sha256",
         )
         _require_optional_non_empty_strings(table, "channel")
+        _require_positive_when_present(
+            table,
+            "connection_epoch",
+            "arrival_sequence",
+        )
+        if spec.version >= 2:
+            _require_optional_non_empty_strings(table, "capture_epoch_id")
         if table.column("source_sequence").null_count != table.num_rows:
             raise PartitionValidationError(
                 "wire_message source_sequence must remain null; use arrival_sequence"
@@ -895,6 +909,12 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
         if any(value <= 0 for value in table.column("quantity").to_pylist()):
             raise PartitionValidationError("trade quantity must be positive")
         _require_non_negative(table, "quote_quantity")
+        if spec.version >= 2:
+            _require_positive_when_present(
+                table,
+                "connection_epoch",
+                "arrival_sequence",
+            )
     elif record_type == RecordType.FUNDING:
         _require_non_empty_strings(table, "rate_kind")
         _require_positive_prices(table, "mark_price", "oracle_price")
@@ -921,6 +941,13 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
             "event_kind",
             frozenset({"connect", "disconnect", "gap", "resync_start", "resync_complete"}),
         )
+        if spec.version >= 2:
+            _require_positive_when_present(table, "connection_epoch")
+            _require_optional_non_empty_strings(
+                table,
+                "capture_epoch_id",
+                "socket_role",
+            )
     elif record_type == RecordType.INSTRUMENT_LIFECYCLE:
         _require_closed_vocabulary(table, "instrument_kind", frozenset({"spot", "perp"}))
         _require_closed_vocabulary(
@@ -952,6 +979,99 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
                 raise PartitionValidationError("clock sync request must be sent before its response")
             if uncertainty * 2 != round_trip:
                 raise PartitionValidationError("clock drift uncertainty must equal half the round trip")
+        if spec.version >= 2:
+            _validate_clock_sync_v2(table)
+
+
+def _validate_clock_sync_v2(table: pa.Table) -> None:
+    _require_closed_vocabulary(
+        table,
+        "sample_status",
+        frozenset({"valid", "invalid"}),
+    )
+    _require_optional_non_empty_strings(
+        table,
+        "capture_epoch_id",
+        "invalid_reason",
+    )
+    _require_non_negative(table, "max_uncertainty_ms")
+    _require_positive_when_present(table, "connection_epoch")
+    columns = {
+        name: table.column(name).to_pylist()
+        for name in (
+            "connection_id",
+            "connection_epoch",
+            "capture_epoch_id",
+            "received_time",
+            "response_received_time",
+            "drift_uncertainty_ms",
+            "causal_valid_from",
+            "causal_valid_until",
+            "sample_status",
+            "invalid_reason",
+            "sampling_interval_ms",
+            "max_age_ms",
+            "max_uncertainty_ms",
+        )
+    }
+    for values in zip(*columns.values(), strict=True):
+        row = dict(zip(columns, values, strict=True))
+        sampling_interval_ms = row["sampling_interval_ms"]
+        max_age_ms = row["max_age_ms"]
+        max_uncertainty_ms = row["max_uncertainty_ms"]
+        if sampling_interval_ms is None or int(sampling_interval_ms) <= 0:
+            raise PartitionValidationError("sampling_interval_ms must be positive")
+        if max_age_ms is None or int(max_age_ms) <= 0:
+            raise PartitionValidationError("max_age_ms must be positive")
+        if int(sampling_interval_ms) > int(max_age_ms):
+            raise PartitionValidationError(
+                "sampling_interval_ms must not exceed max_age_ms"
+            )
+        if max_uncertainty_ms is None:
+            raise PartitionValidationError("max_uncertainty_ms must be present")
+        if row["received_time"] != row["response_received_time"]:
+            raise PartitionValidationError(
+                "received_time must equal response_received_time for clock sync"
+            )
+
+        if row["sample_status"] == "valid":
+            for identity in ("connection_id", "connection_epoch", "capture_epoch_id"):
+                if row[identity] is None or (
+                    isinstance(row[identity], str) and not row[identity].strip()
+                ):
+                    raise PartitionValidationError(
+                        f"{identity} must be present for valid clock coverage"
+                    )
+            if row["drift_uncertainty_ms"] > max_uncertainty_ms:
+                raise PartitionValidationError(
+                    "valid clock uncertainty exceeds max_uncertainty_ms"
+                )
+            if row["invalid_reason"] is not None:
+                raise PartitionValidationError(
+                    "invalid_reason must be null for valid clock coverage"
+                )
+            expected_from = row["response_received_time"]
+            if row["causal_valid_from"] != expected_from:
+                raise PartitionValidationError(
+                    "causal_valid_from must equal response_received_time"
+                )
+            expected_until = expected_from + timedelta(
+                milliseconds=int(max_age_ms)
+            )
+            if row["causal_valid_until"] != expected_until:
+                raise PartitionValidationError(
+                    "causal_valid_until must equal causal_valid_from plus max_age_ms"
+                )
+            continue
+
+        if row["causal_valid_from"] is not None or row["causal_valid_until"] is not None:
+            raise PartitionValidationError(
+                "invalid clock sample must not claim a causal validity interval"
+            )
+        if row["invalid_reason"] is None or not str(row["invalid_reason"]).strip():
+            raise PartitionValidationError(
+                "invalid_reason must be present for invalid clock sample"
+            )
 
 
 def _analyze_table(
@@ -979,7 +1099,7 @@ def _analyze_table(
     _require_partition_value(table, "record_type", _record_type_value(key.record_type))
     _require_partition_value(table, "venue", key.venue)
     _require_partition_value(table, "asset", key.asset)
-    _validate_semantics(table, key)
+    _validate_semantics(table, key, spec)
     _validate_l2_metadata(table, key)
 
     event_dates = {
@@ -1533,6 +1653,16 @@ class _CrossSegmentRow:
     l2_last_sequence: int | None
 
 
+def _schema_compatibility_family(record_type: RecordType | str, version: int) -> int:
+    normalized = RecordType(_record_type_value(record_type))
+    breaking_candidates = [
+        candidate
+        for (transition_type, _previous, candidate) in BREAKING_SCHEMA_TRANSITIONS
+        if transition_type == normalized and candidate <= version
+    ]
+    return max(breaking_candidates, default=1)
+
+
 def _cross_segment_gaps(
     root: Path,
     manifests: tuple[PartitionManifest, ...],
@@ -1554,7 +1684,10 @@ def _cross_segment_gaps(
             manifest.partition.venue,
             manifest.partition.asset,
             manifest.partition.record_type,
-            manifest.schema_version,
+            _schema_compatibility_family(
+                manifest.partition.record_type,
+                manifest.schema_version,
+            ),
             manifest.stream_key,
         )
         grouped.setdefault(stream, []).append(manifest)
@@ -1577,13 +1710,16 @@ def _cross_segment_gaps(
                 "inconsistent gap cadence in stream: "
                 f"{sample.venue}/{sample.asset}/{_record_type_value(sample.record_type)}"
             )
-        spec = schema_for(sample.record_type, group[0].schema_version)
         expected_interval_ns = next(iter(intervals))
+        compatibility_family = _schema_compatibility_family(
+            sample.record_type,
+            group[0].schema_version,
+        )
         dataset_key = (
             sample.venue,
             sample.asset,
             sample.record_type,
-            group[0].schema_version,
+            compatibility_family,
         )
         seen_primary_keys = primary_keys_by_dataset.setdefault(dataset_key, set())
         is_l2 = sample.record_type in {
@@ -1594,6 +1730,7 @@ def _cross_segment_gaps(
         stream_rows: list[_CrossSegmentRow] = []
 
         for manifest in group:
+            spec = schema_for(sample.record_type, manifest.schema_version)
             table = read_hashed_table(root, manifest)
             l2_definition = _L2_METADATA_DEFINITIONS.get(RecordType(_record_type_value(sample.record_type)))
             if l2_definition is not None:

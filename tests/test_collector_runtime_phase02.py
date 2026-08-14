@@ -325,10 +325,15 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     assert bbo_rows[0]["source_sequence"] is None
     assert CollectorState.BOOTSTRAPPING in sink.flush_states
     assert CollectorState.LIVE in sink.flush_states
-    assert [row["event_kind"] for row in _parquet_rows(sink.root, "connection_event")] == [
+    connection_events = _parquet_rows(sink.root, "connection_event")
+    assert [row["event_kind"] for row in connection_events] == [
         "connect",
         "disconnect",
     ]
+    assert all(row["schema_version"] == 2 for row in connection_events)
+    assert all(row["connection_epoch"] == 1 for row in connection_events)
+    assert all(row["capture_epoch_id"] for row in connection_events)
+    assert all(row["socket_role"] == "public" for row in connection_events)
     _assert_all_source_sequences_are_null(sink.root)
 
     status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
@@ -499,7 +504,12 @@ def test_stale_critical_channels_are_visible_and_force_disconnect(tmp_path: Path
     metrics = collector.run(duration_seconds=2.5)
 
     assert metrics.gaps == 1
-    assert metrics.stale_channels == ("activeAssetCtx:BTC", "l2Book:BTC")
+    assert metrics.stale_channels == (
+        "activeAssetCtx:BTC",
+        "bbo:BTC",
+        "l2Book:BTC",
+        "trades:BTC",
+    )
     assert socket.closed is True
     reasons = [str(row["reason"]) for row in _parquet_rows(sink.root, "connection_event")]
     assert any("stale critical public streams" in reason for reason in reasons)
@@ -507,6 +517,56 @@ def test_stale_critical_channels_are_visible_and_force_disconnect(tmp_path: Path
     status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
     assert status["ok"] is False
     assert "stale critical public streams" in status["metrics"]["last_error"]
+
+
+def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=100.0,
+        pong_timeout_seconds=200.0,
+        stale_after_seconds=2.0,
+    )
+    fixture_root = Path(__file__).parent / "fixtures" / "hyperliquid"
+    active_context = (fixture_root / "ws_active_asset_ctx.json").read_text(
+        encoding="utf-8"
+    )
+    bbo = (fixture_root / "ws_bbo.json").read_text(encoding="utf-8")
+    l2_book = (fixture_root / "ws_l2_book.json").read_text(encoding="utf-8")
+    trade = (fixture_root / "ws_trades.json").read_text(encoding="utf-8")
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config),
+            (trade, 0.0),
+            (active_context, 0.0),
+            (bbo, 0.0),
+            (l2_book, 0.0),
+            (active_context, 1.5),
+            (bbo, 0.0),
+            (l2_book, 0.0),
+            (active_context, 1.0),
+        ],
+    )
+    collector, _rest, _factory, sink = _collector(
+        tmp_path,
+        config,
+        timer,
+        [socket],
+    )
+
+    metrics = collector.run(duration_seconds=2.4)
+
+    assert metrics.gaps == 1
+    assert metrics.stale_channels == ("trades:BTC",)
+    assert socket.closed is True
+    reasons = [
+        str(row["reason"])
+        for row in _parquet_rows(sink.root, "connection_event")
+    ]
+    assert any("trades:BTC" in reason for reason in reasons)
+    collector.close()
 
 
 def test_invalid_batch_flush_is_terminal_and_close_does_not_retry_it(

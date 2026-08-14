@@ -38,7 +38,7 @@ from hyperlab.collector.websocket import (
     ReceivedWireMessage,
 )
 from hyperlab.data.lake import PartitionValidationError
-from hyperlab.data.schema import RecordType
+from hyperlab.data.schema import RecordType, latest_schema_for
 from hyperlab.storage.sqlite import write_runtime_status
 
 
@@ -132,7 +132,12 @@ class PublicCollector:
         self._critical_stream_keys = frozenset(
             subscription.key
             for subscription in subscriptions
-            if subscription.channel in {"activeAssetCtx", "l2Book"}
+            if subscription.channel in {
+                "activeAssetCtx",
+                "bbo",
+                "l2Book",
+                "trades",
+            }
         )
         self._candle_intervals_by_stream_key = {
             subscription.key: subscription.interval
@@ -373,7 +378,13 @@ class PublicCollector:
                 arrival_sequence = 0
                 stale_baseline = self.clock()
                 for subscription in subscriptions:
-                    if subscription.channel in {"activeAssetCtx", "l2Book", "candle"}:
+                    if subscription.channel in {
+                        "activeAssetCtx",
+                        "bbo",
+                        "l2Book",
+                        "trades",
+                        "candle",
+                    }:
                         self.metrics.last_event_by_channel[subscription.key] = stale_baseline
 
                 while not self._should_stop(started, max_messages, duration_seconds):
@@ -574,6 +585,9 @@ class PublicCollector:
             connection_id=connection_id,
             connection_epoch=connection_epoch,
             arrival_sequence=arrival_sequence,
+            capture_epoch_id=(
+                f"hyperliquid-capture-{connection_epoch}-{connection_id}"
+            ),
         )
         parsed = parse_websocket_message(envelope)
         self.metrics.messages_received += 1
@@ -871,7 +885,7 @@ class PublicCollector:
     ) -> None:
         now = self.clock()
         row: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": latest_schema_for(RecordType.CONNECTION_EVENT).version,
             "record_type": RecordType.CONNECTION_EVENT.value,
             "venue": "hyperliquid",
             "asset": asset,
@@ -887,6 +901,11 @@ class PublicCollector:
             "expected_sequence": None,
             "observed_sequence": None,
             "resync_snapshot_id": None,
+            "connection_epoch": connection_epoch,
+            "capture_epoch_id": (
+                f"hyperliquid-capture-{connection_epoch}-{connection_id}"
+            ),
+            "socket_role": "public",
         }
         self._store_record(
             ParsedRecord(

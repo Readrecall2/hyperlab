@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from typing import Any, Protocol
@@ -18,7 +18,8 @@ from hyperlab.venues.base import ClockMeasurement, NormalizedInstrument, measure
 
 VENUE = "binance_usdm"
 REST_BASE_URL = "https://fapi.binance.com"
-WS_BASE_URL = "wss://fstream.binance.com/stream?streams="
+WS_PUBLIC_BASE_URL = "wss://fstream.binance.com/public/stream?streams="
+WS_MARKET_BASE_URL = "wss://fstream.binance.com/market/stream?streams="
 
 # This is an executable safety boundary, not merely documentation. Paths for
 # accounts, keys, orders, positions, listen keys, transfers, or signing cannot
@@ -192,20 +193,34 @@ class BinancePublicConnector:
         except KeyError:
             raise ValueError(f"asset is not configured for Binance: {asset}") from None
 
-    def websocket_url(self, assets: tuple[str, ...], candle_intervals: tuple[str, ...]) -> str:
-        streams: list[str] = []
+    def websocket_urls(
+        self,
+        assets: tuple[str, ...],
+        candle_intervals: tuple[str, ...],
+    ) -> dict[str, str]:
+        public_streams: list[str] = []
+        market_streams: list[str] = []
         for asset in assets:
             symbol = self.instrument_for_asset(asset).source_symbol.lower()
-            streams.extend(
+            public_streams.extend(
                 (
                     f"{symbol}@bookTicker",
                     f"{symbol}@depth20@100ms",
+                )
+            )
+            market_streams.extend(
+                (
                     f"{symbol}@aggTrade",
                     f"{symbol}@markPrice@1s",
                 )
             )
-            streams.extend(f"{symbol}@kline_{interval}" for interval in candle_intervals)
-        return WS_BASE_URL + "/".join(streams)
+            market_streams.extend(
+                f"{symbol}@kline_{interval}" for interval in candle_intervals
+            )
+        return {
+            "public": WS_PUBLIC_BASE_URL + "/".join(public_streams),
+            "market": WS_MARKET_BASE_URL + "/".join(market_streams),
+        }
 
     def parse_message(self, envelope: WireEnvelope) -> ParsedMessage:
         return parse_binance_message(envelope, self._by_symbol)
@@ -270,6 +285,7 @@ def _wire_record(
         {
             "connection_epoch": envelope.connection_epoch,
             "arrival_sequence": envelope.arrival_sequence,
+            "capture_epoch_id": envelope.capture_epoch_id,
             "channel": channel,
             "message_asset": asset,
             "raw_message": envelope.raw_message,
@@ -305,23 +321,68 @@ def parse_binance_message(
         _wire_record(envelope, channel=channel, asset=asset, is_json=True)
     ]
     issues: list[str] = []
+    stream_types: list[tuple[str, object]] = []
+    if "st" in root:
+        stream_types.append(("wrapper", root["st"]))
+    if data is not None and "st" in data:
+        stream_types.append(("data", data["st"]))
+    if any(
+        not (
+            (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+            or (isinstance(value, str) and value == "1")
+        )
+        for _, value in stream_types
+    ):
+        observed = ",".join(
+            f"{location}={value!r}" for location, value in stream_types
+        )
+        issues.append(f"invalid_stream_type:expected=1:{observed}")
+        return ParsedMessage(channel, tuple(records), tuple(issues))
     if channel is None or data is None:
         issues.append("invalid_combined_stream_envelope")
         return ParsedMessage(channel, tuple(records), tuple(issues))
     if normalized is None:
         issues.append(f"unknown_symbol:{source_symbol or 'missing'}")
         return ParsedMessage(channel, tuple(records), tuple(issues))
+    channel_symbol, separator, _stream_kind = channel.partition("@")
+    if not separator or channel_symbol.upper() != source_symbol:
+        issues.append(
+            "stream_symbol_mismatch:"
+            f"channel={channel_symbol or 'missing'}:payload={source_symbol or 'missing'}"
+        )
+        return ParsedMessage(channel, tuple(records), tuple(issues))
     try:
         event = str(data.get("e", ""))
-        if event == "bookTicker" or channel.endswith("@bookTicker"):
+        if channel.endswith("@bookTicker"):
+            if event != "bookTicker":
+                raise ValueError(
+                    f"event/channel mismatch: expected bookTicker, observed {event or 'missing'}"
+                )
             records.append(_parse_bbo(data, envelope, normalized))
-        elif event == "depthUpdate" and "@depth20" in channel:
+        elif "@depth20" in channel:
+            if event != "depthUpdate":
+                raise ValueError(
+                    f"event/channel mismatch: expected depthUpdate, observed {event or 'missing'}"
+                )
             records.extend(_parse_l2_snapshot(data, envelope, normalized))
-        elif event == "aggTrade" or channel.endswith("@aggTrade"):
+        elif channel.endswith("@aggTrade"):
+            if event != "aggTrade":
+                raise ValueError(
+                    f"event/channel mismatch: expected aggTrade, observed {event or 'missing'}"
+                )
             records.append(_parse_trade(data, envelope, normalized))
-        elif event == "kline" or "@kline_" in channel:
+        elif "@kline_" in channel:
+            if event != "kline":
+                raise ValueError(
+                    f"event/channel mismatch: expected kline, observed {event or 'missing'}"
+                )
             records.append(_parse_candle(data, envelope, normalized))
-        elif event == "markPriceUpdate" or "@markPrice" in channel:
+        elif "@markPrice" in channel:
+            if event != "markPriceUpdate":
+                raise ValueError(
+                    "event/channel mismatch: "
+                    f"expected markPriceUpdate, observed {event or 'missing'}"
+                )
             records.append(_parse_mark_price(data, envelope, normalized))
         else:
             issues.append(f"unknown_channel:{channel}")
@@ -436,6 +497,15 @@ def _parse_trade(
     aggregate_id = int(str(data["a"]))
     price = _required_decimal(data["p"])
     quantity = normalized.normalize_quantity(data["q"])
+    buyer_is_maker = data["m"]
+    if aggregate_id < 0:
+        raise ValueError("Binance aggregate trade ID cannot be negative")
+    if price <= 0:
+        raise ValueError("Binance aggregate trade price must be positive")
+    if quantity <= 0:
+        raise ValueError("Binance aggregate trade quantity must be positive")
+    if not isinstance(buyer_is_maker, bool):
+        raise ValueError("Binance aggregate trade maker flag must be boolean")
     row = _common(
         RecordType.TRADE,
         normalized.asset,
@@ -447,11 +517,13 @@ def _parse_trade(
     row.update(
         {
             "trade_id": f"{normalized.source_symbol}:agg:{aggregate_id}",
-            "aggressor_side": "sell" if bool(data["m"]) else "buy",
+            "aggressor_side": "sell" if buyer_is_maker else "buy",
             "price": price,
             "quantity": quantity,
             "quote_quantity": price * quantity,
             "is_liquidation": None,
+            "connection_epoch": envelope.connection_epoch,
+            "arrival_sequence": envelope.arrival_sequence,
         }
     )
     return ParsedRecord(RecordType.TRADE, normalized.asset, row)
@@ -653,7 +725,62 @@ class BinancePublicRestClient:
         )
 
 
-def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRecord:
+def _positive_milliseconds(value: timedelta, *, label: str) -> int:
+    milliseconds = Decimal(str(value.total_seconds())) * 1_000
+    if milliseconds <= 0 or milliseconds != milliseconds.to_integral_value():
+        raise ValueError(f"{label} must be a positive whole number of milliseconds")
+    return int(milliseconds)
+
+
+def clock_record(
+    measurement: ClockMeasurement,
+    observation_id: str,
+    *,
+    connection_id: str | None = None,
+    connection_epoch: int | None = None,
+    capture_epoch_id: str | None = None,
+    sampling_interval: timedelta = timedelta(seconds=10),
+    max_age: timedelta = timedelta(seconds=15),
+    max_uncertainty_ms: Decimal = Decimal("50"),
+) -> ParsedRecord:
+    sampling_interval_ms = _positive_milliseconds(
+        sampling_interval,
+        label="clock sampling interval",
+    )
+    max_age_ms = _positive_milliseconds(max_age, label="clock maximum age")
+    if max_age < sampling_interval:
+        raise ValueError("clock maximum age cannot be shorter than the sampling interval")
+    if not max_uncertainty_ms.is_finite() or max_uncertainty_ms < 0:
+        raise ValueError("clock maximum uncertainty must be finite and non-negative")
+    if connection_epoch is not None and connection_epoch < 1:
+        raise ValueError("connection_epoch must be positive when present")
+    if connection_id is not None and not connection_id.strip():
+        raise ValueError("connection_id must be non-empty when present")
+    if capture_epoch_id is not None and not capture_epoch_id.strip():
+        raise ValueError("capture_epoch_id must be non-empty when present")
+
+    missing_identity = (
+        connection_id is None or connection_epoch is None or capture_epoch_id is None
+    )
+    uncertainty_exceeded = measurement.drift_uncertainty_ms > max_uncertainty_ms
+    if missing_identity:
+        sample_status = "invalid"
+        invalid_reason = "missing active capture identity"
+    elif uncertainty_exceeded:
+        sample_status = "invalid"
+        invalid_reason = (
+            "clock uncertainty exceeds threshold: "
+            f"{measurement.drift_uncertainty_ms}ms > {max_uncertainty_ms}ms"
+        )
+    else:
+        sample_status = "valid"
+        invalid_reason = None
+    causal_valid_from = (
+        measurement.response_received_time if sample_status == "valid" else None
+    )
+    causal_valid_until = (
+        measurement.response_received_time + max_age if sample_status == "valid" else None
+    )
     row = {
         "schema_version": latest_schema_for(RecordType.CLOCK_SYNC).version,
         "record_type": RecordType.CLOCK_SYNC.value,
@@ -663,7 +790,7 @@ def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRe
         "exchange_time": measurement.server_time,
         "received_time": measurement.response_received_time,
         "source_sequence": None,
-        "connection_id": None,
+        "connection_id": connection_id,
         "request_sent_time": measurement.request_sent_time,
         "response_received_time": measurement.response_received_time,
         "server_time": measurement.server_time,
@@ -671,6 +798,15 @@ def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRe
         "estimated_clock_drift_ms": measurement.estimated_clock_drift_ms,
         "drift_uncertainty_ms": measurement.drift_uncertainty_ms,
         "observation_id": observation_id,
+        "connection_epoch": connection_epoch,
+        "capture_epoch_id": capture_epoch_id,
+        "causal_valid_from": causal_valid_from,
+        "causal_valid_until": causal_valid_until,
+        "sample_status": sample_status,
+        "invalid_reason": invalid_reason,
+        "sampling_interval_ms": sampling_interval_ms,
+        "max_age_ms": max_age_ms,
+        "max_uncertainty_ms": max_uncertainty_ms,
     }
     return ParsedRecord(RecordType.CLOCK_SYNC, "GLOBAL", row)
 

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -15,7 +16,14 @@ from hyperlab.collector.bootstrap import parse_bootstrap
 from hyperlab.collector.models import ParsedRecord, WireEnvelope
 from hyperlab.collector.parser import parse_websocket_message
 from hyperlab.collector.storage import BatchingLakeSink
-from hyperlab.data.lake import discover_partitions, inventory_partitions, validate_partition
+from hyperlab.data.lake import (
+    PartitionKey,
+    discover_partitions,
+    inventory_partitions,
+    validate_partition,
+    write_partition,
+)
+from hyperlab.data.schema import RecordType, schema_for
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
@@ -342,3 +350,29 @@ def test_trade_primary_key_is_deduplicated_after_restart_and_index_rebuild(
         assert empty_source.flush().row_count == 1
     finally:
         empty_source.close()
+
+
+def test_trade_primary_key_remains_deduplicated_across_v1_to_v2_migration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    current = _trade_record(1)
+    legacy_row = dict(current.row)
+    legacy_row["schema_version"] = 1
+    legacy_row.pop("connection_epoch")
+    legacy_row.pop("arrival_sequence")
+    write_partition(
+        root,
+        PartitionKey("hyperliquid", NOW.date(), "BTC", RecordType.TRADE),
+        pa.Table.from_pylist(
+            [legacy_row],
+            schema=schema_for(RecordType.TRADE, version=1).schema,
+        ),
+    )
+
+    sink = BatchingLakeSink(root, batch_size=1, queue_capacity=2)
+    try:
+        assert sink.add(_trade_record(2)) is False
+        assert sink.flush().row_count == 0
+    finally:
+        sink.close()

@@ -46,6 +46,7 @@ class WireEnvelope:
     connection_id: str
     connection_epoch: int
     arrival_sequence: int
+    capture_epoch_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.received_time.tzinfo is None or self.received_time.utcoffset() is None:
@@ -58,6 +59,8 @@ class WireEnvelope:
             raise ValueError("connection_epoch must be positive")
         if self.arrival_sequence < 1:
             raise ValueError("arrival_sequence must be positive")
+        if self.capture_epoch_id is not None and not self.capture_epoch_id.strip():
+            raise ValueError("capture_epoch_id must be non-empty when present")
 
 
 @dataclass(frozen=True, slots=True)

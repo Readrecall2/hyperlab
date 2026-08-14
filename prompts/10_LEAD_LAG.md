@@ -30,4 +30,9 @@ Ne commencer que lorsque les flux multi-venues sub-seconde sont continus, horoda
 
 ## Gate
 
+Statut actuel : `BLOCKED_PRECONDITION_NOT_MET`. Ne lancer aucune étude
+économique tant qu'une nouvelle collecte réelle BTC/ETH n'a pas démontré des
+trades Binance non nuls, une couverture `clock_sync` causale continue et un
+chevauchement strict BBO + L2 + trades des deux venues supérieur à zéro.
+
 Le baseline horaire inclus doit être remplacé par un replay event-driven. Sans cela, aucune conclusion de rentabilité n'est admise.

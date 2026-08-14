@@ -2,10 +2,12 @@
 
 ## Portée
 
-Cette commande satisfait uniquement la précondition de capture de la Phase 10.
-Elle ne lance aucune étude lead-lag, ne calcule aucun signal économique et
-n'introduit aucune route d'ordre. Les deux transports restent publics, sans clé,
-sans adresse de compte et sans signature.
+Cette commande ne fait que produire les données nécessaires à une future
+validation de la Phase 10. Le statut reste explicitement
+`BLOCKED_PRECONDITION_NOT_MET` tant qu'une nouvelle collecte réelle n'a pas
+passé l'audit de continuité. Elle ne lance aucune étude lead-lag, ne calcule
+aucun signal économique et n'introduit aucune route d'ordre. Les transports
+restent publics, sans clé, sans adresse de compte et sans signature.
 
 ## Audit du stockage
 
@@ -95,32 +97,95 @@ run. Un processus externe qui ouvre le même lake reste rejeté par
 | Venue | Flux publics conservés |
 |---|---|
 | Hyperliquid | BBO, états `l2Book`, trades, contextes d'actifs, candles, funding REST et wire WebSocket brut |
-| Binance USD-M | BBO `bookTicker`, snapshots complets top-20 `depth20@100ms`, trades agrégés, mark/funding, candles, mesure d'horloge et wire WebSocket brut |
+| Binance USD-M | socket public : BBO `bookTicker` et snapshots complets top-20 `depth20@100ms` ; socket marché : trades `aggTrade`, mark/funding et candles ; mesures d'horloge continues et wire WebSocket brut |
 
-Chaque frame WebSocket conserve `received_time` UTC, l'identifiant de connexion,
-l'epoch et la séquence d'arrivée locale. Les snapshots Binance sont les états
+Chaque frame WebSocket conserve `received_time` UTC, l'identifiant de connexion
+physique, l'epoch, la séquence d'arrivée locale et l'identifiant de génération
+coordonnée. Le trade normalisé conserve en plus `event_time` (temps de
+transaction `T`), `exchange_time` (temps d'événement `E`) et la même lignée
+physique que son wire `aggTrade`. Les snapshots Binance sont les états
 top-20 complets publiés par ce stream : ils deviennent `l2_book_state` et
 `l2_snapshot`, avec le dernier update ID source. Aucun faux delta et aucun
 niveau au-delà des vingt niveaux publiés ne sont fabriqués.
 
-Au premier snapshot L2 de chaque actif et de chaque connexion Binance, le runtime
+Les sockets Binance `public` et `market` forment une seule génération supervisée.
+La panne ou la staleness d'un membre invalide la génération entière, ferme les
+deux sockets et impose une reconnexion commune. Au premier snapshot L2 de chaque
+actif et de chaque nouvelle génération Binance, le runtime
 enregistre un couple `resync_start` / `resync_complete` lié au snapshot et au
 `book_epoch_id`. BBO et L2 sont surveillés séparément pour BTC et ETH : un flux
-critique silencieux ne peut pas être masqué par l'activité d'un trade, d'une
-candle ou de l'autre actif. Après le seuil de staleness, le run journalise le gap
-et reconnecte en mode fail-closed.
+critique silencieux ne peut pas être masqué par l'autre actif. `aggTrade` est lui
+aussi obligatoire pour chaque actif. Après le seuil de staleness, le run
+journalise le gap et reconnecte en mode fail-closed.
+
+Hyperliquid traite lui aussi, par actif, `activeAssetCtx`, `bbo`, `l2Book`
+et `trades` comme des flux critiques. Le silence de l'un d'eux journalise un
+gap et force la reconnexion publique.
+
+L'horloge Binance est échantillonnée pendant toute la collecte, par défaut toutes
+les 5 secondes. Chaque mesure persiste le RTT, l'offset estimé et l'incertitude
+`RTT / 2`. Une mesure est valide uniquement si son incertitude est au plus de
+50 ms ; sa validité causale est alors l'intervalle semi-ouvert
+`[response_received_time, response_received_time + 15 s)`. Une mesure trop
+incertaine est persistée comme invalide sans intervalle. Une déconnexion, une
+génération différente ou une mesure devenue stale coupe la couverture : aucun
+point n'est interpolé à travers cette période.
 
 ## Démarrage, panne et arrêt
 
 Les deux workers attendent la même barrière de départ. Dès qu'un worker termine,
 échoue ou reçoit une demande d'arrêt, le coordinateur arrête aussi l'autre. Après
 la sortie des deux threads, chaque collecteur ferme son socket et publie son état,
-puis le writer commun effectue le flush final et libère le root lock une seule fois.
+et Binance ferme ses deux sockets physiques requis (`public` et `market`). Le
+writer commun effectue ensuite le flush final et libère le root lock une seule fois.
 
 Les statuts restent séparés :
 
 - `data/runtime_status.json` pour Hyperliquid ;
 - `data/runtime_status_binance_usdm.json` pour Binance USD-M.
+
+## Smoke test causal de 15 minutes
+
+Les bornes explicites isolent les lignes de la nouvelle collecte sans supprimer
+ni réécrire les données déjà présentes dans le lake :
+
+```powershell
+$SmokeStart = [DateTimeOffset]::UtcNow.ToString("o")
+.\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
+  --assets "BTC,ETH" `
+  --candle-intervals 1m `
+  --duration-seconds 900 `
+  --batch-size 10000 `
+  --history-lookback-hours 1
+$SmokeEnd = [DateTimeOffset]::UtcNow.ToString("o")
+```
+
+Après l'arrêt propre, l'audit exact est :
+
+```powershell
+.\.venv\Scripts\python.exe -m hyperlab data continuity data\lake `
+  --assets "BTC,ETH" `
+  --start $SmokeStart `
+  --end $SmokeEnd `
+  --json
+```
+
+Le code de sortie est `0` uniquement si, pour BTC et ETH, les trades normalisés
+et les wires `aggTrade` sont non nuls et reliés exactement. Le premier état L2
+Binance de chaque actif et génération doit être lié exactement à son couple
+`resync_start` / `resync_complete` et au même snapshot. Les états L2 exacts
+suivants ne rafraîchissent la couverture que dans cette connexion publique,
+epoch et carnet déjà armés. L'horloge respecte aussi l'identité wire v2, la
+politique stricte et la cadence réelle.
+Chaque observation de trade exactement reliée reste utilisable causalement au
+plus 30 secondes après son `received_time`. Ce TTL opérationnel borne la
+fraîcheur pour l'audit ; il ne prétend pas inférer une cadence de trades propre à
+la venue.
+Il exige aussi l'absence de gap borné de séquence ou de connexion, une couverture
+`clock_sync.coverage_continuous` vraie et un
+`strict_phase_10_overlap.duration_seconds` strictement positif. Un succès reste
+seulement un gate technique : `phase_10_status` vaut toujours
+`BLOCKED_PRECONDITION_NOT_MET` dans ce rapport.
 
 ## Commande longue destinée à la Phase 10
 
@@ -128,7 +193,7 @@ Capture simultanée de 24 heures, BTC/ETH, avec le batch maximal exposé par la 
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
-  --assets BTC,ETH `
+  --assets "BTC,ETH" `
   --candle-intervals 1m `
   --duration-seconds 86400 `
   --batch-size 10000 `
@@ -146,10 +211,10 @@ Après l'arrêt propre, validez et inventoriez les artefacts avant toute Phase 1
 .\.venv\Scripts\python.exe -m hyperlab data inventory data\lake --json
 ```
 
-La précondition n'est satisfaite que si l'inventaire confirme le chevauchement
-BTC/ETH des deux venues et si la validation ne signale ni corruption ni rupture
-incompatible. Vingt-quatre heures constituent une capture technique longue, pas
-une preuve de représentativité économique, de latence stable ou de rentabilité.
+Exécutez ensuite `data continuity` avec les bornes UTC de cette collecte. Une
+capture de vingt-quatre heures et un audit technique réussi ne constituent pas
+une preuve de représentativité économique, de latence stable ou de rentabilité,
+et ne débloquent pas à eux seuls la Phase 10.
 
 ## Limites explicites
 
@@ -161,4 +226,3 @@ une preuve de représentativité économique, de latence stable ou de rentabilit
 - Les horloges source appartiennent à chaque venue. Toute analyse future devra
   rester causale sur `received_time` et tenir compte des mesures de drift.
 - Ce patch ne réalise aucune analyse économique lead-lag.
-

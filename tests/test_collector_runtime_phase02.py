@@ -145,6 +145,7 @@ SocketItem = tuple[str | BaseException | None, float]
 class FakeSocket:
     def __init__(self, timer: ControlledTime, items: list[SocketItem]) -> None:
         self.timer = timer
+        self.connected_at = timer.now()
         self.items = list(items)
         self.sent: list[dict[str, object]] = []
         self.closed = False
@@ -306,6 +307,7 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     timer = ControlledTime()
     config = _config()
     socket = FakeSocket(timer, _ack_messages(config))
+    socket.connected_at = BASE_TIME - timedelta(milliseconds=1)
     collector, rest, factory, sink = _collector(tmp_path, config, timer, [socket])
 
     metrics = collector.run(max_messages=config.subscription_count)
@@ -323,6 +325,16 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     assert len(bbo_rows) == 1
     assert str(bbo_rows[0]["bid_price"]) == "49999.000000000000000000"
     assert bbo_rows[0]["source_sequence"] is None
+    assert str(bbo_rows[0]["update_id"]).startswith("rest:")
+    l2_headers = _parquet_rows(sink.root, "l2_book_state")
+    l2_levels = _parquet_rows(sink.root, "l2_snapshot")
+    assert len(l2_headers) == 1
+    assert len(l2_levels) == 2
+    rest_snapshot_id = str(l2_headers[0]["snapshot_id"])
+    assert rest_snapshot_id.startswith(
+        f"rest:{l2_headers[0]['connection_id']}:1:"
+    )
+    assert {str(row["snapshot_id"]) for row in l2_levels} == {rest_snapshot_id}
     assert CollectorState.BOOTSTRAPPING in sink.flush_states
     assert CollectorState.LIVE in sink.flush_states
     connection_events = _parquet_rows(sink.root, "connection_event")
@@ -334,6 +346,7 @@ def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:
     assert all(row["connection_epoch"] == 1 for row in connection_events)
     assert all(row["capture_epoch_id"] for row in connection_events)
     assert all(row["socket_role"] == "public" for row in connection_events)
+    assert connection_events[0]["received_time"] == socket.connected_at
     _assert_all_source_sequences_are_null(sink.root)
 
     status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))

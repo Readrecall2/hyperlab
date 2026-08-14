@@ -202,12 +202,7 @@ class BinancePublicConnector:
         market_streams: list[str] = []
         for asset in assets:
             symbol = self.instrument_for_asset(asset).source_symbol.lower()
-            public_streams.extend(
-                (
-                    f"{symbol}@bookTicker",
-                    f"{symbol}@depth20@100ms",
-                )
-            )
+            public_streams.append(f"{symbol}@depth20@100ms")
             market_streams.extend(
                 (
                     f"{symbol}@aggTrade",
@@ -364,6 +359,7 @@ def parse_binance_message(
                 raise ValueError(
                     f"event/channel mismatch: expected depthUpdate, observed {event or 'missing'}"
                 )
+            records.append(_parse_bbo_from_depth(data, envelope, normalized))
             records.extend(_parse_l2_snapshot(data, envelope, normalized))
         elif channel.endswith("@aggTrade"):
             if event != "aggTrade":
@@ -414,6 +410,46 @@ def _parse_bbo(
             "bid_quantity": normalized.normalize_quantity(data["B"]),
             "ask_price": _required_decimal(data["a"]),
             "ask_quantity": normalized.normalize_quantity(data["A"]),
+        }
+    )
+    return ParsedRecord(RecordType.BBO, normalized.asset, row)
+
+
+def _parse_bbo_from_depth(
+    data: Mapping[str, Any],
+    envelope: WireEnvelope,
+    normalized: NormalizedInstrument,
+) -> ParsedRecord:
+    """Derive exact BBO from the first levels of one complete top-20 frame."""
+
+    bids = _sequence(data["b"], label="partial depth bids")
+    asks = _sequence(data["a"], label="partial depth asks")
+    if not bids or not asks:
+        raise ValueError("Binance partial depth BBO requires non-empty bid and ask sides")
+    bid = _sequence(bids[0], label="partial depth best bid")
+    ask = _sequence(asks[0], label="partial depth best ask")
+    if len(bid) != 2 or len(ask) != 2:
+        raise ValueError("Binance partial depth BBO levels must contain price and quantity")
+    transaction_time = _datetime_ms(data.get("T", data["E"]))
+    exchange_time = _datetime_ms(data["E"])
+    update_id = int(str(data["u"]))
+    if update_id < 0:
+        raise ValueError("Binance L2 update sequence cannot be negative")
+    row = _common(
+        RecordType.BBO,
+        normalized.asset,
+        envelope,
+        event_time=transaction_time,
+        exchange_time=exchange_time,
+        source_sequence=update_id,
+    )
+    row.update(
+        {
+            "update_id": f"{normalized.source_symbol}:{update_id}",
+            "bid_price": _required_decimal(bid[0]),
+            "bid_quantity": normalized.normalize_quantity(bid[1]),
+            "ask_price": _required_decimal(ask[0]),
+            "ask_quantity": normalized.normalize_quantity(ask[1]),
         }
     )
     return ParsedRecord(RecordType.BBO, normalized.asset, row)

@@ -28,6 +28,10 @@ class ReceivedWireMessage:
 
 
 class PublicSocket(Protocol):
+    connected_at: datetime
+
+    def start_receiving(self) -> None: ...
+
     def send_json(self, payload: dict[str, object]) -> None: ...
 
     def receive(self, timeout_seconds: float) -> ReceivedWireMessage | None: ...
@@ -48,6 +52,7 @@ class WebsocketClientSocket:
         *,
         queue_capacity: int,
         clock: Callable[[], datetime] = _utc_now,
+        start_immediately: bool = True,
     ) -> None:
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be positive")
@@ -56,13 +61,29 @@ class WebsocketClientSocket:
         self._clock = clock
         self._closed = threading.Event()
         self._terminal_error: BaseException | None = None
+        self.connected_at = self._clock()
+        ReceivedWireMessage("", self.connected_at)
         self._connection.settimeout(1.0)
         self._reader = threading.Thread(
             target=self._read_forever,
             name="public-market-data-ws-reader",
             daemon=True,
         )
-        self._reader.start()
+        self._reader_lock = threading.Lock()
+        self._reader_started = False
+        if start_immediately:
+            self.start_receiving()
+
+    def start_receiving(self) -> None:
+        """Activate the reader once the supervisor has persisted connection lineage."""
+
+        with self._reader_lock:
+            if self._reader_started:
+                return
+            if self._closed.is_set():
+                raise RuntimeError("cannot start a closed public websocket reader")
+            self._reader.start()
+            self._reader_started = True
 
     def send_json(self, payload: dict[str, object]) -> None:
         self._connection.send(json.dumps(payload, separators=(",", ":")))
@@ -70,19 +91,28 @@ class WebsocketClientSocket:
     def receive(self, timeout_seconds: float) -> ReceivedWireMessage | None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if not self._reader_started:
+            raise RuntimeError("public websocket reader has not been started")
+        self._raise_terminal_error()
         try:
-            return self._messages.get(timeout=timeout_seconds)
+            received = self._messages.get(timeout=timeout_seconds)
         except queue.Empty:
-            if self._terminal_error is not None:
-                raise self._terminal_error from None
+            self._raise_terminal_error()
             return None
+        self._raise_terminal_error()
+        return received
+
+    def _raise_terminal_error(self) -> None:
+        error = self._terminal_error
+        if error is not None:
+            raise error from None
 
     def close(self) -> None:
         self._closed.set()
         try:
             self._connection.close()
         finally:
-            if threading.current_thread() is not self._reader:
+            if self._reader_started and threading.current_thread() is not self._reader:
                 self._reader.join(timeout=2.0)
 
     def _read_forever(self) -> None:
@@ -124,7 +154,7 @@ class WebsocketClientSocket:
                 self._messages.put_nowait(received)
             except queue.Full:
                 self._terminal_error = BufferError(
-                    "bounded Hyperliquid websocket queue is full; reconnect required"
+                    "bounded public websocket queue is full; reconnect required"
                 )
                 self._closed.set()
                 self._connection.close()
@@ -184,7 +214,13 @@ class UrlWebsocketClientFactory:
         self.queue_capacity = queue_capacity
         self._clock = clock
 
-    def connect(self, network: str, timeout_seconds: float) -> WebsocketClientSocket:
+    def _connect(
+        self,
+        network: str,
+        timeout_seconds: float,
+        *,
+        start_immediately: bool,
+    ) -> WebsocketClientSocket:
         import websocket
 
         if network != "public":
@@ -198,4 +234,15 @@ class UrlWebsocketClientFactory:
             connection,
             queue_capacity=self.queue_capacity,
             clock=self._clock,
+            start_immediately=start_immediately,
         )
+
+    def connect(self, network: str, timeout_seconds: float) -> WebsocketClientSocket:
+        return self._connect(network, timeout_seconds, start_immediately=True)
+
+    def connect_paused(
+        self,
+        network: str,
+        timeout_seconds: float,
+    ) -> WebsocketClientSocket:
+        return self._connect(network, timeout_seconds, start_immediately=False)

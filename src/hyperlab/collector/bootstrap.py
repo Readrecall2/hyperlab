@@ -310,4 +310,12 @@ def parse_bbo_from_l2(payload: object, envelope: WireEnvelope) -> tuple[ParsedRe
             None if not ask_levels else ask_levels[0],
         ],
     }
-    return tuple(_parse_bbo(bbo_payload, envelope))
+    records = _parse_bbo(bbo_payload, envelope)
+    result: list[ParsedRecord] = []
+    for record in records:
+        row = dict(record.row)
+        row["update_id"] = f"rest:{row['update_id']}"
+        result.append(
+            ParsedRecord(record.record_type, record.asset, row)
+        )
+    return tuple(result)

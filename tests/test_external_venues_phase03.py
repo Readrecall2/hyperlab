@@ -205,14 +205,21 @@ def test_binance_connector_collects_bbo_l2_trade_candle_and_funding_context() ->
 
     assert [record.record_type for record in depth.records] == [
         RecordType.WIRE_MESSAGE,
+        RecordType.BBO,
         RecordType.L2_BOOK_STATE,
         RecordType.L2_SNAPSHOT,
         RecordType.L2_SNAPSHOT,
         RecordType.L2_SNAPSHOT,
         RecordType.L2_SNAPSHOT,
     ]
-    header = depth.records[1]
-    levels = depth.records[2:]
+    depth_bbo = depth.records[1]
+    header = depth.records[2]
+    levels = depth.records[3:]
+    assert depth_bbo.row["bid_price"] == Decimal("60000.1")
+    assert depth_bbo.row["bid_quantity"] == Decimal("1.25")
+    assert depth_bbo.row["ask_price"] == Decimal("60000.2")
+    assert depth_bbo.row["ask_quantity"] == Decimal("2.5")
+    assert depth_bbo.row["update_id"] == "BTCUSDT:43"
     assert header.row["venue"] == "binance_usdm"
     assert header.row["received_time"] == BASE
     assert header.row["bid_level_count"] == 2
@@ -241,11 +248,10 @@ def test_binance_connector_splits_book_and_market_streams_on_official_public_url
     assert urls["public"].startswith(public_prefix)
     assert urls["market"].startswith(market_prefix)
     assert set(urls["public"].removeprefix(public_prefix).split("/")) == {
-        "btcusdt@bookTicker",
         "btcusdt@depth20@100ms",
-        "ethusdt@bookTicker",
         "ethusdt@depth20@100ms",
     }
+    assert "bookTicker" not in urls["public"]
     assert set(urls["market"].removeprefix(market_prefix).split("/")) == {
         "btcusdt@aggTrade",
         "btcusdt@markPrice@1s",
@@ -869,6 +875,94 @@ class FakeReusableSession:
         self.close_calls += 1
 
 
+class ControlledHttpClock:
+    def __init__(self) -> None:
+        self.current = BASE
+
+    def now(self) -> datetime:
+        return self.current
+
+    def advance(self, milliseconds: int) -> None:
+        self.current += timedelta(milliseconds=milliseconds)
+
+
+class ColdThenWarmSession(FakeReusableSession):
+    delays_ms: ClassVar[tuple[int, ...]] = (600, 84, 84)
+
+    def __init__(self, clock: ControlledHttpClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.time_calls = 0
+        self.time_ready = [threading.Event(), threading.Event()]
+
+    def get(self, url: str, **kwargs: object) -> FakeHttpResponse:
+        call_index = len(self.calls)
+        delay_ms = self.delays_ms[call_index]
+        request_sent = self.clock.now()
+        server_midpoint = request_sent + timedelta(milliseconds=delay_ms / 2)
+        if url.endswith("/fapi/v1/exchangeInfo"):
+            payload: object = _exchange_info()
+        elif url.endswith("/fapi/v1/time"):
+            payload = {
+                "serverTime": int(server_midpoint.timestamp() * 1_000),
+            }
+            ready = self.time_ready[self.time_calls]
+            self.time_calls += 1
+        else:
+            raise AssertionError(f"unexpected public REST URL: {url}")
+        self.clock.advance(delay_ms)
+        response = FakeHttpResponse(payload, status_code=self.status_code)
+        self.calls.append({"url": url, **kwargs})
+        self.responses.append(response)
+        if url.endswith("/fapi/v1/time"):
+            ready.set()
+        return response
+
+
+def test_cold_bootstrap_warms_one_session_for_valid_clock_samples() -> None:
+    http_clock = ControlledHttpClock()
+    session = ColdThenWarmSession(http_clock)
+    client = BinancePublicRestClient(
+        transport=RequestsJsonTransport(
+            session=session,  # type: ignore[arg-type]
+        ),
+        clock=http_clock.now,
+    )
+
+    cold_bootstrap = client.exchange_info()
+    measurements = (client.clock_measurement(), client.clock_measurement())
+    records = tuple(
+        clock_record(
+            measurement,
+            f"warm-clock-{index}",
+            connection_id="binance-public-1",
+            connection_epoch=1,
+            capture_epoch_id="binance-capture-1",
+        )
+        for index, measurement in enumerate(measurements, start=1)
+    )
+    client.close()
+
+    assert (
+        cold_bootstrap.response_received_time
+        - cold_bootstrap.request_sent_time
+    ) == timedelta(milliseconds=600)
+    assert [
+        str(call["url"]).rsplit("/", 1)[-1]
+        for call in session.calls
+    ] == ["exchangeInfo", "time", "time"]
+    assert session.close_calls == 1
+    assert all(
+        measurement.round_trip_latency_ms == Decimal("84")
+        and measurement.drift_uncertainty_ms == Decimal("42")
+        for measurement in measurements
+    )
+    assert [record.row["sample_status"] for record in records] == [
+        "valid",
+        "valid",
+    ]
+
+
 def test_rest_transport_reuses_one_http_session_for_clock_samples() -> None:
     session = FakeReusableSession()
     transport = RequestsJsonTransport(session=session)  # type: ignore[arg-type]
@@ -1200,25 +1294,48 @@ def test_binance_complete_l2_snapshot_marks_each_connection_resync(
     )
 
 
-def test_binance_staleness_is_checked_per_required_bbo_and_l2_stream(
+def test_binance_depth_frame_is_the_single_required_public_book_stream(
     tmp_path: Path,
 ) -> None:
     sink = BatchingLakeSink(tmp_path / "lake", batch_size=10, queue_capacity=20)
     collector = _reference_collector(tmp_path, sink)
+    connector = _connector()
     try:
-        collector._initialize_critical_streams(_connector(), at=BASE)
-        collector._critical_stream_last_received["btcusdt@bookTicker"] = BASE + timedelta(
-            seconds=29
-        )
-        collector._critical_stream_last_received["btcusdt@aggTrade"] = BASE + timedelta(
-            seconds=29
-        )
-        assert collector._stale_critical_streams(at=BASE + timedelta(seconds=31)) == (
+        collector._initialize_critical_streams(connector, at=BASE)
+        assert set(collector._critical_stream_last_received) == {
             "btcusdt@depth20@100ms",
+            "btcusdt@aggTrade",
+        }
+        received = BASE + timedelta(seconds=29)
+        parsed = connector.parse_message(
+            WireEnvelope(
+                json.dumps(
+                    _depth_frame(int(received.timestamp() * 1_000), last_sequence=1),
+                    separators=(",", ":"),
+                ),
+                received,
+                "binance-public-1",
+                1,
+                1,
+                "binance-capture-1",
+            )
         )
+        assert {record.record_type for record in parsed.records} >= {
+            RecordType.BBO,
+            RecordType.L2_BOOK_STATE,
+        }
+        collector._observe_critical_stream(
+            parsed,
+            received_time=received,
+            socket_role="public",
+        )
+        collector._critical_stream_last_received["btcusdt@aggTrade"] = received
+
+        assert collector._stale_critical_streams(
+            at=BASE + timedelta(seconds=31)
+        ) == ()
     finally:
         collector.close()
-
 
 def test_binance_agg_trade_is_a_required_stream_for_each_asset(tmp_path: Path) -> None:
     sink = BatchingLakeSink(tmp_path / "lake", batch_size=10, queue_capacity=20)
@@ -1271,10 +1388,16 @@ class FatalWriterSink:
 
 class NoMessageSocket:
     def __init__(self) -> None:
+        self.connected_at = BASE
         self.closed = False
+        self.started = False
+
+    def start_receiving(self) -> None:
+        self.started = True
 
     def receive(self, timeout_seconds: float) -> None:
         del timeout_seconds
+        assert self.started
         raise AssertionError("writer failed before the first socket receive")
 
     def close(self) -> None:
@@ -1287,7 +1410,7 @@ class FatalWriterSocketFactory:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    def connect(self, network: str, timeout_seconds: float) -> NoMessageSocket:
+    def connect_paused(self, network: str, timeout_seconds: float) -> NoMessageSocket:
         del network, timeout_seconds
         return self.socket
 
@@ -1295,10 +1418,16 @@ class FatalWriterSocketFactory:
 class OneFrameSocket:
     def __init__(self, raw_message: str) -> None:
         self.messages = [ReceivedWireMessage(raw_message, BASE)]
+        self.connected_at = BASE - timedelta(milliseconds=1)
         self.closed = False
+        self.started = False
+
+    def start_receiving(self) -> None:
+        self.started = True
 
     def receive(self, timeout_seconds: float) -> ReceivedWireMessage | None:
         del timeout_seconds
+        assert self.started
         return self.messages.pop(0) if self.messages else None
 
     def close(self) -> None:
@@ -1308,6 +1437,8 @@ class OneFrameSocket:
 class SplitSocketFactory:
     sockets: ClassVar[dict[str, OneFrameSocket]] = {}
     urls: ClassVar[dict[str, str]] = {}
+    public_handshake_complete = threading.Event()
+    market_observed_public_paused = False
 
     def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
         if "/public/" in url:
@@ -1318,29 +1449,29 @@ class SplitSocketFactory:
             raise AssertionError(f"unexpected Binance websocket URL: {url}")
         self.urls[self.role] = url
 
-    def connect(self, network: str, timeout_seconds: float) -> OneFrameSocket:
+    def connect_paused(self, network: str, timeout_seconds: float) -> OneFrameSocket:
         assert network == "public"
         assert timeout_seconds > 0
+        if self.role == "public":
+            self.public_handshake_complete.set()
+        else:
+            assert self.public_handshake_complete.wait(timeout=1.0)
+            assert not self.sockets["public"].started
+            type(self).market_observed_public_paused = True
         return self.sockets[self.role]
+
+    def connect(self, network: str, timeout_seconds: float) -> OneFrameSocket:
+        del network, timeout_seconds
+        raise AssertionError("Binance socket pairs must use paused parallel startup")
 
 
 def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    public_frame = _combined(
-        "btcusdt@bookTicker",
-        {
-            "e": "bookTicker",
-            "E": int(BASE.timestamp() * 1_000),
-            "T": int(BASE.timestamp() * 1_000),
-            "s": "BTCUSDT",
-            "u": 1,
-            "b": "60000.1",
-            "B": "1.0",
-            "a": "60000.2",
-            "A": "2.0",
-        },
+    public_frame = _depth_frame(
+        int(BASE.timestamp() * 1_000),
+        last_sequence=1,
     )
     market_frame = _combined(
         "btcusdt@aggTrade",
@@ -1360,6 +1491,8 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
         "market": OneFrameSocket(json.dumps(market_frame, separators=(",", ":"))),
     }
     SplitSocketFactory.urls = {}
+    SplitSocketFactory.public_handshake_complete = threading.Event()
+    SplitSocketFactory.market_observed_public_paused = False
     root = tmp_path / "lake"
     sink = BatchingLakeSink(root, batch_size=100, queue_capacity=200)
     collector = _reference_collector(tmp_path, sink)
@@ -1375,6 +1508,8 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
         collector.close()
 
     assert set(SplitSocketFactory.urls) == {"public", "market"}
+    assert SplitSocketFactory.market_observed_public_paused is True
+    assert all(socket.started for socket in SplitSocketFactory.sockets.values())
     assert all(socket.closed for socket in SplitSocketFactory.sockets.values())
     rows: dict[RecordType, list[dict[str, object]]] = {}
     for manifest in inventory_partitions(root).partitions:
@@ -1389,6 +1524,16 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
     assert len({row["connection_id"] for row in wire_rows}) == 2
     assert {row["connection_epoch"] for row in wire_rows} == {1}
     assert {row["arrival_sequence"] for row in wire_rows} == {1}
+    connect_by_connection = {
+        str(row["connection_id"]): row
+        for row in rows[RecordType.CONNECTION_EVENT]
+        if row["event_kind"] == "connect"
+    }
+    assert all(
+        connect_by_connection[str(row["connection_id"])]["received_time"]
+        <= row["received_time"]
+        for row in wire_rows
+    )
     capture_ids = {row["capture_epoch_id"] for row in wire_rows}
     assert len(capture_ids) == 1
     trade = rows[RecordType.TRADE][0]
@@ -1400,6 +1545,138 @@ def test_binance_runtime_supervises_split_sockets_with_one_capture_identity(
     assert clock["capture_epoch_id"] in capture_ids
     assert clock["sample_status"] == "valid"
 
+
+class PartialHandshakeSocketFactory:
+    market_socket = NoMessageSocket()
+
+    def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
+        self.role = "public" if "/public/" in url else "market"
+
+    def connect_paused(
+        self,
+        network: str,
+        timeout_seconds: float,
+    ) -> NoMessageSocket:
+        assert network == "public"
+        assert timeout_seconds > 0
+        if self.role == "public":
+            raise ConnectionError("simulated public handshake failure")
+        return self.market_socket
+
+
+def test_partial_paired_handshake_closes_unstarted_peer_and_records_supervisor_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    PartialHandshakeSocketFactory.market_socket = NoMessageSocket()
+    root = tmp_path / "lake"
+    collector = _reference_collector(
+        tmp_path,
+        BatchingLakeSink(root, batch_size=100, queue_capacity=200),
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        PartialHandshakeSocketFactory,
+    )
+    monkeypatch.setattr(
+        collector,
+        "_interruptible_sleep",
+        lambda _delay: collector.stop(),
+    )
+
+    try:
+        collector.run()
+    finally:
+        collector.close()
+
+    market = PartialHandshakeSocketFactory.market_socket
+    assert market.closed is True
+    assert market.started is False
+    assert collector.metrics["connections"] == 0
+    assert collector.metrics["physical_connections"] == 1
+    rows: list[dict[str, object]] = []
+    for manifest in inventory_partitions(root).partitions:
+        if manifest.partition.record_type == RecordType.CONNECTION_EVENT:
+            rows.extend(
+                pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
+            )
+    assert [row["event_kind"] for row in rows] == ["gap"]
+    assert rows[0]["socket_role"] == "supervisor"
+    status = json.loads(
+        (tmp_path / "runtime-status.json").read_text(encoding="utf-8")
+    )
+    assert status["capture_epoch_id"] == rows[0]["capture_epoch_id"]
+    assert set(status["physical_connection_ids"]) == {
+        "public",
+        "market",
+    }
+
+
+class MutableHandshakeDeadline:
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def monotonic(self) -> float:
+        return self.seconds
+
+
+class DeadlineHandshakeSocketFactory:
+    sockets: ClassVar[dict[str, NoMessageSocket]] = {}
+    deadline: ClassVar[MutableHandshakeDeadline]
+
+    def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
+        self.role = "public" if "/public/" in url else "market"
+
+    def connect_paused(
+        self,
+        network: str,
+        timeout_seconds: float,
+    ) -> NoMessageSocket:
+        assert network == "public"
+        assert timeout_seconds > 0
+        self.deadline.seconds = 2.0
+        return self.sockets[self.role]
+
+
+def test_deadline_during_paired_handshake_never_activates_a_clean_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline = MutableHandshakeDeadline()
+    sockets = {"public": NoMessageSocket(), "market": NoMessageSocket()}
+    DeadlineHandshakeSocketFactory.deadline = deadline
+    DeadlineHandshakeSocketFactory.sockets = sockets
+    root = tmp_path / "lake"
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=BinancePublicRestClient(transport=FakeTransport()),
+        sink=BatchingLakeSink(root, batch_size=100, queue_capacity=200),
+        runtime_status_path=tmp_path / "runtime-status.json",
+        clock=lambda: BASE,
+        monotonic=deadline.monotonic,
+    )
+    monkeypatch.setattr(collector, "_bootstrap", _connector)
+    monkeypatch.setattr(
+        "hyperlab.venues.runtime.UrlWebsocketClientFactory",
+        DeadlineHandshakeSocketFactory,
+    )
+
+    try:
+        collector.run(duration_seconds=1.0)
+    finally:
+        collector.close()
+
+    assert all(socket.closed for socket in sockets.values())
+    assert not any(socket.started for socket in sockets.values())
+    assert collector.metrics["connections"] == 0
+    assert collector.metrics["physical_connections"] == 2
+    assert collector.metrics["capture_epoch_id"]
+    assert set(collector.metrics["physical_connection_ids"]) == {
+        "public",
+        "market",
+    }
+    assert not list(root.rglob("*.parquet"))
 
 class ScriptedClockRest:
     def __init__(self, measurements: list[object]) -> None:
@@ -1429,9 +1706,15 @@ class ScriptedSocket:
         self.ready = ready or [None] * len(actions)
         self.advance = advance
         self.receive_count = 0
+        self.connected_at = clock()
         self.closed = False
+        self.started = False
+
+    def start_receiving(self) -> None:
+        self.started = True
 
     def receive(self, timeout_seconds: float) -> ReceivedWireMessage | None:
+        assert self.started
         assert timeout_seconds > 0
         if not self.actions:
             return None
@@ -1459,7 +1742,7 @@ class ReconnectingSocketFactory:
     def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
         self.role = "public" if "/public/" in url else "market"
 
-    def connect(self, network: str, timeout_seconds: float) -> ScriptedSocket:
+    def connect_paused(self, network: str, timeout_seconds: float) -> ScriptedSocket:
         assert network == "public"
         assert timeout_seconds > 0
         return self.runs[self.role].pop(0)
@@ -1508,37 +1791,51 @@ def _trade_frame(event_ms: int, *, sequence: int) -> dict[str, object]:
     )
 
 
-def test_market_socket_failure_closes_pair_and_reconnects_with_fresh_lineage(
+def test_market_socket_failure_closes_pair_and_reuses_warm_clock_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rest = ScriptedClockRest(
-        [
-            _clock_measurement_at(0, 20),
-            _clock_measurement_at(2, 20),
-        ]
+    http_clock = ControlledHttpClock()
+    session = ColdThenWarmSession(http_clock)
+    rest = BinancePublicRestClient(
+        transport=RequestsJsonTransport(
+            session=session,  # type: ignore[arg-type]
+        ),
+        clock=http_clock.now,
     )
+    cold_bootstrap = rest.exchange_info()
+    assert (
+        cold_bootstrap.response_received_time
+        - cold_bootstrap.request_sent_time
+    ) == timedelta(milliseconds=600)
+
     base_ms = int(BASE.timestamp() * 1_000)
     first_public = ScriptedSocket(
         [_depth_frame(base_ms, last_sequence=1)],
-        clock=lambda: BASE,
-        ready=[rest.ready[0]],
+        clock=http_clock.now,
+        ready=[session.time_ready[0]],
     )
     first_market = ScriptedSocket(
-        [ConnectionError("simulated market socket failure")],
-        clock=lambda: BASE,
+        [
+            _trade_frame(base_ms + 1, sequence=2),
+            ConnectionError("simulated market socket failure"),
+        ],
+        clock=http_clock.now,
     )
     second_public = ScriptedSocket(
         [
-            _depth_frame(base_ms + 1_000, last_sequence=2),
-            _bbo_frame(base_ms + 1_001, sequence=3),
+            _depth_frame(base_ms + 1_000, last_sequence=3),
+            _depth_frame(base_ms + 1_001, last_sequence=4),
         ],
-        clock=lambda: BASE + timedelta(seconds=2),
-        ready=[rest.ready[1], None],
+        clock=http_clock.now,
+        ready=[session.time_ready[1], None],
     )
     second_market = ScriptedSocket(
-        [_trade_frame(base_ms + 1_000, sequence=4)],
-        clock=lambda: BASE + timedelta(seconds=2),
+        [
+            _trade_frame(base_ms + 1_000, sequence=5),
+            _trade_frame(base_ms + 1_001, sequence=6),
+        ],
+        clock=http_clock.now,
     )
     all_sockets = [first_public, first_market, second_public, second_market]
     ReconnectingSocketFactory.runs = {
@@ -1548,10 +1845,10 @@ def test_market_socket_failure_closes_pair_and_reconnects_with_fresh_lineage(
     root = tmp_path / "lake"
     collector = BinanceReferenceCollector(
         ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
-        rest=rest,  # type: ignore[arg-type]
+        rest=rest,
         sink=BatchingLakeSink(root, batch_size=100, queue_capacity=500),
         runtime_status_path=tmp_path / "runtime-status.json",
-        clock=lambda: BASE + timedelta(seconds=2),
+        clock=http_clock.now,
     )
     monkeypatch.setattr(collector, "_bootstrap", _connector)
     monkeypatch.setattr(collector, "_interruptible_sleep", lambda _delay: None)
@@ -1561,14 +1858,22 @@ def test_market_socket_failure_closes_pair_and_reconnects_with_fresh_lineage(
     )
 
     try:
-        collector.run(max_messages=4)
+        collector.run(max_messages=6)
     finally:
         collector.close()
 
     assert all(socket.closed for socket in all_sockets)
+    assert all(socket.started for socket in all_sockets)
     assert collector.metrics["connections"] == 2
     assert collector.metrics["physical_connections"] == 4
     assert collector.metrics["reconnects"] == 1
+    assert [
+        str(call["url"]).rsplit("/", 1)[-1]
+        for call in session.calls
+    ] == ["exchangeInfo", "time", "time"]
+    assert session.time_calls == 2
+    assert session.close_calls == 1
+
     rows: dict[RecordType, list[dict[str, object]]] = {}
     for manifest in inventory_partitions(root).partitions:
         rows.setdefault(manifest.partition.record_type, []).extend(
@@ -1578,34 +1883,50 @@ def test_market_socket_failure_closes_pair_and_reconnects_with_fresh_lineage(
     for row in rows[RecordType.WIRE_MESSAGE]:
         wire_by_epoch.setdefault(int(str(row["connection_epoch"])), []).append(row)
     assert set(wire_by_epoch) == {1, 2}
+    assert all(
+        row["channel"] != "btcusdt@bookTicker"
+        for epoch_rows in wire_by_epoch.values()
+        for row in epoch_rows
+    )
     assert {
         row["connection_id"] for row in wire_by_epoch[1]
     }.isdisjoint({row["connection_id"] for row in wire_by_epoch[2]})
-    second_public_wire = sorted(
-        (
-            row
-            for row in wire_by_epoch[2]
-            if row["channel"] != "btcusdt@aggTrade"
-        ),
-        key=lambda row: int(str(row["arrival_sequence"])),
+    assert all(
+        sorted(
+            int(str(row["arrival_sequence"]))
+            for row in epoch_rows
+            if row["channel"] == "btcusdt@depth20@100ms"
+        )
+        == list(range(1, 1 + sum(
+            row["channel"] == "btcusdt@depth20@100ms"
+            for row in epoch_rows
+        )))
+        for epoch_rows in wire_by_epoch.values()
     )
-    assert [row["arrival_sequence"] for row in second_public_wire] == [1, 2]
-    second_market_wire = next(
-        row for row in wire_by_epoch[2] if row["channel"] == "btcusdt@aggTrade"
+
+    clock_by_epoch = {
+        int(str(row["connection_epoch"])): row
+        for row in rows[RecordType.CLOCK_SYNC]
+    }
+    assert set(clock_by_epoch) == {1, 2}
+    for epoch, clock_row in clock_by_epoch.items():
+        assert clock_row["round_trip_latency_ms"] == Decimal("84")
+        assert clock_row["drift_uncertainty_ms"] == Decimal("42")
+        assert clock_row["sample_status"] == "valid"
+        assert clock_row["invalid_reason"] is None
+        assert {
+            row["capture_epoch_id"] for row in wire_by_epoch[epoch]
+        } == {clock_row["capture_epoch_id"]}
+    assert (
+        clock_by_epoch[1]["capture_epoch_id"]
+        != clock_by_epoch[2]["capture_epoch_id"]
     )
-    assert second_market_wire["arrival_sequence"] == 1
-    second_capture = second_market_wire["capture_epoch_id"]
+    second_capture = clock_by_epoch[2]["capture_epoch_id"]
     assert any(
         row["event_kind"] == "resync_complete"
         and row["capture_epoch_id"] == second_capture
         for row in rows[RecordType.CONNECTION_EVENT]
     )
-    assert any(
-        row["sample_status"] == "valid"
-        and row["capture_epoch_id"] == second_capture
-        for row in rows[RecordType.CLOCK_SYNC]
-    )
-
 
 class ManualTime:
     def __init__(self) -> None:
@@ -1627,7 +1948,7 @@ class TimedSocketFactory:
     def __init__(self, url: str, *_args: object, **_kwargs: object) -> None:
         self.role = "public" if "/public/" in url else "market"
 
-    def connect(self, network: str, timeout_seconds: float) -> ScriptedSocket:
+    def connect_paused(self, network: str, timeout_seconds: float) -> ScriptedSocket:
         assert network == "public"
         assert timeout_seconds > 0
         return self.sockets[self.role]
@@ -1754,7 +2075,8 @@ def test_binance_coordinated_writer_error_is_fatal_without_reconnect(
         collector.run(max_messages=1)
 
     assert collector.metrics["state"] == "failed"
-    assert collector.metrics["connections"] == 1
+    assert collector.metrics["connections"] == 0
+    assert collector.metrics["physical_connections"] == 2
     assert collector.metrics["reconnects"] == 0
     assert FatalWriterSocketFactory.socket.closed is True
 

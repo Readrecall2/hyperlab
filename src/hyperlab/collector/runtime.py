@@ -344,6 +344,10 @@ class PublicCollector:
                 socket = self.socket_factory.connect(
                     self.config.network, self.config.ws_connect_timeout_seconds
                 )
+                connect_received_at = ReceivedWireMessage(
+                    "",
+                    socket.connected_at,
+                ).received_time
                 connected = True
                 self.metrics.connection_epoch = next_epoch
                 self.metrics.connections += 1
@@ -357,6 +361,7 @@ class PublicCollector:
                     epoch,
                     event_kind="connect",
                     reason=None,
+                    at=connect_received_at,
                 )
 
                 subscriptions = self.config.subscriptions()
@@ -882,8 +887,9 @@ class PublicCollector:
         asset: str = "GLOBAL",
         event_kind: str,
         reason: str | None,
+        at: datetime | None = None,
     ) -> None:
-        now = self.clock()
+        now = self.clock() if at is None else at
         row: dict[str, object] = {
             "schema_version": latest_schema_for(RecordType.CONNECTION_EVENT).version,
             "record_type": RecordType.CONNECTION_EVENT.value,

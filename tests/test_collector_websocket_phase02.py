@@ -49,9 +49,10 @@ class FakeConnection:
 
 
 def test_background_reader_accepts_text_and_decodes_bytes() -> None:
+    connected_at = datetime(2026, 8, 12, 11, 59, 59, 999000, tzinfo=UTC)
     first_received_at = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
     second_received_at = first_received_at + timedelta(milliseconds=1)
-    reception_times = iter((first_received_at, second_received_at))
+    reception_times = iter((connected_at, first_received_at, second_received_at))
     connection = FakeConnection(iter(("first", b"second")))
     socket = WebsocketClientSocket(
         connection,
@@ -66,6 +67,45 @@ def test_background_reader_accepts_text_and_decodes_bytes() -> None:
         assert connection.timeout == 1.0
     finally:
         socket.close()
+
+
+def test_paused_reader_captures_connection_time_before_first_wire() -> None:
+    connected_at = datetime(2026, 8, 12, 11, 59, 59, 999000, tzinfo=UTC)
+    first_received_at = connected_at + timedelta(milliseconds=1)
+    timestamps = iter((connected_at, first_received_at))
+    connection = FakeConnection(iter(("first",)))
+    socket = WebsocketClientSocket(
+        connection,
+        queue_capacity=1,
+        clock=lambda: next(timestamps),
+        start_immediately=False,
+    )
+    try:
+        assert socket.connected_at == connected_at
+        assert not socket._reader.is_alive()
+
+        socket.start_receiving()
+
+        assert socket.receive(0.2) == ReceivedWireMessage("first", first_received_at)
+        assert socket.connected_at < first_received_at
+    finally:
+        socket.close()
+
+
+def test_paused_reader_can_close_before_start_without_joining() -> None:
+    connection = FakeConnection(iter(("must-not-be-read",)))
+    socket = WebsocketClientSocket(
+        connection,
+        queue_capacity=1,
+        start_immediately=False,
+    )
+
+    socket.close()
+
+    assert connection.close_calls == 1
+    assert not socket._reader.is_alive()
+    with pytest.raises(RuntimeError, match="cannot start a closed"):
+        socket.start_receiving()
 
 
 def test_receive_timeout_and_invalid_timeout_are_explicit() -> None:
@@ -116,7 +156,12 @@ def test_non_utc_receive_timestamp_becomes_a_visible_terminal_error() -> None:
     socket = WebsocketClientSocket(
         connection,
         queue_capacity=1,
-        clock=lambda: datetime(2026, 8, 12, 12, 0),
+        clock=iter(
+            (
+                datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+                datetime(2026, 8, 12, 12, 0),
+            )
+        ).__next__,
     )
     try:
         with pytest.raises(ValueError, match="received_time must be timezone-aware"):
@@ -125,16 +170,15 @@ def test_non_utc_receive_timestamp_becomes_a_visible_terminal_error() -> None:
         socket.close()
 
 
-def test_bounded_queue_saturation_is_visible_after_buffered_message() -> None:
+def test_bounded_queue_saturation_fails_before_processing_the_backlog() -> None:
     connection = FakeConnection(iter(("first", "overflow")))
     socket = WebsocketClientSocket(connection, queue_capacity=1)
     try:
         assert connection._closed.wait(0.5), "reader did not close the saturated connection"
-        received = socket.receive(0.2)
-        assert received is not None
-        assert received.raw_message == "first"
-        with pytest.raises(BufferError, match="bounded Hyperliquid websocket queue is full"):
-            socket.receive(0.02)
+        assert socket._messages.qsize() == 1
+        with pytest.raises(BufferError, match="bounded public websocket queue is full"):
+            socket.receive(0.2)
+        assert socket._messages.qsize() == 1
         assert connection.close_calls == 1
     finally:
         socket.close()

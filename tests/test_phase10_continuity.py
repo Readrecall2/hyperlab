@@ -10,6 +10,11 @@ import pytest
 from typer.testing import CliRunner
 
 from hyperlab.cli import app
+from hyperlab.collector.bootstrap import (
+    historical_envelope,
+    parse_bbo_from_l2,
+    parse_l2_snapshot,
+)
 from hyperlab.collector.models import ParsedRecord, WireEnvelope
 from hyperlab.collector.parser import parse_websocket_message
 from hyperlab.collector.storage import BatchingLakeSink
@@ -98,7 +103,10 @@ def _binance_frame(
             "U": source_sequence,
             "u": source_sequence,
             "pu": source_sequence - 1,
-            "b": [] if empty_l2 else [["60000", "1"]],
+            "b": [] if empty_l2 else [[
+                "60000",
+                "0" if zero_bbo_quantity else "1",
+            ]],
             "a": [] if empty_l2 else [["60001", "1"]],
         }
     else:
@@ -122,7 +130,13 @@ def _binance_frame(
         capture,
     )
     parsed = connector.parse_message(envelope)
-    assert parsed.issues == ()
+    if empty_l2:
+        assert len(parsed.issues) == 1
+        assert "partial depth BBO requires non-empty bid and ask sides" in (
+            parsed.issues[0]
+        )
+    else:
+        assert parsed.issues == ()
     return parsed.records
 
 
@@ -294,12 +308,19 @@ def _write_continuity_lake(
     omit_hyperliquid_connect: bool = False,
     hyperliquid_connect_role: str = "public",
     hyperliquid_message_asset_override: object = Ellipsis,
-    hyperliquid_message_asset_kind: str = "bbo",
+    hyperliquid_message_asset_kind: str = "l2",
     hyperliquid_channel_override: object = Ellipsis,
     hyperliquid_channel_kind: str = "bbo",
     mixed_hyperliquid_trade_batch: bool = False,
+    add_hyperliquid_rest_bootstrap: bool = False,
+    corrupt_hyperliquid_rest_bbo: bool = False,
+    forge_hyperliquid_rest_bbo_identity: bool = False,
+    forge_hyperliquid_rest_l2_identity: bool = False,
+    mutate_hyperliquid_rest_bbo_value: bool = False,
     offset_jump_at: datetime | None = None,
     mutate_binance_bbo: bool = False,
+    mutate_binance_depth_bbo: bool = False,
+    omit_binance_depth_bbo: bool = False,
     delayed_hyperliquid_trade: bool = False,
     extra_trade_at: datetime | None = None,
     extra_market_refresh_at: datetime | None = None,
@@ -312,7 +333,7 @@ def _write_continuity_lake(
     forge_binance_maker_type: bool = False,
     forge_binance_stream_type: object | None = None,
     binance_message_asset_override: object = Ellipsis,
-    binance_message_asset_kind: str = "bbo",
+    binance_message_asset_kind: str = "l2",
     binance_channel_override: object = Ellipsis,
     binance_channel_kind: str = "l2",
     add_orphan_required_wire: bool = False,
@@ -403,7 +424,7 @@ def _write_continuity_lake(
     for asset_number, asset in enumerate(("BTC", "ETH"), start=1):
         asset_index = asset_number - 1
         market_arrival = asset_number + market_arrival_offset
-        for kind, offset in (("bbo", 1.0), ("l2", 2.0)):
+        for kind, offset in (("l2", 2.0),):
             public_arrival += 1
             received = BASE + timedelta(seconds=offset + asset_index * 3)
             frame_records = _binance_frame(
@@ -417,10 +438,10 @@ def _write_continuity_lake(
                 capture=binance_capture,
                 empty_l2=(empty_binance_l2 and asset == "BTC" and kind == "l2"),
                 zero_bbo_quantity=(
-                    zero_binance_bbo_quantity and asset == "BTC" and kind == "bbo"
+                    zero_binance_bbo_quantity and asset == "BTC" and kind == "l2"
                 ),
             )
-            if mutate_binance_bbo and asset == "BTC" and kind == "bbo":
+            if mutate_binance_bbo and asset == "BTC" and kind == "l2":
                 frame_records = tuple(
                     (
                         ParsedRecord(
@@ -433,7 +454,24 @@ def _write_continuity_lake(
                     )
                     for record in frame_records
                 )
-            if add_orphan_binance_bbo and asset == "BTC" and kind == "bbo":
+            if (
+                mutate_binance_depth_bbo
+                and asset == "BTC"
+                and kind == "l2"
+            ):
+                frame_records = tuple(
+                    (
+                        ParsedRecord(
+                            record.record_type,
+                            record.asset,
+                            {**record.row, "update_id": "BTCUSDT:mutated-depth"},
+                        )
+                        if record.record_type == RecordType.BBO
+                        else record
+                    )
+                    for record in frame_records
+                )
+            if add_orphan_binance_bbo and asset == "BTC" and kind == "l2":
                 source = next(
                     record
                     for record in frame_records
@@ -449,6 +487,12 @@ def _write_continuity_lake(
                             "update_id": "BTCUSDT:orphan-normalized",
                         },
                     )
+                )
+            if omit_binance_depth_bbo and asset == "BTC" and kind == "l2":
+                frame_records = tuple(
+                    record
+                    for record in frame_records
+                    if record.record_type != RecordType.BBO
                 )
             if omit_binance_l2_levels and asset == "BTC" and kind == "l2":
                 frame_records = tuple(
@@ -472,7 +516,11 @@ def _write_continuity_lake(
                         },
                     )
                 )
-            if kind == "l2" and not omit_binance_resync:
+            if (
+                kind == "l2"
+                and not omit_binance_resync
+                and not (empty_binance_l2 and asset == "BTC")
+            ):
                 state = next(
                     record
                     for record in frame_records
@@ -614,6 +662,78 @@ def _write_continuity_lake(
                 )
             )
 
+    if add_hyperliquid_rest_bootstrap:
+        for asset_index, asset in enumerate(("BTC", "ETH"), start=1):
+            received = BASE + timedelta(seconds=8, milliseconds=asset_index)
+            source_time = received - timedelta(milliseconds=100)
+            payload = {
+                "coin": asset,
+                "time": int(source_time.timestamp() * 1_000),
+                "levels": [
+                    [{"px": "60000", "sz": "1", "n": 1}],
+                    [{"px": "60001", "sz": "1", "n": 1}],
+                ],
+            }
+            envelope = historical_envelope(
+                received,
+                connection_id="hyperliquid-public-1",
+                connection_epoch=1,
+                arrival_sequence=100 + asset_index,
+            )
+            rest_l2 = parse_l2_snapshot(payload, envelope)
+            if forge_hyperliquid_rest_l2_identity and asset == "BTC":
+                rest_l2 = tuple(
+                    ParsedRecord(
+                        record.record_type,
+                        record.asset,
+                        {
+                            **record.row,
+                            "snapshot_id": (
+                                "rest:hyperliquid-public-1:999:999:"
+                                f"{int(source_time.timestamp() * 1_000)}"
+                            ),
+                            "book_epoch_id": "hyperliquid-public-1:999",
+                        },
+                    )
+                    for record in rest_l2
+                )
+            records.extend(rest_l2)
+            rest_bbo = parse_bbo_from_l2(payload, envelope)
+            if corrupt_hyperliquid_rest_bbo and asset == "BTC":
+                rest_bbo = tuple(
+                    ParsedRecord(
+                        record.record_type,
+                        record.asset,
+                        {**record.row, "update_id": "rest:malformed"},
+                    )
+                    for record in rest_bbo
+                )
+            if forge_hyperliquid_rest_bbo_identity and asset == "BTC":
+                rest_bbo = tuple(
+                    ParsedRecord(
+                        record.record_type,
+                        record.asset,
+                        {
+                            **record.row,
+                            "update_id": (
+                                str(record.row["update_id"]).rsplit(":", 2)[0]
+                                + ":999:999"
+                            ),
+                        },
+                    )
+                    for record in rest_bbo
+                )
+            if mutate_hyperliquid_rest_bbo_value and asset == "BTC":
+                rest_bbo = tuple(
+                    ParsedRecord(
+                        record.record_type,
+                        record.asset,
+                        {**record.row, "bid_price": Decimal("1")},
+                    )
+                    for record in rest_bbo
+                )
+            records.extend(rest_bbo)
+
     if mixed_hyperliquid_trade_batch:
         received = BASE + timedelta(seconds=7)
         milliseconds = int(received.timestamp() * 1_000)
@@ -671,30 +791,33 @@ def _write_continuity_lake(
 
     if extra_market_refresh_at is not None:
         for asset_index, asset in enumerate(("BTC", "ETH")):
-            bbo_at = extra_market_refresh_at + timedelta(seconds=asset_index * 2)
-            l2_at = bbo_at + timedelta(seconds=1)
-            for kind, received, arrival in (
-                ("bbo", bbo_at, 5 + asset_index * 2),
-                ("l2", l2_at, 6 + asset_index * 2),
-            ):
-                records.extend(
-                    _binance_frame(
-                        connector,
-                        asset=asset,
-                        kind=kind,
-                        received=received,
-                        connection_id="binance-public-1",
-                        arrival=arrival,
-                        source_sequence=20_000 + arrival,
-                        capture=binance_capture,
-                    )
+            book_at = extra_market_refresh_at + timedelta(seconds=asset_index * 2)
+            records.extend(
+                _binance_frame(
+                    connector,
+                    asset=asset,
+                    kind="l2",
+                    received=book_at,
+                    connection_id="binance-public-1",
+                    arrival=3 + asset_index,
+                    source_sequence=20_003 + asset_index,
+                    capture=binance_capture,
                 )
+            )
+            for kind, received, arrival in (
+                ("bbo", book_at + timedelta(milliseconds=200), 7 + asset_index * 2),
+                (
+                    "l2",
+                    book_at + timedelta(seconds=1, milliseconds=200),
+                    8 + asset_index * 2,
+                ),
+            ):
                 records.extend(
                     _hyperliquid_frame(
                         asset=asset,
                         kind=kind,
-                        received=received + timedelta(milliseconds=200),
-                        arrival=7 + asset_index * 2 + (kind == "l2"),
+                        received=received,
+                        arrival=arrival,
                         capture=hyperliquid_capture,
                     )
                 )
@@ -723,30 +846,32 @@ def _write_continuity_lake(
             )
 
     if periodic_refresh_seconds:
-        public_next = 5
+        public_next = 3
         market_next = 3
         hyperliquid_next = 7
         for refresh_number, seconds in enumerate(periodic_refresh_seconds, start=1):
             for asset_index, asset in enumerate(("BTC", "ETH")):
-                bbo_at = BASE + timedelta(
+                book_at = BASE + timedelta(
                     seconds=seconds + asset_index * 0.1
                 )
-                l2_at = bbo_at + timedelta(milliseconds=20)
-                trade_at = bbo_at + timedelta(milliseconds=40)
-                for kind, received in (("bbo", bbo_at), ("l2", l2_at)):
-                    records.extend(
-                        _binance_frame(
-                            connector,
-                            asset=asset,
-                            kind=kind,
-                            received=received,
-                            connection_id="binance-public-1",
-                            arrival=public_next,
-                            source_sequence=30_000 + public_next,
-                            capture=binance_capture,
-                        )
+                trade_at = book_at + timedelta(milliseconds=40)
+                records.extend(
+                    _binance_frame(
+                        connector,
+                        asset=asset,
+                        kind="l2",
+                        received=book_at + timedelta(milliseconds=20),
+                        connection_id="binance-public-1",
+                        arrival=public_next,
+                        source_sequence=30_000 + public_next,
+                        capture=binance_capture,
                     )
-                    public_next += 1
+                )
+                public_next += 1
+                for kind, received in (
+                    ("bbo", book_at),
+                    ("l2", book_at + timedelta(milliseconds=20)),
+                ):
                     records.extend(
                         _hyperliquid_frame(
                             asset=asset,
@@ -781,7 +906,6 @@ def _write_continuity_lake(
                     )
                 )
                 hyperliquid_next += 1
-
     if add_second_complete_hyperliquid_capture:
         second_hl_capture = "hyperliquid-capture-2"
         second_hl_connection = "hyperliquid-public-2"
@@ -1379,6 +1503,34 @@ def test_real_lake_audit_passes_technical_gate_but_keeps_phase_blocked(
     assert payload["failure_reasons"] == []
 
 
+def test_real_lake_audit_accepts_explicit_hyperliquid_rest_bootstrap_provenance(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        add_hyperliquid_rest_bootstrap=True,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
+    lineage = payload["connection_lineage"]
+    assert isinstance(lineage, dict)
+    assert lineage["hyperliquid"]["normalized_market_lineage_rejections"] == 0
+    level_lineage = payload["normalized_l2_level_lineage"]
+    assert isinstance(level_lineage, dict)
+    assert level_lineage["orphan_level_total"] == 0
+    raw_lineage = payload["required_wire_lineage"]
+    assert isinstance(raw_lineage, dict)
+    assert raw_lineage["orphan_required_wire_total"] == 0
+
+
 def test_real_lake_audit_fails_without_raw_binance_agg_trade(
     tmp_path: Path,
 ) -> None:
@@ -1581,12 +1733,48 @@ def test_real_lake_audit_rejects_looser_self_declared_clock_policy(
             "binance_market_raw_lineage_rejected",
         ),
         (
+            {"mutate_binance_depth_bbo": True},
+            "binance_market_raw_lineage_rejected",
+        ),
+        (
+            {"omit_binance_depth_bbo": True},
+            "required_raw_wire_without_exact_normalization",
+        ),
+        (
+            {
+                "add_hyperliquid_rest_bootstrap": True,
+                "corrupt_hyperliquid_rest_bbo": True,
+            },
+            "hyperliquid_market_raw_lineage_rejected",
+        ),
+        (
+            {
+                "add_hyperliquid_rest_bootstrap": True,
+                "forge_hyperliquid_rest_bbo_identity": True,
+            },
+            "hyperliquid_market_raw_lineage_rejected",
+        ),
+        (
+            {
+                "add_hyperliquid_rest_bootstrap": True,
+                "forge_hyperliquid_rest_l2_identity": True,
+            },
+            "hyperliquid_market_raw_lineage_rejected",
+        ),
+        (
+            {
+                "add_hyperliquid_rest_bootstrap": True,
+                "mutate_hyperliquid_rest_bbo_value": True,
+            },
+            "hyperliquid_market_raw_lineage_rejected",
+        ),
+        (
             {"omit_binance_l2_levels": True},
             "binance_market_raw_lineage_rejected",
         ),
         (
             {"empty_binance_l2": True},
-            "binance_market_raw_lineage_rejected",
+            "required_raw_wire_without_exact_normalization",
         ),
         (
             {"zero_binance_bbo_quantity": True},
@@ -1693,6 +1881,12 @@ def test_real_lake_audit_rejects_looser_self_declared_clock_policy(
         "trade-received-time",
         "trade-quote-quantity",
         "mutated-bbo",
+        "mutated-depth-derived-bbo",
+        "missing-depth-derived-bbo",
+        "malformed-hyperliquid-rest-bbo",
+        "forged-hyperliquid-rest-bbo-identity",
+        "forged-hyperliquid-rest-l2-identity",
+        "mismatched-hyperliquid-rest-bbo-value",
         "missing-l2-levels",
         "empty-sided-l2",
         "zero-bbo-quantity",

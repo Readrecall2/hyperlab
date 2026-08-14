@@ -756,7 +756,13 @@ def _binance_wire_indexes(
         if kind is None or not isinstance(asset, str) or not asset:
             continue
         received = _timestamp(row["received_time"], label="wire received_time")
-        mutable_by_frame[(connection_id, received, asset, kind)].append(row)
+        frame_kinds = (
+            ("l2", "bbo")
+            if kind == "l2"
+            else (kind,)
+        )
+        for frame_kind in frame_kinds:
+            mutable_by_frame[(connection_id, received, asset, frame_kind)].append(row)
     by_frame = {
         key: tuple(
             sorted(
@@ -809,12 +815,23 @@ def _decoded_wire_data(raw: Mapping[str, object]) -> Mapping[str, object] | None
     return data
 
 
+def _normalized_wire_identity_matches(
+    normalized: Mapping[str, object],
+    raw: Mapping[str, object],
+) -> bool:
+    """Require every persisted physical-lineage field to match one raw frame."""
+
+    return all(
+        normalized.get(field) == raw.get(field)
+        for field in ("received_time", "connection_id")
+    )
+
 def _binance_market_matches_wire(
     normalized: Mapping[str, object],
     raw: Mapping[str, object],
     kind: str,
 ) -> bool:
-    if normalized.get("received_time") != raw.get("received_time"):
+    if not _normalized_wire_identity_matches(normalized, raw):
         return False
     data = _decoded_wire_data(raw)
     if data is None:
@@ -823,13 +840,19 @@ def _binance_market_matches_wire(
         symbol = str(data["s"]).upper()
         normalized_asset = normalized.get("asset")
         channel = str(raw["channel"])
-        expected_event, channel_matches = {
-            "bbo": ("bookTicker", channel.endswith("@bookTicker")),
-            "l2": ("depthUpdate", "@depth20" in channel),
-        }[kind]
+        event = str(data.get("e") or "")
+        if kind == "bbo":
+            channel_matches = (
+                event == "bookTicker" and channel.endswith("@bookTicker")
+            ) or (
+                event == "depthUpdate" and "@depth20" in channel
+            )
+        elif kind == "l2":
+            channel_matches = event == "depthUpdate" and "@depth20" in channel
+        else:
+            return False
         if (
-            data.get("e") != expected_event
-            or not isinstance(normalized_asset, str)
+            not isinstance(normalized_asset, str)
             or symbol != f"{normalized_asset.upper()}USDT"
             or not channel_matches
             or channel.partition("@")[0].upper() != symbol
@@ -848,10 +871,38 @@ def _binance_market_matches_wire(
             return False
         if kind == "bbo":
             update = int(str(data["u"]))
-            bid_price = Decimal(str(data["b"]))
-            bid_quantity = Decimal(str(data["B"]))
-            ask_price = Decimal(str(data["a"]))
-            ask_quantity = Decimal(str(data["A"]))
+            if event == "bookTicker":
+                bid_price = Decimal(str(data["b"]))
+                bid_quantity = Decimal(str(data["B"]))
+                ask_price = Decimal(str(data["a"]))
+                ask_quantity = Decimal(str(data["A"]))
+            else:
+                bids = data["b"]
+                asks = data["a"]
+                if (
+                    not isinstance(bids, Sequence)
+                    or isinstance(bids, (str, bytes, bytearray))
+                    or not bids
+                    or not isinstance(asks, Sequence)
+                    or isinstance(asks, (str, bytes, bytearray))
+                    or not asks
+                ):
+                    return False
+                bid = bids[0]
+                ask = asks[0]
+                if (
+                    not isinstance(bid, Sequence)
+                    or isinstance(bid, (str, bytes, bytearray))
+                    or len(bid) != 2
+                    or not isinstance(ask, Sequence)
+                    or isinstance(ask, (str, bytes, bytearray))
+                    or len(ask) != 2
+                ):
+                    return False
+                bid_price = Decimal(str(bid[0]))
+                bid_quantity = Decimal(str(bid[1]))
+                ask_price = Decimal(str(ask[0]))
+                ask_quantity = Decimal(str(ask[1]))
             return (
                 bid_price > 0
                 and bid_quantity > 0
@@ -1017,7 +1068,7 @@ def _binance_trade_matches_wire(
     normalized: Mapping[str, object],
     raw: Mapping[str, object],
 ) -> bool:
-    if normalized.get("received_time") != raw.get("received_time"):
+    if not _normalized_wire_identity_matches(normalized, raw):
         return False
     data = _decoded_wire_data(raw)
     if data is None:
@@ -1328,7 +1379,7 @@ def _hyperliquid_market_matches_wire(
     raw: Mapping[str, object],
     kind: str,
 ) -> bool:
-    if normalized.get("received_time") != raw.get("received_time"):
+    if not _normalized_wire_identity_matches(normalized, raw):
         return False
     raw_message = raw.get("raw_message")
     if not isinstance(raw_message, str):
@@ -1452,6 +1503,214 @@ def _hyperliquid_market_matches_wire(
     return False
 
 
+def _hyperliquid_rest_l2_identity(
+    row: Mapping[str, object],
+) -> tuple[str, str, str, datetime, datetime, datetime, str] | None:
+    """Validate explicit REST snapshot provenance without treating it as wire data."""
+
+    connection = row.get("connection_id")
+    asset = row.get("asset")
+    snapshot = row.get("snapshot_id")
+    book_epoch = row.get("book_epoch_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (connection, asset, snapshot, book_epoch)
+    ):
+        return None
+    assert isinstance(connection, str)
+    assert isinstance(asset, str)
+    assert isinstance(snapshot, str)
+    assert isinstance(book_epoch, str)
+    try:
+        received = _timestamp(row.get("received_time"), label="REST L2 received_time")
+        event_time = _timestamp(row.get("event_time"), label="REST L2 event_time")
+        exchange_time = _timestamp(
+            row.get("exchange_time"),
+            label="REST L2 exchange_time",
+        )
+        prefix = f"rest:{connection}:"
+        if not snapshot.startswith(prefix):
+            return None
+        identity = snapshot.removeprefix(prefix).split(":")
+        if len(identity) != 3:
+            return None
+        epoch, arrival, milliseconds = (int(value) for value in identity)
+    except (TypeError, ValueError):
+        return None
+    if (
+        epoch <= 0
+        or arrival <= 0
+
+        or book_epoch != f"{connection}:{epoch}"
+        or event_time != received
+        or int(exchange_time.timestamp() * 1_000) != milliseconds
+        or row.get("source_sequence") is not None
+    ):
+        return None
+    return (
+        asset,
+        snapshot,
+        book_epoch,
+        received,
+        event_time,
+        exchange_time,
+        connection,
+    )
+
+
+def _hyperliquid_rest_bbo_identity(
+    row: Mapping[str, object],
+) -> tuple[str, str, int, int, datetime, datetime] | None:
+    update_id = row.get("update_id")
+    connection = row.get("connection_id")
+    asset = row.get("asset")
+    if not (
+        isinstance(update_id, str)
+        and update_id
+        and isinstance(connection, str)
+        and connection
+        and isinstance(asset, str)
+        and asset
+    ):
+        return None
+    try:
+        received = _timestamp(row.get("received_time"), label="REST BBO received_time")
+        event_time = _timestamp(row.get("event_time"), label="REST BBO event_time")
+        exchange_time = _timestamp(
+            row.get("exchange_time"),
+            label="REST BBO exchange_time",
+        )
+        milliseconds = int(exchange_time.timestamp() * 1_000)
+        prefix = f"rest:{milliseconds}:{asset}:{connection}:"
+        if not update_id.startswith(prefix):
+            return None
+        identity = update_id.removeprefix(prefix).split(":")
+        if len(identity) != 2:
+            return None
+        epoch, arrival = (int(value) for value in identity)
+    except (TypeError, ValueError):
+        return None
+    if (
+        epoch <= 0
+        or arrival <= 0
+
+        or event_time != exchange_time
+        or row.get("source_sequence") is not None
+    ):
+        return None
+    return asset, connection, epoch, arrival, received, exchange_time
+
+def _persisted_hyperliquid_rest_l2_levels_match_header(
+    loaded: _LoadedLake,
+    asset: str,
+    header: Mapping[str, object],
+) -> bool:
+    identity = _hyperliquid_rest_l2_identity(header)
+    if identity is None or identity[0] != asset:
+        return False
+    snapshot = identity[1]
+    candidates = [
+        row
+        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_SNAPSHOT, asset)
+        if row.get("snapshot_id") == snapshot
+    ]
+    try:
+        bid_count = int(str(header["bid_level_count"]))
+        ask_count = int(str(header["ask_level_count"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    expected_levels = {
+        *(("bid", level) for level in range(bid_count)),
+        *(("ask", level) for level in range(ask_count)),
+    }
+    if bid_count < 0 or ask_count < 0 or len(candidates) != len(expected_levels):
+        return False
+    observed_levels: list[tuple[str, int]] = []
+    for row in candidates:
+        try:
+            if (
+                _hyperliquid_rest_l2_identity(row) != identity
+                or row.get("last_sequence") is not None
+                or row.get("order_count") is None
+                or int(str(row["order_count"])) < 0
+                or Decimal(str(row["price"])) <= 0
+                or Decimal(str(row["quantity"])) <= 0
+            ):
+                return False
+            observed_levels.append((str(row["side"]), int(str(row["level"]))))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+    return len(observed_levels) == len(set(observed_levels)) and set(
+        observed_levels
+    ) == expected_levels
+
+
+def _persisted_hyperliquid_rest_bbo_matches_l2(
+    loaded: _LoadedLake,
+    asset: str,
+    bbo: Mapping[str, object],
+) -> bool:
+    """Accept a REST BBO only when its exact persisted REST L2 source exists."""
+
+    identity = _hyperliquid_rest_bbo_identity(bbo)
+    if identity is None or identity[0] != asset:
+        return False
+    _, connection, epoch, arrival, received, exchange_time = identity
+    milliseconds = int(exchange_time.timestamp() * 1_000)
+    snapshot = f"rest:{connection}:{epoch}:{arrival}:{milliseconds}"
+    headers = [
+        row
+        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_BOOK_STATE, asset)
+        if row.get("snapshot_id") == snapshot
+    ]
+    if len(headers) != 1:
+        return False
+    header = headers[0]
+    header_identity = _hyperliquid_rest_l2_identity(header)
+    if (
+        header_identity is None
+        or header_identity[0] != asset
+        or header_identity[3] != received
+        or header_identity[5] != exchange_time
+        or header_identity[6] != connection
+        or not _persisted_hyperliquid_rest_l2_levels_match_header(
+            loaded,
+            asset,
+            header,
+        )
+    ):
+        return False
+    levels = [
+        row
+        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_SNAPSHOT, asset)
+        if row.get("snapshot_id") == snapshot
+    ]
+
+    def side_matches(side: str, price_field: str, quantity_field: str) -> bool:
+        best = [
+            row
+            for row in levels
+            if row.get("side") == side and row.get("level") == 0
+        ]
+        if not best:
+            return bbo.get(price_field) is None and bbo.get(quantity_field) is None
+        if len(best) != 1:
+            return False
+        try:
+            return (
+                Decimal(str(bbo.get(price_field))) == Decimal(str(best[0]["price"]))
+                and Decimal(str(bbo.get(quantity_field)))
+                == Decimal(str(best[0]["quantity"]))
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+
+    return side_matches("bid", "bid_price", "bid_quantity") and side_matches(
+        "ask",
+        "ask_price",
+        "ask_quantity",
+    )
+
 def _hyperliquid_observations(
     loaded: _LoadedLake,
     assets: Sequence[str],
@@ -1497,6 +1756,20 @@ def _hyperliquid_observations(
     for asset in assets:
         for record_type, kind in type_to_kind.items():
             for row in _all_rows(loaded, HYPERLIQUID, record_type, asset):
+                if (
+                    record_type == RecordType.BBO
+                    and _persisted_hyperliquid_rest_bbo_matches_l2(
+                        loaded, asset, row
+                    )
+                ):
+                    continue
+                if (
+                    record_type == RecordType.L2_BOOK_STATE
+                    and _persisted_hyperliquid_rest_l2_levels_match_header(
+                        loaded, asset, row
+                    )
+                ):
+                    continue
                 connection_id = row.get("connection_id")
                 if not isinstance(connection_id, str) or not connection_id:
                     lineage_rejections += 1
@@ -1631,6 +1904,27 @@ def _orphan_required_wire_counts(
                     )
                 ]
                 expected_count = 1
+                if kind == "l2":
+                    bbo_candidates = [
+                        normalized
+                        for normalized in _all_rows(
+                            loaded,
+                            BINANCE,
+                            RecordType.BBO,
+                            asset,
+                        )
+                        if normalized.get("connection_id")
+                        == raw.get("connection_id")
+                        and normalized.get("received_time")
+                        == raw.get("received_time")
+                    ]
+                    exact_bbo = [
+                        normalized
+                        for normalized in bbo_candidates
+                        if _binance_market_matches_wire(normalized, raw, "bbo")
+                    ]
+                    if len(exact_bbo) != 1:
+                        expected_count = 0
             else:
                 exact = [
                     normalized
@@ -1699,6 +1993,16 @@ def _orphan_normalized_l2_level_counts(
             ].append(raw)
     for asset in assets:
         for header in _all_rows(loaded, venue, RecordType.L2_BOOK_STATE, asset):
+            if venue == HYPERLIQUID:
+                rest_identity = _hyperliquid_rest_l2_identity(header)
+                if rest_identity is not None:
+                    if _persisted_hyperliquid_rest_l2_levels_match_header(
+                        loaded,
+                        asset,
+                        header,
+                    ):
+                        accepted_groups.add(rest_identity)
+                    continue
             connection = header.get("connection_id")
             snapshot = header.get("snapshot_id")
             book_epoch = header.get("book_epoch_id")

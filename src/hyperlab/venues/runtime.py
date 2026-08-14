@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -279,7 +279,6 @@ class BinanceReferenceCollector:
         for asset in self.config.assets:
             symbol = connector.instrument_for_asset(asset).source_symbol.lower()
             for channel, record_type, socket_role in (
-                (f"{symbol}@bookTicker", RecordType.BBO, "public"),
                 (f"{symbol}@depth20@100ms", RecordType.L2_BOOK_STATE, "public"),
                 (f"{symbol}@aggTrade", RecordType.TRADE, "market"),
             ):
@@ -371,7 +370,7 @@ class BinanceReferenceCollector:
         stale_channels = self._stale_critical_streams(at=at)
         if not stale_channels:
             return
-        reason = "required Binance BBO/L2/trade streams stale: " + ", ".join(stale_channels)
+        reason = "required Binance depth-derived BBO/L2 or trade streams stale: " + ", ".join(stale_channels)
         self.metrics["maintenance_or_absence_detected"] = True
         self.metrics["capture_ready"] = False
         self.metrics["state"] = "stale"
@@ -645,6 +644,13 @@ class BinanceReferenceCollector:
             )
             for role in required_roles
         }
+
+        def open_paused(role: str) -> PublicSocket:
+            return factories[role].connect_paused(
+                "public",
+                self.config.connect_timeout_seconds,
+            )
+
         started = self.monotonic()
         epoch = 0
         while not self._stop:
@@ -663,17 +669,49 @@ class BinanceReferenceCollector:
                 self.metrics["reconnects"] = self._counter("reconnects") + 1
             try:
                 self.metrics["state"] = "connecting"
+                self.metrics["capture_ready"] = False
+                self.metrics["clock_sync_valid"] = False
+                self._valid_clock_until = None
+                self.metrics["capture_epoch_id"] = capture_epoch_id
+                self.metrics["physical_connection_ids"] = dict(connection_ids)
+                open_errors: list[Exception] = []
+                with ThreadPoolExecutor(
+                    max_workers=len(required_roles),
+                    thread_name_prefix="binance-public-connect",
+                ) as connect_executor:
+                    connect_futures: dict[Future[PublicSocket], str] = {
+                        connect_executor.submit(open_paused, role): role
+                        for role in required_roles
+                    }
+                    for future in as_completed(connect_futures):
+                        role = connect_futures[future]
+                        try:
+                            socket = future.result()
+                        except Exception as exc:
+                            open_errors.append(exc)
+                            continue
+                        self._sockets[role] = socket
+                        self.metrics["physical_connections"] = self._counter(
+                            "physical_connections"
+                        ) + 1
+                if open_errors:
+                    primary = open_errors[0]
+                    for secondary in open_errors[1:]:
+                        primary.add_note(
+                            "paired Binance socket handshake also failed: "
+                            f"{type(secondary).__name__}: {secondary}"
+                        )
+                    raise primary
+                if self._stop or (
+                    duration_seconds is not None
+                    and self.monotonic() - started >= duration_seconds
+                ):
+                    self._close_sockets()
+                    break
+
+                activation_at = self.clock()
+                self._initialize_critical_streams(connector, at=activation_at)
                 for role in required_roles:
-                    self._sockets[role] = factories[role].connect(
-                        "public",
-                        self.config.connect_timeout_seconds,
-                    )
-                    connected_roles.append(role)
-                    self.metrics["physical_connections"] = self._counter(
-                        "physical_connections"
-                    ) + 1
-                    if len(connected_roles) == 1:
-                        self.metrics["connections"] = self._counter("connections") + 1
                     self._connection_event(
                         "connect",
                         connection_id=connection_ids[role],
@@ -681,15 +719,14 @@ class BinanceReferenceCollector:
                         capture_epoch_id=capture_epoch_id,
                         socket_role=role,
                         channel=role,
+                        at=activation_at,
+                        received_at=activation_at,
                     )
+                    connected_roles.append(role)
+                self.metrics["connections"] = self._counter("connections") + 1
+                for role in required_roles:
+                    self._sockets[role].start_receiving()
                 self.metrics["state"] = "warming"
-                self.metrics["capture_ready"] = False
-                self.metrics["clock_sync_valid"] = False
-                self._valid_clock_until = None
-                self.metrics["capture_epoch_id"] = capture_epoch_id
-                self.metrics["physical_connection_ids"] = dict(connection_ids)
-                connection_started = self.clock()
-                self._initialize_critical_streams(connector, at=connection_started)
                 pending_l2_resync_assets = set(self.config.assets)
                 next_clock_sample_at = self.monotonic()
                 self._drain_clock_sample(

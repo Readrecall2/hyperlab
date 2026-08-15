@@ -849,9 +849,7 @@ def test_stale_critical_channels_are_visible_and_force_disconnect(tmp_path: Path
     assert metrics.gaps == 1
     assert metrics.stale_channels == (
         "activeAssetCtx:BTC",
-        "bbo:BTC",
         "l2Book:BTC",
-        "trades:BTC",
     )
     assert socket.closed is True
     reasons = [str(row["reason"]) for row in _parquet_rows(sink.root, "connection_event")]
@@ -862,7 +860,7 @@ def test_stale_critical_channels_are_visible_and_force_disconnect(tmp_path: Path
     assert "stale critical public streams" in status["metrics"]["last_error"]
 
 
-def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
+def test_event_driven_bbo_and_trade_silence_does_not_disconnect_healthy_state_streams(
     tmp_path: Path,
 ) -> None:
     timer = ControlledTime()
@@ -885,7 +883,6 @@ def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
             (bbo, 0.0),
             (l2_book, 0.0),
             (active_context, 1.5),
-            (bbo, 0.0),
             (l2_book, 0.0),
             (active_context, 1.0),
         ],
@@ -899,11 +896,17 @@ def test_trade_silence_is_critical_while_bbo_context_and_l2_remain_fresh(
 
     metrics = collector.run(duration_seconds=2.4)
 
-    assert metrics.gaps == 1
-    assert metrics.stale_channels == ("trades:BTC",)
+    assert (metrics.connections, metrics.reconnects, metrics.gaps) == (1, 0, 0)
+    assert metrics.stale_channels == ()
     assert socket.closed is True
     reasons = [str(row["reason"]) for row in _parquet_rows(sink.root, "connection_event")]
-    assert any("trades:BTC" in reason for reason in reasons)
+    assert not any("stale critical public streams" in reason for reason in reasons)
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    ingest_age = status["metrics"]["channel_ingest_age_seconds"]
+    assert ingest_age["bbo:BTC"] > config.stale_after_seconds
+    assert ingest_age["trades:BTC"] > config.stale_after_seconds
+    assert ingest_age["activeAssetCtx:BTC"] <= config.stale_after_seconds
+    assert ingest_age["l2Book:BTC"] <= config.stale_after_seconds
     collector.close()
 
 
@@ -1506,6 +1509,55 @@ def test_subscription_ack_timeout_distinguishes_fresh_and_aged_backlog(
         status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
         failure = status["observability"]["reconnect_reasons_by_generation"][0]
         assert failure["will_reconnect"] is False
+
+
+@pytest.mark.parametrize("method", (None, "unsubscribe"))
+def test_non_subscribe_subscription_response_remains_pending_until_ack_timeout(
+    tmp_path: Path,
+    method: str | None,
+) -> None:
+    timer = ControlledTime()
+    config = _config(
+        heartbeat_interval_seconds=1.0,
+        pong_timeout_seconds=2.0,
+        stale_after_seconds=1_000.0,
+    )
+    subscriptions = config.subscriptions()
+    rejected = subscriptions[-1]
+    response_data: dict[str, object] = {"subscription": rejected.payload()}
+    if method is not None:
+        response_data["method"] = method
+    non_subscribe_response = json.dumps(
+        {"channel": "subscriptionResponse", "data": response_data},
+        separators=(",", ":"),
+    )
+    socket = FakeSocket(
+        timer,
+        [
+            *_ack_messages(config)[:-1],
+            (non_subscribe_response, 0.0),
+            (
+                ReceivedWireMessage(
+                    '{"channel":"pong"}',
+                    BASE_TIME + timedelta(seconds=3),
+                    received_monotonic_ns=3_000_000_000,
+                ),
+                3.0,
+            ),
+        ],
+    )
+    collector, _rest, _factory, _sink = _collector(tmp_path, config, timer, [socket])
+
+    try:
+        metrics = collector.run(duration_seconds=2.5)
+        assert (metrics.connections, metrics.reconnects, metrics.gaps) == (1, 0, 1)
+        assert metrics.subscription_acks == config.subscription_count - 1
+        status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+        failure = status["observability"]["reconnect_reasons_by_generation"][0]
+        assert "subscription acknowledgements missing" in failure["reason"]
+        assert rejected.key in failure["reason"]
+    finally:
+        collector.close()
 
 
 def test_duration_expiry_during_connect_creates_no_spurious_generation(

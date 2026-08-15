@@ -2316,6 +2316,7 @@ def test_binance_add_paths_collect_writer_credits_and_propagate_failure(
 
 def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manual = ManualTime()
     rest = ScriptedClockRest([_runtime_http_measurement()])
@@ -2338,6 +2339,8 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         clock=manual.now,
         monotonic=manual.monotonic,
     )
+    records: list[ParsedRecord] = []
+    monkeypatch.setattr(collector, "_add", records.append)
 
     def occupy_clock_worker() -> None:
         blocker_started.set()
@@ -2350,6 +2353,8 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
             connection_id="public-1",
             connection_epoch=1,
             capture_epoch_id="capture-1",
+            clock_schedule_overdue_ms=4.0,
+            single_flight_blocked_ms=0.5,
         )
         manual.seconds = 0.025
         release_blocker.set()
@@ -2370,6 +2375,11 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert observability["samples_retained"] == 1
         latest = observability["latest"]
         assert isinstance(latest, dict)
+        assert latest["observation_id"]
+        assert latest["request_sent_time"] == BASE.isoformat()
+        assert latest["response_received_time"] == (BASE + timedelta(milliseconds=20)).isoformat()
+        assert latest["clock_schedule_overdue_ms"] == pytest.approx(4)
+        assert latest["single_flight_blocked_ms"] == pytest.approx(0.5)
         assert latest["executor_submit_to_worker_start_ms"] == pytest.approx(25)
         assert latest["worker_completion_to_supervisor_drain_ms"] == pytest.approx(15)
         assert latest["authoritative_clock_round_trip_ms"] == pytest.approx(20)
@@ -2400,6 +2410,29 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latest["socket_family"] == "AF_INET"
         assert latest["response_cloudfront_pop"] == "SIN2-P11"
         assert latest["response_cache"] == "Miss from cloudfront"
+        assert len(records) == 1
+        persisted = records[0].row
+        assert persisted["schema_version"] == 3
+        assert persisted["observation_id"] == latest["observation_id"]
+        assert persisted["request_sent_time"] == BASE
+        assert persisted["response_received_time"] == BASE + timedelta(milliseconds=20)
+        assert persisted["clock_schedule_overdue_ms"] == Decimal("4.0")
+        assert persisted["single_flight_blocked_ms"] == Decimal("0.5")
+        assert persisted["executor_submit_to_worker_start_ms"] == Decimal("25.0")
+        assert persisted["worker_completion_to_supervisor_drain_ms"] == Decimal("15.0")
+        assert persisted["transport_lock_wait_ms"] == Decimal("2.0")
+        assert persisted["requests_adapter_header_elapsed_ms"] == Decimal("30.0")
+        assert persisted["session_get_total_ms"] == Decimal("40.0")
+        assert persisted["json_decode_ms"] == Decimal("3.0")
+        assert persisted["diagnostic_prepare_ms"] == Decimal("1.5")
+        assert persisted["diagnostic_finalize_ms"] == Decimal("2.5")
+        assert persisted["requests_session_reused"] is True
+        assert persisted["urllib3_connection_identity"] == "urllib3-connection-1"
+        assert persisted["tls_socket_identity"] == "tls-socket-1"
+        assert persisted["post_request_observation_current"] is True
+        assert persisted["peer_ip"] == "192.0.2.9"
+        assert persisted["peer_port"] == 443
+        assert persisted["response_cloudfront_pop"] == "SIN2-P11"
         for legacy_name in (
             "urllib3_pool_object_delta",
             "urllib3_pool_request_delta",
@@ -3006,17 +3039,19 @@ def test_clock_schedule_attributes_single_flight_separately_from_worker_lag(
         capture_epoch_id="capture-1",
         connection_id="public-1",
         connection_epoch=1,
+        observation_id="clock:capture-1:schedule-test",
         submitted_at=0.0,
         worker_started_at=0.5,
         worker_completed_at=8.0,
     )
 
     try:
-        collector._observe_clock_schedule(
+        schedule_attribution = collector._observe_clock_schedule(
             expected_at=5.0,
             observed_at=12.0,
             prior_context=context,
         )
+        assert schedule_attribution == pytest.approx((7_000, 3_000))
         observability = collector.metrics["clock_observability"]
         assert isinstance(observability, dict)
         assert observability["clock_schedule_overdue_ms"]["p99_ms"] == pytest.approx(7_000)
@@ -3326,6 +3361,7 @@ def test_clock_in_flight_snapshot_distinguishes_queue_run_and_drain_ages(
         capture_epoch_id="capture-in-flight",
         connection_id="public-in-flight",
         connection_epoch=9,
+        observation_id="clock:capture-in-flight:in-flight-test",
         submitted_at=0.0,
     )
     collector._clock_future = future  # type: ignore[assignment]
@@ -3347,6 +3383,7 @@ def test_clock_in_flight_snapshot_distinguishes_queue_run_and_drain_ages(
             "completed_awaiting_drain_age_ms": None,
             "capture_epoch_id": "capture-in-flight",
             "connection_id": "public-in-flight",
+            "observation_id": "clock:capture-in-flight:in-flight-test",
             "connection_epoch": 9,
         }
 

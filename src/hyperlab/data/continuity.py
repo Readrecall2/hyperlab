@@ -959,11 +959,7 @@ def _binance_market_matches_wire(
                 ask_price = Decimal(str(ask[0]))
                 ask_quantity = Decimal(str(ask[1]))
             return (
-                bid_price > 0
-                and bid_quantity > 0
-                and ask_price > 0
-                and ask_quantity > 0
-                and normalized.get("source_sequence") == update
+                normalized.get("source_sequence") == update
                 and normalized.get("update_id") == f"{symbol}:{update}"
                 and Decimal(str(normalized.get("bid_price"))) == bid_price
                 and Decimal(str(normalized.get("bid_quantity"))) == bid_quantity
@@ -1071,12 +1067,6 @@ def _persisted_l2_levels_match_raw(
         return False
     if len(candidates) != len(expected):
         return False
-    if not any(side == "bid" for side, *_ in expected) or not any(
-        side == "ask" for side, *_ in expected
-    ):
-        return False
-    if any(price <= 0 or quantity <= 0 for _, _, price, quantity, _ in expected):
-        return False
     normalized: list[tuple[str, int, Decimal, Decimal, int | None]] = []
     for row in candidates:
         if (
@@ -1117,6 +1107,66 @@ def _persisted_l2_levels_match_raw(
         header.get("bid_level_count") == bid_count
         and header.get("ask_level_count") == ask_count
     )
+
+
+def _normalized_bbo_is_executable(normalized: Mapping[str, object]) -> bool:
+    try:
+        values = tuple(
+            Decimal(str(normalized.get(field)))
+            for field in (
+                "bid_price",
+                "bid_quantity",
+                "ask_price",
+                "ask_quantity",
+            )
+        )
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    return all(value.is_finite() and value > 0 for value in values)
+
+
+def _normalized_l2_is_executable(
+    loaded: _LoadedLake,
+    venue: str,
+    asset: str,
+    header: Mapping[str, object],
+) -> bool:
+    snapshot = header.get("snapshot_id")
+    if not isinstance(snapshot, str) or not snapshot:
+        return False
+    try:
+        bid_count = int(str(header["bid_level_count"]))
+        ask_count = int(str(header["ask_level_count"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if bid_count <= 0 or ask_count <= 0:
+        return False
+    levels = [
+        row
+        for row in _all_rows(loaded, venue, RecordType.L2_SNAPSHOT, asset)
+        if row.get("snapshot_id") == snapshot
+    ]
+    if len(levels) != bid_count + ask_count:
+        return False
+    observed_counts = {"bid": 0, "ask": 0}
+    for row in levels:
+        side = row.get("side")
+        if side not in observed_counts:
+            return False
+        try:
+            price = Decimal(str(row["price"]))
+            quantity = Decimal(str(row["quantity"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+        if (
+            not price.is_finite()
+            or not quantity.is_finite()
+            or price <= 0
+            or quantity <= 0
+        ):
+            return False
+        observed_counts[str(side)] += 1
+    return observed_counts == {"bid": bid_count, "ask": ask_count}
 
 
 def _binance_trade_matches_wire(
@@ -1345,6 +1395,18 @@ def _binance_normalized_observations(
                         lineage_rejections += 1
                     continue
                 capture = next(iter(captures))
+                if (
+                    record_type == RecordType.BBO
+                    and not _normalized_bbo_is_executable(row)
+                ):
+                    continue
+                if (
+                    record_type == RecordType.L2_BOOK_STATE
+                    and not _normalized_l2_is_executable(
+                        loaded, BINANCE, asset, row
+                    )
+                ):
+                    continue
                 if record_type == RecordType.L2_BOOK_STATE:
                     pair = (capture, asset)
                     observed_l2.add(pair)
@@ -1474,26 +1536,34 @@ def _hyperliquid_market_matches_wire(
                     or len(sides) != 2
                 ):
                     return False
-                bid = sides[0]
-                ask = sides[1]
-                if not isinstance(bid, Mapping) or not isinstance(ask, Mapping):
-                    return False
-                bid_price = Decimal(str(bid["px"]))
-                bid_quantity = Decimal(str(bid["sz"]))
-                ask_price = Decimal(str(ask["px"]))
-                ask_quantity = Decimal(str(ask["sz"]))
+                def side_matches(
+                    raw_side: object,
+                    price_field: str,
+                    quantity_field: str,
+                ) -> bool:
+                    if raw_side is None:
+                        return (
+                            normalized.get(price_field) is None
+                            and normalized.get(quantity_field) is None
+                        )
+                    if not isinstance(raw_side, Mapping):
+                        return False
+                    try:
+                        return (
+                            Decimal(str(normalized.get(price_field)))
+                            == Decimal(str(raw_side["px"]))
+                            and Decimal(str(normalized.get(quantity_field)))
+                            == Decimal(str(raw_side["sz"]))
+                        )
+                    except (KeyError, TypeError, ValueError, ArithmeticError):
+                        return False
+
                 return (
-                    bid_price > 0
-                    and bid_quantity > 0
-                    and ask_price > 0
-                    and ask_quantity > 0
-                    and normalized.get("source_sequence") is None
+                    normalized.get("source_sequence") is None
                     and normalized.get("update_id")
                     == f"{milliseconds}:{asset}:{connection}:{epoch}:{arrival}"
-                    and Decimal(str(normalized.get("bid_price"))) == bid_price
-                    and Decimal(str(normalized.get("bid_quantity"))) == bid_quantity
-                    and Decimal(str(normalized.get("ask_price"))) == ask_price
-                    and Decimal(str(normalized.get("ask_quantity"))) == ask_quantity
+                    and side_matches(sides[0], "bid_price", "bid_quantity")
+                    and side_matches(sides[1], "ask_price", "ask_quantity")
                 )
             levels = data["levels"]
             if (
@@ -1852,6 +1922,18 @@ def _hyperliquid_observations(
                 ]
                 if len(exact) != 1:
                     lineage_rejections += 1
+                    continue
+                if (
+                    record_type == RecordType.BBO
+                    and not _normalized_bbo_is_executable(row)
+                ):
+                    continue
+                if (
+                    record_type == RecordType.L2_BOOK_STATE
+                    and not _normalized_l2_is_executable(
+                        loaded, HYPERLIQUID, asset, row
+                    )
+                ):
                     continue
                 observations[str(exact[0]["capture_epoch_id"])][asset][kind].append(
                     received

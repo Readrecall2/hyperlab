@@ -983,6 +983,8 @@ def _validate_semantics(table: pa.Table, key: PartitionKey, spec: SchemaSpec) ->
                 raise PartitionValidationError("clock drift uncertainty must equal half the round trip")
         if spec.version >= 2:
             _validate_clock_sync_v2(table)
+        if spec.version >= 3:
+            _validate_clock_sync_v3(table)
 
 
 def _validate_clock_sync_v2(table: pa.Table) -> None:
@@ -1074,6 +1076,32 @@ def _validate_clock_sync_v2(table: pa.Table) -> None:
             raise PartitionValidationError(
                 "invalid_reason must be present for invalid clock sample"
             )
+
+
+def _validate_clock_sync_v3(table: pa.Table) -> None:
+    _require_non_negative(
+        table,
+        "clock_schedule_overdue_ms",
+        "single_flight_blocked_ms",
+        "executor_submit_to_worker_start_ms",
+        "worker_completion_to_supervisor_drain_ms",
+        "transport_lock_wait_ms",
+        "requests_adapter_header_elapsed_ms",
+        "session_get_total_ms",
+        "json_decode_ms",
+        "diagnostic_prepare_ms",
+        "diagnostic_finalize_ms",
+    )
+    _require_positive_when_present(table, "peer_port")
+    _require_optional_non_empty_strings(
+        table,
+        "urllib3_connection_identity",
+        "tls_socket_identity",
+        "peer_ip",
+        "socket_family",
+        "response_cloudfront_pop",
+        "response_cache",
+    )
 
 
 def _analyze_table(

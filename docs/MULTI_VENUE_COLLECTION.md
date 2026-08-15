@@ -320,13 +320,26 @@ stream depth unique prouve simultanément le BBO et le L2 pour chaque actif ;
 `aggTrade` reste obligatoire pour chaque actif. Après le seuil de staleness, le
 run journalise le gap et reconnecte en mode fail-closed.
 
-Hyperliquid traite lui aussi, par actif, `activeAssetCtx`, `bbo`, `l2Book`
-et `trades` comme des flux critiques. Le silence de l'un d'eux journalise un
-gap et force la reconnexion publique. Les snapshots L2 de restauration REST et
-leur BBO dérivé portent une provenance `rest:` explicite. L'audit ne les traite
-pas comme du wire WebSocket uniquement si l'identité REST, le groupe complet de
-niveaux et les prix/quantités du meilleur bid/ask correspondent exactement ;
-toute provenance incomplète ou incohérente reste rejetée.
+Hyperliquid sépare la liveness du producteur. La santé du transport repose sur
+un lecteur vivant, l'absence d'erreur terminale, la file bornée sans overflow
+ni backlog âgé et les `ping`/`pong` dans leurs délais inchangés. À chaque epoch,
+tous les abonnements sont renvoyés et restent pending jusqu'à un
+`subscriptionResponse` dont `data.method` vaut exactement `subscribe` et dont
+l'abonnement correspond à celui attendu ; une réponse sans `method` ou portant
+`unsubscribe` n'acquitte rien et atteint le délai ACK existant.
+
+`activeAssetCtx` et `l2Book` restent reconnect-critical au seuil stale inchangé
+de 30 secondes. `bbo` et `trades` sont event-driven : leur silence seul ne crée
+ni gap ni reconnexion, tandis que leur âge d'ingestion reste publié. Le TTL
+analytique strict de 30 secondes des trades peut faire échouer le gate aval sans
+déclarer le socket ou l'abonnement mort. Aucun délai, seuil, backoff, capacité de
+socket ou capacité du writer n'est relevé.
+
+Les snapshots L2 de restauration REST et leur BBO dérivé portent une provenance
+`rest:` explicite. L'audit ne les traite pas comme du wire WebSocket uniquement
+si l'identité REST, le groupe complet de niveaux et les prix/quantités du
+meilleur bid/ask correspondent exactement ; toute provenance incomplète ou
+incohérente reste rejetée.
 
 L'horloge Binance est échantillonnée pendant toute la collecte, par défaut toutes
 les 5 secondes. Chaque mesure persiste le RTT, l'offset estimé et l'incertitude
@@ -338,7 +351,18 @@ intervalle valide. Elle n'annule toutefois pas rétroactivement un intervalle
 accepté antérieur qui couvre encore causalement cet instant. L'audit utilise
 uniquement l'union des intervalles acceptés de la même génération éligible.
 
-La conformité de cadence est un contrôle séparé. Chaque ligne `clock_sync` v2
+Le schéma append-only `clock_sync` v3 réutilise le même `observation_id` créé
+avant soumission dans l'état in-flight, l'observation runtime et la ligne durable.
+Ses champs nullables relient le retard de cadence et de single-flight, les délais
+executor/drain, les phases HTTP déjà mesurées, les identités et réutilisations de
+session/connexion/socket, le pair IP/port/famille et le POP/cache CloudFront. Les
+partitions v1/v2 restent lisibles sans réécriture ; les seuils de 50 ms et 10 s,
+l'âge causal de 15 s, la règle de rejection consécutive et l'anneau runtime de
+256 entrées restent inchangés. La v3 n'ajoute aucun historique durable DNS ou
+d'exception HTTP sans temps serveur, ni télémétrie hôte (ordonnanceur,
+mémoire/GC/OOM ou pression writer) ou âge de connexion/origine.
+
+La conformité de cadence est un contrôle séparé. Chaque ligne `clock_sync` v2 ou v3
 persistée et liée exactement à la génération et au wire public compte comme une
 tentative au temps `request_sent_time`, qu'elle soit `VALID` ou `INVALID`.
 Le contrôle couvre la génération active, de son activation liée ou du début de

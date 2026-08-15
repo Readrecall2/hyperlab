@@ -148,9 +148,7 @@ class PublicCollector:
             if subscription.channel
             in {
                 "activeAssetCtx",
-                "bbo",
                 "l2Book",
-                "trades",
             }
         )
         self._candle_intervals_by_stream_key = {

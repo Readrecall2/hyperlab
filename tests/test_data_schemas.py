@@ -318,7 +318,7 @@ def test_clock_sync_v2_appends_causal_validity_without_rewriting_v1() -> None:
     v1 = schema_for(RecordType.CLOCK_SYNC, version=1)
     v2 = schema_for(RecordType.CLOCK_SYNC, version=2)
 
-    assert latest_schema_for(RecordType.CLOCK_SYNC) is v2
+    assert latest_schema_for(RecordType.CLOCK_SYNC).version == 3
     assert v2.schema.names == [
         *v1.schema.names,
         'connection_epoch',
@@ -351,6 +351,63 @@ def test_clock_sync_v2_appends_causal_validity_without_rewriting_v1() -> None:
     assert v2.schema.metadata[b'hyperlab.schema_version'] == b'2'
 
     check_schema_evolution(v1, v2)
+
+
+def test_clock_sync_v3_appends_nullable_runtime_and_http_attribution() -> None:
+    v2 = schema_for(RecordType.CLOCK_SYNC, version=2)
+    v3 = schema_for(RecordType.CLOCK_SYNC, version=3)
+    diagnostic_names = [
+        'clock_schedule_overdue_ms',
+        'single_flight_blocked_ms',
+        'executor_submit_to_worker_start_ms',
+        'worker_completion_to_supervisor_drain_ms',
+        'transport_lock_wait_ms',
+        'requests_adapter_header_elapsed_ms',
+        'session_get_total_ms',
+        'json_decode_ms',
+        'diagnostic_prepare_ms',
+        'diagnostic_finalize_ms',
+        'new_urllib3_connection_object_created',
+        'requests_session_reused',
+        'urllib3_connection_identity',
+        'urllib3_connection_reused',
+        'tls_socket_identity',
+        'tls_socket_reused',
+        'tls_session_reused',
+        'post_request_observation_current',
+        'peer_ip',
+        'peer_port',
+        'socket_family',
+        'response_cloudfront_pop',
+        'response_cache',
+    ]
+
+    assert latest_schema_for(RecordType.CLOCK_SYNC) is v3
+    assert v3.schema.names == [*v2.schema.names, *diagnostic_names]
+    for name in diagnostic_names[:10]:
+        assert v3.schema.field(name) == pa.field(
+            name,
+            pa.decimal128(38, 18),
+            nullable=True,
+        )
+    for name in (
+        'new_urllib3_connection_object_created',
+        'requests_session_reused',
+        'urllib3_connection_reused',
+        'tls_socket_reused',
+        'tls_session_reused',
+        'post_request_observation_current',
+    ):
+        assert v3.schema.field(name) == pa.field(name, pa.bool_(), nullable=True)
+    assert v3.schema.field('peer_port') == pa.field(
+        'peer_port',
+        pa.uint16(),
+        nullable=True,
+    )
+    assert all(v3.schema.field(name).nullable for name in diagnostic_names)
+    assert v2.schema.metadata[b'hyperlab.schema_version'] == b'2'
+    assert v3.schema.metadata[b'hyperlab.schema_version'] == b'3'
+    check_schema_evolution(v2, v3)
 
 
 def test_capture_generation_fields_are_compatible_appends_without_rewriting_v1() -> None:
@@ -390,6 +447,7 @@ def test_registered_multiversion_transitions_are_explicitly_compatible_or_breaki
         (RecordType.TRADE, 1, 2),
         (RecordType.CONNECTION_EVENT, 1, 2),
         (RecordType.CLOCK_SYNC, 1, 2),
+        (RecordType.CLOCK_SYNC, 2, 3),
     }
 
     assert set(BREAKING_SCHEMA_TRANSITIONS).isdisjoint(compatible_transitions)

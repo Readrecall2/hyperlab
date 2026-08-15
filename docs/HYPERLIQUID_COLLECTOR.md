@@ -155,6 +155,9 @@ sont des flux critiques :
 leur dépassement du seuil stale ferme la connexion et déclenche le même chemin
 de reprise. La file bornée échoue explicitement lorsqu’elle est pleine ; elle ne
 supprime pas silencieusement une ligne.
+`bbo` et `trades` restent event-driven : leur silence seul ne force pas une
+reconnexion ; leur TTL analytique de 30 secondes reste distinct et peut faire
+échouer le gate aval sans déclarer le transport mort.
 
 
 Le compteur exponentiel n’est remis à zéro qu’après 60 secondes continues en

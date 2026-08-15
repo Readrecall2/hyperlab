@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from hyperlab.data.lake import (
@@ -14,7 +15,7 @@ from hyperlab.data.lake import (
     write_partition,
 )
 from hyperlab.data.schema import RecordType, schema_for
-from hyperlab.venues.base import ClockMeasurement, measure_clock
+from hyperlab.venues.base import ClockMeasurement, HttpRequestDiagnostics, measure_clock
 from hyperlab.venues.binance import clock_record
 
 BASE = datetime(2026, 8, 13, 12, tzinfo=UTC)
@@ -27,6 +28,7 @@ def _measurement(
     *,
     response_delay: timedelta,
     request_sent_time: datetime = BASE,
+    http_diagnostics: HttpRequestDiagnostics | None = None,
 ) -> ClockMeasurement:
     response_received_time = request_sent_time + response_delay
     return measure_clock(
@@ -34,6 +36,7 @@ def _measurement(
         request_sent_time=request_sent_time,
         response_received_time=response_received_time,
         server_time=request_sent_time + response_delay / 2,
+        http_diagnostics=http_diagnostics,
     )
 
 
@@ -59,7 +62,7 @@ def _record(
     )
 
 
-def _table(row: dict[str, object], *, version: int = 2) -> pa.Table:
+def _table(row: dict[str, object], *, version: int = 3) -> pa.Table:
     return pa.Table.from_pylist(
         [row],
         schema=schema_for(RecordType.CLOCK_SYNC, version=version).schema,
@@ -99,7 +102,7 @@ def test_uncertainty_at_50_ms_has_a_response_causal_bounded_interval() -> None:
     row = _record(measurement, 'clock-at-threshold')
 
     assert measurement.drift_uncertainty_ms == MAX_UNCERTAINTY_MS
-    assert row['schema_version'] == 2
+    assert row['schema_version'] == 3
     assert row['connection_id'] == 'binance-connection-7'
     assert row['connection_epoch'] == 7
     assert row['capture_epoch_id'] == 'capture-epoch-7'
@@ -153,7 +156,7 @@ def test_clock_validity_never_interpolates_across_stale_or_new_epoch_periods() -
     assert uncovered == timedelta(seconds=15)
 
 
-def test_clock_sync_v1_remains_valid_beside_v2_partitions(tmp_path: Path) -> None:
+def test_clock_sync_v1_v2_remain_valid_beside_v3_partitions(tmp_path: Path) -> None:
     measurement = _measurement(response_delay=timedelta(milliseconds=20))
     v1_row = {
         'schema_version': 1,
@@ -173,20 +176,109 @@ def test_clock_sync_v1_remains_valid_beside_v2_partitions(tmp_path: Path) -> Non
         'drift_uncertainty_ms': measurement.drift_uncertainty_ms,
         'observation_id': 'legacy-clock-v1',
     }
+    v3_row = _record(measurement, 'causal-clock-v3')
+    v2_row = {
+        name: v3_row[name]
+        for name in schema_for(RecordType.CLOCK_SYNC, version=2).schema.names
+    }
+    v2_row['schema_version'] = 2
+    v2_row['observation_id'] = 'causal-clock-v2'
     key = PartitionKey('binance_usdm', BASE.date(), 'GLOBAL', RecordType.CLOCK_SYNC)
 
     v1_manifest = write_partition(tmp_path, key, _table(v1_row, version=1))
     v2_manifest = write_partition(
         tmp_path,
         key,
-        _table(_record(measurement, 'causal-clock-v2')),
+        _table(v2_row, version=2),
     )
+    v3_manifest = write_partition(tmp_path, key, _table(v3_row))
 
     assert v1_manifest.schema_version == 1
     assert v2_manifest.schema_version == 2
+    assert v3_manifest.schema_version == 3
     inventory = inventory_partitions(tmp_path)
-    assert sorted(item.schema_version for item in inventory.partitions) == [1, 2]
-    assert inventory.total_rows == 2
+    assert sorted(item.schema_version for item in inventory.partitions) == [1, 2, 3]
+    assert inventory.total_rows == 3
+
+
+def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path) -> None:
+    diagnostics = HttpRequestDiagnostics(
+        transport_lock_wait_ms=Decimal('2.1234567890123456789'),
+        requests_adapter_header_elapsed_ms=Decimal('30'),
+        session_get_total_ms=Decimal('40'),
+        json_decode_ms=Decimal('3'),
+        pool_connections_before=1,
+        pool_connections_after=1,
+        pool_connection_delta=0,
+        pool_requests_before=5,
+        pool_requests_after=6,
+        pool_request_delta=1,
+        new_pool_connection_created=False,
+        requests_session_reused=True,
+        urllib3_connection_identity='urllib3-connection-1',
+        urllib3_connection_reused=True,
+        tls_socket_identity='tls-socket-1',
+        tls_socket_reused=True,
+        tls_session_reused=None,
+        diagnostic_prepare_ms=Decimal('1.5'),
+        diagnostic_finalize_ms=Decimal('2.5'),
+        post_request_observation_current=True,
+        peer_ip='192.0.2.9',
+        peer_port=443,
+        socket_family='AF_INET',
+        response_cloudfront_pop='SIN2-P11',
+        response_cache='Miss from cloudfront',
+    )
+    measurement = _measurement(
+        response_delay=timedelta(milliseconds=20),
+        http_diagnostics=diagnostics,
+    )
+    record = clock_record(
+        measurement,
+        'joinable-clock-v3',
+        connection_id='binance-connection-7',
+        connection_epoch=7,
+        capture_epoch_id='capture-epoch-7',
+        sampling_interval=SAMPLING_INTERVAL,
+        max_age=MAX_AGE,
+        max_uncertainty_ms=MAX_UNCERTAINTY_MS,
+        clock_schedule_overdue_ms=Decimal('4'),
+        single_flight_blocked_ms=Decimal('0.5'),
+        executor_submit_to_worker_start_ms=Decimal('25'),
+        worker_completion_to_supervisor_drain_ms=Decimal('15'),
+    )
+    key = PartitionKey('binance_usdm', BASE.date(), 'GLOBAL', RecordType.CLOCK_SYNC)
+
+    manifest = write_partition(tmp_path, key, _table(dict(record.row)))
+    persisted = pq.ParquetFile(tmp_path / manifest.relative_data_path).read().to_pylist()[0]
+
+    assert manifest.schema_version == 3
+    assert persisted['observation_id'] == 'joinable-clock-v3'
+    assert persisted['request_sent_time'] == measurement.request_sent_time
+    assert persisted['response_received_time'] == measurement.response_received_time
+    assert persisted['clock_schedule_overdue_ms'] == Decimal('4.000000000000000000')
+    assert persisted['single_flight_blocked_ms'] == Decimal(
+        '0.500000000000000000'
+    )
+    assert persisted['executor_submit_to_worker_start_ms'] == Decimal('25.000000000000000000')
+    assert persisted['worker_completion_to_supervisor_drain_ms'] == Decimal(
+        '15.000000000000000000'
+    )
+    assert persisted['transport_lock_wait_ms'] == Decimal(
+        '2.123456789012345679'
+    )
+    assert persisted['requests_adapter_header_elapsed_ms'] == Decimal(
+        '30.000000000000000000'
+    )
+    assert persisted['requests_session_reused'] is True
+    assert persisted['urllib3_connection_identity'] == 'urllib3-connection-1'
+    assert persisted['tls_socket_identity'] == 'tls-socket-1'
+    assert persisted['post_request_observation_current'] is True
+    assert persisted['peer_ip'] == '192.0.2.9'
+    assert persisted['peer_port'] == 443
+    assert persisted['socket_family'] == 'AF_INET'
+    assert persisted['response_cloudfront_pop'] == 'SIN2-P11'
+    assert persisted['response_cache'] == 'Miss from cloudfront'
 
 
 def test_inventory_rejects_trade_duplicate_hidden_at_v1_v2_boundary(
@@ -313,6 +405,40 @@ def test_lake_rejects_inconsistent_invalid_clock_coverage(
     row = _record(
         _measurement(response_delay=timedelta(milliseconds=102)),
         'malformed-invalid-clock',
+    )
+    row.update(updates)
+
+    with pytest.raises(PartitionValidationError, match=message):
+        write_partition(
+            tmp_path,
+            PartitionKey('binance_usdm', BASE.date(), 'GLOBAL', RecordType.CLOCK_SYNC),
+            _table(row),
+        )
+
+
+@pytest.mark.parametrize(
+    ('updates', 'message'),
+    [
+        (
+            {'clock_schedule_overdue_ms': Decimal('-1')},
+            'clock_schedule_overdue_ms',
+        ),
+        (
+            {'executor_submit_to_worker_start_ms': Decimal('-1')},
+            'executor_submit_to_worker_start_ms',
+        ),
+        ({'peer_port': 0}, 'peer_port'),
+        ({'response_cloudfront_pop': ' '}, 'response_cloudfront_pop'),
+    ],
+)
+def test_lake_rejects_invalid_clock_v3_diagnostics(
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    row = _record(
+        _measurement(response_delay=timedelta(milliseconds=20)),
+        'malformed-clock-diagnostics',
     )
     row.update(updates)
 

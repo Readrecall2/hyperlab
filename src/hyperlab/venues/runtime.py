@@ -12,6 +12,7 @@ from decimal import Decimal
 from math import ceil
 from pathlib import Path
 from statistics import median
+from typing import cast
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
 from hyperlab.collector.storage import BatchingLakeSink, CoordinatedWriterError, LakeSink
@@ -52,7 +53,10 @@ class _ClockFutureContext:
     capture_epoch_id: str
     connection_id: str
     connection_epoch: int
+    observation_id: str
     submitted_at: float
+    clock_schedule_overdue_ms: float | None = None
+    single_flight_blocked_ms: float | None = None
     worker_started_at: float | None = None
     worker_completed_at: float | None = None
 
@@ -666,6 +670,7 @@ class BinanceReferenceCollector:
                 "completed_awaiting_drain_age_ms": None,
                 "capture_epoch_id": None,
                 "connection_id": None,
+                "observation_id": None,
                 "connection_epoch": None,
             }
         if context is None:
@@ -680,6 +685,7 @@ class BinanceReferenceCollector:
                 "completed_awaiting_drain_age_ms": None,
                 "capture_epoch_id": None,
                 "connection_id": None,
+                "observation_id": None,
                 "connection_epoch": None,
             }
 
@@ -713,6 +719,7 @@ class BinanceReferenceCollector:
             "completed_awaiting_drain_age_ms": milliseconds(completed_age_seconds),
             "capture_epoch_id": context.capture_epoch_id,
             "connection_id": context.connection_id,
+            "observation_id": context.observation_id,
             "connection_epoch": context.connection_epoch,
         }
 
@@ -810,7 +817,7 @@ class BinanceReferenceCollector:
         drained_at: float,
         error: BaseException | None = None,
         outcome: str | None = None,
-    ) -> None:
+    ) -> dict[str, object]:
         diagnostics = (
             measurement.http_diagnostics
             if measurement is not None
@@ -820,10 +827,18 @@ class BinanceReferenceCollector:
         error_message = (
             None if raw_error_message is None else raw_error_message[:_OBSERVABILITY_ERROR_MESSAGE_LIMIT]
         )
-        request_sent_time = getattr(error, "request_sent_time", None)
-        response_received_time = getattr(error, "response_received_time", None)
+        request_sent_time = (
+            measurement.request_sent_time
+            if measurement is not None
+            else getattr(error, "request_sent_time", None)
+        )
+        response_received_time = (
+            measurement.response_received_time
+            if measurement is not None
+            else getattr(error, "response_received_time", None)
+        )
         failed_request_boundary_duration_ms: float | None = None
-        if isinstance(request_sent_time, datetime) and isinstance(
+        if error is not None and isinstance(request_sent_time, datetime) and isinstance(
             response_received_time,
             datetime,
         ):
@@ -849,6 +864,19 @@ class BinanceReferenceCollector:
             "capture_epoch_id": context.capture_epoch_id,
             "connection_id": context.connection_id,
             "connection_epoch": context.connection_epoch,
+            "observation_id": context.observation_id,
+            "request_sent_time": (
+                request_sent_time.isoformat()
+                if isinstance(request_sent_time, datetime)
+                else None
+            ),
+            "response_received_time": (
+                response_received_time.isoformat()
+                if isinstance(response_received_time, datetime)
+                else None
+            ),
+            "clock_schedule_overdue_ms": context.clock_schedule_overdue_ms,
+            "single_flight_blocked_ms": context.single_flight_blocked_ms,
             "executor_submit_to_worker_start_ms": (
                 None
                 if context.worker_started_at is None
@@ -931,6 +959,7 @@ class BinanceReferenceCollector:
         self._clock_observations.append(observation)
         self._clock_observations_seen += 1
         self.metrics["clock_observability"] = self._clock_observability_payload()
+        return observation
 
     def _finalize_clock_after_generation_close(self) -> None:
         future = self._clock_future
@@ -974,6 +1003,8 @@ class BinanceReferenceCollector:
         connection_id: str,
         connection_epoch: int,
         capture_epoch_id: str,
+        clock_schedule_overdue_ms: float | None = None,
+        single_flight_blocked_ms: float | None = None,
     ) -> None:
         if self._clock_future is not None:
             return
@@ -981,7 +1012,10 @@ class BinanceReferenceCollector:
             capture_epoch_id=capture_epoch_id,
             connection_id=connection_id,
             connection_epoch=connection_epoch,
+            observation_id=f"clock:{capture_epoch_id}:{uuid.uuid4().hex}",
             submitted_at=self.monotonic(),
+            clock_schedule_overdue_ms=clock_schedule_overdue_ms,
+            single_flight_blocked_ms=single_flight_blocked_ms,
         )
         self._clock_future_context = context
         try:
@@ -1012,13 +1046,15 @@ class BinanceReferenceCollector:
         capture_epoch_id = context.capture_epoch_id
         connection_id = context.connection_id
         connection_epoch = context.connection_epoch
+        observation_id = context.observation_id
         try:
             measurement = future.result()
         except Exception as exc:
+            drained_at = self.monotonic()
             self._observe_clock_execution(
                 context,
                 None,
-                drained_at=self.monotonic(),
+                drained_at=drained_at,
                 error=exc,
             )
             reason = f"clock_sync request failed: {type(exc).__name__}: {exc}"
@@ -1037,10 +1073,11 @@ class BinanceReferenceCollector:
                 reason=f"coverage_unknown:{reason}",
             )
             return True
-        self._observe_clock_execution(
+        drained_at = self.monotonic()
+        execution_observation = self._observe_clock_execution(
             context,
             measurement,
-            drained_at=self.monotonic(),
+            drained_at=drained_at,
         )
         if active_capture_epoch_id != capture_epoch_id:
             self.metrics["clock_sample_failures"] = self._counter("clock_sample_failures") + 1
@@ -1050,13 +1087,29 @@ class BinanceReferenceCollector:
             return True
         record = clock_record(
             measurement,
-            f"clock:{capture_epoch_id}:{uuid.uuid4().hex}",
+            observation_id,
             connection_id=connection_id,
             connection_epoch=connection_epoch,
             capture_epoch_id=capture_epoch_id,
             sampling_interval=timedelta(seconds=self.config.clock_sampling_interval_seconds),
             max_age=timedelta(seconds=self.config.clock_max_age_seconds),
             max_uncertainty_ms=self.config.clock_max_uncertainty_ms,
+            clock_schedule_overdue_ms=cast(
+                float | None,
+                execution_observation["clock_schedule_overdue_ms"],
+            ),
+            single_flight_blocked_ms=cast(
+                float | None,
+                execution_observation["single_flight_blocked_ms"],
+            ),
+            executor_submit_to_worker_start_ms=cast(
+                float | None,
+                execution_observation["executor_submit_to_worker_start_ms"],
+            ),
+            worker_completion_to_supervisor_drain_ms=cast(
+                float | None,
+                execution_observation["worker_completion_to_supervisor_drain_ms"],
+            ),
         )
         self._add(record)
         self.metrics["clock_samples"] = self._counter("clock_samples") + 1
@@ -1111,10 +1164,11 @@ class BinanceReferenceCollector:
         expected_at: float,
         observed_at: float,
         prior_context: _ClockFutureContext | None,
-    ) -> None:
+    ) -> tuple[float, float]:
         overdue_seconds = max(observed_at - expected_at, 0.0)
         self._clock_schedule_overdue.observe_seconds(overdue_seconds)
         scheduling_expected_at = expected_at
+        blocked_seconds = 0.0
         if prior_context is not None:
             completed_at = prior_context.worker_completed_at
             blocked_until = observed_at if completed_at is None else min(completed_at, observed_at)
@@ -1127,6 +1181,10 @@ class BinanceReferenceCollector:
             observed_monotonic_ns=round(observed_at * 1_000_000_000),
         )
         self.metrics["clock_observability"] = self._clock_observability_payload()
+        return (
+            round(overdue_seconds * 1_000, 6),
+            round(blocked_seconds * 1_000, 6),
+        )
 
     def _abandon_clock_sample(self) -> None:
         future = self._clock_future
@@ -1324,7 +1382,10 @@ class BinanceReferenceCollector:
                         pending_l2_resync_assets=pending_l2_resync_assets,
                     )
                     if self._clock_future is None and observed_mono >= next_clock_sample_at:
-                        self._observe_clock_schedule(
+                        (
+                            schedule_overdue_ms,
+                            single_flight_blocked_ms,
+                        ) = self._observe_clock_schedule(
                             expected_at=next_clock_sample_at,
                             observed_at=observed_mono,
                             prior_context=prior_clock_context,
@@ -1333,6 +1394,8 @@ class BinanceReferenceCollector:
                             connection_id=connection_ids["public"],
                             connection_epoch=epoch,
                             capture_epoch_id=capture_epoch_id,
+                            clock_schedule_overdue_ms=schedule_overdue_ms,
+                            single_flight_blocked_ms=single_flight_blocked_ms,
                         )
                         next_clock_sample_at = observed_mono + self.config.clock_sampling_interval_seconds
                     for role in required_roles:

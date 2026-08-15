@@ -148,6 +148,8 @@ def _hyperliquid_frame(
     arrival: int,
     capture: str,
     connection_id: str = "hyperliquid-public-1",
+    one_sided_bbo: bool = False,
+    empty_l2_side: bool = False,
 ) -> tuple[ParsedRecord, ...]:
     milliseconds = int(received.timestamp() * 1_000)
     if kind == "bbo":
@@ -158,7 +160,11 @@ def _hyperliquid_frame(
                 "time": milliseconds,
                 "bbo": [
                     {"px": "60000", "sz": "1", "n": 1},
-                    {"px": "60001", "sz": "1", "n": 1},
+                    (
+                        None
+                        if one_sided_bbo
+                        else {"px": "60001", "sz": "1", "n": 1}
+                    ),
                 ],
             },
         }
@@ -170,7 +176,11 @@ def _hyperliquid_frame(
                 "time": milliseconds,
                 "levels": [
                     [{"px": "60000", "sz": "1", "n": 1}],
-                    [{"px": "60001", "sz": "1", "n": 1}],
+                    (
+                        []
+                        if empty_l2_side
+                        else [{"px": "60001", "sz": "1", "n": 1}]
+                    ),
                 ],
             },
         }
@@ -310,6 +320,8 @@ def _write_continuity_lake(
     binance_market_connection_epoch: int = 1,
     omit_hyperliquid_connect: bool = False,
     hyperliquid_connect_role: str = "public",
+    one_sided_hyperliquid_bbo: bool = False,
+    empty_sided_hyperliquid_l2: bool = False,
     hyperliquid_message_asset_override: object = Ellipsis,
     hyperliquid_message_asset_kind: str = "l2",
     hyperliquid_channel_override: object = Ellipsis,
@@ -662,6 +674,16 @@ def _write_continuity_lake(
                     ),
                     arrival=hyperliquid_arrival,
                     capture=hyperliquid_capture,
+                    one_sided_bbo=(
+                        one_sided_hyperliquid_bbo
+                        and asset == "BTC"
+                        and kind == "bbo"
+                    ),
+                    empty_l2_side=(
+                        empty_sided_hyperliquid_l2
+                        and asset == "BTC"
+                        and kind == "l2"
+                    ),
                 )
             )
 
@@ -1535,6 +1557,45 @@ def test_real_lake_audit_passes_technical_gate_but_keeps_phase_blocked(
     assert payload["failure_reasons"] == []
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"one_sided_hyperliquid_bbo": True},
+        {"empty_sided_hyperliquid_l2": True},
+    ),
+    ids=("one-sided-bbo", "empty-sided-l2"),
+)
+def test_exact_non_executable_hyperliquid_books_do_not_arm_strict_overlap(
+    tmp_path: Path,
+    mutation: dict[str, bool],
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(lake, **mutation)
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    required_wire = payload["required_wire_lineage"]
+    assert isinstance(required_wire, dict)
+    assert required_wire["orphan_required_wire_total"] == 0
+    by_venue_asset = required_wire["by_venue_asset"]
+    assert isinstance(by_venue_asset, dict)
+    assert by_venue_asset["hyperliquid"]["BTC"] == 0
+    reasons = payload["failure_reasons"]
+    assert "required_raw_wire_without_exact_normalization" not in reasons
+    assert "hyperliquid_market_raw_lineage_rejected" not in reasons
+    assert (
+        "hyperliquid_market_capture_incomplete:hyperliquid-capture-1" in reasons
+    )
+    overlap = payload["strict_phase_10_overlap"]
+    assert isinstance(overlap, dict)
+    assert float(str(overlap["duration_seconds"])) == 0.0
+
+
 def test_real_lake_audit_accepts_explicit_hyperliquid_rest_bootstrap_provenance(
     tmp_path: Path,
 ) -> None:
@@ -1915,7 +1976,7 @@ def test_real_lake_audit_rejects_looser_self_declared_clock_policy(
         ),
         (
             {"zero_binance_bbo_quantity": True},
-            "binance_market_raw_lineage_rejected",
+            "binance_market_capture_incomplete:binance-capture-1",
         ),
         (
             {"forge_binance_maker_type": True},

@@ -153,9 +153,10 @@ def parse_websocket_message(envelope: WireEnvelope) -> ParsedMessage:
     try:
         if channel == "subscriptionResponse":
             ack = _mapping(data, label="subscription response")
-            subscription = ack.get("subscription")
-            if isinstance(subscription, Mapping):
-                acknowledged = subscription
+            if ack.get("method") == "subscribe":
+                subscription = ack.get("subscription")
+                if isinstance(subscription, Mapping):
+                    acknowledged = subscription
         elif channel == "l2Book":
             records.extend(_parse_l2(data, envelope))
         elif channel == "bbo":

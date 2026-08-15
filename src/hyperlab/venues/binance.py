@@ -1350,6 +1350,22 @@ def _positive_milliseconds(value: timedelta, *, label: str) -> int:
     return int(milliseconds)
 
 
+def _optional_non_negative_milliseconds(
+    value: Decimal | float | None,
+    *,
+    label: str,
+) -> Decimal | None:
+    result = _decimal(value, required=False)
+    if result is not None and result < 0:
+        raise ValueError(f"{label} must be non-negative")
+    if result is None:
+        return None
+    try:
+        return result.quantize(Decimal("0.000000000000000001"))
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} exceeds the durable decimal range") from exc
+
+
 def clock_record(
     measurement: ClockMeasurement,
     observation_id: str,
@@ -1360,6 +1376,10 @@ def clock_record(
     sampling_interval: timedelta = timedelta(seconds=10),
     max_age: timedelta = timedelta(seconds=15),
     max_uncertainty_ms: Decimal = Decimal("50"),
+    clock_schedule_overdue_ms: Decimal | float | None = None,
+    single_flight_blocked_ms: Decimal | float | None = None,
+    executor_submit_to_worker_start_ms: Decimal | float | None = None,
+    worker_completion_to_supervisor_drain_ms: Decimal | float | None = None,
 ) -> ParsedRecord:
     sampling_interval_ms = _positive_milliseconds(
         sampling_interval,
@@ -1376,6 +1396,7 @@ def clock_record(
         raise ValueError("connection_id must be non-empty when present")
     if capture_epoch_id is not None and not capture_epoch_id.strip():
         raise ValueError("capture_epoch_id must be non-empty when present")
+    diagnostics = measurement.http_diagnostics
 
     missing_identity = (
         connection_id is None or connection_epoch is None or capture_epoch_id is None
@@ -1425,6 +1446,75 @@ def clock_record(
         "sampling_interval_ms": sampling_interval_ms,
         "max_age_ms": max_age_ms,
         "max_uncertainty_ms": max_uncertainty_ms,
+        "clock_schedule_overdue_ms": _optional_non_negative_milliseconds(
+            clock_schedule_overdue_ms,
+            label="clock schedule overdue",
+        ),
+        "single_flight_blocked_ms": _optional_non_negative_milliseconds(
+            single_flight_blocked_ms,
+            label="single flight blocked",
+        ),
+        "executor_submit_to_worker_start_ms": _optional_non_negative_milliseconds(
+            executor_submit_to_worker_start_ms,
+            label="executor submit to worker start",
+        ),
+        "worker_completion_to_supervisor_drain_ms": _optional_non_negative_milliseconds(
+            worker_completion_to_supervisor_drain_ms,
+            label="worker completion to supervisor drain",
+        ),
+        "transport_lock_wait_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.transport_lock_wait_ms,
+            label="transport lock wait",
+        ),
+        "requests_adapter_header_elapsed_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.requests_adapter_header_elapsed_ms,
+            label="Requests adapter header elapsed",
+        ),
+        "session_get_total_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.session_get_total_ms,
+            label="session get total",
+        ),
+        "json_decode_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.json_decode_ms,
+            label="JSON decode",
+        ),
+        "diagnostic_prepare_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.diagnostic_prepare_ms,
+            label="diagnostic prepare",
+        ),
+        "diagnostic_finalize_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.diagnostic_finalize_ms,
+            label="diagnostic finalize",
+        ),
+        "new_urllib3_connection_object_created": (
+            None if diagnostics is None else diagnostics.new_urllib3_connection_object_created
+        ),
+        "requests_session_reused": (
+            None if diagnostics is None else diagnostics.requests_session_reused
+        ),
+        "urllib3_connection_identity": (
+            None if diagnostics is None else diagnostics.urllib3_connection_identity
+        ),
+        "urllib3_connection_reused": (
+            None if diagnostics is None else diagnostics.urllib3_connection_reused
+        ),
+        "tls_socket_identity": (
+            None if diagnostics is None else diagnostics.tls_socket_identity
+        ),
+        "tls_socket_reused": None if diagnostics is None else diagnostics.tls_socket_reused,
+        "tls_session_reused": None if diagnostics is None else diagnostics.tls_session_reused,
+        "post_request_observation_current": (
+            None if diagnostics is None else diagnostics.post_request_observation_current
+        ),
+        "peer_ip": None if diagnostics is None else diagnostics.peer_ip,
+        "peer_port": None if diagnostics is None else diagnostics.peer_port,
+        "socket_family": None if diagnostics is None else diagnostics.socket_family,
+        "response_cloudfront_pop": (
+            None if diagnostics is None else diagnostics.response_cloudfront_pop
+        ),
+        "response_cache": None if diagnostics is None else diagnostics.response_cache,
     }
     return ParsedRecord(RecordType.CLOCK_SYNC, "GLOBAL", row)
 

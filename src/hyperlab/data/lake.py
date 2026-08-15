@@ -6,7 +6,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import date as Date
@@ -29,6 +29,7 @@ from hyperlab.data.schema import (
 )
 
 MANIFEST_FORMAT_VERSION = 1
+DEFAULT_PARQUET_BATCH_SIZE = 1_024
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ASSET = re.compile(r"^[A-Za-z0-9@%][A-Za-z0-9@%._/+:-]{0,127}$")
 _CANDLE_INTERVAL = re.compile(r"^([1-9][0-9]*)(s|m|h|d|w)$")
@@ -448,6 +449,76 @@ def read_hashed_table(
         manifest,
         columns=columns,
     )
+
+
+def iter_hashed_batches(
+    root: Path,
+    manifest: PartitionManifest,
+    *,
+    columns: Sequence[str] | None = None,
+    batch_size: int = DEFAULT_PARQUET_BATCH_SIZE,
+) -> Iterator[pa.RecordBatch]:
+    """Yield projected Parquet batches after hashing one open file descriptor.
+
+    The file is hashed and size-checked before the first batch is exposed. The
+    same descriptor is then rewound for Parquet decoding, so a pathname swap
+    cannot substitute different bytes between integrity verification and read.
+    Memory retained by this iterator is bounded by one hash block, Arrow decoder
+    state and the caller-selected positive ``batch_size``.
+    """
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("Parquet batch_size must be a positive integer")
+
+    selected_columns = None if columns is None else list(columns)
+    data_path = root / manifest.relative_data_path
+    try:
+        stream = data_path.open("rb")
+    except FileNotFoundError:
+        raise PartitionValidationError(f"partition data file not found: {data_path.name}") from None
+
+    with stream:
+        digest = hashlib.sha256()
+        size_bytes = 0
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+            size_bytes += len(block)
+        del block
+
+        actual_hash = digest.hexdigest()
+        del digest
+        if actual_hash != manifest.sha256:
+            raise PartitionValidationError(
+                "CORRUPT_PARTITION [hash_mismatch] "
+                f"partition={manifest.relative_data_path.as_posix()} "
+                f"expected_sha256={manifest.sha256} actual_sha256={actual_hash}"
+            )
+        if size_bytes != manifest.size_bytes:
+            raise PartitionValidationError(f"size mismatch for {manifest.data_file}")
+
+        try:
+            parquet_file: pq.ParquetFile | None = None
+            try:
+                stream.seek(0)
+                parquet_file = pq.ParquetFile(stream, pre_buffer=False)
+                batch_iterator = parquet_file.iter_batches(
+                    batch_size=batch_size,
+                    columns=selected_columns,
+                    use_threads=False,
+                )
+                try:
+                    for batch in batch_iterator:
+                        try:
+                            yield batch
+                        finally:
+                            del batch
+                finally:
+                    del batch_iterator
+            finally:
+                if parquet_file is not None:
+                    parquet_file.close(force=True)
+        except Exception as exc:
+            raise PartitionValidationError(f"invalid Parquet file {data_path.name}: {exc}") from None
 
 
 def _timestamp_iso(epoch_ns: int) -> str:

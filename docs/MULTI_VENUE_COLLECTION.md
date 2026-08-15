@@ -655,10 +655,51 @@ if ($AuditExit -ne 0) {
 }
 ```
 
-Cette commande n'inventorie que la nouvelle racine. Sur `data\lake`, les bornes
-`--start` / `--end` sont exactes mais l'implémentation actuelle inventorie encore
-toutes les partitions requises avant de filtrer les lignes ; elle n'est donc pas
-un fast path physique pour le lake historique.
+Cette commande valide séquentiellement chaque manifeste et fichier de la racine.
+La validation de hash, schéma et statistiques matérialise au plus un fichier
+immuable complet à la fois ; la mémoire dépend donc du plus gros fichier, jamais
+de la taille totale du lake. Un second passage projeté vérifie sur disque les clés
+primaires, métadonnées L2 et cadences inter-fichiers. Les bornes `received_time`
+déjà vérifiées élaguent ensuite les colonnes Phase 10 inutiles. Les jointures et
+tris chronologiques utilisent un scratch SQLite hors du lake avec cache de 32 MiB
+et `mmap` nul. Les mutations scratch sont validées au plus tard après 8 192
+opérations afin que SQLite les évacue réellement sur disque au lieu de conserver
+une transaction de taille lake. Aucune population complète du dataset ni liste complète de
+manifestes n'est conservée en RAM ; le scratch disque, lui, croît avec les lignes
+et les fichiers validés.
+
+Sans variable explicite, le scratch éphémère est créé à côté de la racine du lake,
+donc sur le même stockage et hors du lake. Sur un VPS, choisissez de préférence un
+répertoire sur disque local suffisamment dimensionné, hors du lake et non monté en
+`tmpfs` :
+
+```powershell
+New-Item -ItemType Directory -Force C:\hyperlab-audit-scratch | Out-Null
+$env:HYPERLAB_CONTINUITY_SCRATCH = "C:\hyperlab-audit-scratch"
+```
+
+Le bloc Linux ci-dessous fixe aussi `SQLITE_TMPDIR` sur ce même disque afin que
+les tris temporaires SQLite n'utilisent pas un éventuel `/tmp` en mémoire. Le
+champ `peak_scratch_bytes` mesure le fichier de spool persistant et ses index ;
+les fichiers temporaires de tri peuvent disparaître avant l'échantillonnage.
+
+Le bloc JSON additif `observability` rapporte les fichiers validés/sélectionnés,
+les lignes validées/scannées, les bornes internes mesurables, le pic du scratch et
+les temps par phase. Le bloc entier est explicitement non sémantique et ne
+participe jamais au gate ; les compteurs déterministes restent vérifiables comme
+télémétrie de l'exécution.
+
+Mesure synthétique locale du 15 août 2026, Windows/Python 3.12.13 : le processus
+pytest combinant 60 001 manifestes virtuels consommés paresseusement,
+1 000 001 clés d'intégrité spoulées et 5 000 001 timestamps continus a terminé en
+47,548 s avec un pic `PeakWorkingSetSize` de 151 785 472 octets. Le test minimal
+chargeant le même harnais pytest/Arrow/Pandas atteignait 114 618 368 octets. Le
+spool isolé d'un million de clés a occupé 28 893 184 octets persistants, avec
+1 024 clés Python au plus par batch, 8 198 opérations non commitées au pic et
+122 commits. Ces formes testent séparément les bornes critiques ; elles ne sont
+pas un replay Parquet de plusieurs millions de lignes. Ce résultat Windows ne
+constitue ni une mesure RSS Linux, ni une certification de durée ou de scratch
+pour le lake Singapore réel.
 
 Les critères de PASS sont cumulatifs et exacts :
 
@@ -729,17 +770,77 @@ Ne lancez pas `collect` ou `collect-reference` en parallèle de cette commande
 sur le même `data/lake`. Leur erreur `active writer` est le comportement
 fail-closed attendu.
 
-Après l'arrêt propre, validez et inventoriez les artefacts avant toute Phase 10 :
+Après l'arrêt propre, exécutez directement l'audit borné avec les bornes UTC
+exactes et indépendamment enregistrées de la capture. Sur le VPS Linux, remplacez
+les six valeurs entre chevrons ci-dessous ; ne déduisez pas les bornes des
+lignes observées :
 
-```powershell
-.\.venv\Scripts\python.exe -m hyperlab data validate data\lake --json
-.\.venv\Scripts\python.exe -m hyperlab data inventory data\lake --json
+```bash
+set -euo pipefail
+
+REPO_ROOT='<absolute-hyperlab-repository-path>'
+CAPTURE_ROOT='<absolute-completed-lake-path>'
+CAPTURE_START_UTC='<exact-recorded-start-ISO8601-Z>'
+CAPTURE_END_UTC='<exact-recorded-end-ISO8601-Z>'
+AUDIT_SCRATCH='<absolute-local-disk-scratch-path-outside-lake>'
+REPORT_DIR='<absolute-report-directory-outside-lake>'
+
+mkdir -p -- "$AUDIT_SCRATCH" "$REPORT_DIR"
+SCRATCH_FS="$(findmnt -n -o FSTYPE --target "$AUDIT_SCRATCH")"
+if [[ "$SCRATCH_FS" == 'tmpfs' || "$SCRATCH_FS" == 'ramfs' ]]; then
+  echo "Audit scratch must be disk-backed, not $SCRATCH_FS" >&2
+  exit 1
+fi
+df -h -- "$AUDIT_SCRATCH"
+export HYPERLAB_CONTINUITY_SCRATCH="$AUDIT_SCRATCH"
+export SQLITE_TMPDIR="$AUDIT_SCRATCH"
+REPORT_PATH="$REPORT_DIR/phase10-continuity.json"
+if [[ -e "$REPORT_PATH" ]]; then
+  echo "Refusing to overwrite existing gate report: $REPORT_PATH" >&2
+  exit 1
+fi
+REPORT_TMP="$(mktemp "$REPORT_DIR/.phase10-continuity.XXXXXX")"
+trap 'rm -f -- "$REPORT_TMP"' EXIT
+
+cd -- "$REPO_ROOT"
+set +e
+.venv/bin/python -m hyperlab data continuity "$CAPTURE_ROOT" \
+  --assets 'BTC,ETH' \
+  --start "$CAPTURE_START_UTC" \
+  --end "$CAPTURE_END_UTC" \
+  --json | tee "$REPORT_TMP"
+PIPE_STATUS=("${PIPESTATUS[@]}")
+set -e
+
+if (( PIPE_STATUS[1] != 0 )); then
+  rm -f -- "$REPORT_TMP"
+  echo 'Could not persist the Phase 10 report' >&2
+  exit "${PIPE_STATUS[1]}"
+fi
+if ! .venv/bin/python -m json.tool "$REPORT_TMP" >/dev/null; then
+  rm -f -- "$REPORT_TMP"
+  echo 'Continuity exited without a valid JSON gate report' >&2
+  JSON_EXIT="${PIPE_STATUS[0]}"
+  if (( JSON_EXIT == 0 )); then JSON_EXIT=2; fi
+  exit "$JSON_EXIT"
+fi
+mv -- "$REPORT_TMP" "$REPORT_PATH"
+trap - EXIT
+if (( PIPE_STATUS[0] != 0 )); then
+  echo "Phase 10 technical capture gate failed; report: $REPORT_PATH" >&2
+  exit "${PIPE_STATUS[0]}"
+fi
+echo "Phase 10 technical capture gate PASS; report: $REPORT_PATH"
 ```
 
-Exécutez ensuite `data continuity` avec les bornes UTC de cette collecte. Une
-capture de vingt-quatre heures et un audit technique réussi ne constituent pas
-une preuve de représentativité économique, de latence stable ou de rentabilité,
-et ne débloquent pas à eux seuls la Phase 10.
+La commande générale `data inventory` conserve encore son audit inter-segments
+historique non borné et ne doit pas être lancée sur la capture 60k+ fichiers tant
+qu'elle n'a pas reçu le même durcissement. Ce blocage n'affaiblit pas le gate
+Phase 10 : `data continuity` vérifie sur disque les unicités/métadonnées globales,
+recalcule les cadences inter-fichiers et les gaps wire/trade de la fenêtre exacte,
+et reste fail-closed. Une capture de vingt-quatre heures et un audit technique
+réussi ne constituent pas une preuve de représentativité économique, de latence
+stable ou de rentabilité, et ne débloquent pas à eux seuls la Phase 10.
 
 ## Limites explicites
 

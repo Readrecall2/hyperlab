@@ -11,7 +11,7 @@ from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol, cast
 
 import pandas as pd
 import typer
@@ -90,6 +90,62 @@ def _settings() -> Settings:
     if not CONFIG.exists():
         raise typer.BadParameter(f"Configuration introuvable: {CONFIG.resolve()}")
     return load_settings(CONFIG)
+
+
+# These lazy adapters keep the normal CLI startup independent of the event
+# analysis stack and provide narrow seams for fail-closed CLI tests.
+def load_lead_lag_config(path: Path) -> object:
+    from hyperlab.analysis.lead_lag import load_lead_lag_config as implementation
+
+    return implementation(path)
+
+
+class _LeadLagWindow(Protocol):
+    @property
+    def dataset(self) -> object: ...
+
+    @property
+    def intervals(self) -> object: ...
+
+
+def load_validated_lead_lag_window(root: Path, gate_report_path: Path) -> _LeadLagWindow:
+    from hyperlab.analysis.lake import load_validated_lead_lag_window as implementation
+
+    return implementation(root, gate_report_path)
+
+
+def analyze_lead_lag(dataset: object, intervals: object, config: object) -> object:
+    from hyperlab.analysis.lead_lag import analyze_lead_lag as typed_implementation
+
+    implementation = cast(
+        Callable[[object, object, object], object],
+        typed_implementation,
+    )
+    return implementation(dataset, intervals, config)
+
+
+def write_lead_lag_artifacts(
+    analysis: object,
+    window: object,
+    config: object,
+    output: Path,
+) -> Mapping[str, Path]:
+    from hyperlab.analysis.reporting import write_lead_lag_artifacts as implementation
+
+    return implementation(analysis, window, config, output)
+
+
+def _inside_path(root: Path, destination: Path) -> bool:
+    resolved_root = root.resolve(strict=False)
+    resolved_destination = destination.resolve(strict=False)
+    return resolved_destination == resolved_root or resolved_destination.is_relative_to(resolved_root)
+
+
+def _validate_lead_lag_output(root: Path, output: Path) -> None:
+    if _inside_path(root, output):
+        raise ValueError(f"LEAD_LAG_OUTPUT_REFUSED [inside_lake] output={output} root={root}")
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"LEAD_LAG_OUTPUT_REFUSED [already_exists] output={output}")
 
 
 def _csv_values(value: str, *, label: str) -> tuple[str, ...]:
@@ -1175,6 +1231,76 @@ def collect_multi_venue(
                 },
                 "observability": {
                     "writer": writer.metrics_snapshot(),
+                },
+            }
+        )
+    )
+
+
+@app.command("lead-lag-study")
+def lead_lag_study(
+    root: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            help="Racine immuable du lake Phase 10",
+        ),
+    ],
+    gate_report: Annotated[
+        Path,
+        typer.Option(
+            "--gate-report",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Rapport technique Phase 10 valide et lie au lake",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="Nouveau repertoire de rapport, obligatoirement hors du lake",
+        ),
+    ],
+    config_path: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Preregistration TOML de l'etude evenementielle",
+        ),
+    ] = Path("config/lead_lag_phase10.toml"),
+) -> None:
+    """Analyse hors ligne le lead-lag BTC/ETH apres validation technique stricte."""
+
+    try:
+        _validate_lead_lag_output(root, output)
+        config = load_lead_lag_config(config_path)
+        window = load_validated_lead_lag_window(root, gate_report)
+        dataset = window.dataset
+        intervals = window.intervals
+        analysis = analyze_lead_lag(dataset, intervals, config)
+        artifacts = write_lead_lag_artifacts(analysis, window, config, output)
+    except (FileExistsError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    console.print_json(
+        json.dumps(
+            {
+                "status": "EVENT_REPLAY_RESEARCH_ONLY",
+                "source_time_lead_status": "NOT_ADMISSIBLE",
+                "output": str(output.resolve(strict=False)),
+                "artifacts": {
+                    str(name): str(path.resolve(strict=False))
+                    for name, path in artifacts.items()
                 },
             }
         )

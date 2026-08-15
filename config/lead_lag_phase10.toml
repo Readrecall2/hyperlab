@@ -1,0 +1,54 @@
+[study]
+# Phase 10 is an offline event-replay study. These values are preregistered
+# research controls, not estimates of current venue costs or latencies.
+assets = ["BTC", "ETH"]
+horizons_ms = [50, 100, 250, 500, 1000, 2000, 5000]
+trade_window_ms = 250
+momentum_window_ms = 1000
+l2_levels = 10
+minimum_move_bps = 0.5
+max_book_age_ms = 250
+bucket_minutes = 60
+randomization_resamples = 1000
+randomization_block_ms = 60000
+randomization_seed = 42
+minimum_events = 30
+# Fail closed before horizon/scenario event expansion if the projected long-form
+# table exceeds either preregistered resource bound.
+max_event_rows = 5000000
+max_estimated_event_bytes = 8000000000
+
+# Every scenario below is intentionally UNCALIBRATED. The values are explicit so
+# a run cannot silently inherit zero cost, zero latency, guaranteed fills, or an
+# empty queue. They are sensitivity inputs only and make no claim about current
+# Binance or Hyperliquid execution.
+
+[[execution_scenarios]]
+name = "uncalibrated_base"
+calibration_status = "UNCALIBRATED"
+source = "UNCALIBRATED scenario input; not a verified current fee or execution schedule"
+taker_fee_bps = 3.5
+maker_fee_bps = 1.0
+latency_ms = 75
+exit_latency_ms = 75
+slippage_bps = 1.0
+notional_usd = 10000.0
+queue_ahead_multiplier = 1.0
+maker_timeout_ms = 250
+adverse_exit_bps = 2.0
+max_participation = 0.10
+
+[[execution_scenarios]]
+name = "uncalibrated_stress"
+calibration_status = "UNCALIBRATED"
+source = "UNCALIBRATED stress scenario input; not a verified current fee or execution schedule"
+taker_fee_bps = 5.0
+maker_fee_bps = 2.0
+latency_ms = 250
+exit_latency_ms = 250
+slippage_bps = 5.0
+notional_usd = 25000.0
+queue_ahead_multiplier = 2.0
+maker_timeout_ms = 100
+adverse_exit_bps = 10.0
+max_participation = 0.05

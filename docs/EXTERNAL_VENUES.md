@@ -83,11 +83,23 @@ même si l'intervalle antérieur de 15 secondes reste vivant. L'outage se termin
 la prochaine mesure acceptée de la même génération, qui peut rétablir la preuve
 pour les données marché ultérieures sans valider rétroactivement le trou.
 
+La cadence est vérifiée indépendamment sur le `request_sent_time` de chaque
+ligne `clock_sync` v2 liée à l'identité publique de la génération. Une ligne
+`INVALID`, y compris une pointe haute-RTT isolée, atteste qu'une tentative a
+été lancée mais ne devient jamais une preuve d'horloge. Deux lancements peuvent
+être séparés de 10 000 ms au maximum, sans epsilon ; un écart strictement
+supérieur reste fatal. Le même plafond s'applique de l'activation liée de la
+génération à sa première tentative, puis de la dernière tentative à l'événement
+terminal lié ou à la fin de fenêtre. Les intervalles causaux et les bandes
+d'offset continuent d'utiliser exclusivement les observations acceptées ; une
+violation de cadence échoue séparément sans fabriquer un trou causal.
+
 Le gate échoue lorsque l'assessment causal intersecte cette outage. Une outage
 pré-fenêtre récupérée avant l'assessment reste rapportée mais n'invalide pas les
 données ultérieures. Absence de récupération, expiration d'âge après une seule
-rejection, cadence dépassée, absence de mesure valide, discontinuité d'offset,
-échec de requête, identité/policy invalide, déconnexion ou changement de
+rejection, tentative manquante au-delà de 10 secondes, absence de mesure valide,
+discontinuité d'offset, échec de requête, identité/policy invalide, déconnexion
+ou changement de
 génération restent fatals. Aucune interpolation ne relie un vrai trou. Les
 anciennes lignes `clock_sync` v1 restent lisibles mais ne fournissent aucune
 couverture causale à l'audit strict.

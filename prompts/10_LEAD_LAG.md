@@ -46,11 +46,23 @@ Cette outage reste ouverte jusqu'à la prochaine observation acceptée de la mê
 génération ; la récupération peut rendre les données marché ultérieures
 utilisables, jamais la période révoquée.
 
+La cadence d'acquisition est contrôlée séparément sur tous les
+`request_sent_time` des lignes `clock_sync` v2 exactement liées à la
+génération publique, qu'elles soient `VALID` ou `INVALID`. Une ligne
+rejetée compte comme tentative persistée, jamais comme preuve causale. L'écart
+entre deux lancements ne peut dépasser 10 000 ms, sans epsilon. La couverture et
+les bandes d'offset restent dérivées exclusivement des observations acceptées ;
+une violation de cadence ne fabrique pas un intervalle causal invalide. La borne
+de 10 secondes couvre aussi activation vers première tentative et dernière
+tentative vers événement terminal lié ou fin de fenêtre. Un échec de requête ou
+une identité non liée ne peut pas créditer la cadence.
+
 Le gate échoue si l'assessment causal intersecte cette outage. Une outage
 pré-fenêtre récupérée avant l'assessment reste rapportée sans condamner les
 données postérieures. Une absence de récupération, un trou après une seule
-rejection, une observation acceptée trop âgée, une cadence dépassée, une
-discontinuité d'offset, un échec de requête, une identité ou policy invalide, ou
+rejection, une observation acceptée trop âgée, une tentative manquante au-delà
+de 10 secondes, une discontinuité d'offset, un échec de requête, une identité ou
+policy invalide, ou
 une génération active sans mesure valide reste fatal. Il est interdit
 d'interpoler ou de promouvoir une mesure rejetée.
 

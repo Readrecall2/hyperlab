@@ -189,6 +189,36 @@ des observations réseau réelles, mais ne prouvent pas un épinglage à un mauv
 edge. Le diagnostic conserve donc seulement des preuves passives DNS, famille,
 pair effectivement sélectionné, POP/cache et identité de connexion.
 
+## Smoke Singapore du 15 août 2026
+
+La nouvelle collecte réelle bornée à dix minutes a conservé une seule génération
+éligible par venue, zéro gap en fenêtre, zéro déconnexion non propre, une lignée
+Binance brute/normalisée exacte et 2 323 trades normalisés. Le runtime est resté
+sur `SIN2-P11` ; ses RTT persistants étaient principalement de 74 à 78 ms et ses
+incertitudes de 37 à 39 ms, sous le seuil inchangé de 50 ms.
+
+Les compteurs d'horloge étaient exactement `valid_v2_samples=118`,
+`invalid_v2_samples=2`, `rejected_probe_samples=2`,
+`hard_invalid_v2_samples=0`, `max_consecutive_rejected_probes=1`,
+`consecutive_rejection_violations=0`, `offset_discontinuities=0`,
+`generation_gap_count=0` et `market_active_without_valid_clock=[]`.
+La couverture valide atteignait 599,301479 secondes et ne laissait que
+0,037051 seconde hors couverture ; `relevant_gap_count=0`. Le FAIL
+provenait exclusivement du calcul historique de cadence sur les seules
+observations acceptées : `sample_spacing_violations=2`, chacune des deux
+séquences isolées de forme `VALID -> REJECTED -> VALID` produisant
+artificiellement un écart accepté supérieur à 10 000 ms, avec un maximum de
+10 019,006 ms, puis `clock_sync_not_continuous`,
+`clock_sync_sample_spacing_exceeded` et `strict_phase10_overlap_zero`.
+
+Le calcul corrigé ci-dessous ne requalifie jamais une probe rejetée en preuve :
+il vérifie la cadence sur tous les lancements persistés et liés, tout en
+construisant la couverture uniquement avec les observations acceptées. Le zéro
+de chevauchement strict était un effet fail-closed parallèle du même drapeau de
+cadence ; aucune logique de chevauchement n'a été modifiée. Cette collecte reste
+un FAIL historique et la Phase 10 reste `BLOCKED_PRECONDITION_NOT_MET` jusqu'à
+un nouveau smoke Singapore réel.
+
 ## Flux simultanés BTC/ETH
 
 | Venue | Flux publics conservés |
@@ -237,6 +267,22 @@ intervalle valide. Elle n'annule toutefois pas rétroactivement un intervalle
 accepté antérieur qui couvre encore causalement cet instant. L'audit utilise
 uniquement l'union des intervalles acceptés de la même génération éligible.
 
+La conformité de cadence est un contrôle séparé. Chaque ligne `clock_sync` v2
+persistée et liée exactement à la génération et au wire public compte comme une
+tentative au temps `request_sent_time`, qu'elle soit `VALID` ou `INVALID`.
+Le contrôle couvre la génération active, de son activation liée ou du début de
+la fenêtre jusqu'à son événement terminal lié ou la fin de fenêtre : la première
+et la dernière tentative sont donc contrôlées comme les paires internes. L'écart
+entre deux bornes ou lancements consécutifs doit rester inférieur ou égal à
+10 000 ms exactement ; il n'existe aucun epsilon. Une probe rejetée atteste
+uniquement son lancement pour ce contrôle, mais ne crée toujours aucun intervalle
+causal et ne contribue jamais aux bandes d'offset. Une identité non liée ne
+crédite aucune cadence, et un échec de requête reste un événement fatal. Si une
+requête est lancée avant la fin de fenêtre mais répond juste après, son
+`request_sent_time` est retenu uniquement pour la cadence ; sa réponse ne
+devient pas une preuve causale dans la fenêtre et ne modifie pas les séries de
+rejets de celle-ci.
+
 Au plus une rejection haute-RTT consécutive peut être franchie dans une
 génération active, uniquement si les observations acceptées maintiennent une
 couverture continue bornée à 50 ms. Une observation valide suivante remet cette
@@ -250,8 +296,9 @@ la période révoquée.
 Le gate échoue seulement si l'intervalle causal effectivement évalué pour cette
 génération intersecte cette outage, ou pour les autres causes fermées déjà
 définies : absence de récupération, expiration après une seule rejection,
-cadence valide supérieure à 10 secondes, absence de mesure valide, discontinuité
-des bandes d'offset, identité/policy invalide, événement d'échec, déconnexion ou
+écart supérieur à 10 secondes entre deux tentatives liées, absence de mesure
+valide, discontinuité des bandes d'offset, identité/policy invalide, événement
+d'échec, déconnexion ou
 changement de génération. Une outage pré-fenêtre ou antérieure à l'activité
 évaluée reste comptée et publiée même si sa récupération précède l'assessment ;
 elle ne condamne pas les données marché causalement postérieures. Aucun point
@@ -545,6 +592,15 @@ Les critères de PASS sont cumulatifs et exacts :
   sans secondes découvertes. `consecutive_rejection_violations`,
   `max_consecutive_rejected_probes` et `consecutive_rejection_outages` peuvent
   rester non nuls si toute outage historique a récupéré avant l'assessment ;
+  `clock_sync.sample_spacing_population` vaut
+  `all_persisted_identity_bound_v2_clock_sync_attempts`,
+  `clock_sync.sample_spacing_timestamp == "request_sent_time"` et
+  `clock_sync.sample_spacing_bounds` vaut
+  `active_generation_clipped_to_requested_window`. Une vraie tentative
+  manquante garde `clock_sync.causal_coverage_continuous` séparé de la
+  cadence, mais
+  `clock_sync.sample_spacing_violation_capture_generations != []` fait
+  toujours échouer le gate et doit donc valoir `[]` pour un PASS ;
 - `requested_window.leading_margin_within_limit == true`,
   `requested_window.trailing_margin_within_limit == true` et
   `requested_window.trailing_terminal_roles_complete == true` ;

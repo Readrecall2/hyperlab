@@ -69,6 +69,7 @@ class _LoadedLake:
         tuple[str, RecordType, str],
         tuple[dict[str, object], ...],
     ]
+    clock_cadence_successors: tuple[dict[str, object], ...]
     wire_identities: frozenset[tuple[str, str, int, str]]
 
 
@@ -268,6 +269,10 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
         tuple[object, ...],
         tuple[tuple[str, RecordType, str], dict[str, object]],
     ] = {}
+    clock_cadence_successors: dict[
+        tuple[object, ...],
+        tuple[tuple[str, RecordType, str], dict[str, object]],
+    ] = {}
     wire_identities: set[tuple[str, str, int, str]] = set()
 
     def boundary_identity(
@@ -405,6 +410,26 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
                     row,
                     keep_latest=True,
                 )
+            elif received >= end and record_type == RecordType.CLOCK_SYNC:
+                request_sent = _timestamp(
+                    row["request_sent_time"],
+                    label="clock boundary request_sent_time",
+                )
+                if request_sent < end:
+                    retain_boundary(
+                        clock_cadence_successors,
+                        (
+                            "clock-cadence-successor",
+                            venue,
+                            record_type,
+                            str(row.get("capture_epoch_id") or ""),
+                            str(row.get("connection_id") or ""),
+                            int(str(row.get("connection_epoch") or 0)),
+                        ),
+                        map_key,
+                        row,
+                        keep_latest=False,
+                    )
             elif (
                 received >= end
                 and record_type in {RecordType.WIRE_MESSAGE, RecordType.TRADE}
@@ -451,6 +476,18 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
         inventory=inventory,
         rows=frozen,
         boundary_rows=frozen_boundary,
+        clock_cadence_successors=tuple(
+            sorted(
+                (
+                    row
+                    for _, row in clock_cadence_successors.values()
+                ),
+                key=lambda row: _timestamp(
+                    row["request_sent_time"],
+                    label="clock cadence successor request_sent_time",
+                ),
+            )
+        ),
         wire_identities=frozenset(wire_identities),
     )
 
@@ -2190,6 +2227,7 @@ def _event_outages(
             if (
                 identity is None
                 or identity[0] != role
+                or identity[1] > at
                 or explicit_capture not in lineage.eligible_captures
             ):
                 unclean_in_window_disconnect_events += 1
@@ -2221,6 +2259,7 @@ def _event_outages(
             bound_fail_closed = (
                 identity is not None
                 and identity[0] == role
+                and identity[1] <= at
                 and explicit_capture in lineage.eligible_captures
             )
             if not bound_fail_closed:
@@ -2576,6 +2615,7 @@ def _clock_intervals(
     end: datetime,
     event_outages: Iterable[Interval],
     lineage: _ConnectionLineage,
+    active_captures: frozenset[str],
 ) -> _ClockAudit:
     legacy = 0
     valid = 0
@@ -2599,6 +2639,7 @@ def _clock_intervals(
     offset_discontinuity_captures: set[str] = set()
     max_sample_gap_ms: float | None = None
     valid_by_capture: dict[str, list[_ClockSample]] = defaultdict(list)
+    attempt_times_by_capture: dict[str, list[datetime]] = defaultdict(list)
     invalid_times: dict[str, list[datetime]] = defaultdict(list)
     consecutive_rejection_times: dict[str, list[datetime]] = defaultdict(list)
     rejection_streak_by_capture: dict[str, int] = defaultdict(int)
@@ -2683,10 +2724,32 @@ def _clock_intervals(
             continue
         connection = row.get("connection_id")
         connection_epoch = row.get("connection_epoch")
+        request_sent = _timestamp(
+            row["request_sent_time"],
+            label="clock request_sent_time",
+        )
+        identity = (
+            None
+            if not (
+                isinstance(connection, str)
+                and connection
+                and connection_epoch is not None
+            )
+            else lineage.identities.get(
+                (
+                    connection,
+                    int(str(connection_epoch)),
+                    capture,
+                )
+            )
+        )
         identity_valid = (
             isinstance(connection, str)
             and connection
             and connection_epoch is not None
+            and identity is not None
+            and identity[0] == "public"
+            and identity[1] <= request_sent
             and (
                 BINANCE,
                 connection,
@@ -2707,6 +2770,7 @@ def _clock_intervals(
             if start - timedelta(milliseconds=MAX_CLOCK_AGE_MS) <= received < end:
                 unbound_invalid_events += 1
             continue
+        attempt_times_by_capture[capture].append(request_sent)
         status = row.get("sample_status")
         policy = strict_policy_values(row)
         if status == "valid":
@@ -2779,6 +2843,109 @@ def _clock_intervals(
                 in_window_hard_invalid_events += 1
             invalid_times[capture].append(received)
 
+    for row in loaded.clock_cadence_successors:
+        if int(str(row.get("schema_version", 0))) < 2:
+            continue
+        capture = row.get("capture_epoch_id")
+        connection = row.get("connection_id")
+        connection_epoch = row.get("connection_epoch")
+        if (
+            not isinstance(capture, str)
+            or not capture
+            or capture not in active_captures
+            or not isinstance(connection, str)
+            or not connection
+            or connection_epoch is None
+        ):
+            continue
+        request_sent = _timestamp(
+            row["request_sent_time"],
+            label="clock cadence successor request_sent_time",
+        )
+        identity = lineage.identities.get(
+            (
+                connection,
+                int(str(connection_epoch)),
+                capture,
+            )
+        )
+        if (
+            identity is None
+            or identity[0] != "public"
+            or identity[1] > request_sent
+            or (
+                BINANCE,
+                connection,
+                int(str(connection_epoch)),
+                capture,
+            )
+            not in loaded.wire_identities
+            or not _wire_role_matches(row, lineage, "public")
+        ):
+            continue
+        attempt_times_by_capture[capture].append(request_sent)
+
+    capture_start_by_capture = {
+        capture: max(
+            connected_at
+            for (_, _, identity_capture), (_, connected_at) in (
+                *lineage.identities.items(),
+            )
+            if identity_capture == capture
+        )
+        for capture in lineage.eligible_captures
+    }
+    capture_end_by_capture: dict[str, datetime] = {}
+    for row in _rows_with_boundaries(
+        loaded,
+        BINANCE,
+        RecordType.CONNECTION_EVENT,
+    ):
+        if (
+            str(row.get("event_kind") or "") not in _FAIL_CLOSED_EVENTS
+            or _is_clock_gap_event(row)
+        ):
+            continue
+        received = _timestamp(
+            row["received_time"],
+            label="capture terminal received_time",
+        )
+        capture = row.get("capture_epoch_id")
+        connection = row.get("connection_id")
+        connection_epoch = row.get("connection_epoch")
+        role = row.get("socket_role")
+        identity = (
+            None
+            if not (
+                isinstance(capture, str)
+                and capture
+                and isinstance(connection, str)
+                and connection
+                and connection_epoch is not None
+                and isinstance(role, str)
+                and role
+            )
+            else lineage.identities.get(
+                (
+                    connection,
+                    int(str(connection_epoch)),
+                    capture,
+                )
+            )
+        )
+        if (
+            identity is None
+            or identity[0] != role
+            or identity[1] > received
+            or capture not in lineage.eligible_captures
+            or not start < received <= end
+        ):
+            continue
+        prior_end = capture_end_by_capture.get(capture)
+        capture_end_by_capture[capture] = (
+            received if prior_end is None else min(prior_end, received)
+        )
+
     for row in _rows_with_boundaries(
         loaded,
         BINANCE,
@@ -2826,35 +2993,87 @@ def _clock_intervals(
         outages_by_tag[outage.tag].append(outage)
     result: dict[str, tuple[Interval, ...]] = {}
     consecutive_rejection_outages: dict[str, tuple[Interval, ...]] = {}
+
+    def observe_spacing_gap(
+        capture: str,
+        previous: datetime,
+        current: datetime,
+    ) -> None:
+        nonlocal max_sample_gap_ms, spacing_violations
+        if current <= previous:
+            return
+        sample_gap_ms = (current - previous).total_seconds() * 1_000
+        max_sample_gap_ms = (
+            sample_gap_ms
+            if max_sample_gap_ms is None
+            else max(max_sample_gap_ms, sample_gap_ms)
+        )
+        if sample_gap_ms > MAX_CLOCK_SAMPLING_INTERVAL_MS:
+            spacing_violations += 1
+            spacing_violation_captures.add(capture)
+
     for capture in sorted(
-        set(valid_by_capture) | set(invalid_times) | set(consecutive_rejection_times)
+        set(valid_by_capture)
+        | set(attempt_times_by_capture)
+        | set(invalid_times)
+        | set(consecutive_rejection_times)
+        | set(capture_start_by_capture)
     ):
         samples = sorted(
             valid_by_capture.get(capture, ()),
             key=lambda item: item.interval.start,
         )
+        attempt_times = sorted(attempt_times_by_capture.get(capture, ()))
         invalid_outages: list[Interval] = []
         rejection_outages: list[Interval] = []
-        cadence_outages: list[Interval] = []
         offset_outages: list[Interval] = []
-        for previous, current in pairwise(samples):
-            sample_gap_ms = (
-                current.interval.start - previous.interval.start
-            ).total_seconds() * 1_000
-            max_sample_gap_ms = (
-                sample_gap_ms
-                if max_sample_gap_ms is None
-                else max(max_sample_gap_ms, sample_gap_ms)
+        if capture in active_captures:
+            active_start = max(
+                start,
+                capture_start_by_capture.get(capture, start),
             )
-            expected_next = previous.interval.start + timedelta(
-                milliseconds=MAX_CLOCK_SAMPLING_INTERVAL_MS
+            active_end = min(
+                end,
+                capture_end_by_capture.get(capture, end),
             )
-            if current.interval.start > expected_next:
-                spacing_violations += 1
-                spacing_violation_captures.add(capture)
-                cadence_outages.append(
-                    Interval(expected_next, current.interval.start, capture)
+            bounded_attempt_times = [
+                attempt
+                for attempt in attempt_times
+                if attempt <= active_end
+            ]
+            for previous, current in pairwise(bounded_attempt_times):
+                if current <= active_start or previous >= active_end:
+                    continue
+                observe_spacing_gap(capture, previous, current)
+
+            attempts_after_start = [
+                attempt
+                for attempt in bounded_attempt_times
+                if attempt > active_start
+            ]
+            if (
+                active_start < active_end
+                and not any(
+                    attempt <= active_start
+                    for attempt in bounded_attempt_times
                 )
+            ):
+                observe_spacing_gap(
+                    capture,
+                    active_start,
+                    (
+                        attempts_after_start[0]
+                        if attempts_after_start
+                        else active_end
+                    ),
+                )
+            if active_start < active_end and bounded_attempt_times:
+                observe_spacing_gap(
+                    capture,
+                    bounded_attempt_times[-1],
+                    active_end,
+                )
+
         def bands_overlap(first: _ClockSample, second: _ClockSample) -> bool:
             first_low = first.drift_ms - first.uncertainty_ms
             first_high = first.drift_ms + first.uncertainty_ms
@@ -2933,7 +3152,6 @@ def _clock_intervals(
                     *outages_by_tag.get(capture, ()),
                     *invalid_outages,
                     *rejection_outages,
-                    *cadence_outages,
                     *offset_outages,
                 ),
             ),
@@ -3418,6 +3636,7 @@ def audit_phase10_continuity(
         end,
         binance_outages,
         binance_lineage,
+        frozenset(market_active_captures),
     )
     clock_by_capture = clock_audit.intervals
 
@@ -3622,6 +3841,7 @@ def audit_phase10_continuity(
     assessed_span: tuple[datetime, datetime] | None = None
     internal_gap_count = 0
     uncovered = timedelta()
+    causal_coverage_continuous = False
     clock_continuous = False
     if assessed_by_capture:
         assessed_start = min(value[0] for value in assessed_by_capture.values())
@@ -3635,6 +3855,11 @@ def audit_phase10_continuity(
             ),
             assessed_start,
             assessed_end,
+        )
+        causal_coverage_continuous = (
+            coverage
+            and len(assessed_by_capture) == 1
+            and not captures_without_valid_clock
         )
         clock_continuous = (
             coverage
@@ -3859,6 +4084,13 @@ def audit_phase10_continuity(
             "clock_max_age_ms": MAX_CLOCK_AGE_MS,
             "clock_max_uncertainty_ms": float(MAX_CLOCK_UNCERTAINTY_MS),
             "clock_actual_sample_spacing_enforced": True,
+            "clock_sample_spacing_population": (
+                "all_persisted_identity_bound_v2_clock_sync_attempts"
+            ),
+            "clock_sample_spacing_timestamp": "request_sent_time",
+            "clock_sample_spacing_bounds": (
+                "active_generation_clipped_to_requested_window"
+            ),
             "clock_identity_requires_v2_wire_lineage": True,
             "clock_offset_uncertainty_bands_must_overlap": True,
             "physical_connection_roles_required": {
@@ -4033,11 +4265,19 @@ def audit_phase10_continuity(
             "sample_spacing_violation_capture_generations": list(
                 relevant_spacing_captures
             ),
+            "sample_spacing_population": (
+                "all_persisted_identity_bound_v2_clock_sync_attempts"
+            ),
+            "sample_spacing_timestamp": "request_sent_time",
+            "sample_spacing_bounds": (
+                "active_generation_clipped_to_requested_window"
+            ),
             "offset_discontinuities": clock_audit.offset_discontinuities,
             "offset_discontinuity_capture_generations": list(
                 relevant_offset_discontinuity_captures
             ),
             "actual_max_sample_gap_ms": clock_audit.max_sample_gap_ms,
+            "actual_max_cadence_gap_ms": clock_audit.max_sample_gap_ms,
             "strict_max_sampling_interval_ms": MAX_CLOCK_SAMPLING_INTERVAL_MS,
             "strict_max_age_ms": MAX_CLOCK_AGE_MS,
             "strict_max_uncertainty_ms": float(MAX_CLOCK_UNCERTAINTY_MS),
@@ -4067,6 +4307,7 @@ def audit_phase10_continuity(
                 if assessed_span is None
                 else {"start": _iso(assessed_span[0]), "end": _iso(assessed_span[1])}
             ),
+            "causal_coverage_continuous": causal_coverage_continuous,
             "coverage_continuous": clock_continuous,
             "valid_duration_seconds": _seconds(_duration(clock_intervals)),
             "uncovered_seconds": _seconds(uncovered),

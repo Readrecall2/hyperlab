@@ -295,6 +295,7 @@ def _write_continuity_lake(
     clock_failure_at: datetime | None = None,
     loose_clock_at: datetime | None = None,
     wrong_clock_identity_at: datetime | None = None,
+    add_preconnect_clock_attempt: bool = False,
     clock_sample_seconds: tuple[float, ...] = (0.5, 10.5, 20.5),
     prewindow_clock_invalid: bool = False,
     prewindow_clock_rejection_count: int = 0,
@@ -1145,7 +1146,7 @@ def _write_continuity_lake(
         samples.extend(
             (
                 f"clock-pre-invalid-{index}",
-                BASE + timedelta(milliseconds=100 * index),
+                BASE + timedelta(milliseconds=20 + 100 * index),
                 102,
             )
             for index in range(1, prewindow_rejections + 1)
@@ -1192,6 +1193,21 @@ def _write_continuity_lake(
             clock_record(
                 measurement,
                 f"clock-{index}",
+                connection_id="binance-public-1",
+                connection_epoch=1,
+                capture_epoch_id=binance_capture,
+            )
+        )
+    if add_preconnect_clock_attempt:
+        records.append(
+            clock_record(
+                measure_clock(
+                    "binance_usdm",
+                    request_sent_time=BASE - timedelta(milliseconds=10),
+                    response_received_time=BASE + timedelta(milliseconds=10),
+                    server_time=BASE,
+                ),
+                "clock-preconnect-attempt",
                 connection_id="binance-public-1",
                 connection_epoch=1,
                 capture_epoch_id=binance_capture,
@@ -2100,6 +2116,254 @@ def test_real_lake_audit_enforces_actual_clock_sample_spacing(
     assert "clock_sync_sample_spacing_exceeded" in payload["failure_reasons"]
 
 
+def test_real_lake_audit_counts_rejected_probe_attempt_for_cadence(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    rejected_at = BASE + timedelta(seconds=5.5)
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5, 10.519),
+        invalid_clock_at=rejected_at,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=12),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
+    assert clock["valid_v2_samples"] == 2
+    assert clock["invalid_v2_samples"] == 1
+    assert clock["rejected_probe_samples"] == 1
+    assert clock["hard_invalid_v2_samples"] == 0
+    assert clock["max_consecutive_rejected_probes"] == 1
+    assert clock["consecutive_rejection_violations"] == 0
+    assert clock["sample_spacing_violations"] == 0
+    assert clock["actual_max_sample_gap_ms"] == 5_101.0
+    assert clock["actual_max_cadence_gap_ms"] == 5_101.0
+    assert (
+        clock["sample_spacing_population"]
+        == "all_persisted_identity_bound_v2_clock_sync_attempts"
+    )
+    assert clock["sample_spacing_timestamp"] == "request_sent_time"
+    assert (
+        clock["sample_spacing_bounds"]
+        == "active_generation_clipped_to_requested_window"
+    )
+    assert clock["causal_coverage_continuous"] is True
+    assert clock["coverage_continuous"] is True
+    assert clock["uncovered_seconds"] == 0.0
+    assert clock["internal_gap_count"] == 0
+    assert any(
+        datetime.fromisoformat(str(item["start"]).replace("Z", "+00:00"))
+        < rejected_at
+        < datetime.fromisoformat(str(item["end"]).replace("Z", "+00:00"))
+        for item in clock["intervals"]
+        if isinstance(item, dict)
+    )
+    overlap = payload["strict_phase_10_overlap"]
+    assert isinstance(overlap, dict)
+    assert float(str(overlap["duration_seconds"])) > 0
+    assert payload["failure_reasons"] == []
+
+
+def test_real_lake_audit_does_not_tolerate_missing_probe_by_19_ms(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5, 10.519),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=12),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["valid_v2_samples"] == 2
+    assert clock["invalid_v2_samples"] == 0
+    assert clock["sample_spacing_violations"] == 1
+    assert clock["actual_max_sample_gap_ms"] == 10_019.0
+    assert clock["actual_max_cadence_gap_ms"] == 10_019.0
+    assert clock["causal_coverage_continuous"] is True
+    assert clock["coverage_continuous"] is False
+    assert clock["uncovered_seconds"] == 0.0
+    assert clock["internal_gap_count"] == 0
+    assert payload["failure_reasons"] == [
+        "clock_sync_not_continuous",
+        "clock_sync_sample_spacing_exceeded",
+        "strict_phase10_overlap_zero",
+    ]
+    overlap = payload["strict_phase_10_overlap"]
+    assert isinstance(overlap, dict)
+    assert overlap["duration_seconds"] == 0.0
+
+
+def test_real_lake_audit_rejects_missing_terminal_probe_before_age_expiry(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5,),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=12),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["sample_spacing_violations"] == 1
+    assert clock["actual_max_cadence_gap_ms"] == 11_520.0
+    assert clock["causal_coverage_continuous"] is True
+    assert clock["uncovered_seconds"] == 0.0
+    assert "clock_sync_sample_spacing_exceeded" in payload["failure_reasons"]
+
+
+def test_real_lake_audit_bounds_terminal_cadence_at_clean_generation_end(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5,),
+        clean_disconnect_at=BASE + timedelta(seconds=9),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=12),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
+    assert clock["sample_spacing_violations"] == 0
+    assert clock["actual_max_cadence_gap_ms"] == 8_520.0
+    assert clock["causal_coverage_continuous"] is True
+    assert clock["coverage_continuous"] is True
+    assert payload["failure_reasons"] == []
+
+
+def test_real_lake_audit_counts_pre_end_request_completed_after_end_for_cadence(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(1.01, 11.01),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=11),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "PASS", payload["failure_reasons"]
+    assert clock["valid_v2_samples"] == 1
+    assert clock["sample_spacing_violations"] == 0
+    assert clock["actual_max_cadence_gap_ms"] == 10_000.0
+    assert clock["causal_coverage_continuous"] is True
+    assert payload["failure_reasons"] == []
+
+
+def test_real_lake_audit_rejects_missing_initial_probe_before_first_valid(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(12.5, 22.5),
+        extra_trade_at=BASE + timedelta(seconds=15),
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["sample_spacing_violations"] == 1
+    assert float(str(clock["actual_max_cadence_gap_ms"])) > 10_000
+    assert clock["causal_coverage_continuous"] is True
+    assert clock["uncovered_seconds"] == 0.0
+    assert "clock_sync_sample_spacing_exceeded" in payload["failure_reasons"]
+
+
+def test_real_lake_audit_rejects_clock_attempt_started_before_identity_activation(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        add_preconnect_clock_attempt=True,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["wire_identity_rejections"] == 1
+    assert clock["hard_invalid_v2_samples"] == 1
+    assert "clock_sync_in_window_invalid_sample" in payload["failure_reasons"]
+
+
+def test_real_lake_audit_rejects_terminal_event_before_identity_activation(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        prewindow_disconnect=True,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE - timedelta(seconds=2),
+        end=BASE + timedelta(seconds=30),
+    )
+
+    events = payload["connection_events"]
+    assert isinstance(events, dict)
+    binance_events = events["binance_usdm"]
+    assert isinstance(binance_events, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert binance_events["unbound_gap_or_disconnect_events"] == 1
+
+
 def test_real_lake_audit_rejects_clock_offset_discontinuity(
     tmp_path: Path,
 ) -> None:
@@ -2290,6 +2554,11 @@ def test_real_lake_audit_allows_only_explicit_clean_shutdown_margin(
     assert isinstance(window, dict)
     assert window["trailing_margin_within_limit"] is True
     assert window["trailing_terminal_roles_complete"] is True
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert clock["sample_spacing_violations"] == 0
+    assert clock["sample_spacing_violation_capture_generations"] == []
+    assert clock["actual_max_cadence_gap_ms"] == 10_000.0
 
 
 @pytest.mark.parametrize(

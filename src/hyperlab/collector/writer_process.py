@@ -23,12 +23,13 @@ from hyperlab.collector.storage import (
 )
 from hyperlab.collector.telemetry import ProcessRuntimeTelemetry
 from hyperlab.collector.writer_worker import (
+    _TIMING_WINDOW,
     WriterQueueCapacityError,
     WriterWorkerError,
     _Durations,
     _resolve_venue_capacities,
 )
-from hyperlab.data.lake import PartitionManifest
+from hyperlab.data.lake import PartitionKey, PartitionManifest
 
 _CHILD_SNAPSHOT_INTERVAL_NS = 1_000_000_000
 _CHILD_EXIT_EVENT_GRACE_NS = 1_000_000_000
@@ -68,7 +69,23 @@ class _PendingCommand:
     kind: str
     venue: str | None = None
     row_count: int = 0
+    group_rows: tuple[tuple[str, str, int], ...] = ()
     event: threading.Event | None = None
+
+
+_GroupDiagnosticKey = tuple[str, str, str]
+
+
+@dataclass(slots=True)
+class _GroupDiagnostics:
+    enqueued_rows: int = 0
+    acknowledged_rows: int = 0
+    durable_rows: int = 0
+    output_files: int = 0
+    flushes: int = 0
+    queue_residence_rows: int = 0
+    queue_residence_row_ms: float = 0.0
+    queue_residence: _Durations = field(default_factory=_Durations)
 
 
 def _child_snapshot(
@@ -514,6 +531,9 @@ class CoordinatedWriterProcess:
         self._add_timing = {venue: _Durations() for venue in venues}
         self._write_timing = {venue: _Durations() for venue in venues}
         self._flush_timing = _Durations()
+        self._group_diagnostic_capacity = queue_capacity
+        self._group_diagnostic_capacity_rejections = 0
+        self._group_diagnostics: dict[_GroupDiagnosticKey, _GroupDiagnostics] = {}
         self._child_cache: dict[str, object] | None = None
         self._child_cache_received_ns: int | None = None
         self._last_event_sequence = 0
@@ -573,6 +593,82 @@ class CoordinatedWriterProcess:
             self._clients[venue] = client
             return client
 
+    def _group_diagnostics_snapshot_locked(self) -> dict[str, object]:
+        total_durable_rows = sum(diagnostic.durable_rows for diagnostic in self._group_diagnostics.values())
+        total_output_files = sum(diagnostic.output_files for diagnostic in self._group_diagnostics.values())
+        groups: list[dict[str, object]] = []
+        for key in sorted(self._group_diagnostics):
+            venue, asset, record_type = key
+            diagnostic = self._group_diagnostics[key]
+            average_rows_per_file = (
+                None if diagnostic.output_files == 0 else diagnostic.durable_rows / diagnostic.output_files
+            )
+            row_weighted_mean_ms = (
+                None
+                if diagnostic.queue_residence_rows == 0
+                else diagnostic.queue_residence_row_ms / diagnostic.queue_residence_rows
+            )
+            groups.append(
+                {
+                    "venue": venue,
+                    "asset": asset,
+                    "record_type": record_type,
+                    "rows": {
+                        "enqueued": diagnostic.enqueued_rows,
+                        "acknowledged": diagnostic.acknowledged_rows,
+                        "durable": diagnostic.durable_rows,
+                    },
+                    "output_files": diagnostic.output_files,
+                    "average_rows_per_output_file": average_rows_per_file,
+                    "flush_contribution": {
+                        "flushes": diagnostic.flushes,
+                        "rows": diagnostic.durable_rows,
+                        "output_files": diagnostic.output_files,
+                        "row_fraction": (
+                            None if total_durable_rows == 0 else diagnostic.durable_rows / total_durable_rows
+                        ),
+                        "file_fraction": (
+                            None if total_output_files == 0 else diagnostic.output_files / total_output_files
+                        ),
+                    },
+                    "queue_residence_contribution": {
+                        "frames": diagnostic.queue_residence.count,
+                        "rows": diagnostic.queue_residence_rows,
+                        "row_milliseconds": diagnostic.queue_residence_row_ms,
+                        "row_weighted_mean_ms": row_weighted_mean_ms,
+                        "frame_residence_ms": diagnostic.queue_residence.summary().as_dict(),
+                    },
+                }
+            )
+        return {
+            "schema_version": 1,
+            "dimensions": ["venue", "asset", "record_type"],
+            "accounting_status": self._accounting_status,
+            "capacity": {
+                "max_groups": self._group_diagnostic_capacity,
+                "current_groups": len(self._group_diagnostics),
+                "rejections": self._group_diagnostic_capacity_rejections,
+            },
+            "semantics": {
+                "rows": {
+                    "enqueued": "parent_admitted",
+                    "acknowledged": "child_processed_including_duplicates",
+                    "durable": "parent_observed_manifest_rows",
+                },
+                "duplicate_attribution": "venue_only",
+                "flushes": ("parent_observed_flush_events_with_at_least_one_output_manifest_for_group"),
+                "queue_residence": {
+                    "interval": "parent_enqueue_to_child_dequeue",
+                    "row_scope": "child_processed_including_duplicates",
+                    "frame_samples": "one_per_group_per_child_processed_frame",
+                    "lifetime_fields": ["count", "min_ms", "mean_ms", "max_ms"],
+                    "windowed_fields": ["p50_ms", "p95_ms", "p99_ms"],
+                    "percentile_window_samples": _TIMING_WINDOW,
+                },
+            },
+            "groups": groups,
+        }
+
     def metrics_snapshot(self) -> dict[str, object]:
         with self._condition:
             now_ns = self._monotonic_ns()
@@ -616,6 +712,7 @@ class CoordinatedWriterProcess:
                 "closed": self._closed,
                 "failure": (None if self._failure is None else dict(self._failure)),
                 "flush_ms": self._flush_timing.summary().as_dict(),
+                "group_diagnostics": self._group_diagnostics_snapshot_locked(),
                 "storage": storage,
                 "child_process": {
                     "pid": self._process.pid,
@@ -820,6 +917,17 @@ class CoordinatedWriterProcess:
         row_count = len(frozen)
         if row_count == 0:
             return 0
+        grouped_rows: dict[tuple[str, str], int] = {}
+        for record in frozen:
+            group_key = (record.asset, record.record_type.value)
+            grouped_rows[group_key] = grouped_rows.get(group_key, 0) + 1
+        command_group_rows = tuple(
+            (asset, record_type, grouped_rows[(asset, record_type)])
+            for asset, record_type in sorted(grouped_rows)
+        )
+        command_diagnostic_keys = tuple(
+            (client.venue, asset, record_type) for asset, record_type, _group_row_count in command_group_rows
+        )
 
         with self._condition:
             self._require_active_locked(client)
@@ -843,6 +951,28 @@ class CoordinatedWriterProcess:
                     "atomic frame enqueue; no record was admitted"
                 )
 
+            new_diagnostic_keys = tuple(
+                key for key in command_diagnostic_keys if key not in self._group_diagnostics
+            )
+            projected_diagnostic_groups = len(self._group_diagnostics) + len(new_diagnostic_keys)
+            if projected_diagnostic_groups > self._group_diagnostic_capacity:
+                self._group_diagnostic_capacity_rejections += 1
+                raise WriterQueueCapacityError(
+                    "coordinated writer lifetime diagnostic-group capacity exceeded before "
+                    f"atomic frame enqueue: capacity={self._group_diagnostic_capacity}, "
+                    f"projected={projected_diagnostic_groups}; no record was admitted"
+                )
+
+            created_diagnostic_keys: list[_GroupDiagnosticKey] = []
+            try:
+                for diagnostic_key in new_diagnostic_keys:
+                    self._group_diagnostics[diagnostic_key] = _GroupDiagnostics()
+                    created_diagnostic_keys.append(diagnostic_key)
+            except BaseException:
+                for diagnostic_key in created_diagnostic_keys:
+                    del self._group_diagnostics[diagnostic_key]
+                raise
+
             command_id = self._next_command_id
             self._next_command_id += 1
             try:
@@ -856,14 +986,22 @@ class CoordinatedWriterProcess:
                         observed_ns,
                     )
                 )
-            except ProcessWriterError:
-                self._capacity_rejections_by_venue[client.venue] += 1
+            except BaseException as exc:
+                for diagnostic_key in created_diagnostic_keys:
+                    del self._group_diagnostics[diagnostic_key]
+                if isinstance(exc, ProcessWriterError):
+                    self._capacity_rejections_by_venue[client.venue] += 1
                 raise
             self._pending_commands[command_id] = _PendingCommand(
                 kind="frame",
                 venue=client.venue,
                 row_count=row_count,
+                group_rows=command_group_rows,
             )
+            for asset, record_type, group_row_count in command_group_rows:
+                diagnostic_key = (client.venue, asset, record_type)
+                diagnostic = self._group_diagnostics[diagnostic_key]
+                diagnostic.enqueued_rows += group_row_count
             self._queued_by_venue[client.venue] += row_count
             self._outstanding_rows += row_count
             self._outstanding_high_water_rows = max(
@@ -1151,6 +1289,20 @@ class CoordinatedWriterProcess:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise CoordinatedWriterError(f"process writer frame timing {timing_field!r} is invalid")
             timings.add(value / 1_000_000)
+        if sum(group_row_count for _asset, _record_type, group_row_count in pending.group_rows) != submitted:
+            raise CoordinatedWriterError("process writer frame group diagnostics did not match admission")
+        residence_ns = payload.get("queue_residence_ns")
+        if isinstance(residence_ns, bool) or not isinstance(residence_ns, int) or residence_ns < 0:
+            raise CoordinatedWriterError("process writer frame group residence timing is invalid")
+        residence_ms = residence_ns / 1_000_000
+        for asset, record_type, group_row_count in pending.group_rows:
+            diagnostic = self._group_diagnostics.get((venue_key, asset, record_type))
+            if diagnostic is None:
+                raise CoordinatedWriterError("process writer frame group diagnostics were not admitted")
+            diagnostic.acknowledged_rows += group_row_count
+            diagnostic.queue_residence_rows += group_row_count
+            diagnostic.queue_residence_row_ms += residence_ms * group_row_count
+            diagnostic.queue_residence.add(residence_ms)
         self._check_accounting_locked()
 
     def _apply_flush_locked(
@@ -1184,6 +1336,15 @@ class CoordinatedWriterProcess:
             result = results_value[venue]
             if not isinstance(result, FlushResult):
                 raise CoordinatedWriterError("process writer flush result has an invalid type")
+            if (
+                isinstance(result.row_count, bool)
+                or not isinstance(result.row_count, int)
+                or result.row_count < 0
+                or isinstance(result.duplicate_count, bool)
+                or not isinstance(result.duplicate_count, int)
+                or result.duplicate_count < 0
+            ):
+                raise CoordinatedWriterError("process writer flush result has invalid row counters")
             accepted_pending = self._accepted_pending_by_venue[venue]
             duplicates_pending = self._duplicates_pending_by_venue[venue]
             if (full_barrier and result.row_count != accepted_pending) or (
@@ -1210,6 +1371,62 @@ class CoordinatedWriterProcess:
                 raise CoordinatedWriterError(
                     f"process writer flush acknowledgement did not match a pending {expected_kind} command"
                 )
+
+        diagnostic_row_deltas: dict[_GroupDiagnosticKey, int] = {}
+        diagnostic_file_deltas: dict[_GroupDiagnosticKey, int] = {}
+        flushed_groups: set[_GroupDiagnosticKey] = set()
+        for venue in self._venues:
+            result = results[venue]
+            manifest_rows = 0
+            for manifest in result.manifests:
+                if not isinstance(manifest, PartitionManifest):
+                    raise CoordinatedWriterError("process writer flush result contains an invalid manifest")
+                if (
+                    isinstance(manifest.row_count, bool)
+                    or not isinstance(manifest.row_count, int)
+                    or manifest.row_count <= 0
+                ):
+                    raise CoordinatedWriterError("process writer flush manifest has an invalid row count")
+                if not isinstance(manifest.partition, PartitionKey):
+                    raise CoordinatedWriterError("process writer flush manifest has an invalid partition")
+                partition = manifest.partition.as_dict()
+                if partition["venue"] != venue:
+                    raise CoordinatedWriterError(
+                        "process writer flush manifest venue did not match its enclosing result"
+                    )
+                diagnostic_key = (
+                    partition["venue"],
+                    partition["asset"],
+                    partition["record_type"],
+                )
+                diagnostic = self._group_diagnostics.get(diagnostic_key)
+                if diagnostic is None:
+                    raise CoordinatedWriterError("process writer durable group diagnostics were not admitted")
+                manifest_rows += manifest.row_count
+                diagnostic_row_deltas[diagnostic_key] = (
+                    diagnostic_row_deltas.get(diagnostic_key, 0) + manifest.row_count
+                )
+                diagnostic_file_deltas[diagnostic_key] = diagnostic_file_deltas.get(diagnostic_key, 0) + 1
+                flushed_groups.add(diagnostic_key)
+            if manifest_rows != result.row_count:
+                raise CoordinatedWriterError(
+                    "process writer flush manifest rows did not match the result row count: "
+                    f"venue={venue!r}, manifests={manifest_rows}, result={result.row_count}"
+                )
+
+        for diagnostic_key, row_delta in diagnostic_row_deltas.items():
+            diagnostic = self._group_diagnostics[diagnostic_key]
+            if diagnostic.durable_rows + row_delta > diagnostic.acknowledged_rows:
+                raise CoordinatedWriterError(
+                    "process writer durable group diagnostics exceed acknowledged rows"
+                )
+
+        for diagnostic_key in sorted(diagnostic_row_deltas):
+            diagnostic = self._group_diagnostics[diagnostic_key]
+            diagnostic.durable_rows += diagnostic_row_deltas[diagnostic_key]
+            diagnostic.output_files += diagnostic_file_deltas[diagnostic_key]
+        for diagnostic_key in sorted(flushed_groups):
+            self._group_diagnostics[diagnostic_key].flushes += 1
 
         for venue in self._venues:
             result = results[venue]
@@ -1270,6 +1487,26 @@ class CoordinatedWriterProcess:
                 )
             if self._duplicates_pending_by_venue[venue] < 0:
                 raise CoordinatedWriterError(f"process writer {venue!r} duplicate credit is negative")
+
+        if (
+            len(self._group_diagnostics) > self._group_diagnostic_capacity
+            or self._group_diagnostic_capacity_rejections < 0
+        ):
+            raise CoordinatedWriterError(
+                "process writer group diagnostic capacity accounting is inconsistent"
+            )
+        if sum(diagnostic.durable_rows for diagnostic in self._group_diagnostics.values()) != sum(
+            self._durable_rows_by_venue.values()
+        ):
+            raise CoordinatedWriterError("process writer group durable rows do not match venue durable rows")
+
+        for diagnostic in self._group_diagnostics.values():
+            if not (0 <= diagnostic.durable_rows <= diagnostic.acknowledged_rows <= diagnostic.enqueued_rows):
+                raise CoordinatedWriterError("process writer group row diagnostics are inconsistent")
+            if diagnostic.queue_residence_rows != diagnostic.acknowledged_rows:
+                raise CoordinatedWriterError("process writer group residence diagnostics are inconsistent")
+            if diagnostic.output_files < 0 or diagnostic.flushes < 0:
+                raise CoordinatedWriterError("process writer group flush diagnostics are inconsistent")
 
     def _force_stop_process(self) -> None:
         try:

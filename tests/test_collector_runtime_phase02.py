@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -146,6 +147,123 @@ class FakeRest:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class SyntheticFullUniverseRest(FakeRest):
+    '''Production-shaped synthetic bootstrap; never economic or live evidence.'''
+
+    BTC_SOURCE_INDEX = 21
+    ETH_SOURCE_INDEX = 44
+
+    def __init__(self, *, misalign_unrelated_perp: bool = False) -> None:
+        super().__init__()
+        self.misalign_unrelated_perp = misalign_unrelated_perp
+
+    def bootstrap(self, *, observed_at_ms: int | None = None) -> PublicBootstrap:
+        self.bootstrap_calls += 1
+        observed_at_ms = observed_at_ms or int(BASE_TIME.timestamp() * 1_000)
+        unrelated = [
+            {
+                'name': f'SYNTHETIC_UNRELATED_{index:03d}',
+                'szDecimals': index % 6,
+                'maxLeverage': 3 + index % 48,
+                'marginTableId': index,
+            }
+            for index in range(64)
+        ]
+        perp_universe = [
+            *unrelated[: self.BTC_SOURCE_INDEX],
+            {
+                'name': 'BTC',
+                'szDecimals': 5,
+                'maxLeverage': 50,
+                'marginTableId': 20,
+            },
+            *unrelated[self.BTC_SOURCE_INDEX : self.ETH_SOURCE_INDEX - 1],
+            {
+                'name': 'ETH',
+                'szDecimals': 4,
+                'maxLeverage': 50,
+                'marginTableId': 20,
+            },
+            *unrelated[self.ETH_SOURCE_INDEX - 1 :],
+        ]
+        perp_contexts = [
+            {
+                'dayBaseVlm': str(index + 1),
+                'dayNtlVlm': str((index + 1) * 1_000),
+                'funding': '0.00001',
+                'markPx': str(10_000 + index),
+                'midPx': str(10_000.5 + index),
+                'openInterest': '2',
+                'oraclePx': str(10_001 + index),
+                'prevDayPx': str(9_900 + index),
+            }
+            for index in range(len(perp_universe))
+        ]
+        if self.misalign_unrelated_perp:
+            perp_contexts.pop()
+
+        spot_tokens = [
+            {
+                'name': 'USDC',
+                'szDecimals': 8,
+                'weiDecimals': 8,
+                'index': 0,
+            },
+            {
+                'name': 'BTC',
+                'szDecimals': 5,
+                'weiDecimals': 8,
+                'index': 77,
+                'fullName': 'Bitcoin',
+            },
+            *[
+                {
+                    'name': f'SYNTHETIC_SPOT_{index:03d}',
+                    'szDecimals': index % 6,
+                    'weiDecimals': 8,
+                    'index': 1_000 + index,
+                }
+                for index in range(16)
+            ],
+        ]
+        spot_universe = [
+            {
+                'name': 'BTC/USDC',
+                'tokens': [77, 0],
+                'index': 107,
+                'isCanonical': True,
+            },
+            *[
+                {
+                    'name': f'SYNTHETIC_SPOT_{index:03d}/USDC',
+                    'tokens': [1_000 + index, 0],
+                    'index': 1_000 + index,
+                    'isCanonical': True,
+                }
+                for index in range(16)
+            ],
+        ]
+        spot_contexts = [
+            {
+                'coin': '@' + str(pair['index']),
+                'dayNtlVlm': str((index + 1) * 100),
+                'markPx': str(1_000 + index),
+                'midPx': str(1_000.5 + index),
+                'prevDayPx': str(990 + index),
+                'circulatingSupply': str(1_000_000 + index),
+            }
+            for index, pair in enumerate(spot_universe)
+        ]
+        return PublicBootstrap(
+            observed_at_ms=observed_at_ms,
+            perp_payload=[{'universe': perp_universe}, perp_contexts],
+            spot_payload=[
+                {'tokens': spot_tokens, 'universe': spot_universe},
+                spot_contexts,
+            ],
+        )
 
 
 SocketItem = tuple[str | ReceivedWireMessage | BaseException | None, float]
@@ -314,15 +432,16 @@ def _collector(
     timer: ControlledTime,
     sockets: list[FakeSocket],
     *,
+    rest: FakeRest | None = None,
     sleeper: Callable[[float], None] = lambda _delay: None,
 ) -> tuple[PublicCollector, FakeRest, FakeSocketFactory, StateRecordingSink]:
-    rest = FakeRest()
+    resolved_rest = FakeRest() if rest is None else rest
     factory = FakeSocketFactory(sockets)
     sink = StateRecordingSink(tmp_path / "lake")
     connection_ids = iter(("first", "second", "third"))
     collector = PublicCollector(
         config,
-        rest=rest,
+        rest=resolved_rest,
         socket_factory=factory,
         sink=sink,
         runtime_status_path=tmp_path / "runtime_status.json",
@@ -333,7 +452,7 @@ def _collector(
         connection_id_factory=lambda: next(connection_ids),
     )
     sink.state_provider = lambda: collector.metrics.state
-    return collector, rest, factory, sink
+    return collector, resolved_rest, factory, sink
 
 
 def _parquet_rows(root: Path, record_type: str) -> list[dict[str, object]]:
@@ -357,6 +476,129 @@ def _assert_all_source_sequences_are_null(root: Path) -> None:
     for path in paths:
         table = pq.ParquetFile(path).read()
         assert table.column("source_sequence").null_count == table.num_rows, path
+
+
+def test_synthetic_non_economic_full_universe_bootstrap_persists_only_requested_assets(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _config(assets=('BTC', 'ETH'))
+    socket = FakeSocket(timer, _ack_messages(config))
+    rest = SyntheticFullUniverseRest()
+    collector, _rest, _factory, sink = _collector(
+        tmp_path,
+        config,
+        timer,
+        [socket],
+        rest=rest,
+    )
+
+    metrics = collector.run(max_messages=config.subscription_count)
+
+    assert metrics.state == CollectorState.STOPPED
+    assert rest.bootstrap_calls == 1
+    metadata_rows = _parquet_rows(sink.root, 'instrument_metadata')
+    context_rows = _parquet_rows(sink.root, 'market_context')
+    assert {str(row['asset']) for row in metadata_rows} == {'BTC', 'ETH'}
+    assert {str(row['asset']) for row in context_rows} == {'BTC', 'ETH'}
+    assert len(metadata_rows) == len(context_rows) == 2
+
+    metadata_by_asset = {str(row['asset']): row for row in metadata_rows}
+    assert {
+        asset: row['source_index'] for asset, row in metadata_by_asset.items()
+    } == {
+        'BTC': SyntheticFullUniverseRest.BTC_SOURCE_INDEX,
+        'ETH': SyntheticFullUniverseRest.ETH_SOURCE_INDEX,
+    }
+    assert {
+        asset: json.loads(str(row['metadata_json']))['name']
+        for asset, row in metadata_by_asset.items()
+    } == {'BTC': 'BTC', 'ETH': 'ETH'}
+    for row in metadata_rows:
+        metadata_json = str(row['metadata_json'])
+        assert row['metadata_sha256'] == hashlib.sha256(metadata_json.encode()).hexdigest()
+        assert row['connection_id'] == 'ws-1-first'
+        assert row['source_sequence'] is None
+    assert {str(row['observation_id']) for row in context_rows} == {
+        'ws-1-first:1:1'
+    }
+    assert all(row['source_sequence'] is None for row in context_rows)
+
+    status = json.loads((tmp_path / 'runtime_status.json').read_text(encoding='utf-8'))
+    rest_status = status['observability']['worker_phases']['rest']
+    assert rest_status['last_bootstrap_rows'] == 16
+    assert rest_status['bootstrap_rows_total'] == 16
+
+
+def test_bootstrap_scope_preserves_exact_encoded_spot_identity(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    rest = SyntheticFullUniverseRest()
+    collector, _rest, _factory, _sink = _collector(
+        tmp_path,
+        _config(assets=('@107',)),
+        timer,
+        [],
+        rest=rest,
+    )
+    try:
+        records = tuple(
+            collector._iter_rest_records(
+                connection_id='spot-bootstrap',
+                connection_epoch=7,
+                history_hours=1,
+                include_l2=False,
+                query_end=BASE_TIME,
+            )
+        )
+    finally:
+        collector.close()
+
+    bootstrap_records = tuple(
+        record
+        for record in records
+        if record.record_type in {RecordType.INSTRUMENT_METADATA, RecordType.MARKET_CONTEXT}
+    )
+    assert [(record.record_type, record.asset) for record in bootstrap_records] == [
+        (RecordType.INSTRUMENT_METADATA, '@107'),
+        (RecordType.MARKET_CONTEXT, '@107'),
+    ]
+    metadata, context = bootstrap_records
+    assert metadata.row['source_symbol'] == '@107'
+    assert metadata.row['source_index'] == 107
+    assert metadata.row['base_token'] == 'BTC'
+    assert metadata.row['quote_token'] == 'USDC'
+    metadata_json = str(metadata.row['metadata_json'])
+    assert metadata.row['metadata_sha256'] == hashlib.sha256(metadata_json.encode()).hexdigest()
+    assert context.row['instrument_kind'] == 'spot'
+    assert context.row['observation_id'] == 'spot-bootstrap:7:1'
+
+
+def test_unrequested_malformed_bootstrap_entry_still_fails_closed(tmp_path: Path) -> None:
+    timer = ControlledTime()
+    rest = SyntheticFullUniverseRest(misalign_unrelated_perp=True)
+    collector, _rest, _factory, _sink = _collector(
+        tmp_path,
+        _config(assets=('BTC',)),
+        timer,
+        [],
+        rest=rest,
+    )
+    try:
+        with pytest.raises(ValueError, match='perp metadata and contexts are not aligned'):
+            tuple(
+                collector._iter_rest_records(
+                    connection_id='malformed-bootstrap',
+                    connection_epoch=1,
+                    history_hours=1,
+                    include_l2=False,
+                    query_end=BASE_TIME,
+                )
+            )
+        assert rest.funding_calls == []
+        assert rest.candle_calls == []
+        assert rest.l2_calls == []
+    finally:
+        collector.close()
 
 
 def test_rest_bootstrap_precedes_ws_acks_and_live_flush(tmp_path: Path) -> None:

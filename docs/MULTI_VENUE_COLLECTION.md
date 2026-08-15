@@ -100,6 +100,12 @@ cours et acceptées mais pas encore publiées. Une frame qui ne tient pas est
 refusée intégralement par une erreur fatale ; aucune capacité, aucun timeout et
 aucune politique de reconnexion n'ont été augmentés pour absorber un backlog.
 
+Ces réservations isolent la capacité mémoire de chaque venue, pas son temps de
+service disque. Le processus writer consomme une file globale FIFO et traite une
+commande ou une barrière à la fois. Une barrière longue bloque donc les commandes
+suivantes des deux venues : le writer partagé reste volontairement sérialisé et
+n’offre pas une équité temporelle générale entre venues.
+
 La disponibilité d'un auto-flush est maintenant calculée par groupe exact
 `(venue, record_type, asset, date UTC, stream)`, et non par la somme de tous les
 groupes clairsemés. Lorsqu'un groupe publiable atteint `batch_size`, seuls les
@@ -143,23 +149,88 @@ validation. La disponibilité par groupe exact coalesce ces mêmes lignes avant
 publication ; le critère recherché est un débit durable confortablement supérieur
 au pic Binance avec une résidence bornée, pas une file plus grande.
 
-Le stress de référence validé reproduit maintenant le chemin de production :
-452 frames Binance `depth20@100ms`, alternées BTC/ETH et cadencées à cinq fois
-le débit nominal, sont ingérées avec 452 trades Hyperliquid simultanés. Cinq
-lignes `clock_sync` valides sont ajoutées pendant le flux (RTT 80 ms,
-incertitude 40 ms, donc sous le seuil inchangé de 50 ms). Les barrières complètes
-FIFO sont demandées tous les 100 frames, soit toutes les cinq secondes au débit
-nominal, puis une barrière finale publie le reliquat.
+Le stress de référence validé reproduit maintenant le démarrage froid. Une
+réponse Hyperliquid explicitement synthétique et non économique contient 300
+perps et 250 spots, soit 1 100 lignes de métadonnées/contexte passées par les
+parseurs de production. Seules les quatre lignes BTC/ETH sont ensuite retenues,
+puis complétées par 206 lignes d’une heure de funding, candles, état/niveaux L2
+et BBO. Cette frame REST atomique de 210 lignes est immédiatement suivie de la
+barrière FIFO complète utilisée en production.
 
-Le résultat est 19 441 lignes Binance et 452 lignes Hyperliquid, soit 19 893
-lignes durables dans 71 partitions validées. Ces 71 partitions incluent
-explicitement le fan-out des barrières de durabilité et remplacent le résultat
-idéalisé antérieur sans barrières, qui n'est pas une référence de production.
+Pendant cette barrière, deux producteurs simultanés soumettent 452 frames
+Binance `depth20@100ms`, alternées BTC/ETH et cadencées à cinq fois le débit
+nominal, ainsi que 452 trades Hyperliquid. Cinq lignes `clock_sync` valides sont
+ajoutées pendant le flux (RTT 80 ms, incertitude 40 ms, donc sous le seuil
+inchangé de 50 ms). Les barrières complètes FIFO sont ensuite demandées tous les
+100 frames, soit toutes les cinq secondes au débit nominal, puis une barrière
+finale publie le reliquat.
+
+Le résultat est 19 441 lignes Binance et 662 lignes Hyperliquid, soit 20 103
+lignes durables dans 85 partitions validées, dont 14 pour le bootstrap demandé.
+Aucun actif Hyperliquid non configuré n’apparaît dans les manifestes. Ce test
+remplace la référence antérieure de 19 893 lignes/71 partitions, qui couvrait le
+flux soutenu et ses barrières mais pas la forme complète du démarrage REST.
 Les capacités restent 10 000 lignes par venue et 20 000 au total : zéro rejet
 de capacité sur les deux venues, high-water totale strictement inférieure à
 8 000, high-water Binance strictement inférieure à 7 000 et résidence maximale
 Binance strictement inférieure à 5 000 ms. Ces bornes sont des assertions du
 stress, pas une augmentation des caps ni un relâchement de la cadence FIFO.
+
+## Échec de démarrage du long run Singapore (2026-08-15)
+
+La première tentative réelle de six heures a échoué au démarrage. Malgré
+`--assets BTC,ETH`, le bootstrap Hyperliquid matérialisait alors tout l’univers
+perp et spot dans le lake : les métadonnées et contextes d’actifs sans rapport
+formaient environ un millier de partitions d’une ligne. Pendant la barrière de
+flush correspondante, le même writer FIFO ne pouvait pas servir Binance ;
+environ 9 120 lignes L2 Binance se sont accumulées et la high-water de la venue
+a atteint 9 981/10 000.
+
+Au point d’arrêt, le lake comptait 11 423 lignes et 1 165 partitions ; le flush
+le plus long atteignait environ 14 534 ms. Pour Binance, la résidence en file
+était d’environ 6 233 ms en médiane, 13 623 ms au p95 et 14 318 ms au p99, alors
+que les temps parent d’enqueue/add/write restaient inférieurs à environ 1,2 ms.
+Cette dissociation localise l’attente après admission, dans le service durable
+partagé, plutôt que dans la normalisation ou les files WebSocket.
+
+La cause est le fan-out inutile du bootstrap complet, amplifié par une barrière
+globale bloquante, et non une capacité trop faible à augmenter. La réponse
+Hyperliquid complète reste désormais récupérée et validée transitoirement, mais
+seules les lignes de métadonnées et de contexte dont l’identité API exacte est
+configurée sont persistées ; la même règle vaut pour chaque refresh périodique.
+Les caps 10 000/10 000, l’admission atomique des frames, les barrières FIFO, le
+root lock et tous les refus fail-closed restent inchangés.
+
+Le snapshot writer expose aussi des diagnostics versionnés regroupés par
+`(venue, asset, record_type)` : lignes enqueued/acknowledged/durables, fichiers
+produits, moyenne de lignes par fichier, contribution aux flushes et contribution
+pondérée à la résidence en file. Ces métriques attribuent le fan-out sans changer
+l’ordonnancement ni libérer de crédit avant durabilité.
+
+`acknowledged` compte toutes les lignes traitées par le processus enfant, y
+compris les doublons éliminés ; le compteur de doublons reste attribué à la venue
+seulement, pas à ces groupes. `flushes` compte les événements de flush ayant
+produit une sortie pour le groupe agrégé, et non les fichiers ni les partitions
+exactes par date UTC et `stream`.
+
+La résidence mesure l’intervalle entre l’enqueue parent et le dequeue enfant.
+Pour `frame_residence_ms`, `count`, `mean_ms`, `min_ms` et `max_ms` couvrent toute
+la durée du processus, tandis que p50/p95/p99 portent sur les 4 096 échantillons
+les plus récents du groupe. Une attribution finale n’est autoritative qu’après
+drainage (`outstanding_rows == 0`) avec `accounting_status == "exact"` ; un
+snapshot vivant reste intermédiaire et un statut `indeterminate` interdit cette
+lecture finale.
+
+La cardinalité cumulée des groupes diagnostiques est elle-même bornée à la
+`queue_capacity` globale et exposée par `capacity.max_groups`,
+`capacity.current_groups` et `capacity.rejections`. Une nouvelle clé qui
+dépasserait cette borne est refusée avant
+l’enqueue IPC, sans admission partielle. Cette borne mémoire ne relève ni les
+caps de lignes 10 000/20 000 ni leur crédit de durabilité.
+
+Aucun nouveau smoke Singapore réel n’a été exécuté dans cette tâche. Cet essai
+reste un échec de démarrage et la Phase 10 demeure
+`BLOCKED_PRECONDITION_NOT_MET` jusqu’à un nouveau run isolé et son audit complet.
 
 ## Diagnostic réseau REST Singapore (2026-08-14)
 
@@ -362,6 +433,10 @@ one-generation run does not lose its queue high-water evidence.
   for sort, Arrow, analysis, Parquet write/hash/fsync/publication, directory fsync,
   immediate validation, and SQLite commit. `storage.coalescing` exposes le nombre
   de groupes en attente/prêts et la taille maximale d'un groupe exact.
+  `group_diagnostics`, aux dimensions versionnées
+  `(venue, asset, record_type)`, attribue les lignes admises, acquittées et
+  durables, les fichiers et contributions de flush, ainsi que la résidence en
+  file par frame et pondérée par ligne.
 - `reconnect_reasons_by_generation` distinguishes the initiating socket role,
   collateral closes, exact exception/reason, queue/writer/clock state, and whether
   a reconnect was attempted. The continuity report persists corresponding

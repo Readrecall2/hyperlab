@@ -28,6 +28,7 @@ SIGNAL_FAMILIES = (
     "signed_flow",
 )
 SOURCE_TIME_STATUS = "NOT_ADMISSIBLE_NO_SYMMETRIC_HL_CLOCK_CALIBRATION"
+STREAMING_RESOURCE_MODEL_VERSION = "BOUNDED_STREAMING_V1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INFORMATION_EVENT_ROW_BASE_BYTES = 4_096
 _EXECUTION_EVENT_ROW_BASE_BYTES = 8_192
@@ -48,6 +49,19 @@ _STUDY_CONFIG_FIELDS = frozenset(
         "minimum_events",
         "max_event_rows",
         "max_estimated_event_bytes",
+        "streaming_resource_model_version",
+        "max_source_rows_per_chunk",
+        "max_simultaneous_batch_rows",
+        "max_l2_frame_levels",
+        "max_l2_levels_per_chunk",
+        "max_pending_response_states",
+        "max_pending_execution_states",
+        "external_merge_fan_in",
+        "quantile_sort_run_rows",
+        "parquet_row_group_rows",
+        "writer_buffer_rows",
+        "scratch_low_watermark_bytes",
+        "scratch_reserve_bytes",
         "reference_venue",
         "execution_venue",
     }
@@ -245,6 +259,19 @@ class LeadLagConfig:
     minimum_events: int = 30
     max_event_rows: int = 5_000_000
     max_estimated_event_bytes: int = 8_000_000_000
+    streaming_resource_model_version: str = STREAMING_RESOURCE_MODEL_VERSION
+    max_source_rows_per_chunk: int = 100_000
+    max_simultaneous_batch_rows: int = 25_000
+    max_l2_frame_levels: int = 10_000
+    max_l2_levels_per_chunk: int = 100_000
+    max_pending_response_states: int = 500_000
+    max_pending_execution_states: int = 1_000_000
+    external_merge_fan_in: int = 32
+    quantile_sort_run_rows: int = 250_000
+    parquet_row_group_rows: int = 65_536
+    writer_buffer_rows: int = 16_384
+    scratch_low_watermark_bytes: int = 4_000_000_000
+    scratch_reserve_bytes: int = 2_000_000_000
     execution_scenarios: tuple[ExecutionAssumptions, ...] = field(
         default_factory=_default_execution_scenarios
     )
@@ -275,12 +302,39 @@ class LeadLagConfig:
             "minimum_events",
             "max_event_rows",
             "max_estimated_event_bytes",
+            "max_source_rows_per_chunk",
+            "max_simultaneous_batch_rows",
+            "max_l2_frame_levels",
+            "max_l2_levels_per_chunk",
+            "max_pending_response_states",
+            "max_pending_execution_states",
+            "external_merge_fan_in",
+            "quantile_sort_run_rows",
+            "parquet_row_group_rows",
+            "writer_buffer_rows",
+            "scratch_low_watermark_bytes",
+            "scratch_reserve_bytes",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if self.randomization_resamples < 19:
             raise ValueError("randomization_resamples must be at least 19")
+        if self.streaming_resource_model_version != STREAMING_RESOURCE_MODEL_VERSION:
+            raise ValueError(
+                "streaming_resource_model_version must remain "
+                f"{STREAMING_RESOURCE_MODEL_VERSION}"
+            )
+        if self.external_merge_fan_in < 2:
+            raise ValueError("external_merge_fan_in must be at least 2")
+        if self.writer_buffer_rows > self.parquet_row_group_rows:
+            raise ValueError(
+                "writer_buffer_rows must not exceed parquet_row_group_rows"
+            )
+        if self.max_l2_frame_levels > self.max_l2_levels_per_chunk:
+            raise ValueError(
+                "max_l2_frame_levels must not exceed max_l2_levels_per_chunk"
+            )
         scenarios = tuple(self.execution_scenarios)
         if not scenarios:
             raise ValueError("at least one execution scenario is required")
@@ -337,6 +391,19 @@ class LeadLagConfig:
             "minimum_events": self.minimum_events,
             "max_event_rows": self.max_event_rows,
             "max_estimated_event_bytes": self.max_estimated_event_bytes,
+            "streaming_resource_model_version": self.streaming_resource_model_version,
+            "max_source_rows_per_chunk": self.max_source_rows_per_chunk,
+            "max_simultaneous_batch_rows": self.max_simultaneous_batch_rows,
+            "max_l2_frame_levels": self.max_l2_frame_levels,
+            "max_l2_levels_per_chunk": self.max_l2_levels_per_chunk,
+            "max_pending_response_states": self.max_pending_response_states,
+            "max_pending_execution_states": self.max_pending_execution_states,
+            "external_merge_fan_in": self.external_merge_fan_in,
+            "quantile_sort_run_rows": self.quantile_sort_run_rows,
+            "parquet_row_group_rows": self.parquet_row_group_rows,
+            "writer_buffer_rows": self.writer_buffer_rows,
+            "scratch_low_watermark_bytes": self.scratch_low_watermark_bytes,
+            "scratch_reserve_bytes": self.scratch_reserve_bytes,
             "execution_scenarios": [asdict(value) for value in self.execution_scenarios],
             "reference_venue": self.reference_venue,
             "execution_venue": self.execution_venue,
@@ -448,6 +515,73 @@ class LeadLagAnalysis:
             "controls": _records(self.controls),
             "event_row_count": len(self.events),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class LeadLagChunkLimits:
+    """Hard limits for one already-projected asset/interval analysis chunk."""
+
+    max_source_rows_per_chunk: int
+    max_simultaneous_batch_rows: int
+    max_l2_frame_levels: int
+    max_l2_levels_per_chunk: int
+    max_pending_response_states: int
+    max_pending_execution_states: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_source_rows_per_chunk",
+            "max_simultaneous_batch_rows",
+            "max_l2_frame_levels",
+            "max_l2_levels_per_chunk",
+            "max_pending_response_states",
+            "max_pending_execution_states",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    @classmethod
+    def from_config(cls, config: LeadLagConfig) -> LeadLagChunkLimits:
+        return cls(
+            max_source_rows_per_chunk=config.max_source_rows_per_chunk,
+            max_simultaneous_batch_rows=config.max_simultaneous_batch_rows,
+            max_l2_frame_levels=config.max_l2_frame_levels,
+            max_l2_levels_per_chunk=config.max_l2_levels_per_chunk,
+            max_pending_response_states=config.max_pending_response_states,
+            max_pending_execution_states=config.max_pending_execution_states,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LeadLagChunkResult:
+    """Oracle-equivalent event frames and deterministic bounds for one chunk."""
+
+    resource_model_version: str
+    asset: str
+    interval_id: str
+    core_start: pd.Timestamp
+    core_end: pd.Timestamp
+    halo_start: pd.Timestamp
+    halo_end: pd.Timestamp
+    source_row_count: int
+    peak_simultaneous_batch_rows: int
+    peak_l2_frame_levels: int
+    projected_response_states: int
+    projected_execution_states: int
+    primary_signal_count: int
+    reverse_signal_count: int
+    information_events: pd.DataFrame
+    reverse_events: pd.DataFrame
+    execution_events: pd.DataFrame
+
+    @property
+    def output_event_row_count(self) -> int:
+        return (
+            len(self.information_events)
+            + len(self.reverse_events)
+            + len(self.execution_events)
+        )
 
 
 def _json_value(value: object) -> object:
@@ -1026,6 +1160,10 @@ def _build_signals(
 
 class LeadLagCapacityError(ValueError):
     """Raised before long-form event materialization exceeds preregistered limits."""
+
+
+class LeadLagChunkCapacityError(ValueError):
+    """Raised before a bounded chunk exceeds a preregistered hard limit."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2803,6 +2941,395 @@ def _required_venue_assets(
         bbo.loc[bbo["venue"].eq(venue.casefold()), "asset"].astype(str).tolist()
     )
     return tuple(asset for asset in assets if asset not in available)
+
+
+def _chunk_timestamp(value: datetime | pd.Timestamp, *, label: str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tz is None:
+        raise ValueError(f"{label} must be timezone-aware")
+    return timestamp.tz_convert("UTC")
+
+
+def _chunk_halo_bounds(
+    *,
+    interval: StrictInterval,
+    core_start: pd.Timestamp,
+    core_end: pd.Timestamp,
+    config: LeadLagConfig,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    left_halo_ms = max(
+        config.momentum_window_ms + config.max_book_age_ms,
+        config.trade_window_ms,
+        max(config.horizons_ms) + config.max_book_age_ms,
+    )
+    right_halo_ms = (
+        max(config.horizons_ms)
+        + max(scenario.exit_latency_ms for scenario in config.execution_scenarios)
+        + config.max_book_age_ms
+    )
+    interval_start = pd.Timestamp(interval.start)
+    interval_end = pd.Timestamp(interval.end)
+    return (
+        max(interval_start, core_start - pd.Timedelta(milliseconds=left_halo_ms)),
+        min(interval_end, core_end + pd.Timedelta(milliseconds=right_halo_ms)),
+    )
+
+
+def _slice_chunk_frame(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    asset: str,
+    halo_start: pd.Timestamp,
+    halo_end: pd.Timestamp,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    _require_columns(frame, {"asset", "received_time"}, label=label)
+    received = _timestamp_series(frame["received_time"], label=f"{label}.received_time")
+    assets = frame["asset"].astype(str).str.strip().str.upper()
+    selected = assets.eq(asset) & received.ge(halo_start) & received.lt(halo_end)
+    result = frame.loc[selected].copy()
+    result["received_time"] = received.loc[selected]
+    return result.reset_index(drop=True)
+
+
+def _peak_simultaneous_source_rows(frames: Sequence[pd.DataFrame]) -> int:
+    received = [
+        frame["received_time"]
+        for frame in frames
+        if not frame.empty and "received_time" in frame
+    ]
+    if not received:
+        return 0
+    counts = pd.concat(received, ignore_index=True).value_counts(sort=False)
+    return int(counts.max()) if len(counts) else 0
+
+
+def _peak_l2_frame_levels(frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    exploded_required = {"venue", "asset", "received_time", "side", "price", "quantity"}
+    atomic_required = {"venue", "asset", "received_time", "bids", "asks"}
+    if atomic_required.issubset(frame.columns) and not exploded_required.issubset(
+        frame.columns
+    ):
+        maximum = 0
+        for bids, asks in frame[["bids", "asks"]].itertuples(index=False, name=None):
+            if not isinstance(bids, (list, tuple)):
+                raise ValueError("l2.bids must contain an atomic level sequence")
+            if not isinstance(asks, (list, tuple)):
+                raise ValueError("l2.asks must contain an atomic level sequence")
+            maximum = max(maximum, len(bids) + len(asks))
+        return maximum
+    _require_columns(frame, exploded_required, label="l2")
+    keys = ["venue", "asset", "received_time"]
+    if "snapshot_id" in frame:
+        keys.append("snapshot_id")
+    sizes = frame.groupby(keys, sort=False, dropna=False).size()
+    return int(sizes.max()) if len(sizes) else 0
+
+
+def _l2_level_count(frame: pd.DataFrame) -> int:
+    """Count the exact level rows that ``_prepare_l2`` would materialize."""
+
+    if frame.empty:
+        return 0
+    exploded_required = {"venue", "asset", "received_time", "side", "price", "quantity"}
+    atomic_required = {"venue", "asset", "received_time", "bids", "asks"}
+    if atomic_required.issubset(frame.columns) and not exploded_required.issubset(
+        frame.columns
+    ):
+        total = 0
+        for bids, asks in frame[["bids", "asks"]].itertuples(index=False, name=None):
+            if not isinstance(bids, (list, tuple)):
+                raise ValueError("l2.bids must contain an atomic level sequence")
+            if not isinstance(asks, (list, tuple)):
+                raise ValueError("l2.asks must contain an atomic level sequence")
+            total += len(bids) + len(asks)
+        return total
+    _require_columns(frame, exploded_required, label="l2")
+    return len(frame)
+
+
+def _enforce_chunk_bound(
+    observed: int,
+    limit: int,
+    *,
+    observed_name: str,
+    limit_name: str,
+) -> None:
+    if observed > limit:
+        raise LeadLagChunkCapacityError(
+            "lead-lag bounded chunk refused materialization: "
+            f"{observed_name}={observed} exceeds {limit_name}={limit}"
+        )
+
+
+def _signals_in_core(
+    signals: pd.DataFrame,
+    *,
+    core_start: pd.Timestamp,
+    core_end: pd.Timestamp,
+) -> pd.DataFrame:
+    if signals.empty:
+        return signals.reset_index(drop=True)
+    selected = signals["signal_time"].ge(core_start) & signals["signal_time"].lt(
+        core_end
+    )
+    return signals.loc[selected].reset_index(drop=True)
+
+
+def _response_output_rows(
+    events: pd.DataFrame, *, row_kind: Literal["information", "control"]
+) -> pd.DataFrame:
+    result = events.copy()
+    result["row_kind"] = row_kind
+    result["execution_scenario"] = None
+    result["execution_model"] = None
+    result["execution_calibration_status"] = None
+    result["execution_status"] = "NOT_APPLICABLE"
+    return _sort_frame(
+        result,
+        (
+            "signal_time",
+            "asset",
+            "signal_family",
+            "horizon_ms",
+            "signal_id",
+            "row_kind",
+            "execution_scenario",
+            "execution_model",
+        ),
+    )
+
+
+def analyze_lead_lag_chunk(
+    dataset: LeadLagDataset,
+    interval: StrictInterval,
+    config: LeadLagConfig,
+    *,
+    asset: str,
+    core_start: datetime | pd.Timestamp,
+    core_end: datetime | pd.Timestamp,
+    limits: LeadLagChunkLimits | None = None,
+) -> LeadLagChunkResult:
+    """Build oracle-equivalent event rows for one bounded asset/interval core.
+
+    The supplied dataset may contain more than the requested core. Only the
+    deterministic causal halo, clipped to ``interval``, is prepared. Halo
+    signals are feature state only and are never emitted.
+    """
+
+    if not isinstance(dataset, LeadLagDataset):
+        raise TypeError("dataset must be a LeadLagDataset")
+    if not isinstance(interval, StrictInterval):
+        raise TypeError("interval must be a StrictInterval")
+    if not isinstance(config, LeadLagConfig):
+        raise TypeError("config must be a LeadLagConfig")
+    active_limits = LeadLagChunkLimits.from_config(config) if limits is None else limits
+    if not isinstance(active_limits, LeadLagChunkLimits):
+        raise TypeError("limits must be a LeadLagChunkLimits")
+
+    normalized_asset = asset.strip().upper()
+    if normalized_asset not in config.assets:
+        raise ValueError("chunk asset must be one of the configured assets")
+    start = _chunk_timestamp(core_start, label="chunk core_start")
+    end = _chunk_timestamp(core_end, label="chunk core_end")
+    interval_start = pd.Timestamp(interval.start)
+    interval_end = pd.Timestamp(interval.end)
+    if not interval_start <= start < end <= interval_end:
+        raise ValueError(
+            "chunk core must be a non-empty half-open window inside one strict interval"
+        )
+    halo_start, halo_end = _chunk_halo_bounds(
+        interval=interval,
+        core_start=start,
+        core_end=end,
+        config=config,
+    )
+
+    raw_bbo = _slice_chunk_frame(
+        dataset.bbo,
+        label="bbo",
+        asset=normalized_asset,
+        halo_start=halo_start,
+        halo_end=halo_end,
+    )
+    raw_trades = _slice_chunk_frame(
+        dataset.trades,
+        label="trades",
+        asset=normalized_asset,
+        halo_start=halo_start,
+        halo_end=halo_end,
+    )
+    raw_l2 = _slice_chunk_frame(
+        dataset.l2,
+        label="l2",
+        asset=normalized_asset,
+        halo_start=halo_start,
+        halo_end=halo_end,
+    )
+    source_row_count = len(raw_bbo) + len(raw_trades) + len(raw_l2)
+    _enforce_chunk_bound(
+        source_row_count,
+        active_limits.max_source_rows_per_chunk,
+        observed_name="source_rows",
+        limit_name="max_source_rows_per_chunk",
+    )
+    peak_simultaneous = _peak_simultaneous_source_rows(
+        (raw_bbo, raw_trades, raw_l2)
+    )
+    _enforce_chunk_bound(
+        peak_simultaneous,
+        active_limits.max_simultaneous_batch_rows,
+        observed_name="simultaneous_batch_rows",
+        limit_name="max_simultaneous_batch_rows",
+    )
+    peak_l2_levels = _peak_l2_frame_levels(raw_l2)
+    _enforce_chunk_bound(
+        peak_l2_levels,
+        active_limits.max_l2_frame_levels,
+        observed_name="l2_frame_levels",
+        limit_name="max_l2_frame_levels",
+    )
+    l2_level_count = _l2_level_count(raw_l2)
+    _enforce_chunk_bound(
+        l2_level_count,
+        active_limits.max_l2_levels_per_chunk,
+        observed_name="l2_levels_per_chunk",
+        limit_name="max_l2_levels_per_chunk",
+    )
+
+    bbo = _prepare_bbo(raw_bbo)
+    trades = _prepare_trades(raw_trades)
+    l2 = _prepare_l2(raw_l2)
+    missing_reference = _required_venue_assets(
+        bbo, venue=config.reference_venue, assets=(normalized_asset,)
+    )
+    missing_execution = _required_venue_assets(
+        bbo, venue=config.execution_venue, assets=(normalized_asset,)
+    )
+    if missing_reference or missing_execution:
+        missing = [
+            venue
+            for venue, values in (
+                (config.reference_venue, missing_reference),
+                (config.execution_venue, missing_execution),
+            )
+            if values
+        ]
+        raise ValueError(
+            "missing required BBO venue/assets for chunk: " + ", ".join(missing)
+        )
+
+    intervals = (interval,)
+    primary_signals = _signals_in_core(
+        _build_signals(
+            bbo,
+            trades,
+            l2,
+            venue=config.reference_venue,
+            assets=(normalized_asset,),
+            config=config,
+            intervals=intervals,
+        ),
+        core_start=start,
+        core_end=end,
+    )
+    reverse_signals = _signals_in_core(
+        _build_signals(
+            bbo,
+            trades,
+            l2,
+            venue=config.execution_venue,
+            assets=(normalized_asset,),
+            config=config,
+            intervals=intervals,
+        ),
+        core_start=start,
+        core_end=end,
+    )
+    projected_response_states = (
+        len(primary_signals) + len(reverse_signals)
+    ) * len(config.horizons_ms)
+    projected_execution_states = (
+        len(primary_signals)
+        * len(config.horizons_ms)
+        * len(config.execution_scenarios)
+        * 2
+    )
+    _enforce_chunk_bound(
+        projected_response_states,
+        active_limits.max_pending_response_states,
+        observed_name="projected_response_states",
+        limit_name="max_pending_response_states",
+    )
+    _enforce_chunk_bound(
+        projected_execution_states,
+        active_limits.max_pending_execution_states,
+        observed_name="projected_execution_states",
+        limit_name="max_pending_execution_states",
+    )
+
+    information = _response_rows(
+        primary_signals,
+        bbo,
+        intervals,
+        config,
+        response_venue=config.execution_venue,
+        signal_role="primary",
+    )
+    reverse = _response_rows(
+        reverse_signals,
+        bbo,
+        intervals,
+        config,
+        response_venue=config.reference_venue,
+        signal_role="reverse",
+    )
+    execution = _execution_rows(
+        information,
+        bbo,
+        trades,
+        l2,
+        intervals,
+        config,
+    )
+    execution = _sort_frame(
+        execution,
+        (
+            "signal_time",
+            "asset",
+            "signal_family",
+            "horizon_ms",
+            "signal_id",
+            "row_kind",
+            "execution_scenario",
+            "execution_model",
+        ),
+    )
+    return LeadLagChunkResult(
+        resource_model_version=config.streaming_resource_model_version,
+        asset=normalized_asset,
+        interval_id=_interval_id(interval),
+        core_start=start,
+        core_end=end,
+        halo_start=halo_start,
+        halo_end=halo_end,
+        source_row_count=source_row_count,
+        peak_simultaneous_batch_rows=peak_simultaneous,
+        peak_l2_frame_levels=peak_l2_levels,
+        projected_response_states=projected_response_states,
+        projected_execution_states=projected_execution_states,
+        primary_signal_count=len(primary_signals),
+        reverse_signal_count=len(reverse_signals),
+        information_events=_response_output_rows(
+            information, row_kind="information"
+        ),
+        reverse_events=_response_output_rows(reverse, row_kind="control"),
+        execution_events=execution,
+    )
 
 
 def analyze_lead_lag(

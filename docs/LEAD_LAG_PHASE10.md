@@ -22,7 +22,7 @@ study before reading results:
 - executable BBO prices rather than future mid-prices;
 - preregistered trade-flow and momentum windows, L2 depth, time buckets,
   minimum-move band, maximum book age, sample floor, block-randomization controls,
-  and fail-closed event-row and estimated-memory bounds;
+  and versioned bounded-memory/disk controls;
 - explicit baseline and stress execution scenarios.
 
 Every scenario is `UNCALIBRATED`. Hyperliquid maker/taker fees, entry and exit
@@ -64,18 +64,22 @@ approval from files present in the lake, repair lineage, interpolate rejected
 clock probes, or substitute an older manifest. Gate failure must occur before
 the output directory or any artifact is created.
 
-The preregistration also caps projected long-form output at 5,000,000 event rows
-and 8,000,000,000 estimated bytes. Before allocating the horizon/scenario event
-expansion or creating output, the analysis computes its projection and fails
-closed if either bound would be exceeded. Raising a cap merely to force a run is
-not evidence that the workload is safe; an oversized study requires a reviewed
-bounded or streaming design.
+The 5,000,000-row and 8,000,000,000-byte fields now apply only to the retained
+pandas reference oracle. The production command never raises or consults those
+limits. It uses `BOUNDED_STREAMING_V1`: projected Arrow reads, disk-backed
+manifest and source catalogs, one received-time state machine per asset and
+strict interval, bounded rolling and pending state, an exact two-pass
+count/preflight, an exact disk-backed quantile/event spool, and fixed-row-group
+Parquet publication.
 
-The deterministic `CONSERVATIVE_LONG_FORM_V1` projection charges at least
-4,096 bytes per information/control row and 8,192 bytes per execution row,
-adds variable asset, interval-tag, and scenario text, then applies a peak
-materialization multiplier of 2. These constants and both projected totals are
-recorded in the result summary so an accepted run remains auditable.
+The preregistration freezes independent limits for rolling source state,
+complete simultaneous batches, levels in one atomic L2 frame, total retained L2
+levels, pending response and execution states, external ordering fan-in,
+exact-quantile runs, Parquet row groups, writer buffers, and scratch
+free-space/reserve. Breaching any one is fatal. The total projected event
+population is a disk-sizing counter, not a RAM allocation cap; the command can
+therefore admit more than five million rows only when its bounded state and disk
+preflights pass.
 
 The command also refuses an output path inside `ROOT`, an existing output path,
 or a non-empty output directory. This prevents publication into the immutable
@@ -84,24 +88,46 @@ for every run.
 
 ## Command
 
-From the repository environment:
+From the repository environment, after the six-hour capture is complete and its
+independently saved technical gate has passed, substitute the two literal input
+paths below. The generated output is a new sibling of the immutable lake:
 
 ```powershell
-hyperlab lead-lag-study ROOT `
-  --gate-report PATH `
-  --config config/lead_lag_phase10.toml `
-  --output REPORT_DIR
+$LakeRoot = (Resolve-Path -LiteralPath 'D:\path\to\completed-singapore-lake').Path
+$GateReport = (Resolve-Path -LiteralPath 'D:\path\to\saved-passing-technical-gate.json').Path
+$Config = (Resolve-Path -LiteralPath '.\config\lead_lag_phase10.toml').Path
+$Output = Join-Path -Path (Split-Path -Parent $LakeRoot) -ChildPath (
+  'singapore-6h-phase10-2-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+)
+
+& '.\.venv\Scripts\python.exe' -m hyperlab lead-lag-study `
+  $LakeRoot `
+  --gate-report $GateReport `
+  --config $Config `
+  --output $Output
 ```
 
-The pipeline is intentionally ordered:
+The production pipeline is intentionally ordered:
 
-1. `hyperlab.analysis.lake.load_validated_lead_lag_window` validates the lake,
-   manifest, gate, lineage, clock evidence, and replay window without mutation.
-2. `hyperlab.analysis.lead_lag.analyze_lead_lag` performs the preregistered causal
-   event replay and retains every variant and bucket, including failures and
-   empty/ineligible cells. The same module owns `load_lead_lag_config`.
-3. `hyperlab.analysis.reporting.write_lead_lag_artifacts` atomically publishes to
-   the new external report directory only after validation and analysis succeed.
+1. `hyperlab.analysis.streaming_lake.validate_bounded_lead_lag_gate` validates
+   the exact saved report bytes, re-runs continuity, validates both complete v1
+   schemas, and compares their versioned semantic payloads. Only the top-level
+   `/observability` object is excluded from semantic equality; it is still
+   schema-validated and remains bound by the raw report hash.
+2. `hyperlab.analysis.streaming_lake.load_bounded_lead_lag_window` catalogs
+   manifests on disk, streams `selected_manifests.jsonl`, reads required columns
+   in bounded Arrow batches, reconstructs complete L2 frames, and spools rows in
+   received-time order. It never returns a complete `LeadLagDataset`.
+3. `hyperlab.analysis.streaming.run_bounded_lead_lag_study` performs two passes
+   through the scalar received-time watermark kernel: an exact count and disk
+   preflight, then direct bounded event spooling. The kernel consumes complete
+   equal-time batches, resets at every asset/strict-interval boundary, and has no
+   pandas/DataFrame fallback. The pandas `analyze_lead_lag` path remains only a
+   small synthetic-fixture semantic oracle.
+4. The v2 publisher writes bounded CSV/JSON/Markdown and fixed-row-group Parquet
+   in a hidden sibling staging directory, rechecks gate bytes plus every selected
+   manifest/data hash, removes scratch, and performs one atomic write-through
+   rename.
 
 Do not point `REPORT_DIR` at the lake or create it in advance. This command is
 not a collector and does not launch, restart, or monitor a Singapore smoke.
@@ -121,6 +147,13 @@ lake:
   multiple-testing controls, including empty cells;
 - `events.parquet`: event-level replay evidence used to derive the aggregates,
   with primary, reverse-control, execution, interval, and causal timestamps.
+- `selected_manifests.jsonl`: the canonical streamed selected-manifest evidence;
+  its SHA-256, line count, and canonical manifest-set fingerprint are bound in
+  every output format;
+- `observability.json`: explicitly non-semantic runtime telemetry, including
+  scan counts, causal-state high-water marks, scratch high-water, output rows,
+  and phase timings. Deterministic counters also appear in `result.json`, while
+  runtime timing and available-disk values do not affect its semantic hash.
 
 The report must make the following warnings prominent:
 
@@ -160,9 +193,11 @@ stability outside the tuning sample. The uncalibrated scenarios only show
 sensitivity to declared assumptions.
 
 Event output size scales with the number of causal signals, horizons, and
-execution scenarios. The preregistered preflight bounds that expansion before
-the long-form event table is allocated. The report records projected and actual
-row counts and memory estimates. Operators must not redirect temporary or final
+execution scenarios. The preregistered count pass sizes disk before the event
+spool is created; it does not allocate a long-form event table. The report
+records files/rows scanned, every output-row class, asset/interval kernels and
+receive batches processed, each rolling/pending/writer high-water mark, scratch
+high-water, and phase timings. Operators must not redirect temporary or final
 output into the immutable lake.
 
 ## Validation boundary

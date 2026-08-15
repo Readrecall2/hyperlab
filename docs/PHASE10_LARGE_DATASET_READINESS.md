@@ -2,25 +2,22 @@
 
 ## Status
 
-Phase 10-1 continuity hardening is the current priority.
+The bounded implementation is complete. Its two-million-source-row stress,
+focused suite, full repository suite, and independent final diff review are all
+green. The exact operational status is:
 
-Phase 10-2 large-dataset analysis remains:
+    PHASE10_2_AUTHORIZED_AFTER_SAVED_TECHNICAL_GATE_PASS
 
-    BLOCKED_LARGE_DATASET_STREAMING_NOT_IMPLEMENTED
-
-The existing lead-lag study must not be run against the completed six-hour
-capture until the bounded design in this document is implemented, shown
-equivalent to the reference implementation, and validated under representative
-load. Raising the existing row or estimated-memory limits is not an acceptable
-substitute.
-
-This plan does not authorize access to the running Singapore capture, collector
-changes, network activity, trading, order submission, signing, secrets, or a
-weaker Phase 10 technical gate.
+The implementation does not raise or consult the legacy 5,000,000-row or
+8,000,000,000-byte pandas materialization limits in production. It authorizes
+only an offline study after an independently saved technical-gate PASS is
+revalidated. It does not authorize access to a still-running capture, collector
+changes, network activity, trading, order submission, signing, secrets, a
+profitability claim, or a weaker Phase 10 technical gate.
 
 ## Repository and commit anchors
 
-This document was prepared from the following local, read-only audit anchors:
+The design audit began from the following local, read-only anchors:
 
 - bounded-memory worktree:
   `C:\Dev\hyperlab-phase10-bounded`;
@@ -32,20 +29,19 @@ This document was prepared from the following local, read-only audit anchors:
 - analysis worktree:
   `C:\Dev\hyperlab-phase10-analysis`;
 - analysis branch: `phase-10-lead-lag-analysis`;
-- current analysis implementation:
+- original analysis implementation:
   `470042c4d0cffd615c6803fe068ebe0f6c8fa9e0`;
 - analysis checkpoint:
   `cb1c18e0bc9bfd452671d7fd9d4c70af3499bf24`;
 - merge base of the two worktrees:
   `6ed00ff22c818f7b2d38b31444cc2477d5376e9a`.
 
-The analysis branch was cut before `cb7ce3c`. It must receive the completed
-bounded-memory branch before further Phase 10-2 implementation. Analysis code
-must not be copied into this worktree while continuity and its shared lake
-interfaces are changing.
+The bounded continuity commit `1982efc` was merged into this worktree by
+`e146cb6`. The required pre-refactor checkpoint is `e871d55`. No continuity,
+collector, writer, runtime, network, DNS, or clock behavior was modified by the
+Phase 10-2 implementation.
 
-All source references below are to commit `470042c` in the analysis worktree
-unless stated otherwise:
+The original unbounded source references below describe commit `470042c`:
 
 - `config/lead_lag_phase10.toml`;
 - `src/hyperlab/analysis/lake.py`;
@@ -90,6 +86,63 @@ upstream loader or signal construction safe on a 4 GiB host.
 The current `event_table_estimated_memory_bytes` field is measured only after
 the final table exists. It is not a measurement of process peak RSS and must not
 be represented as one.
+
+## Implemented bounded architecture
+
+The production CLI now dispatches exclusively to
+`hyperlab.analysis.streaming.run_bounded_lead_lag_study`. The original
+`LeadLagDataset` and pandas implementation remain available as the
+small-synthetic-fixture semantic oracle, but are not imported or called by the
+production runner.
+
+The bounded runner is composed as follows:
+
+1. `gate_binding.py` reads and hashes the exact saved gate-report bytes,
+   validates the full version-1 semantic and observability contracts, reruns the
+   independent continuity audit, and compares canonical semantic payloads after
+   excluding exactly top-level `/observability`. Unknown semantic fields and
+   nested fields named `observability` remain compared. The exact saved bytes
+   are checked again immediately before publication.
+2. `streaming_lake.py` catalogs manifests in SQLite, incrementally writes and
+   hashes `selected_manifests.jsonl`, reads only record-type projections in
+   bounded Arrow batches, verifies content hashes, reconstructs complete atomic
+   L2 frames on disk, and exposes complete received-time batches in
+   deterministic asset/strict-interval order. It never returns a complete
+   source population.
+3. `streaming_kernel.py` is a pandas-free causal watermark state machine. It
+   applies complete equal-time batches atomically, uses `received_time` only,
+   resets at every strict-interval boundary, emits all eight signal families at
+   all seven horizons for BTC and ETH, and retains bounded BBO, public-trade,
+   trade-window, L2, pending-response, pending-execution, and output-buffer
+   state. Every configured cap is fail-closed.
+4. `streaming_execution.py` evaluates Hyperliquid-only maker and taker attempts
+   from scalar causal timelines. It preserves latency, fees, spread,
+   depth/slippage, public queue evidence, missed and partial fills, unresolved
+   exposure, adverse exit, and break-even move without constructing a complete
+   execution table.
+5. `streaming_store.py` writes event mappings into a disk-backed canonical
+   spool with a preregistered fixed Arrow schema and nanosecond timestamps.
+   Fixed-size buffers and row groups feed streaming Parquet publication; no
+   complete event population or data-derived schema is held in memory.
+6. `streaming_aggregates.py` computes every configured metric, bucket, decay,
+   false-positive count, negative-lag control, reverse control, block-sign
+   randomization, max-T value, and Benjamini-Hochberg value from projected spool
+   scans. Quantiles use exact disk-backed order statistics with pandas linear
+   interpolation; no approximate sketch is used. Randomization operates on
+   deterministic per-hypothesis/per-block sums rather than an event-by-resample
+   matrix.
+7. `streaming_reporting.py` publishes schema-v2 JSON, Markdown, CSV, and Parquet
+   artifacts from a hidden sibling staging directory. It binds raw and semantic
+   gate hashes, canonicalizer version and excluded pointer, config hash,
+   manifest-set fingerprint, and selected-manifest JSONL hash/count. A final
+   input recheck, file and directory flush, and atomic rename are required;
+   failure or interruption removes staging and leaves no completed report.
+
+Production performs an exact count pass before its event pass so disk needs are
+known before full output generation. Runtime-dependent timings and free-space
+measurements are written to `observability.json` and excluded from the semantic
+result hash; deterministic counters and bounded-state high-water marks remain in
+the analysis result.
 
 ## Semantics that must not change
 
@@ -173,8 +226,8 @@ high-water marks. The analysis loader at `470042c` compares the complete saved
 report with a complete fresh report, so it cannot reproduce the new report
 without a versioned semantic contract.
 
-The integration patch must introduce a versioned canonicalizer, for example
-`phase10_semantic_gate_payload_v1(report)`, with these rules:
+The implementation uses the versioned
+`phase10_semantic_gate_payload_v1(report)` canonicalizer with these rules:
 
 1. Validate the complete saved JSON first, including duplicate-key rejection,
    finite numbers, gate schema, thresholds, and gate status. Strictly validate
@@ -206,11 +259,11 @@ evidence. A malformed or unknown `observability` schema fails validation before
 canonicalization; excluding it from semantic equality never means accepting it
 without validation.
 
-## Target bounded architecture
+## Bounded architecture contract
 
 ### 1. Immutable window descriptor
 
-Replace the production loader's full `LeadLagDataset` return value with a
+The production loader replaces the full `LeadLagDataset` return value with a
 small immutable descriptor containing:
 
 - root and requested window;
@@ -231,7 +284,7 @@ This requires artifact schema version 2.
 
 ### 2. Projected, hash-checked input
 
-Add or reuse a shared bounded lake iterator that:
+The shared bounded lake iterator:
 
 - prunes manifests by partition key and manifest `received_time` bounds;
 - reads only columns required for the selected record type;
@@ -376,6 +429,7 @@ controls such as:
 - maximum projected source rows per chunk;
 - maximum rows in one simultaneous batch;
 - maximum levels in one atomic L2 frame;
+- maximum aggregate L2 levels per chunk before pandas reconstruction;
 - maximum pending response states;
 - maximum pending execution states;
 - external-merge fan-in;
@@ -384,8 +438,25 @@ controls such as:
 - writer-buffer rows;
 - scratch-space low-watermark and reserve.
 
-Values must be chosen from synthetic stress measurements and documented before
-the real study. They must not be raised after inspecting economic results.
+The frozen `BOUNDED_STREAMING_V1` preregistration uses these limits:
+
+| Bound | Value |
+| --- | ---: |
+| retained rolling source rows | 100,000 |
+| one complete simultaneous batch | 25,000 rows |
+| one atomic L2 frame | 10,000 levels |
+| retained L2 state | 100,000 levels |
+| pending response states | 500,000 |
+| pending execution states | 1,000,000 |
+| external ordering fan-in | 32 |
+| exact-quantile sort run | 250,000 rows |
+| Parquet row group | 65,536 rows |
+| writer buffer | 16,384 rows |
+| scratch low-watermark | 4,000,000,000 bytes |
+| scratch reserve | 2,000,000,000 bytes |
+
+They are independent of the legacy pandas oracle limits and must not be raised
+after inspecting economic results.
 
 A preliminary streaming count pass should compute exact primary and reverse
 signal counts without retaining signals. It then reports:
@@ -421,6 +492,55 @@ value in the saved evidence file.
 
 No specific peak RSS may be claimed unless it is measured in a separate process
 with a stated platform, Python/Arrow versions, fixture shape, and sampler.
+
+## Measured bounded stress evidence
+
+The exact production-component stress command was:
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path 'src').Path
+& 'C:\Dev\hyperlab-phase12\.venv\Scripts\python.exe' `
+  'scripts\phase10_streaming_stress.py' `
+  --manifests 60001 `
+  --source-rows 2000000 `
+  --minimum-output-events 2000000 `
+  --writer-buffer-rows 16384 `
+  --quantile-run-rows 250000 `
+  --scratch-parent '.tmp'
+```
+
+It ran in a separate process on Windows 11 with Python 3.12.13, PyArrow 21.0.0,
+and `GetProcessMemoryInfo.PeakWorkingSetSize` as the RSS sampler. It used a lazy
+complete-received-time source for Binance USD-M and Hyperliquid BBO, L2, and
+trade observations for BTC and ETH. The real kernel processed 2,000,000 source
+rows in 31,250 complete batches and emitted 2,624,748 rows: 437,458 information,
+437,458 control, and 1,749,832 execution. Every emitted row passed through the
+disk EventSpool and fixed-schema Parquet writer. A separate exact configured
+grid exercised all assets, eight families, seven horizons, scenarios, maker and
+taker models, exact quantiles, and controls.
+
+Measured results:
+
+- peak RSS: 315,895,808 bytes (301.3 MiB);
+- scratch high-water: 11,127,138,981 bytes (10.36 GiB);
+- causal kernel plus event spool: 893.5733869 s;
+- full fixed-schema Parquet publication: 710.2055910 s;
+- exact configured-grid aggregate and Parquet pass: 1.6162266 s;
+- total: 1,605.4293692 s (26.76 min);
+- maximum complete source batch: 64 rows;
+- maximum retained source state: 336 rows;
+- maximum BBO history: 124 rows;
+- maximum public-trade history: 22 rows;
+- maximum trade-window state: 2 batches;
+- maximum L2 history: 124 frames / 496 levels;
+- maximum pending response / execution state: 332 / 832;
+- maximum sink/output buffer: 16,384 rows.
+
+A 200,064-source-row comparison run retained the same causal high-water values;
+therefore 10x duration increased disk volume and elapsed time without increasing
+retained causal state. Its measured peak RSS was 297,865,216 bytes. The lazy
+catalog test separately traverses 60,001 manifests without constructing a file
+list. Neither stress path accessed the Singapore capture.
 
 ## Required regression and stress tests
 
@@ -538,18 +658,35 @@ records the shared history and makes conflicts auditable.
 
 ## Validation commands
 
-Run from `C:\Dev\hyperlab-phase10-analysis` after implementation, using the
-repository environment and a repository-local temporary directory:
+The final validation was run from `C:\Dev\hyperlab-phase10-analysis` with
+`C:\Dev\hyperlab-phase12\.venv\Scripts\python.exe` because the analysis
+worktree's local environment was unavailable. `PYTHONPATH` was set to the
+resolved repository `src` directory and every pytest invocation used a
+repository-local temporary directory with the cache provider disabled.
 
-    python -m ruff check .
-    python -m mypy src/hyperlab
-    python -m pytest tests/test_lead_lag_lake.py tests/test_lead_lag_analysis.py tests/test_lead_lag_cli.py -p no:cacheprovider --basetemp .tmp/pytest-phase10-2-focused
-    python -m pytest -p no:cacheprovider --basetemp .tmp/pytest-phase10-2-full
-    git diff --check
+- `python -m ruff check .`: passed;
+- `python -m mypy src/hyperlab --no-incremental`: passed, 86 source files;
+- focused Phase 10-2 suite, covering gate, lake, store, kernel, execution,
+  aggregates, analysis, reporting, invariance, stress, pandas oracle, and CLI:
+  161 passed in 707.25 s;
+- full `python -m pytest`: 966 passed in 1,267.40 s;
+- five warnings came only from a pandas-oracle conversion that discards
+  nonzero nanoseconds; the production kernel-to-spool-to-Parquet seam has a
+  dedicated exact `+123 ns` regression;
+- final `git diff --check`: passed;
+- independent final read-only review: no blockers. It verified fail-closed gate
+  binding, bounded projected input and state, received-time causality, exact
+  controls and quantiles, fixed-schema atomic publication, unchanged legacy
+  limits, and diff confinement. Its residual notes are that the synthetic
+  stress separates the full 2,624,748-row kernel/spool/Parquet path from the
+  1,344-row exact configured aggregate grid, the 60,001-file test exercises a
+  lazy mocked catalog rather than 60,001 physical Parquet files, and measured
+  synthetic RSS is evidence rather than a guarantee for a real capture. Runtime
+  disk preflights and state caps remain fail-closed.
 
-Also run the dedicated lazy 60,000-file/million-row stress target and preserve
-its command, platform, elapsed time, internal high-water marks, scratch peak,
-and measured process peak RSS in the validation report.
+The dedicated 60,001-manifest and two-million-source-row stress command,
+platform, elapsed time, internal high-water marks, scratch peak, and measured
+process peak RSS are preserved in the measured evidence section above.
 
 Do not use the Singapore six-hour capture as a development or stress fixture.
 It may be analyzed only after the implementation, equivalence suite, full
@@ -573,9 +710,8 @@ of these are true:
 - no collector/runtime/storage/network/DNS/clock-policy or trading path was
   introduced.
 
-Until then, the exact operational status is:
-
-    BLOCKED_LARGE_DATASET_STREAMING_NOT_IMPLEMENTED
-
-There is intentionally no authorized `lead-lag-study` command for the real
-six-hour dataset at this stage.
+Every item above is now green. The six-hour Phase 10-2 study is authorized only
+after the capture is complete and immutable and an independently saved
+technical-gate PASS exists. The command itself revalidates that report, reruns
+the technical audit, compares the semantic gate, and rechecks immutable inputs
+before publication. Authorization is not an economic or profitability claim.

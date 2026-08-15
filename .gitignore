@@ -20,3 +20,5 @@ jjlab-hyperlab/data/*
 !jjlab-hyperlab/data/.gitkeep
 
 .pytest_tmp/
+.pytest-tmp-*/
+.tmp/

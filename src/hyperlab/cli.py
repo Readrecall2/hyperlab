@@ -135,6 +135,25 @@ def write_lead_lag_artifacts(
     return implementation(analysis, window, config, output)
 
 
+def run_bounded_lead_lag_study(
+    root: Path,
+    gate_report_path: Path,
+    config: object,
+    output: Path,
+) -> Mapping[str, Path]:
+    """Lazy production adapter; the pandas engine remains a fixture oracle only."""
+
+    from hyperlab.analysis.streaming import (
+        run_bounded_lead_lag_study as typed_implementation,
+    )
+
+    implementation = cast(
+        Callable[[Path, Path, object, Path], Mapping[str, Path]],
+        typed_implementation,
+    )
+    return implementation(root, gate_report_path, config, output)
+
+
 def _inside_path(root: Path, destination: Path) -> bool:
     resolved_root = root.resolve(strict=False)
     resolved_destination = destination.resolve(strict=False)
@@ -1284,11 +1303,12 @@ def lead_lag_study(
     try:
         _validate_lead_lag_output(root, output)
         config = load_lead_lag_config(config_path)
-        window = load_validated_lead_lag_window(root, gate_report)
-        dataset = window.dataset
-        intervals = window.intervals
-        analysis = analyze_lead_lag(dataset, intervals, config)
-        artifacts = write_lead_lag_artifacts(analysis, window, config, output)
+        artifacts = run_bounded_lead_lag_study(
+            root,
+            gate_report,
+            config,
+            output,
+        )
     except (FileExistsError, OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
 

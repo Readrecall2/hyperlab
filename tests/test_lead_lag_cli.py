@@ -107,18 +107,10 @@ def test_lead_lag_gate_failure_creates_no_output(
     monkeypatch.setattr(cli_module, "load_lead_lag_config", lambda _path: config)
     monkeypatch.setattr(
         cli_module,
-        "load_validated_lead_lag_window",
-        lambda _root, _gate: (_ for _ in ()).throw(ValueError("technical_capture_gate must PASS")),
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "analyze_lead_lag",
-        lambda *_args: pytest.fail("analysis must not run after a gate failure"),
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "write_lead_lag_artifacts",
-        lambda *_args: pytest.fail("artifacts must not be written after a gate failure"),
+        "run_bounded_lead_lag_study",
+        lambda *_args: (_ for _ in ()).throw(
+            ValueError("technical_capture_gate must PASS")
+        ),
     )
 
     result = runner.invoke(app, _arguments(root, gate_report, config_path, output))
@@ -129,17 +121,13 @@ def test_lead_lag_gate_failure_creates_no_output(
     assert not output.exists()
 
 
-def test_lead_lag_command_calls_validated_pipeline_in_order(
+def test_lead_lag_command_uses_bounded_pipeline_exclusively(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, gate_report, config_path = _input_paths(tmp_path)
     output = tmp_path / "report"
     config = object()
-    dataset = object()
-    intervals = (object(),)
-    window = SimpleNamespace(dataset=dataset, intervals=intervals)
-    analysis = object()
     calls: list[str] = []
 
     def load_config(path: Path) -> object:
@@ -147,41 +135,41 @@ def test_lead_lag_command_calls_validated_pipeline_in_order(
         calls.append("config")
         return config
 
-    def load_window(path: Path, gate: Path) -> object:
-        assert path == root
-        assert gate == gate_report
-        calls.append("gate_and_lake")
-        return window
-
-    def analyze(loaded_dataset: object, loaded_intervals: object, loaded_config: object) -> object:
-        assert loaded_dataset is dataset
-        assert loaded_intervals is intervals
-        assert loaded_config is config
-        calls.append("analysis")
-        return analysis
-
-    def write(
-        loaded_analysis: object,
-        loaded_window: object,
+    def bounded(
+        path: Path,
+        gate: Path,
         loaded_config: object,
         target: Path,
     ) -> dict[str, Path]:
-        assert loaded_analysis is analysis
-        assert loaded_window is window
+        assert path == root
+        assert gate == gate_report
         assert loaded_config is config
         assert target == output
-        calls.append("publication")
+        calls.append("bounded_gate_analysis_publication")
         return {"result": output / "result.json"}
 
     monkeypatch.setattr(cli_module, "load_lead_lag_config", load_config)
-    monkeypatch.setattr(cli_module, "load_validated_lead_lag_window", load_window)
-    monkeypatch.setattr(cli_module, "analyze_lead_lag", analyze)
-    monkeypatch.setattr(cli_module, "write_lead_lag_artifacts", write)
+    monkeypatch.setattr(cli_module, "run_bounded_lead_lag_study", bounded)
+    monkeypatch.setattr(
+        cli_module,
+        "load_validated_lead_lag_window",
+        lambda *_args: pytest.fail("production CLI must not invoke the pandas loader"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "analyze_lead_lag",
+        lambda *_args: pytest.fail("production CLI must not invoke the pandas oracle"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "write_lead_lag_artifacts",
+        lambda *_args: pytest.fail("production CLI must not invoke the v1 writer"),
+    )
 
     result = runner.invoke(app, _arguments(root, gate_report, config_path, output))
 
     assert result.exit_code == 0
-    assert calls == ["config", "gate_and_lake", "analysis", "publication"]
+    assert calls == ["config", "bounded_gate_analysis_publication"]
     assert "EVENT_REPLAY_RESEARCH_ONLY" in result.output
     assert "NOT_ADMISSIBLE" in result.output
 

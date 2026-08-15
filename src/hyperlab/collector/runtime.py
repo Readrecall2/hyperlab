@@ -1080,10 +1080,14 @@ class PublicCollector:
             perp_payload=raw_bootstrap.perp_payload,
             spot_payload=raw_bootstrap.spot_payload,
         )
-        yield from parse_bootstrap(
+        bootstrap_records = parse_bootstrap(
             bootstrap,
             connection_id=connection_id,
             connection_epoch=connection_epoch,
+        )
+        requested_assets = frozenset(self.config.assets)
+        yield from (
+            record for record in bootstrap_records if record.asset in requested_assets
         )
 
         start_ms = end_ms - history_hours * 3_600_000

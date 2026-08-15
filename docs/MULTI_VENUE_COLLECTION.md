@@ -100,6 +100,12 @@ cours et acceptées mais pas encore publiées. Une frame qui ne tient pas est
 refusée intégralement par une erreur fatale ; aucune capacité, aucun timeout et
 aucune politique de reconnexion n'ont été augmentés pour absorber un backlog.
 
+Ces réservations isolent la capacité mémoire de chaque venue, pas son temps de
+service disque. Le processus writer consomme une file globale FIFO et traite une
+commande ou une barrière à la fois. Une barrière longue bloque donc les commandes
+suivantes des deux venues : le writer partagé reste volontairement sérialisé et
+n’offre pas une équité temporelle générale entre venues.
+
 La disponibilité d'un auto-flush est maintenant calculée par groupe exact
 `(venue, record_type, asset, date UTC, stream)`, et non par la somme de tous les
 groupes clairsemés. Lorsqu'un groupe publiable atteint `batch_size`, seuls les
@@ -143,23 +149,88 @@ validation. La disponibilité par groupe exact coalesce ces mêmes lignes avant
 publication ; le critère recherché est un débit durable confortablement supérieur
 au pic Binance avec une résidence bornée, pas une file plus grande.
 
-Le stress de référence validé reproduit maintenant le chemin de production :
-452 frames Binance `depth20@100ms`, alternées BTC/ETH et cadencées à cinq fois
-le débit nominal, sont ingérées avec 452 trades Hyperliquid simultanés. Cinq
-lignes `clock_sync` valides sont ajoutées pendant le flux (RTT 80 ms,
-incertitude 40 ms, donc sous le seuil inchangé de 50 ms). Les barrières complètes
-FIFO sont demandées tous les 100 frames, soit toutes les cinq secondes au débit
-nominal, puis une barrière finale publie le reliquat.
+Le stress de référence validé reproduit maintenant le démarrage froid. Une
+réponse Hyperliquid explicitement synthétique et non économique contient 300
+perps et 250 spots, soit 1 100 lignes de métadonnées/contexte passées par les
+parseurs de production. Seules les quatre lignes BTC/ETH sont ensuite retenues,
+puis complétées par 206 lignes d’une heure de funding, candles, état/niveaux L2
+et BBO. Cette frame REST atomique de 210 lignes est immédiatement suivie de la
+barrière FIFO complète utilisée en production.
 
-Le résultat est 19 441 lignes Binance et 452 lignes Hyperliquid, soit 19 893
-lignes durables dans 71 partitions validées. Ces 71 partitions incluent
-explicitement le fan-out des barrières de durabilité et remplacent le résultat
-idéalisé antérieur sans barrières, qui n'est pas une référence de production.
+Pendant cette barrière, deux producteurs simultanés soumettent 452 frames
+Binance `depth20@100ms`, alternées BTC/ETH et cadencées à cinq fois le débit
+nominal, ainsi que 452 trades Hyperliquid. Cinq lignes `clock_sync` valides sont
+ajoutées pendant le flux (RTT 80 ms, incertitude 40 ms, donc sous le seuil
+inchangé de 50 ms). Les barrières complètes FIFO sont ensuite demandées tous les
+100 frames, soit toutes les cinq secondes au débit nominal, puis une barrière
+finale publie le reliquat.
+
+Le résultat est 19 441 lignes Binance et 662 lignes Hyperliquid, soit 20 103
+lignes durables dans 85 partitions validées, dont 14 pour le bootstrap demandé.
+Aucun actif Hyperliquid non configuré n’apparaît dans les manifestes. Ce test
+remplace la référence antérieure de 19 893 lignes/71 partitions, qui couvrait le
+flux soutenu et ses barrières mais pas la forme complète du démarrage REST.
 Les capacités restent 10 000 lignes par venue et 20 000 au total : zéro rejet
 de capacité sur les deux venues, high-water totale strictement inférieure à
 8 000, high-water Binance strictement inférieure à 7 000 et résidence maximale
 Binance strictement inférieure à 5 000 ms. Ces bornes sont des assertions du
 stress, pas une augmentation des caps ni un relâchement de la cadence FIFO.
+
+## Échec de démarrage du long run Singapore (2026-08-15)
+
+La première tentative réelle de six heures a échoué au démarrage. Malgré
+`--assets BTC,ETH`, le bootstrap Hyperliquid matérialisait alors tout l’univers
+perp et spot dans le lake : les métadonnées et contextes d’actifs sans rapport
+formaient environ un millier de partitions d’une ligne. Pendant la barrière de
+flush correspondante, le même writer FIFO ne pouvait pas servir Binance ;
+environ 9 120 lignes L2 Binance se sont accumulées et la high-water de la venue
+a atteint 9 981/10 000.
+
+Au point d’arrêt, le lake comptait 11 423 lignes et 1 165 partitions ; le flush
+le plus long atteignait environ 14 534 ms. Pour Binance, la résidence en file
+était d’environ 6 233 ms en médiane, 13 623 ms au p95 et 14 318 ms au p99, alors
+que les temps parent d’enqueue/add/write restaient inférieurs à environ 1,2 ms.
+Cette dissociation localise l’attente après admission, dans le service durable
+partagé, plutôt que dans la normalisation ou les files WebSocket.
+
+La cause est le fan-out inutile du bootstrap complet, amplifié par une barrière
+globale bloquante, et non une capacité trop faible à augmenter. La réponse
+Hyperliquid complète reste désormais récupérée et validée transitoirement, mais
+seules les lignes de métadonnées et de contexte dont l’identité API exacte est
+configurée sont persistées ; la même règle vaut pour chaque refresh périodique.
+Les caps 10 000/10 000, l’admission atomique des frames, les barrières FIFO, le
+root lock et tous les refus fail-closed restent inchangés.
+
+Le snapshot writer expose aussi des diagnostics versionnés regroupés par
+`(venue, asset, record_type)` : lignes enqueued/acknowledged/durables, fichiers
+produits, moyenne de lignes par fichier, contribution aux flushes et contribution
+pondérée à la résidence en file. Ces métriques attribuent le fan-out sans changer
+l’ordonnancement ni libérer de crédit avant durabilité.
+
+`acknowledged` compte toutes les lignes traitées par le processus enfant, y
+compris les doublons éliminés ; le compteur de doublons reste attribué à la venue
+seulement, pas à ces groupes. `flushes` compte les événements de flush ayant
+produit une sortie pour le groupe agrégé, et non les fichiers ni les partitions
+exactes par date UTC et `stream`.
+
+La résidence mesure l’intervalle entre l’enqueue parent et le dequeue enfant.
+Pour `frame_residence_ms`, `count`, `mean_ms`, `min_ms` et `max_ms` couvrent toute
+la durée du processus, tandis que p50/p95/p99 portent sur les 4 096 échantillons
+les plus récents du groupe. Une attribution finale n’est autoritative qu’après
+drainage (`outstanding_rows == 0`) avec `accounting_status == "exact"` ; un
+snapshot vivant reste intermédiaire et un statut `indeterminate` interdit cette
+lecture finale.
+
+La cardinalité cumulée des groupes diagnostiques est elle-même bornée à la
+`queue_capacity` globale et exposée par `capacity.max_groups`,
+`capacity.current_groups` et `capacity.rejections`. Une nouvelle clé qui
+dépasserait cette borne est refusée avant
+l’enqueue IPC, sans admission partielle. Cette borne mémoire ne relève ni les
+caps de lignes 10 000/20 000 ni leur crédit de durabilité.
+
+Aucun nouveau smoke Singapore réel n’a été exécuté dans cette tâche. Cet essai
+reste un échec de démarrage et la Phase 10 demeure
+`BLOCKED_PRECONDITION_NOT_MET` jusqu’à un nouveau run isolé et son audit complet.
 
 ## Diagnostic réseau REST Singapore (2026-08-14)
 
@@ -362,6 +433,10 @@ one-generation run does not lose its queue high-water evidence.
   for sort, Arrow, analysis, Parquet write/hash/fsync/publication, directory fsync,
   immediate validation, and SQLite commit. `storage.coalescing` exposes le nombre
   de groupes en attente/prêts et la taille maximale d'un groupe exact.
+  `group_diagnostics`, aux dimensions versionnées
+  `(venue, asset, record_type)`, attribue les lignes admises, acquittées et
+  durables, les fichiers et contributions de flush, ainsi que la résidence en
+  file par frame et pondérée par ligne.
 - `reconnect_reasons_by_generation` distinguishes the initiating socket role,
   collateral closes, exact exception/reason, queue/writer/clock state, and whether
   a reconnect was attempted. The continuity report persists corresponding
@@ -556,10 +631,51 @@ if ($AuditExit -ne 0) {
 }
 ```
 
-Cette commande n'inventorie que la nouvelle racine. Sur `data\lake`, les bornes
-`--start` / `--end` sont exactes mais l'implémentation actuelle inventorie encore
-toutes les partitions requises avant de filtrer les lignes ; elle n'est donc pas
-un fast path physique pour le lake historique.
+Cette commande valide séquentiellement chaque manifeste et fichier de la racine.
+La validation de hash, schéma et statistiques matérialise au plus un fichier
+immuable complet à la fois ; la mémoire dépend donc du plus gros fichier, jamais
+de la taille totale du lake. Un second passage projeté vérifie sur disque les clés
+primaires, métadonnées L2 et cadences inter-fichiers. Les bornes `received_time`
+déjà vérifiées élaguent ensuite les colonnes Phase 10 inutiles. Les jointures et
+tris chronologiques utilisent un scratch SQLite hors du lake avec cache de 32 MiB
+et `mmap` nul. Les mutations scratch sont validées au plus tard après 8 192
+opérations afin que SQLite les évacue réellement sur disque au lieu de conserver
+une transaction de taille lake. Aucune population complète du dataset ni liste complète de
+manifestes n'est conservée en RAM ; le scratch disque, lui, croît avec les lignes
+et les fichiers validés.
+
+Sans variable explicite, le scratch éphémère est créé à côté de la racine du lake,
+donc sur le même stockage et hors du lake. Sur un VPS, choisissez de préférence un
+répertoire sur disque local suffisamment dimensionné, hors du lake et non monté en
+`tmpfs` :
+
+```powershell
+New-Item -ItemType Directory -Force C:\hyperlab-audit-scratch | Out-Null
+$env:HYPERLAB_CONTINUITY_SCRATCH = "C:\hyperlab-audit-scratch"
+```
+
+Le bloc Linux ci-dessous fixe aussi `SQLITE_TMPDIR` sur ce même disque afin que
+les tris temporaires SQLite n'utilisent pas un éventuel `/tmp` en mémoire. Le
+champ `peak_scratch_bytes` mesure le fichier de spool persistant et ses index ;
+les fichiers temporaires de tri peuvent disparaître avant l'échantillonnage.
+
+Le bloc JSON additif `observability` rapporte les fichiers validés/sélectionnés,
+les lignes validées/scannées, les bornes internes mesurables, le pic du scratch et
+les temps par phase. Le bloc entier est explicitement non sémantique et ne
+participe jamais au gate ; les compteurs déterministes restent vérifiables comme
+télémétrie de l'exécution.
+
+Mesure synthétique locale du 15 août 2026, Windows/Python 3.12.13 : le processus
+pytest combinant 60 001 manifestes virtuels consommés paresseusement,
+1 000 001 clés d'intégrité spoulées et 5 000 001 timestamps continus a terminé en
+47,548 s avec un pic `PeakWorkingSetSize` de 151 785 472 octets. Le test minimal
+chargeant le même harnais pytest/Arrow/Pandas atteignait 114 618 368 octets. Le
+spool isolé d'un million de clés a occupé 28 893 184 octets persistants, avec
+1 024 clés Python au plus par batch, 8 198 opérations non commitées au pic et
+122 commits. Ces formes testent séparément les bornes critiques ; elles ne sont
+pas un replay Parquet de plusieurs millions de lignes. Ce résultat Windows ne
+constitue ni une mesure RSS Linux, ni une certification de durée ou de scratch
+pour le lake Singapore réel.
 
 Les critères de PASS sont cumulatifs et exacts :
 
@@ -630,17 +746,77 @@ Ne lancez pas `collect` ou `collect-reference` en parallèle de cette commande
 sur le même `data/lake`. Leur erreur `active writer` est le comportement
 fail-closed attendu.
 
-Après l'arrêt propre, validez et inventoriez les artefacts avant toute Phase 10 :
+Après l'arrêt propre, exécutez directement l'audit borné avec les bornes UTC
+exactes et indépendamment enregistrées de la capture. Sur le VPS Linux, remplacez
+les six valeurs entre chevrons ci-dessous ; ne déduisez pas les bornes des
+lignes observées :
 
-```powershell
-.\.venv\Scripts\python.exe -m hyperlab data validate data\lake --json
-.\.venv\Scripts\python.exe -m hyperlab data inventory data\lake --json
+```bash
+set -euo pipefail
+
+REPO_ROOT='<absolute-hyperlab-repository-path>'
+CAPTURE_ROOT='<absolute-completed-lake-path>'
+CAPTURE_START_UTC='<exact-recorded-start-ISO8601-Z>'
+CAPTURE_END_UTC='<exact-recorded-end-ISO8601-Z>'
+AUDIT_SCRATCH='<absolute-local-disk-scratch-path-outside-lake>'
+REPORT_DIR='<absolute-report-directory-outside-lake>'
+
+mkdir -p -- "$AUDIT_SCRATCH" "$REPORT_DIR"
+SCRATCH_FS="$(findmnt -n -o FSTYPE --target "$AUDIT_SCRATCH")"
+if [[ "$SCRATCH_FS" == 'tmpfs' || "$SCRATCH_FS" == 'ramfs' ]]; then
+  echo "Audit scratch must be disk-backed, not $SCRATCH_FS" >&2
+  exit 1
+fi
+df -h -- "$AUDIT_SCRATCH"
+export HYPERLAB_CONTINUITY_SCRATCH="$AUDIT_SCRATCH"
+export SQLITE_TMPDIR="$AUDIT_SCRATCH"
+REPORT_PATH="$REPORT_DIR/phase10-continuity.json"
+if [[ -e "$REPORT_PATH" ]]; then
+  echo "Refusing to overwrite existing gate report: $REPORT_PATH" >&2
+  exit 1
+fi
+REPORT_TMP="$(mktemp "$REPORT_DIR/.phase10-continuity.XXXXXX")"
+trap 'rm -f -- "$REPORT_TMP"' EXIT
+
+cd -- "$REPO_ROOT"
+set +e
+.venv/bin/python -m hyperlab data continuity "$CAPTURE_ROOT" \
+  --assets 'BTC,ETH' \
+  --start "$CAPTURE_START_UTC" \
+  --end "$CAPTURE_END_UTC" \
+  --json | tee "$REPORT_TMP"
+PIPE_STATUS=("${PIPESTATUS[@]}")
+set -e
+
+if (( PIPE_STATUS[1] != 0 )); then
+  rm -f -- "$REPORT_TMP"
+  echo 'Could not persist the Phase 10 report' >&2
+  exit "${PIPE_STATUS[1]}"
+fi
+if ! .venv/bin/python -m json.tool "$REPORT_TMP" >/dev/null; then
+  rm -f -- "$REPORT_TMP"
+  echo 'Continuity exited without a valid JSON gate report' >&2
+  JSON_EXIT="${PIPE_STATUS[0]}"
+  if (( JSON_EXIT == 0 )); then JSON_EXIT=2; fi
+  exit "$JSON_EXIT"
+fi
+mv -- "$REPORT_TMP" "$REPORT_PATH"
+trap - EXIT
+if (( PIPE_STATUS[0] != 0 )); then
+  echo "Phase 10 technical capture gate failed; report: $REPORT_PATH" >&2
+  exit "${PIPE_STATUS[0]}"
+fi
+echo "Phase 10 technical capture gate PASS; report: $REPORT_PATH"
 ```
 
-Exécutez ensuite `data continuity` avec les bornes UTC de cette collecte. Une
-capture de vingt-quatre heures et un audit technique réussi ne constituent pas
-une preuve de représentativité économique, de latence stable ou de rentabilité,
-et ne débloquent pas à eux seuls la Phase 10.
+La commande générale `data inventory` conserve encore son audit inter-segments
+historique non borné et ne doit pas être lancée sur la capture 60k+ fichiers tant
+qu'elle n'a pas reçu le même durcissement. Ce blocage n'affaiblit pas le gate
+Phase 10 : `data continuity` vérifie sur disque les unicités/métadonnées globales,
+recalcule les cadences inter-fichiers et les gaps wire/trade de la fenêtre exacte,
+et reste fail-closed. Une capture de vingt-quatre heures et un audit technique
+réussi ne constituent pas une preuve de représentativité économique, de latence
+stable ou de rentabilité, et ne débloquent pas à eux seuls la Phase 10.
 
 ## Limites explicites
 

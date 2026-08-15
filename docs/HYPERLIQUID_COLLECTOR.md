@@ -72,6 +72,15 @@ et les marchés spot conservent leur identifiant source, par exemple
 `PURR/USDC` ou `@107`. Une absence ou une ambiguïté provoque une erreur visible ;
 aucune valeur de prix ou de volume n’est inventée.
 
+Les deux endpoints de métadonnées renvoient l’univers public complet. Cette
+réponse complète reste transitoirement en mémoire et passe intégralement par la
+validation du parseur, notamment les alignements perp, les tables de tokens spot
+et les identifiants API. La sélection intervient seulement ensuite, avant le
+sink : seules les lignes `instrument_metadata` et `market_context` dont
+`asset` correspond exactement à un actif configuré sont persistées. Il n’existe
+aucun alias implicite : `BTC` et `ETH` désignent ici leurs coins perp, tandis
+qu’un spot encodé reste par exemple `@107`, avec son index source inchangé.
+
 ### 2. Abonnements WebSocket
 
 Pour chaque actif, les abonnements publics sont :
@@ -111,6 +120,12 @@ fusionné dans le sink que lorsqu’il est disponible. Le refresh périodique
 n’ajoute pas un second snapshot L2, déjà couvert par le flux WebSocket. Une
 erreur REST reste visible dans `runtime_status.json` et produit un gap
 `coverage_unknown`; elle n’est jamais masquée comme une collecte complète.
+
+Le refresh conserve la même frontière que le bootstrap initial : l’univers de
+métadonnées est récupéré et validé en entier de façon transitoire, puis seules
+les métadonnées et contextes des actifs configurés exactement sont proposés au
+sink. Les historiques de funding, candles et états L2 restent, comme auparavant,
+interrogés uniquement pour les actifs demandés.
 
 La déduplication persistante supprime les observations historiques strictement
 identiques entre bootstrap, resynchronisation, refresh et redémarrage, tout en

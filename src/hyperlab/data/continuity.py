@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 
+import pyarrow as pa
+
+from hyperlab.data.continuity_store import (
+    BoundedRowStore,
+    SpilledSequence,
+    SpilledTimestampSeries,
+    StreamingMetrics,
+    configured_scratch_parent,
+)
 from hyperlab.data.lake import (
     Gap,
     InventoryReport,
     PartitionKey,
-    inventory_partitions,
-    read_hashed_table,
+    PartitionManifest,
+    PartitionValidationError,
+    iter_hashed_batches,
+    validate_partition,
 )
-from hyperlab.data.schema import RecordType
+from hyperlab.data.schema import BREAKING_SCHEMA_TRANSITIONS, RecordType, schema_for
 
 PHASE_10_STATUS = "BLOCKED_PRECONDITION_NOT_MET"
 BINANCE = "binance_usdm"
@@ -40,6 +53,38 @@ _REQUIRED_TYPES = frozenset(
     }
 )
 _FAIL_CLOSED_EVENTS = frozenset({"disconnect", "gap"})
+_CANONICAL_PARQUET = re.compile(r"^part-[0-9a-f]{64}\.parquet$")
+_CANONICAL_MANIFEST = re.compile(r"^part-[0-9a-f]{64}\.manifest\.json$")
+_FUNDING_BUCKET_TOLERANCE_NS = 60 * 1_000_000_000
+_L2_INTEGRITY_METADATA = {
+    RecordType.L2_SNAPSHOT: (
+        "snapshot_id",
+        (
+            "book_epoch_id",
+            "connection_id",
+            "last_sequence",
+            "event_time",
+            "exchange_time",
+            "received_time",
+            "source_sequence",
+        ),
+        "snapshot",
+    ),
+    RecordType.L2_DELTA: (
+        "update_id",
+        (
+            "book_epoch_id",
+            "connection_id",
+            "first_sequence",
+            "last_sequence",
+            "event_time",
+            "exchange_time",
+            "received_time",
+            "source_sequence",
+        ),
+        "delta",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -64,13 +109,11 @@ class Interval:
 @dataclass(frozen=True, slots=True)
 class _LoadedLake:
     inventory: InventoryReport
-    rows: Mapping[tuple[str, RecordType, str], tuple[dict[str, object], ...]]
-    boundary_rows: Mapping[
-        tuple[str, RecordType, str],
-        tuple[dict[str, object], ...],
-    ]
-    clock_cadence_successors: tuple[dict[str, object], ...]
+    inventory_partition_count: int
+    store: BoundedRowStore
     wire_identities: frozenset[tuple[str, str, int, str]]
+    relevant_gaps: SpilledSequence[tuple[str, Gap, bool]]
+    metrics: StreamingMetrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,11 +203,7 @@ def _merge(intervals: Iterable[Interval], *, preserve_tags: bool = True) -> tupl
     )
     merged: list[Interval] = []
     for item in ordered:
-        if (
-            merged
-            and (not preserve_tags or merged[-1].tag == item.tag)
-            and item.start <= merged[-1].end
-        ):
+        if merged and (not preserve_tags or merged[-1].tag == item.tag) and item.start <= merged[-1].end:
             previous = merged[-1]
             merged[-1] = Interval(
                 previous.start,
@@ -257,23 +296,284 @@ def _row_in_window(row: Mapping[str, object], start: datetime, end: datetime) ->
     return isinstance(value, datetime) and start <= _utc(value) < end
 
 
-def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
-    # Inventory is deliberately first: it retains every existing validation.
-    inventory = inventory_partitions(root)
-    rows: dict[tuple[str, RecordType, str], list[dict[str, object]]] = defaultdict(list)
-    predecessors: dict[
-        tuple[object, ...],
-        tuple[tuple[str, RecordType, str], dict[str, object]],
-    ] = {}
-    successors: dict[
-        tuple[object, ...],
-        tuple[tuple[str, RecordType, str], dict[str, object]],
-    ] = {}
-    clock_cadence_successors: dict[
-        tuple[object, ...],
-        tuple[tuple[str, RecordType, str], dict[str, object]],
-    ] = {}
+def _schema_compatibility_family(record_type: RecordType, version: int) -> int:
+    breaking_candidates = [
+        candidate
+        for (transition_type, _previous, candidate) in BREAKING_SCHEMA_TRANSITIONS
+        if transition_type == record_type and candidate <= version
+    ]
+    return max(breaking_candidates, default=1)
+
+
+def _normalized_integrity_order(
+    row: Mapping[str, object],
+    columns: Sequence[str],
+) -> tuple[tuple[int, object], ...]:
+    return tuple((1, "") if row.get(column) is None else (0, row[column]) for column in columns)
+
+
+def _timestamp_iso_ns(epoch_ns: int) -> str:
+    seconds, nanoseconds = divmod(epoch_ns, 1_000_000_000)
+    base = datetime.fromtimestamp(seconds, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    return f"{base}.{nanoseconds:09d}Z"
+
+
+def _funding_bucket(epoch_ns: int, interval_ns: int) -> int:
+    tolerance_ns = min(
+        _FUNDING_BUCKET_TOLERANCE_NS,
+        max(interval_ns // 2 - 1, 0),
+    )
+    return (epoch_ns + tolerance_ns) // interval_ns
+
+
+def _gap_is_relevant(
+    key: PartitionKey,
+    gap: Gap,
+    assets: frozenset[str],
+    start: datetime,
+    end: datetime,
+) -> bool:
+    allowed_assets = {*assets, "GLOBAL", "CONNECTION"}
+    first_date = start.date()
+    last_date = (end - timedelta(microseconds=1)).date()
+    key_date = key.date if isinstance(key.date, datetime) else datetime.fromisoformat(str(key.date)).date()
+    if (
+        key.venue not in {BINANCE, HYPERLIQUID}
+        or key.record_type not in _REQUIRED_TYPES
+        or key.asset not in allowed_assets
+        or not first_date <= key_date <= last_date
+        or gap.kind not in {"time", "funding_bucket"}
+    ):
+        return False
+    try:
+        left = _utc(datetime.fromisoformat(gap.start.replace("Z", "+00:00")))
+        right = _utc(datetime.fromisoformat(gap.end.replace("Z", "+00:00")))
+    except ValueError:
+        return False
+    return left < end and right > start
+
+
+def _batch_timestamp_ns(batch: pa.RecordBatch, column: str) -> list[int]:
+    index = batch.schema.get_field_index(column)
+    if index < 0:
+        raise ValueError(f"continuity integrity scan requires {column}")
+    values = batch.column(index).cast(pa.int64()).to_pylist()
+    if any(value is None for value in values):
+        raise ValueError(f"continuity integrity scan found null {column}")
+    return [int(value) for value in values]
+
+
+_PROJECTED_ROW_COLUMNS = frozenset(
+    {
+        "schema_version",
+        "record_type",
+        "venue",
+        "asset",
+        "event_time",
+        "exchange_time",
+        "received_time",
+        "source_sequence",
+        "connection_id",
+        "connection_epoch",
+        "capture_epoch_id",
+        "message_asset",
+        "channel",
+        "raw_message",
+        "arrival_sequence",
+        "snapshot_id",
+        "book_epoch_id",
+        "first_sequence",
+        "last_sequence",
+        "bid_level_count",
+        "ask_level_count",
+        "side",
+        "level",
+        "price",
+        "quantity",
+        "order_count",
+        "bid_price",
+        "bid_quantity",
+        "ask_price",
+        "ask_quantity",
+        "update_id",
+        "trade_id",
+        "quote_quantity",
+        "aggressor_side",
+        "is_liquidation",
+        "event_kind",
+        "socket_role",
+        "reason",
+        "resync_snapshot_id",
+        "observation_id",
+        "request_sent_time",
+        "response_received_time",
+        "round_trip_latency_ms",
+        "estimated_clock_drift_ms",
+        "drift_uncertainty_ms",
+        "causal_valid_from",
+        "causal_valid_until",
+        "sample_status",
+        "invalid_reason",
+        "sampling_interval_ms",
+        "max_age_ms",
+        "max_uncertainty_ms",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundaryCandidate:
+    map_key: tuple[str, RecordType, str]
+    row: dict[str, object]
+    manifest_order: int
+    row_order: int
+    columns: tuple[str, ...]
+
+
+def _manifest_received_bounds(
+    manifest: PartitionManifest,
+) -> tuple[datetime | None, datetime | None]:
+    bounds = manifest.timestamp_bounds.get("received_time", {})
+
+    def parse(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        return _utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+    return parse(bounds.get("min")), parse(bounds.get("max"))
+
+
+def _manifest_needed_for_scan(
+    manifest: PartitionManifest,
+    assets: frozenset[str],
+    start: datetime,
+    end: datetime,
+) -> bool:
+    key = manifest.partition
+    record_type = RecordType(key.record_type)
+    if key.venue not in {BINANCE, HYPERLIQUID} or record_type not in _REQUIRED_TYPES:
+        return False
+    if (
+        record_type
+        in {
+            RecordType.BBO,
+            RecordType.L2_BOOK_STATE,
+            RecordType.L2_SNAPSHOT,
+            RecordType.TRADE,
+        }
+        and key.asset not in assets
+    ):
+        return False
+    minimum, maximum = _manifest_received_bounds(manifest)
+    if record_type in {
+        RecordType.BBO,
+        RecordType.L2_BOOK_STATE,
+        RecordType.L2_SNAPSHOT,
+    }:
+        return not ((maximum is not None and maximum < start) or (minimum is not None and minimum >= end))
+    if record_type == RecordType.CONNECTION_EVENT:
+        return minimum is None or minimum < end
+    # Wire/trade need exact predecessor and successor rows. Clock cadence also
+    # admits a request sent before end whose response arrives after end.
+    return True
+
+
+def _discover_partition_paths_bounded(
+    root: Path,
+    store: BoundedRowStore,
+) -> Iterator[Path]:
+    if not root.exists():
+        store.metrics.manifest_files_discovered = 0
+        return
+    canonical_root = root.resolve()
+    scratch = store.directory.resolve()
+    try:
+        scratch.relative_to(canonical_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("continuity scratch directory must be outside the immutable lake")
+    pending: list[tuple[str, str, str]] = []
+    first_outside: str | None = None
+    first_noncanonical_parquet: str | None = None
+    first_noncanonical_manifest: str | None = None
+    for artifact in root.rglob("*"):
+        relative = artifact.relative_to(root).as_posix()
+        try:
+            artifact.resolve().relative_to(canonical_root)
+        except ValueError:
+            if first_outside is None or relative < first_outside:
+                first_outside = relative
+        name = artifact.name
+        kind: str | None = None
+        stem: str | None = None
+        if name.endswith(".parquet"):
+            if _CANONICAL_PARQUET.fullmatch(name) is None:
+                if first_noncanonical_parquet is None or relative < first_noncanonical_parquet:
+                    first_noncanonical_parquet = relative
+                continue
+            kind = "parquet"
+            stem = name.removesuffix(".parquet")
+        elif name.endswith(".manifest.json"):
+            if _CANONICAL_MANIFEST.fullmatch(name) is None:
+                if first_noncanonical_manifest is None or relative < first_noncanonical_manifest:
+                    first_noncanonical_manifest = relative
+                continue
+            kind = "manifest"
+            stem = name.removesuffix(".manifest.json")
+        if kind is None or stem is None:
+            continue
+        parent = Path(relative).parent.as_posix()
+        pending.append((relative, f"{parent}/{stem}", kind))
+        if len(pending) >= 512:
+            store.add_artifacts(pending)
+            pending.clear()
+    if pending:
+        store.add_artifacts(pending)
+    if first_outside is not None:
+        raise PartitionValidationError(
+            f"discovered artifact resolves outside data lake root: {first_outside}"
+        )
+    if first_noncanonical_parquet is not None:
+        raise PartitionValidationError(f"non-canonical Parquet file: {first_noncanonical_parquet}")
+    if first_noncanonical_manifest is not None:
+        raise PartitionValidationError(f"non-canonical manifest file: {first_noncanonical_manifest}")
+    orphan = store.orphan_parquet_path()
+    if orphan is not None:
+        raise PartitionValidationError(f"orphan Parquet without manifest: {orphan}")
+    store.metrics.manifest_files_discovered = store.manifest_artifact_count()
+    for relative in store.iter_manifest_relative_paths():
+        yield root / Path(relative)
+
+
+def _load_lake(
+    root: Path,
+    start: datetime,
+    end: datetime,
+    assets: Sequence[str],
+) -> _LoadedLake:
+    metrics = StreamingMetrics()
+    canonical_root = root.resolve()
+    configured_parent = configured_scratch_parent()
+    if configured_parent is not None:
+        try:
+            configured_parent.relative_to(canonical_root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("HYPERLAB_CONTINUITY_SCRATCH must be outside the immutable lake")
+    scratch_parent = canonical_root.parent if configured_parent is None else configured_parent
+    store = BoundedRowStore(
+        metrics,
+        scratch_parent=scratch_parent,
+    )
+    predecessors: dict[tuple[object, ...], _BoundaryCandidate] = {}
+    successors: dict[tuple[object, ...], _BoundaryCandidate] = {}
+    clock_cadence_successors: dict[tuple[object, ...], _BoundaryCandidate] = {}
     wire_identities: set[tuple[str, str, int, str]] = set()
+    relevant_gap_rows: SpilledSequence[tuple[str, Gap, bool]] = store.new_sequence()
+    total_rows = 0
+    selected_assets = frozenset(assets)
 
     def boundary_identity(
         venue: str,
@@ -323,172 +623,407 @@ def _load_lake(root: Path, start: datetime, end: datetime) -> _LoadedLake:
         return None
 
     def retain_boundary(
-        candidates: dict[
-            tuple[object, ...],
-            tuple[tuple[str, RecordType, str], dict[str, object]],
-        ],
+        candidates: dict[tuple[object, ...], _BoundaryCandidate],
         token: tuple[object, ...],
         map_key: tuple[str, RecordType, str],
         row: dict[str, object],
+        manifest_order: int,
+        row_order: int,
+        columns: tuple[str, ...],
         *,
         keep_latest: bool,
     ) -> None:
         previous = candidates.get(token)
         if previous is None:
-            candidates[token] = (map_key, row)
+            candidates[token] = _BoundaryCandidate(
+                map_key,
+                row,
+                manifest_order,
+                row_order,
+                columns,
+            )
             return
         previous_time = _timestamp(
-            previous[1]["received_time"],
+            previous.row["received_time"],
             label="boundary received_time",
         )
         current_time = _timestamp(row["received_time"], label="boundary received_time")
         if (keep_latest and current_time > previous_time) or (
             not keep_latest and current_time < previous_time
         ):
-            candidates[token] = (map_key, row)
+            candidates[token] = _BoundaryCandidate(
+                map_key,
+                row,
+                manifest_order,
+                row_order,
+                columns,
+            )
 
-    for manifest in inventory.partitions:
-        raw_record_type = manifest.partition.record_type
-        record_type = (
-            raw_record_type
-            if isinstance(raw_record_type, RecordType)
-            else RecordType(raw_record_type)
-        )
-        if record_type not in _REQUIRED_TYPES:
-            continue
-        for raw_row in read_hashed_table(root, manifest).to_pylist():
-            row = {str(name): value for name, value in raw_row.items()}
-            received = _timestamp(row["received_time"], label="received_time")
-            venue = manifest.partition.venue
-            asset = manifest.partition.asset
-            map_key = (venue, record_type, asset)
-            if (
-                record_type == RecordType.WIRE_MESSAGE
-                and int(str(row.get("schema_version", 0))) >= 2
-                and received < end
-                and isinstance(row.get("connection_id"), str)
-                and row.get("connection_epoch") is not None
-                and isinstance(row.get("capture_epoch_id"), str)
-                and str(row["capture_epoch_id"])
+    validation_elapsed = 0.0
+    scan_elapsed = 0.0
+    try:
+        paths = _discover_partition_paths_bounded(root, store)
+        for manifest_order, path in enumerate(paths):
+            validation_started = time.perf_counter()
+            manifest = validate_partition(path)
+            validation_elapsed += time.perf_counter() - validation_started
+            expected_manifest_path = (canonical_root / manifest.relative_manifest_path).resolve()
+            if path.resolve() != expected_manifest_path:
+                raise PartitionValidationError(
+                    f"manifest is outside canonical root layout: {path.relative_to(root).as_posix()}"
+                )
+            metrics.manifest_files_validated += 1
+            metrics.max_file_rows = max(metrics.max_file_rows, manifest.row_count)
+            metrics.max_file_size_bytes = max(
+                metrics.max_file_size_bytes,
+                manifest.size_bytes,
+            )
+            total_rows += manifest.row_count
+            metrics.rows_validated += manifest.row_count
+            key = manifest.partition
+            record_type = RecordType(key.record_type)
+            for gap in manifest.gaps:
+                if _gap_is_relevant(key, gap, selected_assets, start, end):
+                    relevant_gap_rows.append((key.relative_path.as_posix(), gap, False))
+
+            spec = schema_for(record_type, manifest.schema_version)
+            compatibility_family = _schema_compatibility_family(
+                record_type,
+                manifest.schema_version,
+            )
+            dataset_id = store.integrity_dataset_id(
+                key.venue,
+                key.asset,
+                record_type.value,
+                compatibility_family,
+            )
+            stream_id, cadence_consistent = store.integrity_stream_id(
+                key.venue,
+                key.asset,
+                record_type.value,
+                compatibility_family,
+                manifest.stream_key,
+                manifest.expected_interval_ns,
+            )
+            if not cadence_consistent:
+                raise PartitionValidationError(
+                    f"inconsistent gap cadence in stream: {key.venue}/{key.asset}/{record_type.value}"
+                )
+
+            semantic_selected = _manifest_needed_for_scan(
+                manifest,
+                selected_assets,
+                start,
+                end,
+            )
+            if semantic_selected:
+                metrics.manifest_files_selected += 1
+            else:
+                metrics.manifest_files_pruned += 1
+
+            metrics.parquet_file_scan_operations += 1
+            metrics.unique_parquet_files_scanned += 1
+            phase_schema_names = tuple(
+                name for name in manifest.null_counts if name in _PROJECTED_ROW_COLUMNS
+            )
+            if semantic_selected and "received_time" not in phase_schema_names:
+                raise ValueError("continuity projected scan requires received_time")
+
+            integrity_columns = set(spec.primary_key)
+            l2_definition = _L2_INTEGRITY_METADATA.get(record_type)
+            if l2_definition is not None:
+                integrity_columns.add(l2_definition[0])
+                integrity_columns.update(l2_definition[1])
+            cadence_selected = (
+                manifest.expected_interval_ns is not None
+                and key.venue in {BINANCE, HYPERLIQUID}
+                and record_type in _REQUIRED_TYPES
+                and key.asset in {*selected_assets, "GLOBAL", "CONNECTION"}
+            )
+            if cadence_selected:
+                integrity_columns.update(spec.order_key)
+                integrity_columns.add("funding_time" if record_type == RecordType.FUNDING else "event_time")
+            selected_columns = integrity_columns | (set(phase_schema_names) if semantic_selected else set())
+            scan_schema_names = tuple(name for name in manifest.null_counts if name in selected_columns)
+            missing_columns = selected_columns - set(scan_schema_names)
+            if missing_columns:
+                raise ValueError(
+                    "continuity integrity scan is missing columns: " + ",".join(sorted(missing_columns))
+                )
+            row_cursor = 0
+            scan_started = time.perf_counter()
+            for batch in iter_hashed_batches(
+                root,
+                manifest,
+                columns=scan_schema_names,
             ):
-                wire_identities.add(
-                    (
-                        venue,
-                        str(row["connection_id"]),
-                        int(str(row["connection_epoch"])),
-                        str(row["capture_epoch_id"]),
+                batch_rows = batch.to_pylist()
+                metrics.observe_batch(
+                    record_type,
+                    len(batch_rows),
+                    semantic_scan=semantic_selected,
+                )
+                primary_keys = [tuple(row.get(name) for name in spec.primary_key) for row in batch_rows]
+                if not store.add_integrity_primary_keys(dataset_id, primary_keys):
+                    raise PartitionValidationError("duplicate primary keys: 1")
+                if l2_definition is not None:
+                    identifier_name, metadata_names, label = l2_definition
+                    metadata_by_identifier: dict[str, tuple[object, ...]] = {}
+                    for row in batch_rows:
+                        identifier = str(row[identifier_name])
+                        metadata = tuple(row.get(name) for name in metadata_names)
+                        previous_metadata = metadata_by_identifier.setdefault(
+                            identifier,
+                            metadata,
+                        )
+                        if previous_metadata != metadata:
+                            raise PartitionValidationError(
+                                f"inconsistent L2 {label} metadata for "
+                                f"{identifier_name} {identifier!r} across partitions"
+                            )
+                    conflict = store.add_integrity_l2_metadata(
+                        dataset_id,
+                        metadata_by_identifier,
                     )
-                )
-            include = _row_in_window(row, start, end)
-            if record_type == RecordType.CLOCK_SYNC and manifest.schema_version >= 2:
-                valid_from = row.get("causal_valid_from")
-                valid_until = row.get("causal_valid_until")
-                include = include or (
-                    isinstance(valid_from, datetime)
-                    and isinstance(valid_until, datetime)
-                    and _utc(valid_from) < end
-                    and _utc(valid_until) > start
-                )
-            if include:
-                rows[map_key].append(row)
-                continue
-            token = boundary_identity(venue, record_type, asset, row)
-            if token is None:
-                continue
-            if received < start:
-                if record_type == RecordType.CLOCK_SYNC:
-                    if row.get("sample_status") == "valid":
-                        continue
-                    if received < start - timedelta(
-                        milliseconds=MAX_CLOCK_AGE_MS
+                    if conflict is not None:
+                        raise PartitionValidationError(
+                            f"inconsistent L2 {label} metadata for "
+                            f"{identifier_name} {conflict!r} across partitions"
+                        )
+                if cadence_selected:
+                    timestamp_name = "funding_time" if record_type == RecordType.FUNDING else "event_time"
+                    cadence_values = _batch_timestamp_ns(batch, timestamp_name)
+                    store.add_integrity_cadence_rows(
+                        stream_id,
+                        [
+                            (
+                                _normalized_integrity_order(row, spec.order_key),
+                                manifest_order,
+                                row_cursor + offset,
+                                cadence_values[offset],
+                                manifest.data_file,
+                                key.relative_path.as_posix(),
+                            )
+                            for offset, row in enumerate(batch_rows)
+                        ],
+                    )
+                if not semantic_selected:
+                    row_cursor += len(batch_rows)
+                    del batch_rows
+                    continue
+                in_window_rows: list[dict[str, object]] = []
+                in_window_orders: list[int] = []
+                for offset, raw_row in enumerate(batch_rows):
+                    row_order = row_cursor + offset
+                    row = {name: raw_row.get(name) for name in phase_schema_names}
+                    received = _timestamp(row["received_time"], label="received_time")
+                    venue = key.venue
+                    asset = key.asset
+                    map_key = (venue, record_type, asset)
+                    if (
+                        record_type == RecordType.WIRE_MESSAGE
+                        and int(str(row.get("schema_version", 0))) >= 2
+                        and received < end
+                        and isinstance(row.get("connection_id"), str)
+                        and row.get("connection_epoch") is not None
+                        and isinstance(row.get("capture_epoch_id"), str)
+                        and str(row["capture_epoch_id"])
                     ):
+                        wire_identities.add(
+                            (
+                                venue,
+                                str(row["connection_id"]),
+                                int(str(row["connection_epoch"])),
+                                str(row["capture_epoch_id"]),
+                            )
+                        )
+                    include = _row_in_window(row, start, end)
+                    if record_type == RecordType.CLOCK_SYNC and manifest.schema_version >= 2:
+                        valid_from = row.get("causal_valid_from")
+                        valid_until = row.get("causal_valid_until")
+                        include = include or (
+                            isinstance(valid_from, datetime)
+                            and isinstance(valid_until, datetime)
+                            and _utc(valid_from) < end
+                            and _utc(valid_until) > start
+                        )
+                    if include:
+                        in_window_rows.append(row)
+                        in_window_orders.append(row_order)
                         continue
-                retain_boundary(
-                    predecessors,
-                    ("predecessor", *token),
-                    map_key,
-                    row,
-                    keep_latest=True,
-                )
-            elif received >= end and record_type == RecordType.CLOCK_SYNC:
-                request_sent = _timestamp(
-                    row["request_sent_time"],
-                    label="clock boundary request_sent_time",
-                )
-                if request_sent < end:
-                    retain_boundary(
-                        clock_cadence_successors,
-                        (
-                            "clock-cadence-successor",
-                            venue,
-                            record_type,
-                            str(row.get("capture_epoch_id") or ""),
-                            str(row.get("connection_id") or ""),
-                            int(str(row.get("connection_epoch") or 0)),
-                        ),
-                        map_key,
-                        row,
-                        keep_latest=False,
+                    token = boundary_identity(venue, record_type, asset, row)
+                    if token is None:
+                        continue
+                    if received < start:
+                        if record_type == RecordType.CLOCK_SYNC:
+                            if row.get("sample_status") == "valid":
+                                continue
+                            if received < start - timedelta(milliseconds=MAX_CLOCK_AGE_MS):
+                                continue
+                        retain_boundary(
+                            predecessors,
+                            ("predecessor", *token),
+                            map_key,
+                            row,
+                            manifest_order,
+                            row_order,
+                            phase_schema_names,
+                            keep_latest=True,
+                        )
+                    elif received >= end and record_type == RecordType.CLOCK_SYNC:
+                        request_sent = _timestamp(
+                            row["request_sent_time"],
+                            label="clock boundary request_sent_time",
+                        )
+                        if request_sent < end:
+                            retain_boundary(
+                                clock_cadence_successors,
+                                (
+                                    "clock-cadence-successor",
+                                    venue,
+                                    record_type,
+                                    str(row.get("capture_epoch_id") or ""),
+                                    str(row.get("connection_id") or ""),
+                                    int(str(row.get("connection_epoch") or 0)),
+                                ),
+                                map_key,
+                                row,
+                                manifest_order,
+                                row_order,
+                                phase_schema_names,
+                                keep_latest=False,
+                            )
+                    elif record_type in {
+                        RecordType.WIRE_MESSAGE,
+                        RecordType.TRADE,
+                    }:
+                        retain_boundary(
+                            successors,
+                            ("successor", *token),
+                            map_key,
+                            row,
+                            manifest_order,
+                            row_order,
+                            phase_schema_names,
+                            keep_latest=False,
+                        )
+                if in_window_rows:
+                    store.insert_batch(
+                        venue=key.venue,
+                        record_type=record_type,
+                        asset=key.asset,
+                        population="in",
+                        manifest_order=manifest_order,
+                        first_row_order=in_window_orders[0],
+                        columns=phase_schema_names,
+                        rows=in_window_rows,
+                        row_orders=in_window_orders,
                     )
-            elif (
-                received >= end
-                and record_type in {RecordType.WIRE_MESSAGE, RecordType.TRADE}
-            ):
-                retain_boundary(
-                    successors,
-                    ("successor", *token),
-                    map_key,
-                    row,
-                    keep_latest=False,
-                )
-    frozen = {
-        key: tuple(
-            sorted(
-                values,
-                key=lambda row: (
-                    _timestamp(row["received_time"], label="received_time"),
-                    str(row.get("connection_id") or ""),
-                    str(row.get("source_sequence") or ""),
-                ),
-            )
+                row_cursor += len(batch_rows)
+                del batch_rows
+            scan_elapsed += time.perf_counter() - scan_started
+
+        integrity_started = time.perf_counter()
+        previous_stream_id: int | None = None
+        previous_cadence: tuple[int, int, str] | None = None
+        for (
+            stream_id,
+            cadence_record_type,
+            _cadence_asset,
+            expected_interval_ns,
+            cadence_ns,
+            manifest_id,
+            partition_path,
+        ) in store.iter_integrity_cadence_rows():
+            if stream_id != previous_stream_id:
+                previous_stream_id = stream_id
+                previous_cadence = None
+            is_funding = cadence_record_type == RecordType.FUNDING.value
+            current_value = _funding_bucket(cadence_ns, expected_interval_ns) if is_funding else cadence_ns
+            cadence_step = 1 if is_funding else expected_interval_ns
+            if previous_cadence is not None:
+                previous_value, previous_time_ns, previous_manifest = previous_cadence
+                difference = current_value - previous_value
+                if difference > cadence_step and previous_manifest != manifest_id:
+                    gap = Gap(
+                        kind="funding_bucket" if is_funding else "time",
+                        start=_timestamp_iso_ns(previous_time_ns),
+                        end=_timestamp_iso_ns(cadence_ns),
+                        missing_count=(
+                            difference - 1 if is_funding else max(difference // cadence_step - 1, 1)
+                        ),
+                    )
+                    partition_key = PartitionKey.from_leaf(Path(partition_path))
+                    if _gap_is_relevant(
+                        partition_key,
+                        gap,
+                        selected_assets,
+                        start,
+                        end,
+                    ):
+                        relevant_gap_rows.append((partition_path, gap, True))
+            previous_cadence = (current_value, cadence_ns, manifest_id)
+        metrics.observe_phase(
+            "cross_segment_integrity",
+            time.perf_counter() - integrity_started,
         )
-        for key, values in rows.items()
-    }
-    boundary: dict[
-        tuple[str, RecordType, str],
-        list[dict[str, object]],
-    ] = defaultdict(list)
-    for map_key, row in (*predecessors.values(), *successors.values()):
-        boundary[map_key].append(row)
-    frozen_boundary = {
-        key: tuple(
-            sorted(
-                values,
-                key=lambda row: _timestamp(
-                    row["received_time"],
-                    label="boundary received_time",
-                ),
-            )
+        metrics.max_boundary_candidates = (
+            len(predecessors)
+            + len(successors)
+            + len(clock_cadence_successors)
         )
-        for key, values in boundary.items()
-    }
+        metrics.wire_identity_keys = len(wire_identities)
+
+        for candidate in (*predecessors.values(), *successors.values()):
+            store.insert_batch(
+                venue=candidate.map_key[0],
+                record_type=candidate.map_key[1],
+                asset=candidate.map_key[2],
+                population="boundary",
+                manifest_order=candidate.manifest_order,
+                first_row_order=candidate.row_order,
+                columns=candidate.columns,
+                rows=(candidate.row,),
+            )
+        for candidate in clock_cadence_successors.values():
+            store.insert_batch(
+                venue=candidate.map_key[0],
+                record_type=candidate.map_key[1],
+                asset=candidate.map_key[2],
+                population="cadence",
+                manifest_order=candidate.manifest_order,
+                first_row_order=candidate.row_order,
+                columns=candidate.columns,
+                rows=(candidate.row,),
+            )
+        index_started = time.perf_counter()
+        store.finalize_indexes()
+        metrics.observe_phase(
+            "scratch_index_build",
+            time.perf_counter() - index_started,
+        )
+    except BaseException:
+        store.close()
+        raise
+    metrics.observe_phase("manifest_validation", validation_elapsed)
+    metrics.observe_phase("projected_row_scan_and_spool", scan_elapsed)
+    inventory = InventoryReport(
+        partitions=(),
+        total_rows=total_rows,
+        venues=(),
+        assets=(),
+        record_types=(),
+        dates=(),
+        delisted_assets=(),
+        cross_segment_gaps=(),
+    )
     return _LoadedLake(
         inventory=inventory,
-        rows=frozen,
-        boundary_rows=frozen_boundary,
-        clock_cadence_successors=tuple(
-            sorted(
-                (
-                    row
-                    for _, row in clock_cadence_successors.values()
-                ),
-                key=lambda row: _timestamp(
-                    row["request_sent_time"],
-                    label="clock cadence successor request_sent_time",
-                ),
-            )
-        ),
+        inventory_partition_count=metrics.manifest_files_validated,
+        store=store,
         wire_identities=frozenset(wire_identities),
+        relevant_gaps=relevant_gap_rows,
+        metrics=metrics,
     )
 
 
@@ -497,15 +1032,14 @@ def _all_rows(
     venue: str,
     record_type: RecordType,
     asset: str | None = None,
-) -> tuple[dict[str, object], ...]:
-    if asset is not None:
-        return loaded.rows.get((venue, record_type, asset), ())
-    result: list[dict[str, object]] = []
-    for (row_venue, row_type, _), rows in loaded.rows.items():
-        if row_venue == venue and row_type == record_type:
-            result.extend(rows)
-    return tuple(
-        sorted(result, key=lambda row: _timestamp(row["received_time"], label="received_time"))
+    *,
+    filters: Mapping[str, object] | None = None,
+) -> Iterator[dict[str, object]]:
+    return loaded.store.iter_rows(
+        venue,
+        record_type,
+        asset,
+        filters=filters,
     )
 
 
@@ -514,23 +1048,12 @@ def _rows_with_boundaries(
     venue: str,
     record_type: RecordType,
     asset: str | None = None,
-) -> tuple[dict[str, object], ...]:
-    result = list(_all_rows(loaded, venue, record_type, asset))
-    for (row_venue, row_type, row_asset), rows in loaded.boundary_rows.items():
-        if (
-            row_venue == venue
-            and row_type == record_type
-            and (asset is None or row_asset == asset)
-        ):
-            result.extend(rows)
-    return tuple(
-        sorted(
-            result,
-            key=lambda row: _timestamp(
-                row["received_time"],
-                label="boundary-aware received_time",
-            ),
-        )
+) -> Iterator[dict[str, object]]:
+    return loaded.store.iter_rows(
+        venue,
+        record_type,
+        asset,
+        with_boundaries=True,
     )
 
 
@@ -552,10 +1075,7 @@ def _connection_lineage(
         venue,
         RecordType.CONNECTION_EVENT,
     ):
-        if (
-            int(str(row.get("schema_version", 0))) < 2
-            or row.get("event_kind") != "connect"
-        ):
+        if int(str(row.get("schema_version", 0))) < 2 or row.get("event_kind") != "connect":
             continue
         received = _timestamp(row["received_time"], label="connect received_time")
         in_window = start <= received < end
@@ -594,9 +1114,7 @@ def _connection_lineage(
             continue
         identities[identity] = events[0]
 
-    by_capture_role: dict[str, dict[str, list[tuple[str, int, str]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    by_capture_role: dict[str, dict[str, list[tuple[str, int, str]]]] = defaultdict(lambda: defaultdict(list))
     for identity, (role, _) in identities.items():
         by_capture_role[identity[2]][role].append(identity)
     eligible = frozenset(
@@ -607,11 +1125,7 @@ def _connection_lineage(
         and (
             venue != BINANCE
             or len(
-                {
-                    identity[1]
-                    for identities_for_role in by_role.values()
-                    for identity in identities_for_role
-                }
+                {identity[1] for identities_for_role in by_role.values() for identity in identities_for_role}
             )
             == 1
         )
@@ -728,18 +1242,12 @@ def _raw_payload_assets(
     data = root.get("data")
     if isinstance(data, Mapping):
         coin = data.get("coin")
-        return (
-            frozenset({str(coin).upper()})
-            if isinstance(coin, str) and coin
-            else frozenset()
-        )
+        return frozenset({str(coin).upper()}) if isinstance(coin, str) and coin else frozenset()
     if isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
         return frozenset(
             str(item["coin"]).upper()
             for item in data
-            if isinstance(item, Mapping)
-            and isinstance(item.get("coin"), str)
-            and str(item["coin"])
+            if isinstance(item, Mapping) and isinstance(item.get("coin"), str) and str(item["coin"])
         )
     return frozenset()
 
@@ -762,11 +1270,7 @@ def _raw_primary_payload_asset(
     data = root.get("data")
     if venue == BINANCE and isinstance(data, Mapping):
         symbol = str(data.get("s") or "").upper()
-        return (
-            symbol.removesuffix("USDT")
-            if symbol.endswith("USDT") and len(symbol) > 4
-            else None
-        )
+        return symbol.removesuffix("USDT") if symbol.endswith("USDT") and len(symbol) > 4 else None
     if isinstance(data, Mapping):
         coin = data.get("coin")
         return str(coin).upper() if isinstance(coin, str) and coin else None
@@ -778,60 +1282,63 @@ def _raw_primary_payload_asset(
     return None
 
 
-def _binance_wire_indexes(
+def _binance_wire_by_sequence(
     loaded: _LoadedLake,
-) -> tuple[
-    dict[tuple[str, int, int], dict[str, object]],
-    dict[tuple[str, datetime, str, str], tuple[dict[str, object], ...]],
-]:
-    by_sequence: dict[tuple[str, int, int], dict[str, object]] = {}
-    mutable_by_frame: dict[
-        tuple[str, datetime, str, str],
-        list[dict[str, object]],
-    ] = defaultdict(list)
-    for row in _all_rows(loaded, BINANCE, RecordType.WIRE_MESSAGE):
-        if int(str(row.get("schema_version", 0))) < 2:
-            continue
-        connection_id = row.get("connection_id")
-        epoch = row.get("connection_epoch")
-        sequence = row.get("arrival_sequence")
-        capture = row.get("capture_epoch_id")
-        asset = row.get("message_asset")
-        kind = _wire_kind(row.get("channel"), row.get("raw_message"))
-        if (
-            not isinstance(connection_id, str)
-            or not connection_id
-            or epoch is None
-            or sequence is None
-            or not isinstance(capture, str)
-            or not capture
-        ):
-            continue
-        by_sequence[(connection_id, int(str(epoch)), int(str(sequence)))] = row
-        if kind is None or not isinstance(asset, str) or not asset:
-            continue
-        received = _timestamp(row["received_time"], label="wire received_time")
-        frame_kinds = (
+    connection_id: str,
+    connection_epoch: int,
+    arrival_sequence: int,
+) -> Mapping[str, object] | None:
+    rows = list(
+        _all_rows(
+            loaded,
+            BINANCE,
+            RecordType.WIRE_MESSAGE,
+            filters={
+                "connection_id": connection_id,
+                "connection_epoch": connection_epoch,
+                "arrival_sequence": arrival_sequence,
+            },
+        )
+    )
+    return rows[-1] if rows else None
+
+
+def _binance_wire_frame_candidates(
+    loaded: _LoadedLake,
+    connection_id: str,
+    received: datetime,
+    asset: str,
+    kind: str,
+) -> tuple[dict[str, object], ...]:
+    candidates = (
+        row
+        for row in _all_rows(
+            loaded,
+            BINANCE,
+            RecordType.WIRE_MESSAGE,
+            filters={
+                "connection_id": connection_id,
+                "received_time": received,
+                "message_asset": asset,
+            },
+        )
+        if kind
+        in (
             ("l2", "bbo")
-            if kind == "l2"
-            else (kind,)
+            if _wire_kind(row.get("channel"), row.get("raw_message")) == "l2"
+            else (_wire_kind(row.get("channel"), row.get("raw_message")),)
         )
-        for frame_kind in frame_kinds:
-            mutable_by_frame[(connection_id, received, asset, frame_kind)].append(row)
-    by_frame = {
-        key: tuple(
-            sorted(
-                values,
-                key=lambda row: (
-                    int(str(row["connection_epoch"])),
-                    int(str(row["arrival_sequence"])),
-                    str(row["capture_epoch_id"]),
-                ),
-            )
+    )
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda row: (
+                int(str(row["connection_epoch"])),
+                int(str(row["arrival_sequence"])),
+                str(row["capture_epoch_id"]),
+            ),
         )
-        for key, values in mutable_by_frame.items()
-    }
-    return by_sequence, by_frame
+    )
 
 
 def _decoded_wire_data(raw: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -854,11 +1361,7 @@ def _decoded_wire_data(raw: Mapping[str, object]) -> Mapping[str, object] | None
     data = root.get("data")
     if not isinstance(data, Mapping):
         return None
-    declared_versions = tuple(
-        mapping["st"]
-        for mapping in (root, data)
-        if "st" in mapping
-    )
+    declared_versions = tuple(mapping["st"] for mapping in (root, data) if "st" in mapping)
     if any(
         not (
             (isinstance(declared, int) and not isinstance(declared, bool) and declared == 1)
@@ -876,10 +1379,8 @@ def _normalized_wire_identity_matches(
 ) -> bool:
     """Require every persisted physical-lineage field to match one raw frame."""
 
-    return all(
-        normalized.get(field) == raw.get(field)
-        for field in ("received_time", "connection_id")
-    )
+    return all(normalized.get(field) == raw.get(field) for field in ("received_time", "connection_id"))
+
 
 def _binance_market_matches_wire(
     normalized: Mapping[str, object],
@@ -897,9 +1398,7 @@ def _binance_market_matches_wire(
         channel = str(raw["channel"])
         event = str(data.get("e") or "")
         if kind == "bbo":
-            channel_matches = (
-                event == "bookTicker" and channel.endswith("@bookTicker")
-            ) or (
+            channel_matches = (event == "bookTicker" and channel.endswith("@bookTicker")) or (
                 event == "depthUpdate" and "@depth20" in channel
             )
         elif kind == "l2":
@@ -1010,8 +1509,13 @@ def _persisted_l2_levels_match_raw(
         return False
     candidates = [
         row
-        for row in _all_rows(loaded, venue, RecordType.L2_SNAPSHOT, asset)
-        if row.get("snapshot_id") == snapshot
+        for row in _all_rows(
+            loaded,
+            venue,
+            RecordType.L2_SNAPSHOT,
+            asset,
+            filters={"snapshot_id": snapshot},
+        )
     ]
     raw_message = raw.get("raw_message")
     if not isinstance(raw_message, str):
@@ -1042,10 +1546,7 @@ def _persisted_l2_levels_match_raw(
             order_count_required = True
         expected: list[tuple[str, int, Decimal, Decimal, int | None]] = []
         for side, raw_levels in zip(("bid", "ask"), raw_sides, strict=True):
-            if (
-                not isinstance(raw_levels, Sequence)
-                or isinstance(raw_levels, (str, bytes, bytearray))
-            ):
+            if not isinstance(raw_levels, Sequence) or isinstance(raw_levels, (str, bytes, bytearray)):
                 return False
             for level_number, raw_level in enumerate(raw_levels):
                 if venue == BINANCE:
@@ -1064,16 +1565,12 @@ def _persisted_l2_levels_match_raw(
                     price = Decimal(str(raw_level["px"]))
                     quantity = Decimal(str(raw_level["sz"]))
                     order_count = int(str(raw_level["n"]))
-                expected.append(
-                    (side, level_number, price, quantity, order_count)
-                )
+                expected.append((side, level_number, price, quantity, order_count))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
     if len(candidates) != len(expected):
         return False
-    if not any(side == "bid" for side, *_ in expected) or not any(
-        side == "ask" for side, *_ in expected
-    ):
+    if not any(side == "bid" for side, *_ in expected) or not any(side == "ask" for side, *_ in expected):
         return False
     if any(price <= 0 or quantity <= 0 for _, _, price, quantity, _ in expected):
         return False
@@ -1100,9 +1597,7 @@ def _persisted_l2_levels_match_raw(
                     int(str(row["level"])),
                     Decimal(str(row["price"])),
                     Decimal(str(row["quantity"])),
-                    None
-                    if raw_order_count is None
-                    else int(str(raw_order_count)),
+                    None if raw_order_count is None else int(str(raw_order_count)),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -1113,10 +1608,7 @@ def _persisted_l2_levels_match_raw(
         return False
     bid_count = sum(side == "bid" for side, *_ in expected)
     ask_count = sum(side == "ask" for side, *_ in expected)
-    return (
-        header.get("bid_level_count") == bid_count
-        and header.get("ask_level_count") == ask_count
-    )
+    return header.get("bid_level_count") == bid_count and header.get("ask_level_count") == ask_count
 
 
 def _binance_trade_matches_wire(
@@ -1169,20 +1661,30 @@ def _binance_normalized_observations(
     loaded: _LoadedLake,
     assets: Sequence[str],
     lineage: _ConnectionLineage,
-    by_sequence: Mapping[tuple[str, int, int], Mapping[str, object]],
-    by_frame: Mapping[
-        tuple[str, datetime, str, str],
-        Sequence[Mapping[str, object]],
-    ],
 ) -> tuple[
-    dict[str, dict[str, dict[str, list[datetime]]]],
+    dict[str, dict[str, dict[str, SpilledTimestampSeries]]],
     dict[str, dict[str, int]],
     tuple[tuple[str, str], ...],
     int,
 ]:
-    observations: dict[str, dict[str, dict[str, list[datetime]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
+    observations: dict[
+        str,
+        dict[str, dict[str, SpilledTimestampSeries]],
+    ] = {}
+
+    def append_observation(
+        capture: str,
+        asset: str,
+        kind: str,
+        received: datetime,
+    ) -> None:
+        kinds = observations.setdefault(capture, {}).setdefault(asset, {})
+        series = kinds.get(kind)
+        if series is None:
+            series = loaded.store.new_timestamp_series()
+            kinds[kind] = series
+        series.append(received)
+
     counts = {
         asset: {
             "normalized_count": 0,
@@ -1229,20 +1731,10 @@ def _binance_normalized_observations(
             and event.get("socket_role") == "public"
             and isinstance(event.get("channel"), str)
             and "@depth20" in str(event["channel"])
-            and str(event["channel"]).partition("@")[0].upper()
-            == f"{event_asset}USDT"
-            and lineage.identities.get(
-                (connection, int(str(connection_epoch)), capture)
-            )
-            is not None
-            and lineage.identities[
-                (connection, int(str(connection_epoch)), capture)
-            ][0]
-            == "public"
-            and lineage.identities[
-                (connection, int(str(connection_epoch)), capture)
-            ][1]
-            <= received
+            and str(event["channel"]).partition("@")[0].upper() == f"{event_asset}USDT"
+            and lineage.identities.get((connection, int(str(connection_epoch)), capture)) is not None
+            and lineage.identities[(connection, int(str(connection_epoch)), capture)][0] == "public"
+            and lineage.identities[(connection, int(str(connection_epoch)), capture)][1] <= received
         ):
             key = (
                 capture,
@@ -1266,9 +1758,9 @@ def _binance_normalized_observations(
                 )
     observed_l2: set[tuple[str, str]] = set()
     valid_l2: set[tuple[str, str]] = set()
-    exact_l2_rows: list[
-        tuple[str, str, str, int, str, str, datetime, int]
-    ] = []
+    exact_l2_rows: SpilledSequence[tuple[str, str, str, int, str, str, datetime, int]] = (
+        loaded.store.new_sequence()
+    )
     lineage_rejections = 0
     for row in _all_rows(loaded, BINANCE, RecordType.WIRE_MESSAGE):
         asset = row.get("message_asset")
@@ -1299,8 +1791,11 @@ def _binance_normalized_observations(
                     epoch = row.get("connection_epoch")
                     sequence = row.get("arrival_sequence")
                     if epoch is not None and sequence is not None:
-                        raw = by_sequence.get(
-                            (connection_id, int(str(epoch)), int(str(sequence)))
+                        raw = _binance_wire_by_sequence(
+                            loaded,
+                            connection_id,
+                            int(str(epoch)),
+                            int(str(sequence)),
                         )
                         if (
                             raw is not None
@@ -1313,9 +1808,12 @@ def _binance_normalized_observations(
                             captures.add(str(raw["capture_epoch_id"]))
                             lineage_epoch = int(str(raw["connection_epoch"]))
                 else:
-                    frame_candidates = by_frame.get(
-                        (connection_id, received, asset, kind),
-                        (),
+                    frame_candidates = _binance_wire_frame_candidates(
+                        loaded,
+                        connection_id,
+                        received,
+                        asset,
+                        kind,
                     )
                     exact_candidates = [
                         raw
@@ -1372,7 +1870,7 @@ def _binance_normalized_observations(
                         )
                     )
                     continue
-                observations[capture][asset][kind].append(received)
+                append_observation(capture, asset, kind, received)
                 if record_type == RecordType.TRADE:
                     counts[asset]["normalized_with_raw_lineage_count"] += 1
     resync_arm_points: dict[
@@ -1414,13 +1912,11 @@ def _binance_normalized_observations(
         received,
         arrival,
     ) in exact_l2_rows:
-        arm = resync_arm_points.get(
-            (capture, asset, connection_id, lineage_epoch, book_epoch_id)
-        )
+        arm = resync_arm_points.get((capture, asset, connection_id, lineage_epoch, book_epoch_id))
         if arm is None or not _at_or_after_resync_arm(received, arrival, arm):
             continue
         valid_l2.add((capture, asset))
-        observations[capture][asset]["l2"].append(received)
+        append_observation(capture, asset, "l2", received)
     return (
         observations,
         counts,
@@ -1443,13 +1939,8 @@ def _hyperliquid_market_matches_wire(
         root = json.loads(raw_message)
         if not isinstance(root, Mapping):
             return False
-        expected_channel = {"bbo": "bbo", "l2": "l2Book", "trade": "trades"}[
-            kind
-        ]
-        if (
-            root.get("channel") != expected_channel
-            or raw.get("channel") != expected_channel
-        ):
+        expected_channel = {"bbo": "bbo", "l2": "l2Book", "trade": "trades"}[kind]
+        if root.get("channel") != expected_channel or raw.get("channel") != expected_channel:
             return False
         data = root["data"]
         connection = str(raw["connection_id"])
@@ -1461,10 +1952,7 @@ def _hyperliquid_market_matches_wire(
                 return False
             milliseconds = int(str(data["time"]))
             source_time = datetime.fromtimestamp(milliseconds / 1_000, tz=UTC)
-            if (
-                normalized.get("event_time") != source_time
-                or normalized.get("exchange_time") != source_time
-            ):
+            if normalized.get("event_time") != source_time or normalized.get("exchange_time") != source_time:
                 return False
             if kind == "bbo":
                 sides = data["bbo"]
@@ -1513,17 +2001,13 @@ def _hyperliquid_market_matches_wire(
                 return False
             return (
                 normalized.get("source_sequence") is None
-                and normalized.get("snapshot_id")
-                == f"ws:{connection}:{epoch}:{arrival}:{milliseconds}"
+                and normalized.get("snapshot_id") == f"ws:{connection}:{epoch}:{arrival}:{milliseconds}"
                 and normalized.get("book_epoch_id") == f"{connection}:{epoch}"
                 and normalized.get("bid_level_count") == len(bids)
                 and normalized.get("ask_level_count") == len(asks)
             )
         if kind == "trade":
-            if (
-                not isinstance(data, Sequence)
-                or isinstance(data, (str, bytes, bytearray))
-            ):
+            if not isinstance(data, Sequence) or isinstance(data, (str, bytes, bytearray)):
                 return False
             for raw_trade in data:
                 if not isinstance(raw_trade, Mapping) or str(raw_trade.get("coin")) != asset:
@@ -1538,15 +2022,11 @@ def _hyperliquid_market_matches_wire(
                 if (
                     normalized.get("event_time") == source_time
                     and normalized.get("exchange_time") == source_time
-                    and normalized.get("trade_id")
-                    == f"{milliseconds}:{asset}:{trade_id}"
-                    and Decimal(str(normalized.get("price")))
-                    == Decimal(str(raw_trade["px"]))
-                    and Decimal(str(normalized.get("quantity")))
-                    == Decimal(str(raw_trade["sz"]))
+                    and normalized.get("trade_id") == f"{milliseconds}:{asset}:{trade_id}"
+                    and Decimal(str(normalized.get("price"))) == Decimal(str(raw_trade["px"]))
+                    and Decimal(str(normalized.get("quantity"))) == Decimal(str(raw_trade["sz"]))
                     and Decimal(str(normalized.get("quote_quantity")))
-                    == Decimal(str(raw_trade["px"]))
-                    * Decimal(str(raw_trade["sz"]))
+                    == Decimal(str(raw_trade["px"])) * Decimal(str(raw_trade["sz"]))
                     and normalized.get("is_liquidation") is None
                     and normalized.get("aggressor_side") == aggressor
                     and normalized.get("connection_epoch") == epoch
@@ -1567,10 +2047,7 @@ def _hyperliquid_rest_l2_identity(
     asset = row.get("asset")
     snapshot = row.get("snapshot_id")
     book_epoch = row.get("book_epoch_id")
-    if not all(
-        isinstance(value, str) and value
-        for value in (connection, asset, snapshot, book_epoch)
-    ):
+    if not all(isinstance(value, str) and value for value in (connection, asset, snapshot, book_epoch)):
         return None
     assert isinstance(connection, str)
     assert isinstance(asset, str)
@@ -1595,7 +2072,6 @@ def _hyperliquid_rest_l2_identity(
     if (
         epoch <= 0
         or arrival <= 0
-
         or book_epoch != f"{connection}:{epoch}"
         or event_time != received
         or int(exchange_time.timestamp() * 1_000) != milliseconds
@@ -1645,15 +2121,10 @@ def _hyperliquid_rest_bbo_identity(
         epoch, arrival = (int(value) for value in identity)
     except (TypeError, ValueError):
         return None
-    if (
-        epoch <= 0
-        or arrival <= 0
-
-        or event_time != exchange_time
-        or row.get("source_sequence") is not None
-    ):
+    if epoch <= 0 or arrival <= 0 or event_time != exchange_time or row.get("source_sequence") is not None:
         return None
     return asset, connection, epoch, arrival, received, exchange_time
+
 
 def _persisted_hyperliquid_rest_l2_levels_match_header(
     loaded: _LoadedLake,
@@ -1666,8 +2137,13 @@ def _persisted_hyperliquid_rest_l2_levels_match_header(
     snapshot = identity[1]
     candidates = [
         row
-        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_SNAPSHOT, asset)
-        if row.get("snapshot_id") == snapshot
+        for row in _all_rows(
+            loaded,
+            HYPERLIQUID,
+            RecordType.L2_SNAPSHOT,
+            asset,
+            filters={"snapshot_id": snapshot},
+        )
     ]
     try:
         bid_count = int(str(header["bid_level_count"]))
@@ -1695,9 +2171,7 @@ def _persisted_hyperliquid_rest_l2_levels_match_header(
             observed_levels.append((str(row["side"]), int(str(row["level"]))))
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return False
-    return len(observed_levels) == len(set(observed_levels)) and set(
-        observed_levels
-    ) == expected_levels
+    return len(observed_levels) == len(set(observed_levels)) and set(observed_levels) == expected_levels
 
 
 def _persisted_hyperliquid_rest_bbo_matches_l2(
@@ -1715,8 +2189,13 @@ def _persisted_hyperliquid_rest_bbo_matches_l2(
     snapshot = f"rest:{connection}:{epoch}:{arrival}:{milliseconds}"
     headers = [
         row
-        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_BOOK_STATE, asset)
-        if row.get("snapshot_id") == snapshot
+        for row in _all_rows(
+            loaded,
+            HYPERLIQUID,
+            RecordType.L2_BOOK_STATE,
+            asset,
+            filters={"snapshot_id": snapshot},
+        )
     ]
     if len(headers) != 1:
         return False
@@ -1737,26 +2216,25 @@ def _persisted_hyperliquid_rest_bbo_matches_l2(
         return False
     levels = [
         row
-        for row in _all_rows(loaded, HYPERLIQUID, RecordType.L2_SNAPSHOT, asset)
-        if row.get("snapshot_id") == snapshot
+        for row in _all_rows(
+            loaded,
+            HYPERLIQUID,
+            RecordType.L2_SNAPSHOT,
+            asset,
+            filters={"snapshot_id": snapshot},
+        )
     ]
 
     def side_matches(side: str, price_field: str, quantity_field: str) -> bool:
-        best = [
-            row
-            for row in levels
-            if row.get("side") == side and row.get("level") == 0
-        ]
+        best = [row for row in levels if row.get("side") == side and row.get("level") == 0]
         if not best:
             return bbo.get(price_field) is None and bbo.get(quantity_field) is None
         if len(best) != 1:
             return False
         try:
-            return (
-                Decimal(str(bbo.get(price_field))) == Decimal(str(best[0]["price"]))
-                and Decimal(str(bbo.get(quantity_field)))
-                == Decimal(str(best[0]["quantity"]))
-            )
+            return Decimal(str(bbo.get(price_field))) == Decimal(str(best[0]["price"])) and Decimal(
+                str(bbo.get(quantity_field))
+            ) == Decimal(str(best[0]["quantity"]))
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return False
 
@@ -1766,63 +2244,46 @@ def _persisted_hyperliquid_rest_bbo_matches_l2(
         "ask_quantity",
     )
 
+
 def _hyperliquid_observations(
     loaded: _LoadedLake,
     assets: Sequence[str],
     lineage: _ConnectionLineage,
-) -> tuple[dict[str, dict[str, dict[str, list[datetime]]]], int]:
-    observations: dict[str, dict[str, dict[str, list[datetime]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
+) -> tuple[dict[str, dict[str, dict[str, SpilledTimestampSeries]]], int]:
+    observations: dict[
+        str,
+        dict[str, dict[str, SpilledTimestampSeries]],
+    ] = {}
+
+    def append_observation(
+        capture: str,
+        asset: str,
+        kind: str,
+        received: datetime,
+    ) -> None:
+        kinds = observations.setdefault(capture, {}).setdefault(asset, {})
+        series = kinds.get(kind)
+        if series is None:
+            series = loaded.store.new_timestamp_series()
+            kinds[kind] = series
+        series.append(received)
+
     type_to_kind = {
         RecordType.BBO: "bbo",
         RecordType.L2_BOOK_STATE: "l2",
         RecordType.TRADE: "trade",
     }
-    wire_candidates: dict[
-        tuple[str, datetime, str, str],
-        list[dict[str, object]],
-    ] = defaultdict(list)
-    for row in _all_rows(loaded, HYPERLIQUID, RecordType.WIRE_MESSAGE):
-        if int(str(row.get("schema_version", 0))) < 2:
-            continue
-        connection_id = row.get("connection_id")
-        capture = row.get("capture_epoch_id")
-        asset = row.get("message_asset")
-        payload_assets = _raw_payload_assets(HYPERLIQUID, row)
-        channel = str(row.get("channel") or "")
-        kind = {"bbo": "bbo", "l2Book": "l2", "trades": "trade"}.get(channel)
-        if (
-            isinstance(connection_id, str)
-            and connection_id
-            and isinstance(capture, str)
-            and capture
-            and isinstance(asset, str)
-            and asset
-            and asset == _raw_primary_payload_asset(HYPERLIQUID, row)
-            and kind is not None
-        ):
-            received = _timestamp(row["received_time"], label="wire received_time")
-            for payload_asset in payload_assets:
-                wire_candidates[
-                    (connection_id, received, payload_asset, kind)
-                ].append(row)
     lineage_rejections = 0
     for asset in assets:
         for record_type, kind in type_to_kind.items():
             for row in _all_rows(loaded, HYPERLIQUID, record_type, asset):
-                if (
-                    record_type == RecordType.BBO
-                    and _persisted_hyperliquid_rest_bbo_matches_l2(
-                        loaded, asset, row
-                    )
+                if record_type == RecordType.BBO and _persisted_hyperliquid_rest_bbo_matches_l2(
+                    loaded, asset, row
                 ):
                     continue
                 if (
                     record_type == RecordType.L2_BOOK_STATE
-                    and _persisted_hyperliquid_rest_l2_levels_match_header(
-                        loaded, asset, row
-                    )
+                    and _persisted_hyperliquid_rest_l2_levels_match_header(loaded, asset, row)
                 ):
                     continue
                 connection_id = row.get("connection_id")
@@ -1830,9 +2291,26 @@ def _hyperliquid_observations(
                     lineage_rejections += 1
                     continue
                 received = _timestamp(row["received_time"], label="market received_time")
-                candidates = wire_candidates.get(
-                    (connection_id, received, asset, kind),
-                    (),
+                candidates = (
+                    raw
+                    for raw in _all_rows(
+                        loaded,
+                        HYPERLIQUID,
+                        RecordType.WIRE_MESSAGE,
+                        filters={
+                            "connection_id": connection_id,
+                            "received_time": received,
+                        },
+                    )
+                    if int(str(raw.get("schema_version", 0))) >= 2
+                    and asset in _raw_payload_assets(HYPERLIQUID, raw)
+                    and raw.get("message_asset") == _raw_primary_payload_asset(HYPERLIQUID, raw)
+                    and {
+                        "bbo": "bbo",
+                        "l2Book": "l2",
+                        "trades": "trade",
+                    }.get(str(raw.get("channel") or ""))
+                    == kind
                 )
                 exact = [
                     raw
@@ -1853,8 +2331,11 @@ def _hyperliquid_observations(
                 if len(exact) != 1:
                     lineage_rejections += 1
                     continue
-                observations[str(exact[0]["capture_epoch_id"])][asset][kind].append(
-                    received
+                append_observation(
+                    str(exact[0]["capture_epoch_id"]),
+                    asset,
+                    kind,
+                    received,
                 )
     return observations, lineage_rejections
 
@@ -1883,26 +2364,16 @@ def _orphan_required_wire_counts(
         payload_kind = _payload_wire_kind(venue, raw.get("raw_message"))
         kind = payload_kind or persisted_kind
         if venue == BINANCE:
-            payload_asset_candidates = _raw_payload_assets(BINANCE, raw) & set(
-                assets
-            )
+            payload_asset_candidates = _raw_payload_assets(BINANCE, raw) & set(assets)
             payload_asset = (
-                next(iter(payload_asset_candidates))
-                if len(payload_asset_candidates) == 1
-                else None
+                next(iter(payload_asset_candidates)) if len(payload_asset_candidates) == 1 else None
             )
             if payload_asset is not None and persisted_asset != payload_asset:
                 counts[payload_asset] += 1
                 continue
-            fallback_asset = (
-                persisted_asset if isinstance(persisted_asset, str) else None
-            )
+            fallback_asset = persisted_asset if isinstance(persisted_asset, str) else None
             target = payload_asset or fallback_asset
-            target_assets = (
-                (target,)
-                if isinstance(target, str) and target in counts
-                else ()
-            )
+            target_assets = (target,) if isinstance(target, str) and target in counts else ()
         else:
             payload_assets = _raw_payload_assets(venue, raw)
             requested_payload_assets = payload_assets & set(assets)
@@ -1931,9 +2402,14 @@ def _orphan_required_wire_counts(
                     venue,
                     type_by_kind[kind],
                     asset,
+                    filters={
+                        "connection_id": str(raw.get("connection_id") or ""),
+                        "received_time": _timestamp(
+                            raw["received_time"],
+                            label="orphan raw received_time",
+                        ),
+                    },
                 )
-                if normalized.get("connection_id") == raw.get("connection_id")
-                and normalized.get("received_time") == raw.get("received_time")
             ]
             if not _wire_role_matches(raw, lineage, expected_role[kind]):
                 counts[asset] += 1
@@ -1967,11 +2443,14 @@ def _orphan_required_wire_counts(
                             BINANCE,
                             RecordType.BBO,
                             asset,
+                            filters={
+                                "connection_id": str(raw.get("connection_id") or ""),
+                                "received_time": _timestamp(
+                                    raw["received_time"],
+                                    label="orphan raw received_time",
+                                ),
+                            },
                         )
-                        if normalized.get("connection_id")
-                        == raw.get("connection_id")
-                        and normalized.get("received_time")
-                        == raw.get("received_time")
                     ]
                     exact_bbo = [
                         normalized
@@ -2003,8 +2482,7 @@ def _orphan_required_wire_counts(
                         root = json.loads(str(raw_message))
                         data = root["data"]
                         expected_count = sum(
-                            isinstance(item, Mapping) and item.get("coin") == asset
-                            for item in data
+                            isinstance(item, Mapping) and item.get("coin") == asset for item in data
                         )
                     except (KeyError, TypeError, json.JSONDecodeError):
                         expected_count = 0
@@ -2022,30 +2500,7 @@ def _orphan_normalized_l2_level_counts(
     """Count persisted levels that do not belong to one exact raw/header frame."""
 
     counts = {asset: 0 for asset in assets}
-    accepted_groups: set[
-        tuple[str, str, str, datetime, datetime, datetime, str]
-    ] = set()
-    raw_by_frame: dict[
-        tuple[str, datetime, str],
-        list[dict[str, object]],
-    ] = defaultdict(list)
-    for raw in _all_rows(loaded, venue, RecordType.WIRE_MESSAGE):
-        connection = raw.get("connection_id")
-        asset = raw.get("message_asset")
-        if (
-            isinstance(connection, str)
-            and connection
-            and isinstance(asset, str)
-            and asset in counts
-            and _wire_kind(raw.get("channel"), raw.get("raw_message")) == "l2"
-        ):
-            raw_by_frame[
-                (
-                    connection,
-                    _timestamp(raw["received_time"], label="wire received_time"),
-                    asset,
-                )
-            ].append(raw)
+    accepted_groups = loaded.store.new_set()
     for asset in assets:
         for header in _all_rows(loaded, venue, RecordType.L2_BOOK_STATE, asset):
             if venue == HYPERLIQUID:
@@ -2076,9 +2531,19 @@ def _orphan_normalized_l2_level_counts(
                 and isinstance(exchange_time, datetime)
             ):
                 continue
-            candidates = raw_by_frame.get(
-                (connection, _utc(received), asset),
-                (),
+            candidates = (
+                raw
+                for raw in _all_rows(
+                    loaded,
+                    venue,
+                    RecordType.WIRE_MESSAGE,
+                    filters={
+                        "connection_id": connection,
+                        "received_time": _utc(received),
+                    },
+                )
+                if raw.get("message_asset") == asset
+                and _wire_kind(raw.get("channel"), raw.get("raw_message")) == "l2"
             )
             exact = [
                 raw
@@ -2110,7 +2575,16 @@ def _orphan_normalized_l2_level_counts(
                     )
                 )
     for asset in assets:
-        for level in _all_rows(loaded, venue, RecordType.L2_SNAPSHOT, asset):
+        current_key: tuple[object, ...] | None = None
+        current_count = 0
+        current_accepted = False
+
+        for level in loaded.store.iter_rows(
+            venue,
+            RecordType.L2_SNAPSHOT,
+            asset,
+            order_by="snapshot_group",
+        ):
             snapshot = level.get("snapshot_id")
             book_epoch = level.get("book_epoch_id")
             received = level.get("received_time")
@@ -2126,8 +2600,15 @@ def _orphan_normalized_l2_level_counts(
                 _timestamp(exchange_time, label="l2 level exchange_time"),
                 str(connection or ""),
             )
-            if key not in accepted_groups:
-                counts[asset] += 1
+            if key != current_key:
+                if current_key is not None and not current_accepted:
+                    counts[asset] += current_count
+                current_key = key
+                current_accepted = key in accepted_groups
+                current_count = 0
+            current_count += 1
+        if current_key is not None and not current_accepted:
+            counts[asset] += current_count
     return counts
 
 
@@ -2140,12 +2621,8 @@ def _connection_capture_map(loaded: _LoadedLake, venue: str) -> dict[str, set[st
 
 
 def _is_clock_gap_event(row: Mapping[str, object]) -> bool:
-    return (
-        str(row.get("event_kind") or "") in _FAIL_CLOSED_EVENTS
-        and (
-            row.get("channel") == "clock_sync"
-            or row.get("socket_role") in {"clock", "clock_sync"}
-        )
+    return str(row.get("event_kind") or "") in _FAIL_CLOSED_EVENTS and (
+        row.get("channel") == "clock_sync" or row.get("socket_role") in {"clock", "clock_sync"}
     )
 
 
@@ -2164,9 +2641,7 @@ def _event_outages(
     unclean_in_window_disconnect_events = 0
     clean_terminal_roles: dict[str, set[str]] = defaultdict(set)
     active_event_captures: set[str] = set()
-    failure_events_by_capture: dict[
-        str, list[dict[str, object]]
-    ] = defaultdict(list)
+    failure_events_by_capture: dict[str, list[dict[str, object]]] = defaultdict(list)
     resync_events: dict[
         tuple[str, str, str, int, str],
         dict[str, list[tuple[datetime, str]]],
@@ -2194,14 +2669,10 @@ def _event_outages(
             unclean_in_window_disconnect_events += 1
         connection_id = row.get("connection_id")
         explicit_capture = row.get("capture_epoch_id")
-        clean_stop = (
-            event_kind == "disconnect"
-            and str(row.get("reason") or "").strip().lower()
-            in {
-                "collector stop requested",
-                "collector stop requested or bounded run completed",
-            }
-        )
+        clean_stop = event_kind == "disconnect" and str(row.get("reason") or "").strip().lower() in {
+            "collector stop requested",
+            "collector stop requested or bounded run completed",
+        }
         if clean_stop and start <= at < end:
             connection_epoch = row.get("connection_epoch")
             role = row.get("socket_role")
@@ -2277,8 +2748,7 @@ def _event_outages(
                     and identity_capture in lineage.eligible_captures
                 ]
                 capture_conflicts_with_active_physical_identity = (
-                    len(physical_matches) == 1
-                    and explicit_capture != physical_matches[0]
+                    len(physical_matches) == 1 and explicit_capture != physical_matches[0]
                 )
                 if (
                     capture_conflicts_with_active_physical_identity
@@ -2313,8 +2783,7 @@ def _event_outages(
                 and row.get("socket_role") == "public"
                 and isinstance(row.get("asset"), str)
                 and str(row["asset"]) not in {"", "GLOBAL"}
-                and row.get("book_epoch_id")
-                == f"{connection_id}:{int(str(connection_epoch))}"
+                and row.get("book_epoch_id") == f"{connection_id}:{int(str(connection_epoch))}"
                 and (
                     venue != BINANCE
                     or event_kind != "resync_complete"
@@ -2332,10 +2801,7 @@ def _event_outages(
                         == f"{str(row['asset']).upper()}USDT"
                     )
                 )
-                and (
-                    venue != BINANCE
-                    or identity[1] <= at
-                )
+                and (venue != BINANCE or identity[1] <= at)
             )
             if not bound_resync:
                 if start <= at < end:
@@ -2359,19 +2825,11 @@ def _event_outages(
                             "received_time": _iso(at),
                             "event_kind": event_kind,
                             "socket_role": (
-                                str(row["socket_role"])
-                                if row.get("socket_role") is not None
-                                else None
+                                str(row["socket_role"]) if row.get("socket_role") is not None else None
                             ),
-                            "channel": (
-                                str(row["channel"])
-                                if row.get("channel") is not None
-                                else None
-                            ),
+                            "channel": (str(row["channel"]) if row.get("channel") is not None else None),
                             "connection_id": str(connection_id or "") or None,
-                            "reason": (
-                                str(raw_reason) if raw_reason is not None else None
-                            ),
+                            "reason": (str(raw_reason) if raw_reason is not None else None),
                         }
                     )
             connection_epoch = row.get("connection_epoch")
@@ -2387,48 +2845,19 @@ def _event_outages(
                 if at < end:
                     outages.append(Interval(max(at, start), end, tag))
             elif event_kind == "resync_start":
-                resync_events[resync_key][event_kind].append(
-                    (max(at, start), "")
-                )
+                resync_events[resync_key][event_kind].append((max(at, start), ""))
             elif event_kind == "resync_complete":
                 resync_snapshot = row.get("resync_snapshot_id")
-                if venue != BINANCE or (
-                    isinstance(resync_snapshot, str) and resync_snapshot
-                ):
+                if venue != BINANCE or (isinstance(resync_snapshot, str) and resync_snapshot):
                     resync_events[resync_key][event_kind].append(
                         (
                             min(at, end),
                             str(resync_snapshot or ""),
                         )
                     )
-    valid_snapshots: set[
-        tuple[str, str, str, int, str, str, datetime]
-    ] = set()
-    wire_candidates: dict[
-        tuple[str, datetime, str],
-        list[dict[str, object]],
-    ] = defaultdict(list)
-    for wire_row in _all_rows(loaded, venue, RecordType.WIRE_MESSAGE):
-        raw_connection = wire_row.get("connection_id")
-        raw_asset = wire_row.get("message_asset")
-        if (
-            isinstance(raw_connection, str)
-            and raw_connection
-            and isinstance(raw_asset, str)
-            and raw_asset
-            and _raw_required_kind(venue, wire_row)
-            == "l2"
-        ):
-            wire_candidates[
-                (
-                    raw_connection,
-                    _timestamp(
-                        wire_row["received_time"],
-                        label="wire received_time",
-                    ),
-                    raw_asset,
-                )
-            ].append(wire_row)
+    valid_snapshots: SpilledSequence[tuple[str, str, str, int, str, str, datetime]] = (
+        loaded.store.new_sequence()
+    )
     for header in _all_rows(loaded, venue, RecordType.L2_BOOK_STATE):
         connection = header.get("connection_id")
         header_snapshot = header.get("snapshot_id")
@@ -2448,13 +2877,22 @@ def _event_outages(
         assert isinstance(header_snapshot, str)
         assert isinstance(header_book_epoch, str)
         assert isinstance(asset, str)
-        l2_wire_rows = wire_candidates.get(
-            (
-                connection,
-                _timestamp(header["received_time"], label="l2 received_time"),
-                asset,
-            ),
-            [],
+        l2_received = _timestamp(
+            header["received_time"],
+            label="l2 received_time",
+        )
+        l2_wire_rows = (
+            wire_row
+            for wire_row in _all_rows(
+                loaded,
+                venue,
+                RecordType.WIRE_MESSAGE,
+                filters={
+                    "connection_id": connection,
+                    "received_time": l2_received,
+                },
+            )
+            if wire_row.get("message_asset") == asset and _raw_required_kind(venue, wire_row) == "l2"
         )
         exact = [
             candidate_wire
@@ -2479,7 +2917,7 @@ def _event_outages(
         ]
         if len(exact) == 1:
             exact_wire = exact[0]
-            valid_snapshots.add(
+            valid_snapshots.append(
                 (
                     str(exact_wire["capture_epoch_id"]),
                     asset,
@@ -2487,16 +2925,13 @@ def _event_outages(
                     int(str(exact_wire["connection_epoch"])),
                     header_book_epoch,
                     header_snapshot,
-                    _timestamp(
-                        header["received_time"],
-                        label="l2 received_time",
-                    ),
+                    l2_received,
                 )
             )
     for (tag, asset, connection, epoch, book_epoch), events in resync_events.items():
         completions = sorted(events["resync_complete"])
         for outage_start, _ in sorted(events["resync_start"]):
-            recovery_candidates: list[datetime] = []
+            outage_end = end
             for completion_at, completion_snapshot in completions:
                 if completion_at < outage_start:
                     continue
@@ -2510,20 +2945,12 @@ def _event_outages(
                     ):
                         continue
                     if venue == BINANCE:
-                        if (
-                            snapshot[5] == completion_snapshot
-                            and snapshot[6] == completion_at
-                        ):
-                            recovery_candidates.append(completion_at)
-                    elif (
-                        snapshot[6] >= completion_at
-                        and (
-                            not completion_snapshot
-                            or snapshot[5] == completion_snapshot
-                        )
+                        if snapshot[5] == completion_snapshot and snapshot[6] == completion_at:
+                            outage_end = min(outage_end, completion_at)
+                    elif snapshot[6] >= completion_at and (
+                        not completion_snapshot or snapshot[5] == completion_snapshot
                     ):
-                        recovery_candidates.append(snapshot[6])
-            outage_end = min(recovery_candidates, default=end)
+                        outage_end = min(outage_end, snapshot[6])
             if outage_start < outage_end:
                 outages.append(Interval(outage_start, outage_end, tag))
     return _EventOutageAudit(
@@ -2532,9 +2959,7 @@ def _event_outages(
         unbound_resync_events=unbound_resync_events,
         active_event_captures=frozenset(active_event_captures),
         in_window_gap_events=in_window_gap_events,
-        unclean_in_window_disconnect_events=(
-            unclean_in_window_disconnect_events
-        ),
+        unclean_in_window_disconnect_events=(unclean_in_window_disconnect_events),
         failure_events_by_capture={
             capture: tuple(
                 sorted(
@@ -2545,8 +2970,7 @@ def _event_outages(
             for capture, events in sorted(failure_events_by_capture.items())
         },
         clean_terminal_roles={
-            capture: frozenset(roles)
-            for capture, roles in sorted(clean_terminal_roles.items())
+            capture: frozenset(roles) for capture, roles in sorted(clean_terminal_roles.items())
         },
     )
 
@@ -2559,16 +2983,35 @@ def _state_intervals(
     end: datetime,
     outages: Iterable[Interval],
 ) -> tuple[Interval, ...]:
-    intervals = (
-        Interval(value, min(value + ttl, end), tag)
-        for value in timestamps
-        if start <= value < end and value < min(value + ttl, end)
-    )
-    return _subtract(_clip(intervals, start, end), outages)
+    merged: list[Interval] = []
+    current_start: datetime | None = None
+    current_end: datetime | None = None
+    for value in timestamps:
+        if not start <= value < end:
+            continue
+        interval_end = min(value + ttl, end)
+        if value >= interval_end:
+            continue
+        if current_start is None or current_end is None:
+            current_start = value
+            current_end = interval_end
+            continue
+        if value <= current_end:
+            current_end = max(current_end, interval_end)
+            continue
+        merged.append(Interval(current_start, current_end, tag))
+        current_start = value
+        current_end = interval_end
+    if current_start is not None and current_end is not None:
+        merged.append(Interval(current_start, current_end, tag))
+    return _subtract(_clip(merged, start, end), outages)
 
 
 def _required_market_intervals(
-    observations: Mapping[str, Mapping[str, Mapping[str, Sequence[datetime]]]],
+    observations: Mapping[
+        str,
+        Mapping[str, Mapping[str, Iterable[datetime]]],
+    ],
     assets: Sequence[str],
     ttl: timedelta,
     start: datetime,
@@ -2581,13 +3024,9 @@ def _required_market_intervals(
             kinds = by_asset.get(asset, {})
             current: tuple[Interval, ...] | None = None
             for kind in ("bbo", "l2"):
-                intervals = _state_intervals(
-                    kinds.get(kind, ()), tag, ttl, start, end, outages
-                )
+                intervals = _state_intervals(kinds.get(kind, ()), tag, ttl, start, end, outages)
                 current = (
-                    intervals
-                    if current is None
-                    else _intersect(current, intervals, require_same_tag=True)
+                    intervals if current is None else _intersect(current, intervals, require_same_tag=True)
                 )
             trade_freshness = _state_intervals(
                 kinds.get("trade", ()),
@@ -2648,11 +3087,11 @@ def _clock_intervals(
         row: Mapping[str, object],
     ) -> tuple[int, int, Decimal, Decimal, Decimal] | None:
         try:
-            sampling_interval_ms = int(str(row.get('sampling_interval_ms')))
-            max_age_ms = int(str(row.get('max_age_ms')))
-            declared_uncertainty = Decimal(str(row.get('max_uncertainty_ms')))
-            measured_uncertainty = Decimal(str(row.get('drift_uncertainty_ms')))
-            estimated_drift = Decimal(str(row.get('estimated_clock_drift_ms')))
+            sampling_interval_ms = int(str(row.get("sampling_interval_ms")))
+            max_age_ms = int(str(row.get("max_age_ms")))
+            declared_uncertainty = Decimal(str(row.get("max_uncertainty_ms")))
+            measured_uncertainty = Decimal(str(row.get("drift_uncertainty_ms")))
+            estimated_drift = Decimal(str(row.get("estimated_clock_drift_ms")))
         except (ArithmeticError, TypeError, ValueError):
             return None
         if (
@@ -2681,13 +3120,13 @@ def _clock_intervals(
         received: datetime,
         policy: tuple[int, int, Decimal, Decimal, Decimal] | None,
     ) -> bool:
-        if policy is None or row.get('sample_status') != 'invalid':
+        if policy is None or row.get("sample_status") != "invalid":
             return False
         measured_uncertainty = policy[3]
-        invalid_reason = row.get('invalid_reason')
-        response_received = row.get('response_received_time')
+        invalid_reason = row.get("invalid_reason")
+        response_received = row.get("response_received_time")
         try:
-            round_trip_ms = Decimal(str(row.get('round_trip_latency_ms')))
+            round_trip_ms = Decimal(str(row.get("round_trip_latency_ms")))
         except (ArithmeticError, TypeError, ValueError):
             return False
         return (
@@ -2697,11 +3136,12 @@ def _clock_intervals(
             and measured_uncertainty == round_trip_ms / 2
             and isinstance(response_received, datetime)
             and _utc(response_received) == received
-            and row.get('causal_valid_from') is None
-            and row.get('causal_valid_until') is None
+            and row.get("causal_valid_from") is None
+            and row.get("causal_valid_until") is None
             and isinstance(invalid_reason, str)
-            and invalid_reason.startswith('clock uncertainty exceeds threshold:')
+            and invalid_reason.startswith("clock uncertainty exceeds threshold:")
         )
+
     for row in _rows_with_boundaries(
         loaded,
         BINANCE,
@@ -2730,11 +3170,7 @@ def _clock_intervals(
         )
         identity = (
             None
-            if not (
-                isinstance(connection, str)
-                and connection
-                and connection_epoch is not None
-            )
+            if not (isinstance(connection, str) and connection and connection_epoch is not None)
             else lineage.identities.get(
                 (
                     connection,
@@ -2774,10 +3210,7 @@ def _clock_intervals(
         status = row.get("sample_status")
         policy = strict_policy_values(row)
         if status == "valid":
-            strict_policy_valid = (
-                policy is not None
-                and policy[3] <= MAX_CLOCK_UNCERTAINTY_MS
-            )
+            strict_policy_valid = policy is not None and policy[3] <= MAX_CLOCK_UNCERTAINTY_MS
             if not strict_policy_valid:
                 invalid += 1
                 hard_invalid += 1
@@ -2843,7 +3276,11 @@ def _clock_intervals(
                 in_window_hard_invalid_events += 1
             invalid_times[capture].append(received)
 
-    for row in loaded.clock_cadence_successors:
+    for row in loaded.store.iter_rows(
+        BINANCE,
+        RecordType.CLOCK_SYNC,
+        population="cadence",
+    ):
         if int(str(row.get("schema_version", 0))) < 2:
             continue
         capture = row.get("capture_epoch_id")
@@ -2888,9 +3325,7 @@ def _clock_intervals(
     capture_start_by_capture = {
         capture: max(
             connected_at
-            for (_, _, identity_capture), (_, connected_at) in (
-                *lineage.identities.items(),
-            )
+            for (_, _, identity_capture), (_, connected_at) in (*lineage.identities.items(),)
             if identity_capture == capture
         )
         for capture in lineage.eligible_captures
@@ -2901,10 +3336,7 @@ def _clock_intervals(
         BINANCE,
         RecordType.CONNECTION_EVENT,
     ):
-        if (
-            str(row.get("event_kind") or "") not in _FAIL_CLOSED_EVENTS
-            or _is_clock_gap_event(row)
-        ):
+        if str(row.get("event_kind") or "") not in _FAIL_CLOSED_EVENTS or _is_clock_gap_event(row):
             continue
         received = _timestamp(
             row["received_time"],
@@ -2942,9 +3374,7 @@ def _clock_intervals(
         ):
             continue
         prior_end = capture_end_by_capture.get(capture)
-        capture_end_by_capture[capture] = (
-            received if prior_end is None else min(prior_end, received)
-        )
+        capture_end_by_capture[capture] = received if prior_end is None else min(prior_end, received)
 
     for row in _rows_with_boundaries(
         loaded,
@@ -2962,9 +3392,7 @@ def _clock_intervals(
         event_epoch = row.get("connection_epoch")
         public_identities = [
             (connection, epoch)
-            for (connection, epoch, identity_capture), (role, _) in (
-                *lineage.identities.items(),
-            )
+            for (connection, epoch, identity_capture), (role, _) in (*lineage.identities.items(),)
             if identity_capture == capture and role == "public"
         ]
         event_bound = (
@@ -3004,9 +3432,7 @@ def _clock_intervals(
             return
         sample_gap_ms = (current - previous).total_seconds() * 1_000
         max_sample_gap_ms = (
-            sample_gap_ms
-            if max_sample_gap_ms is None
-            else max(max_sample_gap_ms, sample_gap_ms)
+            sample_gap_ms if max_sample_gap_ms is None else max(max_sample_gap_ms, sample_gap_ms)
         )
         if sample_gap_ms > MAX_CLOCK_SAMPLING_INTERVAL_MS:
             spacing_violations += 1
@@ -3036,36 +3462,20 @@ def _clock_intervals(
                 end,
                 capture_end_by_capture.get(capture, end),
             )
-            bounded_attempt_times = [
-                attempt
-                for attempt in attempt_times
-                if attempt <= active_end
-            ]
+            bounded_attempt_times = [attempt for attempt in attempt_times if attempt <= active_end]
             for previous, current in pairwise(bounded_attempt_times):
                 if current <= active_start or previous >= active_end:
                     continue
                 observe_spacing_gap(capture, previous, current)
 
-            attempts_after_start = [
-                attempt
-                for attempt in bounded_attempt_times
-                if attempt > active_start
-            ]
-            if (
-                active_start < active_end
-                and not any(
-                    attempt <= active_start
-                    for attempt in bounded_attempt_times
-                )
+            attempts_after_start = [attempt for attempt in bounded_attempt_times if attempt > active_start]
+            if active_start < active_end and not any(
+                attempt <= active_start for attempt in bounded_attempt_times
             ):
                 observe_spacing_gap(
                     capture,
                     active_start,
-                    (
-                        attempts_after_start[0]
-                        if attempts_after_start
-                        else active_end
-                    ),
+                    (attempts_after_start[0] if attempts_after_start else active_end),
                 )
             if active_start < active_end and bounded_attempt_times:
                 observe_spacing_gap(
@@ -3099,11 +3509,7 @@ def _clock_intervals(
                 ),
                 None,
             )
-            recovery_at = (
-                end
-                if recovery_index is None
-                else samples[recovery_index].interval.start
-            )
+            recovery_at = end if recovery_index is None else samples[recovery_index].interval.start
             if discontinuous.interval.start < recovery_at:
                 offset_outages.append(
                     Interval(
@@ -3118,32 +3524,20 @@ def _clock_intervals(
         effective_samples = [sample.interval for sample in samples]
         for invalid_at in sorted(invalid_times.get(capture, ())):
             recovery = next(
-                (
-                    sample.interval.start
-                    for sample in samples
-                    if sample.interval.start > invalid_at
-                ),
+                (sample.interval.start for sample in samples if sample.interval.start > invalid_at),
                 end,
             )
             if invalid_at < recovery:
-                invalid_outages.append(
-                    Interval(max(invalid_at, start), min(recovery, end), capture)
-                )
+                invalid_outages.append(Interval(max(invalid_at, start), min(recovery, end), capture))
         for rejection_at in sorted(consecutive_rejection_times.get(capture, ())):
             recovery = next(
-                (
-                    sample.interval.start
-                    for sample in samples
-                    if sample.interval.start > rejection_at
-                ),
+                (sample.interval.start for sample in samples if sample.interval.start > rejection_at),
                 end,
             )
             outage_start = max(rejection_at, start)
             outage_end = min(recovery, end)
             if outage_start < outage_end:
-                rejection_outages.append(
-                    Interval(outage_start, outage_end, capture)
-                )
+                rejection_outages.append(Interval(outage_start, outage_end, capture))
         consecutive_rejection_outages[capture] = tuple(rejection_outages)
         result[capture] = _clip(
             _subtract(
@@ -3174,26 +3568,20 @@ def _clock_intervals(
         in_window_hard_invalid_events=in_window_hard_invalid_events,
         in_window_failure_events=in_window_failure_events,
         consecutive_rejection_violations=consecutive_rejection_violations,
-        consecutive_rejection_violation_captures=frozenset(
-            consecutive_rejection_violation_captures
-        ),
+        consecutive_rejection_violation_captures=frozenset(consecutive_rejection_violation_captures),
         consecutive_rejection_outages=consecutive_rejection_outages,
         max_consecutive_rejected_probes=max_consecutive_rejected_probes,
         spacing_violations=spacing_violations,
         spacing_violation_captures=frozenset(spacing_violation_captures),
         offset_discontinuities=offset_discontinuities,
-        offset_discontinuity_captures=frozenset(
-            offset_discontinuity_captures
-        ),
-        max_sample_gap_ms=(
-            None if max_sample_gap_ms is None else round(max_sample_gap_ms, 3)
-        ),
+        offset_discontinuity_captures=frozenset(offset_discontinuity_captures),
+        max_sample_gap_ms=(None if max_sample_gap_ms is None else round(max_sample_gap_ms, 3)),
     )
 
 
-def _gap_payload(key: PartitionKey, gap: Gap, *, boundary: bool) -> dict[str, object]:
+def _gap_payload(partition: str, gap: Gap, *, boundary: bool) -> dict[str, object]:
     return {
-        "partition": key.relative_path.as_posix(),
+        "partition": partition,
         "kind": gap.kind,
         "start": gap.start,
         "end": gap.end,
@@ -3204,7 +3592,6 @@ def _gap_payload(key: PartitionKey, gap: Gap, *, boundary: bool) -> dict[str, ob
 
 
 def _relevant_gaps(
-    inventory: InventoryReport,
     assets: Sequence[str],
     start: datetime,
     end: datetime,
@@ -3217,44 +3604,12 @@ def _relevant_gaps(
     checked independently below and are the authority for bounded sequencing.
     """
 
-    allowed_assets = {*assets, "GLOBAL", "CONNECTION"}
-    first_date = start.date()
-    last_date = (end - timedelta(microseconds=1)).date()
-
-    def relevant(key: PartitionKey, gap: Gap) -> bool:
-        if (
-            key.venue not in {BINANCE, HYPERLIQUID}
-            or key.record_type not in _REQUIRED_TYPES
-            or key.asset not in allowed_assets
-            or not first_date
-            <= (
-                key.date
-                if isinstance(key.date, datetime)
-                else datetime.fromisoformat(str(key.date)).date()
-            )
-            <= last_date
-        ):
-            return False
-        if gap.kind not in {"time", "funding_bucket"}:
-            return False
-        try:
-            left = _utc(datetime.fromisoformat(gap.start.replace("Z", "+00:00")))
-            right = _utc(datetime.fromisoformat(gap.end.replace("Z", "+00:00")))
-        except ValueError:
-            return False
-        return left < end and right > start
-
-    result: list[dict[str, object]] = []
-    for manifest in inventory.partitions:
-        for gap in manifest.gaps:
-            if relevant(manifest.partition, gap):
-                result.append(_gap_payload(manifest.partition, gap, boundary=False))
-    for key, gap in inventory.cross_segment_gaps:
-        if relevant(key, gap):
-            result.append(_gap_payload(key, gap, boundary=True))
+    result = [
+        _gap_payload(partition, gap, boundary=boundary) for partition, gap, boundary in loaded.relevant_gaps
+    ]
 
     # Recompute physical arrival continuity after filtering to the explicit run.
-    connect_times: dict[tuple[str, str, int, str], list[datetime]] = defaultdict(list)
+    epochs_beginning_in_window: set[tuple[str, str, int, str]] = set()
     for venue in (BINANCE, HYPERLIQUID):
         for row in _rows_with_boundaries(
             loaded,
@@ -3273,22 +3628,25 @@ def _relevant_gaps(
                 and isinstance(capture, str)
                 and capture
             ):
-                connect_times[(venue, connection, int(str(epoch)), capture)].append(
-                    _timestamp(row["received_time"], label="connect received_time")
+                connected_at = _timestamp(
+                    row["received_time"],
+                    label="connect received_time",
                 )
+                if start <= connected_at < end:
+                    epochs_beginning_in_window.add((venue, connection, int(str(epoch)), capture))
     for venue in (BINANCE, HYPERLIQUID):
-        wire_rows = list(
-            _rows_with_boundaries(
-                loaded,
-                venue,
-                RecordType.WIRE_MESSAGE,
-            )
-        )
-        grouped: dict[
+        wire_previous_by_group: dict[
             tuple[str, int, str],
-            list[tuple[int, datetime]],
-        ] = defaultdict(list)
-        for row in wire_rows:
+            tuple[int, datetime],
+        ] = {}
+        has_predecessor: set[tuple[str, int, str]] = set()
+        seen_in_window: set[tuple[str, int, str]] = set()
+        for row in loaded.store.iter_rows(
+            venue,
+            RecordType.WIRE_MESSAGE,
+            with_boundaries=True,
+            order_by="received_arrival",
+        ):
             connection = row.get("connection_id")
             epoch = row.get("connection_epoch")
             capture = row.get("capture_epoch_id")
@@ -3301,119 +3659,123 @@ def _relevant_gaps(
                 and capture
                 and arrival is not None
             ):
-                grouped[(connection, int(str(epoch)), capture)].append(
-                    (
-                        int(str(arrival)),
-                        _timestamp(row["received_time"], label="wire received_time"),
-                    )
+                wire_group = (connection, int(str(epoch)), capture)
+                wire_current = (
+                    int(str(arrival)),
+                    _timestamp(row["received_time"], label="wire received_time"),
                 )
-        for (connection, epoch, capture), values in sorted(grouped.items()):
-            values.sort(key=lambda item: (item[1], item[0]))
-            in_window = [
-                value for value in values if start <= value[1] < end
-            ]
-            if not in_window:
+            else:
                 continue
-            has_predecessor = any(value[1] < start for value in values)
-            epoch_begins_in_window = any(
-                start <= value < end
-                for value in connect_times.get(
-                    (venue, connection, epoch, capture),
-                    (),
-                )
-            )
+            if wire_current[1] < start:
+                has_predecessor.add(wire_group)
+            if start <= wire_current[1] < end and wire_group not in seen_in_window:
+                seen_in_window.add(wire_group)
+                epoch_begins_in_window = (
+                    venue,
+                    connection,
+                    wire_group[1],
+                    capture,
+                ) in epochs_beginning_in_window
+                if wire_group not in has_predecessor and epoch_begins_in_window and wire_current[0] != 1:
+                    result.append(
+                        {
+                            "partition": f"venue={venue}/bounded-wire",
+                            "kind": "arrival_sequence_initial",
+                            "start": "0",
+                            "end": str(wire_current[0]),
+                            "missing_count": max(wire_current[0] - 1, 0),
+                            "connection_id": connection,
+                            "connection_epoch": wire_group[1],
+                            "capture_epoch_id": capture,
+                            "cross_segment": False,
+                        }
+                    )
+            previous = wire_previous_by_group.get(wire_group)
             if (
-                not has_predecessor
-                and epoch_begins_in_window
-                and in_window[0][0] != 1
+                previous is not None
+                and wire_group in seen_in_window
+                and previous[1] < end
+                and wire_current[1] >= start
+                and wire_current[0] != previous[0] + 1
             ):
-                result.append(
-                    {
-                        "partition": f"venue={venue}/bounded-wire",
-                        "kind": "arrival_sequence_initial",
-                        "start": "0",
-                        "end": str(in_window[0][0]),
-                        "missing_count": max(in_window[0][0] - 1, 0),
-                        "connection_id": connection,
-                        "connection_epoch": epoch,
-                        "capture_epoch_id": capture,
-                        "cross_segment": False,
-                    }
-                )
-            for previous, current in pairwise(values):
-                if previous[1] >= end or current[1] < start:
-                    continue
-                if current[0] == previous[0] + 1:
-                    continue
                 result.append(
                     {
                         "partition": f"venue={venue}/bounded-wire",
                         "kind": (
                             "arrival_sequence"
-                            if current[0] > previous[0] + 1
+                            if wire_current[0] > previous[0] + 1
                             else "arrival_sequence_regression"
                         ),
                         "start": str(previous[0]),
-                        "end": str(current[0]),
-                        "missing_count": max(current[0] - previous[0] - 1, 0),
+                        "end": str(wire_current[0]),
+                        "missing_count": max(
+                            wire_current[0] - previous[0] - 1,
+                            0,
+                        ),
                         "connection_id": connection,
-                        "connection_epoch": epoch,
+                        "connection_epoch": wire_group[1],
                         "capture_epoch_id": capture,
                         "cross_segment": False,
                     }
                 )
+            wire_previous_by_group[wire_group] = wire_current
 
     for asset in assets:
-        grouped_trades: dict[
+        trade_previous_by_group: dict[
             tuple[str, int],
-            list[tuple[int, datetime]],
-        ] = defaultdict(list)
-        for row in _rows_with_boundaries(
-            loaded,
+            tuple[int, datetime],
+        ] = {}
+        groups_with_in_window_rows: set[tuple[str, int]] = set()
+        pending_gaps: dict[tuple[str, int], list[dict[str, object]]] = defaultdict(list)
+        for row in loaded.store.iter_rows(
             BINANCE,
             RecordType.TRADE,
             asset,
+            with_boundaries=True,
+            order_by="received_source",
         ):
             connection = row.get("connection_id")
             epoch = row.get("connection_epoch")
             sequence = row.get("source_sequence")
-            if (
-                isinstance(connection, str)
-                and connection
-                and epoch is not None
-                and sequence is not None
-            ):
-                grouped_trades[(connection, int(str(epoch)))].append(
-                    (
-                        int(str(sequence)),
-                        _timestamp(row["received_time"], label="trade received_time"),
-                    )
+            if isinstance(connection, str) and connection and epoch is not None and sequence is not None:
+                trade_group = (connection, int(str(epoch)))
+                trade_current = (
+                    int(str(sequence)),
+                    _timestamp(row["received_time"], label="trade received_time"),
                 )
-        for (connection, epoch), values in sorted(grouped_trades.items()):
-            values.sort(key=lambda item: (item[1], item[0]))
-            if not any(start <= value[1] < end for value in values):
+            else:
                 continue
-            for previous, current in pairwise(values):
-                if previous[1] >= end or current[1] < start:
-                    continue
-                if current[0] == previous[0] + 1:
-                    continue
-                result.append(
+            if start <= trade_current[1] < end:
+                groups_with_in_window_rows.add(trade_group)
+            previous = trade_previous_by_group.get(trade_group)
+            if (
+                previous is not None
+                and previous[1] < end
+                and trade_current[1] >= start
+                and trade_current[0] != previous[0] + 1
+            ):
+                pending_gaps[trade_group].append(
                     {
                         "partition": f"venue={BINANCE}/asset={asset}/bounded-trade",
                         "kind": (
                             "source_sequence"
-                            if current[0] > previous[0] + 1
+                            if trade_current[0] > previous[0] + 1
                             else "source_sequence_regression"
                         ),
                         "start": str(previous[0]),
-                        "end": str(current[0]),
-                        "missing_count": max(current[0] - previous[0] - 1, 0),
+                        "end": str(trade_current[0]),
+                        "missing_count": max(
+                            trade_current[0] - previous[0] - 1,
+                            0,
+                        ),
                         "connection_id": connection,
-                        "connection_epoch": epoch,
+                        "connection_epoch": trade_group[1],
                         "cross_segment": False,
                     }
                 )
+            trade_previous_by_group[trade_group] = trade_current
+        for trade_group in sorted(groups_with_in_window_rows):
+            result.extend(pending_gaps.get(trade_group, ()))
     return sorted(
         result,
         key=lambda item: (
@@ -3464,16 +3826,16 @@ def _at_or_after_resync_arm(
     return (_utc(received), arrival_sequence) >= (_utc(arm[0]), arm[1])
 
 
-def audit_phase10_continuity(
+def _audit_phase10_continuity_impl(
     root: Path,
     *,
     assets: Sequence[str],
     start: datetime,
     end: datetime,
     state_ttl: timedelta = DEFAULT_STATE_TTL,
+    loaded_holder: list[_LoadedLake],
 ) -> dict[str, object]:
-    """Audit technical capture readiness while Phase 10 remains blocked."""
-
+    audit_started = time.perf_counter()
     start = _utc(start)
     end = _utc(end)
     original_assets = tuple(assets)
@@ -3491,7 +3853,10 @@ def audit_phase10_continuity(
     if state_ttl > DEFAULT_STATE_TTL:
         raise ValueError("continuity state TTL cannot exceed the strict 30-second bound")
 
-    loaded = _load_lake(root, start, end)
+    loaded = _load_lake(root, start, end, normalized_assets)
+    loaded_holder.append(loaded)
+    semantic_started = time.perf_counter()
+    phase_started = time.perf_counter()
     binance_lineage = _connection_lineage(
         loaded,
         BINANCE,
@@ -3506,7 +3871,11 @@ def audit_phase10_continuity(
         start,
         end,
     )
-    by_sequence, by_frame = _binance_wire_indexes(loaded)
+    loaded.metrics.observe_phase(
+        "connection_lineage",
+        time.perf_counter() - phase_started,
+    )
+    phase_started = time.perf_counter()
     binance_capture_map = _connection_capture_map(loaded, BINANCE)
     hyperliquid_capture_map = _connection_capture_map(loaded, HYPERLIQUID)
     binance_outage_audit = _event_outages(
@@ -3525,15 +3894,26 @@ def audit_phase10_continuity(
         hyperliquid_capture_map,
         hyperliquid_lineage,
     )
+    loaded.metrics.observe_phase(
+        "connection_events_and_outages",
+        time.perf_counter() - phase_started,
+    )
     market_active_captures = tuple(
         sorted(
             binance_lineage.observed_captures
             | binance_outage_audit.active_event_captures
             | {
                 str(row["capture_epoch_id"])
-                for (_, _, asset, _), rows in by_frame.items()
-                if asset in normalized_assets
-                for row in rows
+                for row in _all_rows(
+                    loaded,
+                    BINANCE,
+                    RecordType.WIRE_MESSAGE,
+                )
+                if int(str(row.get("schema_version", 0))) >= 2
+                and row.get("message_asset") in normalized_assets
+                and _wire_kind(row.get("channel"), row.get("raw_message")) in {"bbo", "l2", "trade"}
+                and isinstance(row.get("capture_epoch_id"), str)
+                and str(row["capture_epoch_id"])
             }
         )
     )
@@ -3545,17 +3925,14 @@ def audit_phase10_continuity(
                 str(row["capture_epoch_id"])
                 for row in _all_rows(loaded, HYPERLIQUID, RecordType.WIRE_MESSAGE)
                 if row.get("message_asset") in normalized_assets
-                and _wire_kind(row.get("channel"), row.get("raw_message"))
-                in {"bbo", "l2", "trade"}
+                and _wire_kind(row.get("channel"), row.get("raw_message")) in {"bbo", "l2", "trade"}
                 and isinstance(row.get("capture_epoch_id"), str)
                 and str(row["capture_epoch_id"])
             }
         )
     )
     binance_role_invalid_captures = tuple(
-        capture
-        for capture in market_active_captures
-        if capture not in binance_lineage.eligible_captures
+        capture for capture in market_active_captures if capture not in binance_lineage.eligible_captures
     )
     hyperliquid_role_invalid_captures = tuple(
         capture
@@ -3564,6 +3941,7 @@ def audit_phase10_continuity(
     )
     binance_outages = binance_outage_audit.intervals
     hyperliquid_outages = hyperliquid_outage_audit.intervals
+    phase_started = time.perf_counter()
     (
         binance_observations,
         trade_counts,
@@ -3573,8 +3951,6 @@ def audit_phase10_continuity(
         loaded,
         normalized_assets,
         binance_lineage,
-        by_sequence,
-        by_frame,
     )
     (
         hyperliquid_observations,
@@ -3584,6 +3960,11 @@ def audit_phase10_continuity(
         normalized_assets,
         hyperliquid_lineage,
     )
+    loaded.metrics.observe_phase(
+        "raw_normalized_lineage",
+        time.perf_counter() - phase_started,
+    )
+    phase_started = time.perf_counter()
     binance_orphan_required_wire = _orphan_required_wire_counts(
         loaded,
         BINANCE,
@@ -3611,9 +3992,14 @@ def audit_phase10_continuity(
         normalized_assets,
         hyperliquid_lineage,
     )
-    orphan_normalized_l2_level_total = sum(
-        binance_orphan_l2_levels.values()
-    ) + sum(hyperliquid_orphan_l2_levels.values())
+    orphan_normalized_l2_level_total = sum(binance_orphan_l2_levels.values()) + sum(
+        hyperliquid_orphan_l2_levels.values()
+    )
+    loaded.metrics.observe_phase(
+        "orphan_lineage",
+        time.perf_counter() - phase_started,
+    )
+    phase_started = time.perf_counter()
     binance_market = _required_market_intervals(
         binance_observations,
         normalized_assets,
@@ -3630,6 +4016,11 @@ def audit_phase10_continuity(
         end,
         hyperliquid_outages,
     )
+    loaded.metrics.observe_phase(
+        "market_coverage_intervals",
+        time.perf_counter() - phase_started,
+    )
+    phase_started = time.perf_counter()
     clock_audit = _clock_intervals(
         loaded,
         start,
@@ -3638,42 +4029,33 @@ def audit_phase10_continuity(
         binance_lineage,
         frozenset(market_active_captures),
     )
+    loaded.metrics.observe_phase(
+        "clock_causal_coverage",
+        time.perf_counter() - phase_started,
+    )
     clock_by_capture = clock_audit.intervals
 
     market_ready_by_capture = {
         capture: _intersect_many(
-            [
-                binance_market.get(capture, {}).get(asset, ())
-                for asset in normalized_assets
-            ]
+            [binance_market.get(capture, {}).get(asset, ()) for asset in normalized_assets]
         )
         for capture in sorted(binance_market)
     }
     market_ready_by_capture = {
-        capture: intervals
-        for capture, intervals in market_ready_by_capture.items()
-        if intervals
+        capture: intervals for capture, intervals in market_ready_by_capture.items() if intervals
     }
     captures_without_valid_clock = tuple(
-        capture
-        for capture in market_active_captures
-        if not clock_by_capture.get(capture)
+        capture for capture in market_active_captures if not clock_by_capture.get(capture)
     )
     binance_market_incomplete_captures = tuple(
         capture
         for capture in market_active_captures
-        if not all(
-            binance_market.get(capture, {}).get(asset)
-            for asset in normalized_assets
-        )
+        if not all(binance_market.get(capture, {}).get(asset) for asset in normalized_assets)
     )
     hyperliquid_market_incomplete_captures = tuple(
         capture
         for capture in hyperliquid_active_captures
-        if not all(
-            hyperliquid_market.get(capture, {}).get(asset)
-            for asset in normalized_assets
-        )
+        if not all(hyperliquid_market.get(capture, {}).get(asset) for asset in normalized_assets)
     )
     multiple_hyperliquid_active_captures = len(hyperliquid_active_captures) > 1
     active_capture_set = set(market_active_captures)
@@ -3681,12 +4063,10 @@ def audit_phase10_continuity(
         sorted(active_capture_set & set(clock_audit.spacing_violation_captures))
     )
     relevant_offset_discontinuity_captures = tuple(
-        sorted(
-            active_capture_set
-            & set(clock_audit.offset_discontinuity_captures)
-        )
+        sorted(active_capture_set & set(clock_audit.offset_discontinuity_captures))
     )
 
+    phase_started = time.perf_counter()
     eligible_captures = tuple(
         capture
         for capture in sorted(clock_by_capture)
@@ -3709,9 +4089,7 @@ def audit_phase10_continuity(
                     hyperliquid_market[hyperliquid_capture].get(asset, ()),
                 )
                 tag = f"{binance_capture}|{hyperliquid_capture}"
-                retagged = tuple(
-                    Interval(item.start, item.end, tag) for item in strict_asset
-                )
+                retagged = tuple(Interval(item.start, item.end, tag) for item in strict_asset)
                 trade_qualified = tuple(
                     item
                     for item in retagged
@@ -3745,9 +4123,16 @@ def audit_phase10_continuity(
                     for asset in normalized_assets
                 ):
                     strict_all.append(candidate)
+    loaded.metrics.observe_phase(
+        "strict_overlap",
+        time.perf_counter() - phase_started,
+    )
 
-    relevant_gaps = _relevant_gaps(
-        loaded.inventory, normalized_assets, start, end, loaded
+    phase_started = time.perf_counter()
+    relevant_gaps = _relevant_gaps(normalized_assets, start, end, loaded)
+    loaded.metrics.observe_phase(
+        "bounded_gap_validation",
+        time.perf_counter() - phase_started,
     )
     if (
         relevant_gaps
@@ -3789,9 +4174,7 @@ def audit_phase10_continuity(
         market_ready_start = min(item.start for item in intervals)
         connect_times = [
             connected_at
-            for (_, _, identity_capture), (_, connected_at) in (
-                *binance_lineage.identities.items(),
-            )
+            for (_, _, identity_capture), (_, connected_at) in (*binance_lineage.identities.items(),)
             if identity_capture == capture
         ]
         readiness = max((market_ready_start, *connect_times))
@@ -3848,18 +4231,12 @@ def audit_phase10_continuity(
         assessed_end = max(value[1] for value in assessed_by_capture.values())
         assessed_span = (assessed_start, assessed_end)
         coverage, internal_gap_count, uncovered = _covered_without_gaps(
-            (
-                interval
-                for capture in assessed_by_capture
-                for interval in clock_by_capture.get(capture, ())
-            ),
+            (interval for capture in assessed_by_capture for interval in clock_by_capture.get(capture, ())),
             assessed_start,
             assessed_end,
         )
         causal_coverage_continuous = (
-            coverage
-            and len(assessed_by_capture) == 1
-            and not captures_without_valid_clock
+            coverage and len(assessed_by_capture) == 1 and not captures_without_valid_clock
         )
         clock_continuous = (
             coverage
@@ -3895,48 +4272,30 @@ def audit_phase10_continuity(
         )
 
     generation_gap_count = max(len(assessed_by_capture) - 1, 0)
-    leading_gap = (
-        timedelta()
-        if assessed_span is None
-        else max(assessed_span[0] - start, timedelta())
-    )
-    trailing_gap = (
-        end - start
-        if assessed_span is None
-        else max(end - assessed_span[1], timedelta())
-    )
+    leading_gap = timedelta() if assessed_span is None else max(assessed_span[0] - start, timedelta())
+    trailing_gap = end - start if assessed_span is None else max(end - assessed_span[1], timedelta())
     requested_margin_limit = timedelta(milliseconds=MAX_CLOCK_AGE_MS)
     leading_margin_exceeded = leading_gap > requested_margin_limit
     trailing_margin_exceeded = trailing_gap > requested_margin_limit
-    trailing_terminal_roles_complete = (
-        assessed_span is not None
-        and (
-            trailing_gap == timedelta()
-            or (
-                len(market_active_captures) == 1
-                and binance_outage_audit.clean_terminal_roles.get(
-                    market_active_captures[0],
-                    frozenset(),
-                )
-                == frozenset({"public", "market"})
-                and len(hyperliquid_active_captures) == 1
-                and hyperliquid_outage_audit.clean_terminal_roles.get(
-                    hyperliquid_active_captures[0],
-                    frozenset(),
-                )
-                == frozenset({"public"})
+    trailing_terminal_roles_complete = assessed_span is not None and (
+        trailing_gap == timedelta()
+        or (
+            len(market_active_captures) == 1
+            and binance_outage_audit.clean_terminal_roles.get(
+                market_active_captures[0],
+                frozenset(),
             )
+            == frozenset({"public", "market"})
+            and len(hyperliquid_active_captures) == 1
+            and hyperliquid_outage_audit.clean_terminal_roles.get(
+                hyperliquid_active_captures[0],
+                frozenset(),
+            )
+            == frozenset({"public"})
         )
     )
-    trailing_terminal_incomplete = (
-        trailing_gap > timedelta()
-        and not trailing_terminal_roles_complete
-    )
-    if (
-        leading_margin_exceeded
-        or trailing_margin_exceeded
-        or trailing_terminal_incomplete
-    ):
+    trailing_terminal_incomplete = trailing_gap > timedelta() and not trailing_terminal_roles_complete
+    if leading_margin_exceeded or trailing_margin_exceeded or trailing_terminal_incomplete:
         clock_continuous = False
         strict_all = []
         strict_by_asset = defaultdict(list)
@@ -3968,19 +4327,13 @@ def audit_phase10_continuity(
         reasons.append("binance_gap_or_disconnect_unbound")
     if hyperliquid_outage_audit.unbound_fail_closed_events:
         reasons.append("hyperliquid_gap_or_disconnect_unbound")
-    if (
-        binance_outage_audit.unbound_resync_events
-        or hyperliquid_outage_audit.unbound_resync_events
-    ):
+    if binance_outage_audit.unbound_resync_events or hyperliquid_outage_audit.unbound_resync_events:
         reasons.append("resync_event_unbound")
     if orphan_required_wire_total:
         reasons.append("required_raw_wire_without_exact_normalization")
     if orphan_normalized_l2_level_total:
         reasons.append("normalized_l2_level_without_exact_raw_header_lineage")
-    if (
-        binance_outage_audit.in_window_gap_events
-        or hyperliquid_outage_audit.in_window_gap_events
-    ):
+    if binance_outage_audit.in_window_gap_events or hyperliquid_outage_audit.in_window_gap_events:
         reasons.append("in_window_capture_gap_event")
     if (
         binance_outage_audit.unclean_in_window_disconnect_events
@@ -3988,26 +4341,22 @@ def audit_phase10_continuity(
     ):
         reasons.append("in_window_disconnect_without_clean_stop_reason")
     reasons.extend(
-        f"binance_l2_resync_missing:{asset}:{capture}"
-        for capture, asset in missing_binance_resyncs
+        f"binance_l2_resync_missing:{asset}:{capture}" for capture, asset in missing_binance_resyncs
     )
     if multiple_hyperliquid_active_captures:
         reasons.append("hyperliquid_multiple_active_capture_generations")
     reasons.extend(
-        f"binance_market_capture_incomplete:{capture}"
-        for capture in binance_market_incomplete_captures
+        f"binance_market_capture_incomplete:{capture}" for capture in binance_market_incomplete_captures
     )
     reasons.extend(
         f"hyperliquid_market_capture_incomplete:{capture}"
         for capture in hyperliquid_market_incomplete_captures
     )
     reasons.extend(
-        f"clock_sync_missing_valid_for_market_capture:{capture}"
-        for capture in captures_without_valid_clock
+        f"clock_sync_missing_valid_for_market_capture:{capture}" for capture in captures_without_valid_clock
     )
     reasons.extend(
-        f"binance_connection_role_lineage_invalid:{capture}"
-        for capture in binance_role_invalid_captures
+        f"binance_connection_role_lineage_invalid:{capture}" for capture in binance_role_invalid_captures
     )
     reasons.extend(
         f"hyperliquid_connection_role_lineage_invalid:{capture}"
@@ -4051,11 +4400,9 @@ def audit_phase10_continuity(
             "duration_seconds": _seconds(_duration(intervals)),
         }
     clock_intervals = tuple(
-        interval
-        for capture in sorted(clock_by_capture)
-        for interval in clock_by_capture[capture]
+        interval for capture in sorted(clock_by_capture) for interval in clock_by_capture[capture]
     )
-    return {
+    payload: dict[str, object] = {
         "audit_version": 1,
         "phase_10_status": PHASE_10_STATUS,
         "technical_capture_gate": "PASS" if not reasons else "FAIL",
@@ -4069,9 +4416,7 @@ def audit_phase10_continuity(
             "max_unassessed_margin_ms": MAX_CLOCK_AGE_MS,
             "leading_margin_within_limit": not leading_margin_exceeded,
             "trailing_margin_within_limit": not trailing_margin_exceeded,
-            "trailing_terminal_roles_complete": (
-                trailing_terminal_roles_complete
-            ),
+            "trailing_terminal_roles_complete": (trailing_terminal_roles_complete),
         },
         "policy": {
             "interval_semantics": "half_open_received_time_causal",
@@ -4084,13 +4429,9 @@ def audit_phase10_continuity(
             "clock_max_age_ms": MAX_CLOCK_AGE_MS,
             "clock_max_uncertainty_ms": float(MAX_CLOCK_UNCERTAINTY_MS),
             "clock_actual_sample_spacing_enforced": True,
-            "clock_sample_spacing_population": (
-                "all_persisted_identity_bound_v2_clock_sync_attempts"
-            ),
+            "clock_sample_spacing_population": ("all_persisted_identity_bound_v2_clock_sync_attempts"),
             "clock_sample_spacing_timestamp": "request_sent_time",
-            "clock_sample_spacing_bounds": (
-                "active_generation_clipped_to_requested_window"
-            ),
+            "clock_sample_spacing_bounds": ("active_generation_clipped_to_requested_window"),
             "clock_identity_requires_v2_wire_lineage": True,
             "clock_offset_uncertainty_bands_must_overlap": True,
             "physical_connection_roles_required": {
@@ -4104,103 +4445,55 @@ def audit_phase10_continuity(
             "phase_10_may_be_unblocked_by_this_audit": False,
         },
         "binance_trades": {
-            "normalized_total": sum(
-                value["normalized_count"] for value in trade_counts.values()
-            ),
+            "normalized_total": sum(value["normalized_count"] for value in trade_counts.values()),
             "normalized_with_raw_lineage_total": sum(
-                value["normalized_with_raw_lineage_count"]
-                for value in trade_counts.values()
+                value["normalized_with_raw_lineage_count"] for value in trade_counts.values()
             ),
-            "raw_agg_trade_total": sum(
-                value["raw_agg_trade_count"] for value in trade_counts.values()
-            ),
+            "raw_agg_trade_total": sum(value["raw_agg_trade_count"] for value in trade_counts.values()),
             "raw_agg_trade_with_role_lineage_total": sum(
-                value["raw_agg_trade_with_role_lineage_count"]
-                for value in trade_counts.values()
+                value["raw_agg_trade_with_role_lineage_count"] for value in trade_counts.values()
             ),
             "by_asset": trade_counts,
         },
         "connection_lineage": {
             BINANCE: {
-                "eligible_capture_generations": sorted(
-                    binance_lineage.eligible_captures
-                ),
-                "market_active_invalid_capture_generations": list(
-                    binance_role_invalid_captures
-                ),
-                "incomplete_capture_generations": list(
-                    binance_market_incomplete_captures
-                ),
-                "ambiguous_or_wrong_role_connect_identities": (
-                    binance_lineage.rejected_identity_count
-                ),
+                "eligible_capture_generations": sorted(binance_lineage.eligible_captures),
+                "market_active_invalid_capture_generations": list(binance_role_invalid_captures),
+                "incomplete_capture_generations": list(binance_market_incomplete_captures),
+                "ambiguous_or_wrong_role_connect_identities": (binance_lineage.rejected_identity_count),
                 "unbound_connect_events": binance_lineage.unbound_connect_events,
-                "normalized_market_lineage_rejections": (
-                    binance_lineage_rejections
-                ),
+                "normalized_market_lineage_rejections": (binance_lineage_rejections),
             },
             HYPERLIQUID: {
-                "eligible_capture_generations": sorted(
-                    hyperliquid_lineage.eligible_captures
-                ),
-                "market_active_invalid_capture_generations": list(
-                    hyperliquid_role_invalid_captures
-                ),
-                "incomplete_capture_generations": list(
-                    hyperliquid_market_incomplete_captures
-                ),
-                "multiple_active_capture_generations": (
-                    multiple_hyperliquid_active_captures
-                ),
-                "ambiguous_or_wrong_role_connect_identities": (
-                    hyperliquid_lineage.rejected_identity_count
-                ),
+                "eligible_capture_generations": sorted(hyperliquid_lineage.eligible_captures),
+                "market_active_invalid_capture_generations": list(hyperliquid_role_invalid_captures),
+                "incomplete_capture_generations": list(hyperliquid_market_incomplete_captures),
+                "multiple_active_capture_generations": (multiple_hyperliquid_active_captures),
+                "ambiguous_or_wrong_role_connect_identities": (hyperliquid_lineage.rejected_identity_count),
                 "unbound_connect_events": hyperliquid_lineage.unbound_connect_events,
-                "normalized_market_lineage_rejections": (
-                    hyperliquid_lineage_rejections
-                ),
+                "normalized_market_lineage_rejections": (hyperliquid_lineage_rejections),
             },
         },
         "connection_events": {
             BINANCE: {
-                "unbound_gap_or_disconnect_events": (
-                    binance_outage_audit.unbound_fail_closed_events
-                ),
-                "unbound_resync_events": (
-                    binance_outage_audit.unbound_resync_events
-                ),
-                "in_window_gap_events": (
-                    binance_outage_audit.in_window_gap_events
-                ),
+                "unbound_gap_or_disconnect_events": (binance_outage_audit.unbound_fail_closed_events),
+                "unbound_resync_events": (binance_outage_audit.unbound_resync_events),
+                "in_window_gap_events": (binance_outage_audit.in_window_gap_events),
                 "unclean_in_window_disconnect_events": (
                     binance_outage_audit.unclean_in_window_disconnect_events
                 ),
-                "event_active_capture_generations": sorted(
-                    binance_outage_audit.active_event_captures
-                ),
-                "failure_events_by_capture_generation": (
-                    binance_outage_audit.failure_events_by_capture
-                ),
+                "event_active_capture_generations": sorted(binance_outage_audit.active_event_captures),
+                "failure_events_by_capture_generation": (binance_outage_audit.failure_events_by_capture),
             },
             HYPERLIQUID: {
-                "unbound_gap_or_disconnect_events": (
-                    hyperliquid_outage_audit.unbound_fail_closed_events
-                ),
-                "unbound_resync_events": (
-                    hyperliquid_outage_audit.unbound_resync_events
-                ),
-                "in_window_gap_events": (
-                    hyperliquid_outage_audit.in_window_gap_events
-                ),
+                "unbound_gap_or_disconnect_events": (hyperliquid_outage_audit.unbound_fail_closed_events),
+                "unbound_resync_events": (hyperliquid_outage_audit.unbound_resync_events),
+                "in_window_gap_events": (hyperliquid_outage_audit.in_window_gap_events),
                 "unclean_in_window_disconnect_events": (
                     hyperliquid_outage_audit.unclean_in_window_disconnect_events
                 ),
-                "event_active_capture_generations": sorted(
-                    hyperliquid_outage_audit.active_event_captures
-                ),
-                "failure_events_by_capture_generation": (
-                    hyperliquid_outage_audit.failure_events_by_capture
-                ),
+                "event_active_capture_generations": sorted(hyperliquid_outage_audit.active_event_captures),
+                "failure_events_by_capture_generation": (hyperliquid_outage_audit.failure_events_by_capture),
             },
         },
         "required_wire_lineage": {
@@ -4220,8 +4513,7 @@ def audit_phase10_continuity(
         "binance_l2_resync": {
             "missing_count": len(missing_binance_resyncs),
             "missing": [
-                {"capture_epoch_id": capture, "asset": asset}
-                for capture, asset in missing_binance_resyncs
+                {"capture_epoch_id": capture, "asset": asset} for capture, asset in missing_binance_resyncs
             ],
         },
         "clock_sync": {
@@ -4235,16 +4527,10 @@ def audit_phase10_continuity(
             "wire_identity_rejections": clock_audit.identity_rejections,
             "unbound_invalid_events": clock_audit.unbound_invalid_events,
             "in_window_invalid_events": clock_audit.in_window_invalid_events,
-            "in_window_rejected_probe_events": (
-                clock_audit.in_window_rejected_probe_events
-            ),
-            "in_window_hard_invalid_events": (
-                clock_audit.in_window_hard_invalid_events
-            ),
+            "in_window_rejected_probe_events": (clock_audit.in_window_rejected_probe_events),
+            "in_window_hard_invalid_events": (clock_audit.in_window_hard_invalid_events),
             "in_window_failure_events": clock_audit.in_window_failure_events,
-            "consecutive_rejection_violations": (
-                clock_audit.consecutive_rejection_violations
-            ),
+            "consecutive_rejection_violations": (clock_audit.consecutive_rejection_violations),
             "consecutive_rejection_violation_capture_generations": list(
                 relevant_consecutive_rejection_captures
             ),
@@ -4255,53 +4541,31 @@ def audit_phase10_continuity(
                     for outage in clock_audit.consecutive_rejection_outages[capture]
                 )
             ),
-            "max_consecutive_rejected_probes": (
-                clock_audit.max_consecutive_rejected_probes
-            ),
-            "strict_max_consecutive_rejected_probes": (
-                MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES
-            ),
+            "max_consecutive_rejected_probes": (clock_audit.max_consecutive_rejected_probes),
+            "strict_max_consecutive_rejected_probes": (MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES),
             "sample_spacing_violations": clock_audit.spacing_violations,
-            "sample_spacing_violation_capture_generations": list(
-                relevant_spacing_captures
-            ),
-            "sample_spacing_population": (
-                "all_persisted_identity_bound_v2_clock_sync_attempts"
-            ),
+            "sample_spacing_violation_capture_generations": list(relevant_spacing_captures),
+            "sample_spacing_population": ("all_persisted_identity_bound_v2_clock_sync_attempts"),
             "sample_spacing_timestamp": "request_sent_time",
-            "sample_spacing_bounds": (
-                "active_generation_clipped_to_requested_window"
-            ),
+            "sample_spacing_bounds": ("active_generation_clipped_to_requested_window"),
             "offset_discontinuities": clock_audit.offset_discontinuities,
-            "offset_discontinuity_capture_generations": list(
-                relevant_offset_discontinuity_captures
-            ),
+            "offset_discontinuity_capture_generations": list(relevant_offset_discontinuity_captures),
             "actual_max_sample_gap_ms": clock_audit.max_sample_gap_ms,
             "actual_max_cadence_gap_ms": clock_audit.max_sample_gap_ms,
             "strict_max_sampling_interval_ms": MAX_CLOCK_SAMPLING_INTERVAL_MS,
             "strict_max_age_ms": MAX_CLOCK_AGE_MS,
             "strict_max_uncertainty_ms": float(MAX_CLOCK_UNCERTAINTY_MS),
             "eligible_capture_generations": list(eligible_captures),
-            "market_active_capture_generations": list(
-                market_active_captures
-            ),
-            "market_active_without_valid_clock": list(
-                captures_without_valid_clock
-            ),
+            "market_active_capture_generations": list(market_active_captures),
+            "market_active_without_valid_clock": list(captures_without_valid_clock),
             "assessed_capture_generations": sorted(assessed_by_capture),
             "market_ready_at_by_capture": {
-                capture: _iso(value)
-                for capture, value in sorted(market_ready_at_by_capture.items())
+                capture: _iso(value) for capture, value in sorted(market_ready_at_by_capture.items())
             },
             "initial_acquisition_delay_ms_by_capture": {
-                capture: value
-                for capture, value in sorted(
-                    initial_clock_delay_ms_by_capture.items()
-                )
+                capture: value for capture, value in sorted(initial_clock_delay_ms_by_capture.items())
             },
-            "initial_acquisition_delay_violations": sorted(
-                initial_clock_delay_violations
-            ),
+            "initial_acquisition_delay_violations": sorted(initial_clock_delay_violations),
             "assessed_span": (
                 None
                 if assessed_span is None
@@ -4324,10 +4588,47 @@ def audit_phase10_continuity(
             "intervals": _interval_payload(strict_intervals),
         },
         "validation": {
-            "inventory_partition_count": len(loaded.inventory.partitions),
+            "inventory_partition_count": loaded.inventory_partition_count,
             "inventory_row_count": loaded.inventory.total_rows,
             "relevant_gap_count": len(relevant_gaps),
             "relevant_gaps": relevant_gaps,
         },
         "failure_reasons": reasons,
     }
+    loaded.metrics.observe_phase(
+        "semantic_validation",
+        time.perf_counter() - semantic_started,
+    )
+    loaded.store.observe_scratch_size()
+    loaded.metrics.observe_phase(
+        "total",
+        time.perf_counter() - audit_started,
+    )
+    payload["observability"] = loaded.metrics.as_dict()
+    loaded.store.close()
+    return payload
+
+
+def audit_phase10_continuity(
+    root: Path,
+    *,
+    assets: Sequence[str],
+    start: datetime,
+    end: datetime,
+    state_ttl: timedelta = DEFAULT_STATE_TTL,
+) -> dict[str, object]:
+    """Audit technical capture readiness while Phase 10 remains blocked."""
+
+    loaded_holder: list[_LoadedLake] = []
+    try:
+        return _audit_phase10_continuity_impl(
+            root,
+            assets=assets,
+            start=start,
+            end=end,
+            state_ttl=state_ttl,
+            loaded_holder=loaded_holder,
+        )
+    finally:
+        for loaded in loaded_holder:
+            loaded.store.close()

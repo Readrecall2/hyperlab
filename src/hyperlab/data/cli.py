@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -39,6 +39,23 @@ def daily_quality_report(root: Path, report_date: date) -> dict[str, object]:
     from hyperlab.data.quality import daily_quality_report as implementation
 
     return implementation(root, report_date)
+
+
+def phase10_continuity_report(
+    root: Path,
+    *,
+    assets: Sequence[str],
+    start: datetime,
+    end: datetime,
+) -> dict[str, object]:
+    from hyperlab.data.continuity import audit_phase10_continuity
+
+    return audit_phase10_continuity(
+        root,
+        assets=assets,
+        start=start,
+        end=end,
+    )
 
 
 def build_catalog(root: Path, database: Path) -> Path:
@@ -138,6 +155,34 @@ def _parse_date(value: str | None, option: str) -> date | None:
     if parsed.isoformat() != value:
         raise ValueError(f"INVALID_DATE [{option}] value={value}; expected=YYYY-MM-DD")
     return parsed
+
+
+def _parse_utc_timestamp(value: str, option: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"INVALID_TIMESTAMP [{option}] value={value}; expected=UTC_ISO_8601"
+        ) from exc
+    offset = parsed.utcoffset()
+    if parsed.tzinfo is None or offset is None:
+        raise ValueError(
+            f"INVALID_TIMESTAMP [{option}] value={value}; expected=UTC_ISO_8601"
+        )
+    if offset != timedelta():
+        raise ValueError(
+            f"INVALID_TIMESTAMP [{option}] value={value}; expected=UTC_ISO_8601"
+        )
+    return parsed.astimezone(UTC)
+
+
+def _parse_assets(value: str) -> tuple[str, ...]:
+    assets = tuple(item.strip().upper() for item in value.split(",") if item.strip())
+    if not assets or len(assets) != len(set(assets)):
+        raise ValueError(
+            f"INVALID_ASSETS [assets] value={value}; expected=unique_comma_separated_assets"
+        )
+    return assets
 
 
 def _manifest_payload(manifest: object) -> dict[str, object]:
@@ -340,6 +385,60 @@ def inventory_data(
             typer.echo(_canonical_json(payload), nl=False)
         else:
             _print_inventory_table(payload)
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        _print_error(exc)
+        raise typer.Exit(2) from None
+
+
+@data_app.command("continuity")
+def continuity_data(
+    root: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
+    ],
+    assets_value: Annotated[
+        str,
+        typer.Option("--assets", help="Actifs requis, séparés par des virgules"),
+    ],
+    start_value: Annotated[
+        str,
+        typer.Option("--start", help="Début UTC ISO 8601 inclus"),
+    ],
+    end_value: Annotated[
+        str,
+        typer.Option("--end", help="Fin UTC ISO 8601 exclue"),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Sortie JSON canonique"),
+    ] = False,
+) -> None:
+    """Audite sans interpolation le recouvrement technique strict de Phase 10."""
+
+    try:
+        assets = _parse_assets(assets_value)
+        start = _parse_utc_timestamp(start_value, "start")
+        end = _parse_utc_timestamp(end_value, "end")
+        if start >= end:
+            raise ValueError(
+                f"INVALID_TIMESTAMP_RANGE [continuity] start={start_value} end={end_value}"
+            )
+        payload = phase10_continuity_report(
+            root,
+            assets=assets,
+            start=start,
+            end=end,
+        )
+        if json_output:
+            typer.echo(_canonical_json(payload), nl=False)
+        else:
+            console.print(
+                "Phase 10: "
+                f"{payload.get('phase_10_status')} — "
+                f"capture technique: {payload.get('technical_capture_gate')}"
+            )
+        if payload.get("technical_capture_gate") != "PASS":
+            raise typer.Exit(2)
     except (ImportError, OSError, TypeError, ValueError) as exc:
         _print_error(exc)
         raise typer.Exit(2) from None

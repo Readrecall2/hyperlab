@@ -233,6 +233,15 @@ d'un bull market. Voir <a href="MOMENTUM_REGIME_PHASE09.md"><code>MOMENTUM_REGIM
 <h3 id="3-6-lead-lag">3.6 Lead-lag<a class="heading-link" href="#3-6-lead-lag" aria-label="Lien vers cette section">#</a></h3>
 <p>Une venue de référence bouge ; Hyperliquid réagit légèrement plus tard ; le bot tente d'exploiter ce délai.</p>
 <p>Le prototype inclus utilise des barres horaires uniquement pour exercer le moteur. Une conclusion réelle exige flux sub-seconde, horloges synchronisées, mesure de latence et replay du carnet.</p>
+<p>Le gate technique Phase 10 reste <code>BLOCKED_PRECONDITION_NOT_MET</code>. La capture
+Singapore de six heures décrite par le rapport forensique demeure un <code>FAIL</code> et
+les nouveaux diagnostics ne peuvent pas la requalifier rétroactivement : une
+nouvelle collecte réelle isolée de six heures et son audit complet sont
+nécessaires. Sur Hyperliquid, ni la raison d'une fermeture pair/transport, ni la
+reconnexion, ni la resynchronisation de l'état courant ne prouvent
+l'exhaustivité de l'intervalle manquant, faute de séquence serveur et de curseur
+public de replay. Tout gap dans la fenêtre et toute multiplicité de générations
+actives restent fatals.</p>
 <h3 id="3-7-market-making">3.7 Market making<a class="heading-link" href="#3-7-market-making" aria-label="Lien vers cette section">#</a></h3>
 <p>Le bot place bid et ask autour d'une fair value, réduit son risque selon l'inventaire et retire ses ordres quand le flux devient toxique.</p>
 <p>Un simple backtest OHLC est invalide ici. Il faut estimer la place dans la file, les fills, les cancel/replace et l'adverse selection.</p>

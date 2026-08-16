@@ -6,12 +6,14 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
@@ -19,6 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from hyperlab.collector.models import ParsedRecord
+from hyperlab.collector.telemetry import MonotonicTimingSummary
 from hyperlab.data.lake import (
     PartitionKey,
     PartitionManifest,
@@ -30,6 +33,7 @@ from hyperlab.data.lake import (
     validate_partition,
     write_partition,
 )
+from hyperlab.data.lake import _fsync_directory as _fsync_lake_directory
 from hyperlab.data.schema import RecordType, SchemaSpec, latest_schema_for, schema_for
 
 
@@ -76,11 +80,321 @@ _GroupKey = tuple[str, RecordType, str, str, str]
 _ObservationSignature = tuple[str, str, str]
 _ObservationHeadKey = tuple[str, str]
 _StablePrimaryKey = tuple[str, str]
-_OBSERVATION_INDEX_VERSION = 3
+_OBSERVATION_INDEX_VERSION = 4
 _PERSISTENT_PRIMARY_KEY_TYPES = frozenset({RecordType.TRADE})
 _DEFAULT_MIN_FREE_BYTES = 128 * 1024 * 1024
 _DEFAULT_MIN_FREE_PERCENT = 2.0
 _SESSION_FILE = ".collector-session.json"
+_PARTIAL_FLUSH_BARRIER_ONLY_TYPES = frozenset(
+    {
+        RecordType.CANDLE,
+        RecordType.FUNDING,
+    }
+)
+_RecentKey = tuple[RecordType, tuple[object, ...]]
+_STORAGE_TIMING_WINDOW = 4_096
+_STORAGE_TIMING_STAGES = (
+    "flush_total",
+    "sort",
+    "arrow_build",
+    "partition_analysis",
+    "partition_directory_fsync",
+    "parquet_write",
+    "parquet_fsync",
+    "parquet_hash",
+    "partition_publish",
+    "data_directory_fsync",
+    "manifest_fsync",
+    "manifest_directory_fsync",
+    "immediate_validation",
+    "sqlite_commit",
+)
+
+
+class _StorageMetrics:
+    """Bounded monotonic timings plus small lifetime counters."""
+
+    def __init__(self) -> None:
+        self._timings = {
+            stage: MonotonicTimingSummary(window_capacity=_STORAGE_TIMING_WINDOW)
+            for stage in _STORAGE_TIMING_STAGES
+        }
+        self._lock = threading.Lock()
+        self._flush_attempts = 0
+        self._flush_succeeded = 0
+        self._flush_failed = 0
+        self._rows_written = 0
+        self._partitions_written = 0
+
+    def observe(self, stage: str, duration_ns: int) -> None:
+        timing = self._timings.get(stage)
+        if timing is not None:
+            timing.observe_ns(max(duration_ns, 0))
+
+    def begin_flush(self) -> None:
+        with self._lock:
+            self._flush_attempts += 1
+
+    def end_flush(
+        self,
+        *,
+        succeeded: bool,
+        row_count: int,
+        partition_count: int,
+    ) -> None:
+        with self._lock:
+            if succeeded:
+                self._flush_succeeded += 1
+                self._rows_written += row_count
+                self._partitions_written += partition_count
+            else:
+                self._flush_failed += 1
+
+    def snapshot(
+        self,
+        *,
+        batch_size: int,
+        queue_capacity: int,
+        pending_count: int,
+        high_water: int,
+        pending_group_count: int,
+        ready_group_count: int,
+        max_group_rows: int,
+    ) -> dict[str, object]:
+        with self._lock:
+            attempts = self._flush_attempts
+            succeeded = self._flush_succeeded
+            failed = self._flush_failed
+            rows_written = self._rows_written
+            partitions_written = self._partitions_written
+        return {
+            "schema_version": 1,
+            "queue": {
+                "batch_size_rows": batch_size,
+                "capacity_rows": queue_capacity,
+                "pending_rows": pending_count,
+                "high_water_rows": high_water,
+            },
+            "coalescing": {
+                "readiness": "exact_group",
+                "pending_groups": pending_group_count,
+                "ready_groups": ready_group_count,
+                "max_group_rows": max_group_rows,
+            },
+            "flushes": {
+                "attempted": attempts,
+                "succeeded": succeeded,
+                "failed": failed,
+                "in_progress": attempts - succeeded - failed,
+            },
+            "written": {
+                "rows": rows_written,
+                "partitions": partitions_written,
+            },
+            "timings_ms": {stage: self._timings[stage].as_dict() for stage in _STORAGE_TIMING_STAGES},
+        }
+
+
+def _instrument_flush(
+    method: Callable[[Any], FlushResult],
+) -> Callable[[Any], FlushResult]:
+    """Measure every flush attempt without changing its control flow."""
+
+    @wraps(method)
+    def measured(sink: Any) -> FlushResult:
+        started_ns = sink._monotonic_ns()
+        sink._metrics.begin_flush()
+        try:
+            result = method(sink)
+        except BaseException:
+            sink._metrics.observe(
+                "flush_total",
+                sink._monotonic_ns() - started_ns,
+            )
+            sink._metrics.end_flush(
+                succeeded=False,
+                row_count=0,
+                partition_count=0,
+            )
+            raise
+        sink._metrics.observe(
+            "flush_total",
+            sink._monotonic_ns() - started_ns,
+        )
+        sink._metrics.end_flush(
+            succeeded=True,
+            row_count=result.row_count,
+            partition_count=len(result.manifests),
+        )
+        return result
+
+    return measured
+
+
+@dataclass(frozen=True, slots=True)
+class _GroupMutation:
+    group_key: _GroupKey
+    primary_key: tuple[object, ...]
+    primary_existed: bool
+    previous_row: dict[str, object] | None
+    group_created: bool
+
+
+@dataclass(slots=True)
+class _RecentBatch:
+    """Transactional LRU view whose work scales with touches and evictions."""
+
+    recent: OrderedDict[_RecentKey, None]
+    capacity: int
+    touched: OrderedDict[_RecentKey, None] = field(default_factory=OrderedDict)
+    removed_global: set[_RecentKey] = field(default_factory=set)
+    size: int = field(init=False)
+    oldest: Iterator[_RecentKey] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.size = len(self.recent)
+        self.oldest = iter(self.recent)
+
+    def contains(self, key: _RecentKey) -> bool:
+        return key in self.touched or (key in self.recent and key not in self.removed_global)
+
+    def touch(self, key: _RecentKey) -> None:
+        """Mark an existing key most-recent without mutating global history."""
+
+        self.touched.pop(key, None)
+        self.touched[key] = None
+
+    def insert(self, key: _RecentKey) -> None:
+        if self.contains(key):
+            raise AssertionError("recent-key batch insertion must be unique")
+        self.touched[key] = None
+        self.size += 1
+        if self.size > self.capacity:
+            self._evict_oldest()
+
+    def commit(self) -> None:
+        for key in self.removed_global:
+            self.recent.pop(key, None)
+        for key in self.touched:
+            if key in self.recent:
+                self.recent.move_to_end(key)
+            else:
+                self.recent[key] = None
+
+    def _evict_oldest(self) -> None:
+        for candidate in self.oldest:
+            if candidate in self.removed_global or candidate in self.touched:
+                continue
+            self.removed_global.add(candidate)
+            self.size -= 1
+            return
+
+        candidate, _ = self.touched.popitem(last=False)
+        if candidate in self.recent:
+            self.removed_global.add(candidate)
+        self.size -= 1
+
+
+@dataclass(slots=True)
+class _ObservationBatch:
+    """Transactional payload updates plus exact LRU order."""
+
+    observations: OrderedDict[_ObservationHeadKey, str]
+    capacity: int
+    touched: OrderedDict[_ObservationHeadKey, str] = field(default_factory=OrderedDict)
+    removed_global: set[_ObservationHeadKey] = field(default_factory=set)
+    size: int = field(init=False)
+    oldest: Iterator[_ObservationHeadKey] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.size = len(self.observations)
+        self.oldest = iter(self.observations)
+
+    def get(self, key: _ObservationHeadKey) -> str | None:
+        if key in self.touched:
+            return self.touched[key]
+        if key in self.removed_global:
+            return None
+        return self.observations.get(key)
+
+    def set(self, key: _ObservationHeadKey, payload: str) -> None:
+        existed = self.get(key) is not None
+        self.touched.pop(key, None)
+        self.touched[key] = payload
+        if existed:
+            return
+        self.size += 1
+        if self.size > self.capacity:
+            self._evict_oldest()
+
+    def commit(self) -> None:
+        for key in self.removed_global:
+            self.observations.pop(key, None)
+        for key, payload in self.touched.items():
+            self.observations[key] = payload
+            self.observations.move_to_end(key)
+
+    def _evict_oldest(self) -> None:
+        for candidate in self.oldest:
+            if candidate in self.removed_global or candidate in self.touched:
+                continue
+            self.removed_global.add(candidate)
+            self.size -= 1
+            return
+
+        candidate, _ = self.touched.popitem(last=False)
+        if candidate in self.observations:
+            self.removed_global.add(candidate)
+        self.size -= 1
+
+
+@dataclass(slots=True)
+class _PendingObservationBatch:
+    pending: OrderedDict[_ObservationHeadKey, _ObservationSignature]
+    touched: OrderedDict[_ObservationHeadKey, _ObservationSignature] = field(default_factory=OrderedDict)
+
+    def set(
+        self,
+        key: _ObservationHeadKey,
+        signature: _ObservationSignature,
+    ) -> None:
+        self.touched.pop(key, None)
+        self.touched[key] = signature
+
+    def commit(self) -> None:
+        for key, signature in self.touched.items():
+            self.pending[key] = signature
+            self.pending.move_to_end(key)
+
+
+@dataclass(slots=True)
+class _BatchMutationJournal:
+    pending_count: int
+    duplicate_count: int
+    high_water: int
+    recent: _RecentBatch
+    observations: _ObservationBatch
+    pending_observations: _PendingObservationBatch
+    group_mutations: list[_GroupMutation] = field(default_factory=list)
+    stable_keys_added: list[_StablePrimaryKey] = field(default_factory=list)
+
+    def rollback(self, sink: BatchingLakeSink) -> None:
+        for group_mutation in reversed(self.group_mutations):
+            group = sink._groups[group_mutation.group_key]
+            if group_mutation.primary_existed:
+                assert group_mutation.previous_row is not None
+                group[group_mutation.primary_key] = group_mutation.previous_row
+            else:
+                group.pop(group_mutation.primary_key, None)
+            if group_mutation.group_created and not group:
+                sink._groups.pop(group_mutation.group_key, None)
+
+        for stable_key in reversed(self.stable_keys_added):
+            sink._pending_stable_primary_keys.discard(stable_key)
+
+        sink._pending_count = self.pending_count
+        sink._duplicate_count = self.duplicate_count
+        sink.high_water = self.high_water
 
 
 def _canonical_scalar(value: object) -> object:
@@ -152,9 +466,10 @@ def _stable_primary_key(
 ) -> _StablePrimaryKey | None:
     if record_type not in _PERSISTENT_PRIMARY_KEY_TYPES:
         return None
+    del schema_version
     canonical = _canonical_json(primary_key)
     return (
-        f"{record_type.value}:v{schema_version}",
+        f"{record_type.value}:compatible-primary-key",
         hashlib.sha256(canonical.encode()).hexdigest(),
     )
 
@@ -307,6 +622,9 @@ def ensure_storage_capacity(
 
 
 def _fsync_parent(path: Path) -> None:
+    if path.is_dir():
+        _fsync_lake_directory(path.parent)
+        return
     if os.name == "nt":
         return
     descriptor = os.open(path.parent, os.O_RDONLY)
@@ -400,11 +718,27 @@ def _recover_interrupted_publications(root: Path) -> None:
 
 
 def _recover_orphans(root: Path) -> None:
+    """Prove existing manifests durable, then rebuild manifests for orphan data."""
+
+    existing_manifest_directories: set[Path] = set()
+    recovery_root = root / ".recovery"
+    for manifest_path in sorted(
+        root.rglob("part-*.manifest.json"),
+        key=lambda path: path.as_posix(),
+    ):
+        if recovery_root in manifest_path.parents:
+            continue
+        validate_partition(manifest_path)
+        existing_manifest_directories.add(manifest_path.parent)
+
     for data_path in sorted(root.rglob("part-*.parquet"), key=lambda path: path.as_posix()):
         manifest_path = data_path.with_name(f"{data_path.stem}.manifest.json")
-        if manifest_path.exists() or (root / ".recovery") in data_path.parents:
+        if recovery_root in data_path.parents or manifest_path.exists():
             continue
         recover_partition_manifest(root, data_path)
+
+    for directory in sorted(existing_manifest_directories, key=lambda path: path.as_posix()):
+        _fsync_lake_directory(directory)
 
 
 class _PersistentObservationIndex:
@@ -649,6 +983,7 @@ class BatchingLakeSink:
         min_free_bytes: int | None = None,
         min_free_percent: float | None = None,
         validate_integrity: bool = False,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if batch_size <= 0 or queue_capacity < batch_size or recent_key_capacity <= 0:
             raise ValueError("invalid batch or queue capacity")
@@ -661,6 +996,8 @@ class BatchingLakeSink:
         self.batch_size = batch_size
         self.queue_capacity = queue_capacity
         self.recent_key_capacity = recent_key_capacity
+        self._monotonic_ns = monotonic_ns
+        self._metrics = _StorageMetrics()
         self._groups: dict[_GroupKey, OrderedDict[tuple[object, ...], dict[str, object]]] = {}
         self._recent: OrderedDict[tuple[RecordType, tuple[object, ...]], None] = OrderedDict()
         self._observations: OrderedDict[_ObservationHeadKey, str] = OrderedDict()
@@ -699,15 +1036,41 @@ class BatchingLakeSink:
 
     @property
     def should_flush(self) -> bool:
-        return self._pending_count >= self.batch_size
+        return any(
+            group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+            for group_key, group in self._groups.items()
+        )
+
+    def metrics_snapshot(self) -> dict[str, object]:
+        group_sizes = tuple(len(group) for group in self._groups.values())
+        return self._metrics.snapshot(
+            batch_size=self.batch_size,
+            queue_capacity=self.queue_capacity,
+            pending_count=self._pending_count,
+            high_water=self.high_water,
+            pending_group_count=len(group_sizes),
+            ready_group_count=sum(
+                group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+                for group_key, group in self._groups.items()
+            ),
+            max_group_rows=max(group_sizes, default=0),
+        )
 
     def add(self, record: ParsedRecord) -> bool:
+        return self._add(record, journal=None)
+
+    def _add(
+        self,
+        record: ParsedRecord,
+        *,
+        journal: _BatchMutationJournal | None,
+    ) -> bool:
         spec = latest_schema_for(record.record_type)
         row = dict(record.row)
         row["schema_version"] = spec.version
         partition_asset = record.asset
         primary_key = self._primary_key(spec, row)
-        recent_key = (record.record_type, primary_key)
+        recent_key: _RecentKey = (record.record_type, primary_key)
         observation = _observation_signature(record.record_type, row)
         stable_primary_key = _stable_primary_key(
             record.record_type,
@@ -722,8 +1085,11 @@ class BatchingLakeSink:
             self._duplicate_count += 1
             return False
         if observation is not None:
-            head_key = observation[:2]
-            cached_payload = self._observations.get(head_key)
+            cached_head_key: _ObservationHeadKey = (observation[0], observation[1])
+            if journal is None:
+                cached_payload = self._observations.get(cached_head_key)
+            else:
+                cached_payload = journal.observations.get(cached_head_key)
             if cached_payload == observation[2] or (
                 cached_payload is None
                 and self._observation_index is not None
@@ -731,88 +1097,190 @@ class BatchingLakeSink:
             ):
                 self._duplicate_count += 1
                 return False
-        if recent_key in self._recent:
-            self._recent.move_to_end(recent_key)
+        if journal is None:
+            recent_duplicate = recent_key in self._recent
+        else:
+            recent_duplicate = journal.recent.contains(recent_key)
+        if recent_duplicate:
+            if journal is None:
+                self._recent.move_to_end(recent_key)
+            else:
+                journal.recent.touch(recent_key)
             self._duplicate_count += 1
             return False
 
         group_key = self._group_key(record.record_type, partition_asset, row)
         group = self._groups.get(group_key)
         if group is not None and primary_key in group:
+            if journal is not None:
+                journal.group_mutations.append(
+                    _GroupMutation(
+                        group_key,
+                        primary_key,
+                        True,
+                        group[primary_key],
+                        False,
+                    )
+                )
             group[primary_key] = row
             self._duplicate_count += 1
             return False
         if self._pending_count >= self.queue_capacity:
             raise BufferError("collector queue capacity exceeded; no record was dropped")
-        group = self._groups.setdefault(group_key, OrderedDict())
+
+        group_created = group is None
+        if group is None:
+            group = OrderedDict()
+        if journal is not None:
+            journal.group_mutations.append(
+                _GroupMutation(
+                    group_key,
+                    primary_key,
+                    False,
+                    None,
+                    group_created,
+                )
+            )
+        if group_created:
+            self._groups[group_key] = group
 
         group[primary_key] = row
         self._pending_count += 1
         self.high_water = max(self.high_water, self._pending_count)
-        self._recent[recent_key] = None
-        if len(self._recent) > self.recent_key_capacity:
-            self._recent.popitem(last=False)
+        if journal is None:
+            self._recent[recent_key] = None
+            if len(self._recent) > self.recent_key_capacity:
+                self._recent.popitem(last=False)
+        else:
+            journal.recent.insert(recent_key)
+
         if observation is not None:
-            head_key = observation[:2]
-            self._observations[head_key] = observation[2]
-            self._observations.move_to_end(head_key)
-            self._pending_observations[head_key] = observation
-            self._pending_observations.move_to_end(head_key)
-            if len(self._observations) > self.recent_key_capacity:
-                self._observations.popitem(last=False)
-        if stable_primary_key is not None:
+            head_key: _ObservationHeadKey = (observation[0], observation[1])
+            if journal is None:
+                self._observations[head_key] = observation[2]
+                self._observations.move_to_end(head_key)
+                if len(self._observations) > self.recent_key_capacity:
+                    self._observations.popitem(last=False)
+                self._pending_observations[head_key] = observation
+                self._pending_observations.move_to_end(head_key)
+            else:
+                journal.observations.set(head_key, observation[2])
+                journal.pending_observations.set(head_key, observation)
+
+        if stable_primary_key is not None and stable_primary_key not in self._pending_stable_primary_keys:
             self._pending_stable_primary_keys.add(stable_primary_key)
+            if journal is not None:
+                journal.stable_keys_added.append(stable_primary_key)
         return True
 
     def add_many(self, records: Iterable[ParsedRecord]) -> int:
-        """Add one logical source batch without exposing a partial batch to a flush."""
+        """Atomically add one frame with work bounded by that frame's mutations."""
 
         batch = tuple(records)
         if len(batch) > self.queue_capacity - self._pending_count:
             raise BufferError("collector queue capacity exceeded before atomic batch; no record was added")
-        groups = {key: group.copy() for key, group in self._groups.items()}
-        recent = self._recent.copy()
-        observations = self._observations.copy()
-        pending_observations = self._pending_observations.copy()
-        pending_stable_primary_keys = self._pending_stable_primary_keys.copy()
-        pending_count = self._pending_count
-        duplicate_count = self._duplicate_count
-        high_water = self.high_water
+        journal = _BatchMutationJournal(
+            pending_count=self._pending_count,
+            duplicate_count=self._duplicate_count,
+            high_water=self.high_water,
+            recent=_RecentBatch(
+                self._recent,
+                self.recent_key_capacity,
+            ),
+            observations=_ObservationBatch(
+                self._observations,
+                self.recent_key_capacity,
+            ),
+            pending_observations=_PendingObservationBatch(
+                self._pending_observations,
+            ),
+        )
+        accepted = 0
         try:
-            return sum(self.add(record) for record in batch)
+            for record in batch:
+                accepted += int(self._add(record, journal=journal))
         except BaseException:
-            self._groups = groups
-            self._recent = recent
-            self._observations = observations
-            self._pending_observations = pending_observations
-            self._pending_stable_primary_keys = pending_stable_primary_keys
-            self._pending_count = pending_count
-            self._duplicate_count = duplicate_count
-            self.high_water = high_water
+            journal.rollback(self)
             raise
+        journal.recent.commit()
+        journal.observations.commit()
+        journal.pending_observations.commit()
+        return accepted
 
+    @_instrument_flush
+    def flush_ready(self) -> FlushResult:
+        ready = tuple(
+            group_key
+            for group_key, group in self._groups.items()
+            if group_key[1] not in _PARTIAL_FLUSH_BARRIER_ONLY_TYPES and len(group) >= self.batch_size
+        )
+        return self._flush_groups(ready, final_barrier=False)
+
+    @_instrument_flush
     def flush(self) -> FlushResult:
+        return self._flush_groups(tuple(self._groups), final_barrier=True)
+
+    def _flush_groups(
+        self,
+        selected_group_keys: tuple[_GroupKey, ...],
+        *,
+        final_barrier: bool,
+    ) -> FlushResult:
+        if not selected_group_keys and not final_barrier:
+            return FlushResult((), 0, 0)
         ensure_storage_capacity(
             self.root,
             min_free_bytes=self._min_free_bytes,
             min_free_percent=self._min_free_percent,
         )
-        if not self._groups:
+        if not selected_group_keys:
             duplicates = self._duplicate_count
             self._duplicate_count = 0
             return FlushResult((), 0, duplicates)
 
         manifests: list[PartitionManifest] = []
+        selected_stable_primary_keys: set[_StablePrimaryKey] = set()
         written = 0
-        for group_key in sorted(
-            self._groups,
-            key=lambda item: (item[3], item[2], item[0], item[1].value, item[4]),
-        ):
+        sort_started_ns = self._monotonic_ns()
+        try:
+            group_keys = sorted(
+                selected_group_keys,
+                key=lambda item: (item[3], item[2], item[0], item[1].value, item[4]),
+            )
+        finally:
+            self._metrics.observe(
+                "sort",
+                self._monotonic_ns() - sort_started_ns,
+            )
+        for group_key in group_keys:
             venue, record_type, asset, day, _stream = group_key
             spec = latest_schema_for(record_type)
             rows = list(self._groups[group_key].values())
-            rows.sort(key=lambda row: self._order_key(spec, row))
-            table = pa.Table.from_pylist(rows, schema=spec.schema)
+            if not final_barrier and record_type in _PERSISTENT_PRIMARY_KEY_TYPES:
+                for row in rows:
+                    stable = _stable_primary_key(
+                        record_type,
+                        spec.version,
+                        self._primary_key(spec, row),
+                    )
+                    if stable is not None:
+                        selected_stable_primary_keys.add(stable)
+            sort_started_ns = self._monotonic_ns()
+            try:
+                rows.sort(key=lambda row: self._order_key(spec, row))
+            finally:
+                self._metrics.observe(
+                    "sort",
+                    self._monotonic_ns() - sort_started_ns,
+                )
+            arrow_started_ns = self._monotonic_ns()
+            try:
+                table = pa.Table.from_pylist(rows, schema=spec.schema)
+            finally:
+                self._metrics.observe(
+                    "arrow_build",
+                    self._monotonic_ns() - arrow_started_ns,
+                )
             manifest = write_partition(
                 self.root,
                 PartitionKey(
@@ -822,22 +1290,49 @@ class BatchingLakeSink:
                     record_type=record_type,
                 ),
                 table,
+                _timing_observer=self._metrics.observe,
+                _monotonic_ns=self._monotonic_ns,
             )
             manifests.append(manifest)
             written += len(rows)
 
-        if self._observation_index is not None:
-            self._observation_index.commit(
-                list(self._pending_observations.values()),
-                sorted(self._pending_stable_primary_keys),
-                manifests,
-            )
-        self._pending_observations.clear()
-        self._pending_stable_primary_keys.clear()
-        duplicates = self._duplicate_count
-        self._groups.clear()
-        self._pending_count = 0
-        self._duplicate_count = 0
+        if not selected_stable_primary_keys.issubset(self._pending_stable_primary_keys):
+            raise RuntimeError("partial flush selected an untracked stable primary key")
+        should_commit_index = final_barrier or bool(selected_stable_primary_keys)
+        if self._observation_index is not None and should_commit_index:
+            sqlite_started_ns = self._monotonic_ns()
+            try:
+                self._observation_index.commit(
+                    list(self._pending_observations.values()) if final_barrier else [],
+                    (
+                        sorted(self._pending_stable_primary_keys)
+                        if final_barrier
+                        else sorted(selected_stable_primary_keys)
+                    ),
+                    manifests,
+                )
+            finally:
+                self._metrics.observe(
+                    "sqlite_commit",
+                    self._monotonic_ns() - sqlite_started_ns,
+                )
+
+        for group_key in group_keys:
+            del self._groups[group_key]
+        self._pending_count -= written
+        if self._pending_count < 0:
+            raise RuntimeError("partial flush produced negative pending-row accounting")
+
+        if final_barrier:
+            self._pending_observations.clear()
+            self._pending_stable_primary_keys.clear()
+            duplicates = self._duplicate_count
+            self._duplicate_count = 0
+            if self._groups or self._pending_count:
+                raise RuntimeError("full flush left pending groups or rows")
+        else:
+            self._pending_stable_primary_keys.difference_update(selected_stable_primary_keys)
+            duplicates = 0
         return FlushResult(tuple(manifests), written, duplicates)
 
     def close(self) -> None:
@@ -953,10 +1448,12 @@ class CoordinatedLakeWriter:
         recent_key_capacity: int = 100_000,
         min_free_bytes: int | None = None,
         min_free_percent: float | None = None,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if not venues or len(venues) != len(set(venues)) or any(not venue for venue in venues):
             raise ValueError("coordinated writer venues must be non-empty and unique")
         self.root = root
+        self._venue_order = venues
         self._venues = frozenset(venues)
         self._lock = threading.RLock()
         self._sink = BatchingLakeSink(
@@ -967,6 +1464,7 @@ class CoordinatedLakeWriter:
             _serialized_cross_thread_access=True,
             min_free_bytes=min_free_bytes,
             min_free_percent=min_free_percent,
+            monotonic_ns=monotonic_ns,
         )
         self._clients: dict[str, CoordinatedLakeSink] = {}
         self._pending_by_venue = {venue: 0 for venue in venues}
@@ -985,6 +1483,14 @@ class CoordinatedLakeWriter:
     def pending_count(self) -> int:
         with self._lock:
             return self._sink.pending_count
+
+    @property
+    def should_flush(self) -> bool:
+        with self._lock:
+            return self._sink.should_flush
+
+    def metrics_snapshot(self) -> dict[str, object]:
+        return self._sink.metrics_snapshot()
 
     def client(self, venue: str) -> CoordinatedLakeSink:
         with self._lock:
@@ -1063,7 +1569,7 @@ class CoordinatedLakeWriter:
                 )
             try:
                 if batch and self._sink.should_flush:
-                    self._record_flush(self._sink.flush())
+                    self._record_flush(self._sink.flush_ready(), full_barrier=False)
                 accepted = self._sink.add_many(batch)
             except Exception as exc:
                 raise CoordinatedWriterError(
@@ -1079,31 +1585,89 @@ class CoordinatedLakeWriter:
             self._duplicates_since_flush[client.venue] += duplicates
             return accepted
 
-    def _record_flush(self, result: FlushResult) -> None:
+    def _record_flush(self, result: FlushResult, *, full_barrier: bool) -> None:
         expected_duplicates = sum(self._duplicates_since_flush.values())
-        if result.duplicate_count != expected_duplicates:
+        if full_barrier and result.duplicate_count != expected_duplicates:
             raise CoordinatedWriterError(
                 "coordinated writer duplicate accounting mismatch: "
                 f"sink={result.duplicate_count}, clients={expected_duplicates}"
             )
+        if not full_barrier and result.duplicate_count != 0:
+            raise CoordinatedWriterError("coordinated writer partial flush returned duplicate credit")
         rows_by_venue = {venue: 0 for venue in self._venues}
+        manifests_by_venue: dict[str, list[PartitionManifest]] = {venue: [] for venue in self._venues}
         for manifest in result.manifests:
             venue = manifest.partition.venue
             if venue not in self._venues:
                 raise CoordinatedWriterError(f"coordinated writer published an incompatible venue: {venue!r}")
             rows_by_venue[venue] += manifest.row_count
-            self._manifest_credit[venue].append(manifest)
+            manifests_by_venue[venue].append(manifest)
+        if sum(rows_by_venue.values()) != result.row_count:
+            raise CoordinatedWriterError(
+                "coordinated writer flush row-count mismatch: "
+                f"manifests={sum(rows_by_venue.values())}, result={result.row_count}"
+            )
         for venue in self._venues:
-            if rows_by_venue[venue] != self._pending_by_venue[venue]:
+            pending = self._pending_by_venue[venue]
+            if (full_barrier and rows_by_venue[venue] != pending) or (
+                not full_barrier and rows_by_venue[venue] > pending
+            ):
                 raise CoordinatedWriterError(
                     "coordinated writer row accounting mismatch for "
                     f"{venue}: manifests={rows_by_venue[venue]}, "
-                    f"pending={self._pending_by_venue[venue]}"
+                    f"pending={pending}, full_barrier={full_barrier}"
                 )
+
+        for venue in self._venues:
+            self._manifest_credit[venue].extend(manifests_by_venue[venue])
             self._row_credit[venue] += rows_by_venue[venue]
-            self._duplicate_credit[venue] += self._duplicates_since_flush[venue]
-            self._pending_by_venue[venue] = 0
-            self._duplicates_since_flush[venue] = 0
+            self._pending_by_venue[venue] -= rows_by_venue[venue]
+            if full_barrier:
+                self._duplicate_credit[venue] += self._duplicates_since_flush[venue]
+                self._duplicates_since_flush[venue] = 0
+
+    def _drain_all_credits(self) -> dict[str, FlushResult]:
+        results = {
+            venue: FlushResult(
+                tuple(self._manifest_credit[venue]),
+                self._row_credit[venue],
+                self._duplicate_credit[venue],
+            )
+            for venue in self._venue_order
+        }
+        for venue in self._venue_order:
+            self._manifest_credit[venue].clear()
+            self._row_credit[venue] = 0
+            self._duplicate_credit[venue] = 0
+        return results
+
+    def flush_ready_all(self) -> dict[str, FlushResult]:
+        """Publish ready exact groups and retain sparse groups for a full barrier."""
+
+        with self._lock:
+            if self._closed:
+                raise CoordinatedWriterError("coordinated lake writer is closed")
+            try:
+                physical_result = self._sink.flush_ready()
+            except Exception as exc:
+                raise CoordinatedWriterError(
+                    "coordinated lake ready-group flush failed for all venues"
+                ) from exc
+            self._record_flush(physical_result, full_barrier=False)
+            return self._drain_all_credits()
+
+    def flush_all(self) -> dict[str, FlushResult]:
+        """Physically flush once and atomically drain credits for every venue."""
+
+        with self._lock:
+            if self._closed:
+                raise CoordinatedWriterError("coordinated lake writer is closed")
+            try:
+                physical_result = self._sink.flush()
+            except Exception as exc:
+                raise CoordinatedWriterError("coordinated lake flush failed for all venues") from exc
+            self._record_flush(physical_result, full_barrier=True)
+            return self._drain_all_credits()
 
     def _client_flush(self, client: CoordinatedLakeSink) -> FlushResult:
         with self._lock:
@@ -1114,7 +1678,7 @@ class CoordinatedLakeWriter:
                 raise CoordinatedWriterError(
                     f"coordinated lake flush failed for venue {client.venue!r}"
                 ) from exc
-            self._record_flush(physical_result)
+            self._record_flush(physical_result, full_barrier=True)
             venue = client.venue
             result = FlushResult(
                 tuple(self._manifest_credit[venue]),
@@ -1140,6 +1704,6 @@ class CoordinatedLakeWriter:
                 return
             self._closed = True
             try:
-                self._record_flush(self._sink.flush())
+                self._record_flush(self._sink.flush(), full_barrier=True)
             finally:
                 self._sink.close()

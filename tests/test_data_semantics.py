@@ -234,6 +234,67 @@ def test_wire_message_preserves_exact_non_json_text(tmp_path: Path) -> None:
     assert decoded.column("source_sequence")[0].as_py() is None
 
 
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("field", ["connection_epoch", "arrival_sequence"])
+def test_wire_lineage_is_strictly_positive_in_every_schema_version(
+    tmp_path: Path,
+    version: int,
+    field: str,
+) -> None:
+    row = _valid_row(RecordType.WIRE_MESSAGE)
+    row.update(schema_version=version, **{field: 0})
+    if version == 2:
+        row["capture_epoch_id"] = "capture-1"
+    table = pa.Table.from_pylist(
+        [row],
+        schema=schema_for(RecordType.WIRE_MESSAGE, version=version).schema,
+    )
+
+    with pytest.raises(PartitionValidationError, match=field):
+        write_partition(
+            tmp_path,
+            PartitionKey("hyperliquid", DAY, "BTC", RecordType.WIRE_MESSAGE),
+            table,
+        )
+
+
+@pytest.mark.parametrize(
+    ("record_type", "field"),
+    [
+        (RecordType.TRADE, "connection_epoch"),
+        (RecordType.TRADE, "arrival_sequence"),
+        (RecordType.CONNECTION_EVENT, "connection_epoch"),
+    ],
+)
+def test_optional_v2_lineage_is_positive_when_present(
+    tmp_path: Path,
+    record_type: RecordType,
+    field: str,
+) -> None:
+    row = _valid_row(record_type)
+    row["schema_version"] = 2
+    if record_type == RecordType.TRADE:
+        row.update(connection_epoch=1, arrival_sequence=1)
+    else:
+        row.update(
+            connection_epoch=1,
+            capture_epoch_id="capture-1",
+            socket_role="public",
+        )
+    row[field] = 0
+    table = pa.Table.from_pylist(
+        [row],
+        schema=schema_for(record_type, version=2).schema,
+    )
+
+    with pytest.raises(PartitionValidationError, match=field):
+        write_partition(
+            tmp_path,
+            PartitionKey("hyperliquid", DAY, "BTC", record_type),
+            table,
+        )
+
+
 @pytest.mark.parametrize(
     ("record_type", "changes", "message"),
     [

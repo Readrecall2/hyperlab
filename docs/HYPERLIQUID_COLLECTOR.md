@@ -73,6 +73,15 @@ et les marchés spot conservent leur identifiant source, par exemple
 `PURR/USDC` ou `@107`. Une absence ou une ambiguïté provoque une erreur visible ;
 aucune valeur de prix ou de volume n’est inventée.
 
+Les deux endpoints de métadonnées renvoient l’univers public complet. Cette
+réponse complète reste transitoirement en mémoire et passe intégralement par la
+validation du parseur, notamment les alignements perp, les tables de tokens spot
+et les identifiants API. La sélection intervient seulement ensuite, avant le
+sink : seules les lignes `instrument_metadata` et `market_context` dont
+`asset` correspond exactement à un actif configuré sont persistées. Il n’existe
+aucun alias implicite : `BTC` et `ETH` désignent ici leurs coins perp, tandis
+qu’un spot encodé reste par exemple `@107`, avec son index source inchangé.
+
 ### 2. Abonnements WebSocket
 
 Pour chaque actif, les abonnements publics sont :
@@ -103,6 +112,14 @@ carnet), mais ne prouve pas que tous les trades survenus pendant la coupure ont
 abonnements. Chaque coupure produit donc un événement de connexion et un gap
 `coverage_unknown` ; il est interdit de convertir ce gap en continuité supposée.
 
+Les informations de fermeture pair/transport et la réussite de la reconnexion
+ou de la resynchronisation ne changent pas cette conclusion. Elles peuvent
+expliquer pourquoi le socket s'est terminé et rétablir un état courant
+prospectif ; elles ne démontrent pas les messages absents de l'intervalle fermé.
+Pour le gate Phase 10, tout `gap` qui intersecte la fenêtre demandée reste fatal,
+et plusieurs générations Hyperliquid actives restent fatales même si la
+génération finale possède un arrêt propre.
+
 ### 4. Refresh REST périodique concurrent
 
 En `LIVE`, un worker REST unique rafraîchit périodiquement les métadonnées,
@@ -112,6 +129,12 @@ fusionné dans le sink que lorsqu’il est disponible. Le refresh périodique
 n’ajoute pas un second snapshot L2, déjà couvert par le flux WebSocket. Une
 erreur REST reste visible dans `runtime_status.json` et produit un gap
 `coverage_unknown`; elle n’est jamais masquée comme une collecte complète.
+
+Le refresh conserve la même frontière que le bootstrap initial : l’univers de
+métadonnées est récupéré et validé en entier de façon transitoire, puis seules
+les métadonnées et contextes des actifs configurés exactement sont proposés au
+sink. Les historiques de funding, candles et états L2 restent, comme auparavant,
+interrogés uniquement pour les actifs demandés.
 
 La déduplication persistante supprime les observations historiques strictement
 identiques entre bootstrap, resynchronisation, refresh et redémarrage, tout en
@@ -142,6 +165,16 @@ leur dépassement du seuil stale ferme la connexion et déclenche le même chemi
 de reprise. La file bornée échoue explicitement lorsqu’elle est pleine ; elle ne
 supprime pas silencieusement une ligne.
 
+Lorsqu'une fermeture pair/transport ordinaire est observée, le lecteur conserve
+son terminal en attente et le superviseur draine d'abord en FIFO les messages
+déjà admis avant de faire remonter l'erreur. Cette mesure prévient une perte
+locale des frames déjà reçues ; elle ne certifie ni la période distante ni
+l'absence de message perdu avant réception. `queue_overflow` reste au contraire
+immédiatement fatal.
+`bbo` et `trades` restent event-driven : leur silence seul ne force pas une
+reconnexion ; leur TTL analytique de 30 secondes reste distinct et peut faire
+échouer le gate aval sans déclarer le transport mort.
+
 
 Le compteur exponentiel n’est remis à zéro qu’après 60 secondes continues en
 état `LIVE`, afin qu’une suite de connexions instables reste effectivement
@@ -158,6 +191,16 @@ HTTP déjà en vol reste néanmoins bornée par son timeout. Si un processus ne
 termine pas dans cette fenêtre, l’orchestrateur peut encore le tuer : la preuve
 d’un arrêt propre reste donc le statut final et la validation des manifestes,
 pas la seule réception du signal.
+
+La télémétrie terminale expose `terminal_origin`, `terminal_observed_at`,
+`terminal_observed_age_ms`, `terminal_close_code` et `terminal_close_reason`.
+Les origines bornées distinguent `peer_close_frame`, `legacy_recv_empty`,
+`transport_exception`, `unexpected_opcode`, `invalid_utf8`,
+`unexpected_message_type`, `invalid_receive_timestamp` et `queue_overflow`. Un
+arrêt borné demandé par le superviseur écrit un `disconnect` propre avec la
+raison `collector stop requested or bounded run completed` avant le flush et la
+fermeture, sans fabriquer de `gap`. Ces diagnostics attribuent l'incident ; ils
+ne réparent jamais une couverture.
 
 ## Transport REST public minimal
 
@@ -311,6 +354,14 @@ candle sont écrites comme observations immuables ; aucune ligne n’est promue
 - âge par `channel:asset[:interval]` et liste des flux stale ;
 - backoff courant, compteurs ping/pong et gaps visibles.
 
+Pour chaque échec de génération,
+`reconnect_reasons_by_generation[].failure_snapshot` fige aussi l'état
+collecteur/processus/writer et la liveness (`collector_state`, `connected`,
+`live`, `connection_age_ms`, `live_duration_ms`, `pending_ack_count`,
+`pending_ack_subscriptions`, `ping`, `pong`). Ce snapshot et les champs
+terminaux expliquent une panne ; les catégories persistées
+`gap`/`coverage_unknown` restent seules déterminantes pour l'exhaustivité.
+
 Les manifestes de partitions complètent ce statut par bornes temporelles,
 hashes, doublons, ordre, trous détectables et qualité. Trois catégories doivent
 rester distinctes :
@@ -450,6 +501,11 @@ logs, les manifestes et une conclusion explicite. Jusqu’à présence de cette
 preuve dans le dépôt, le statut demeure :
 
 > **SOAK 24 H : NON CERTIFIÉ — VALIDATION RÉELLE EN ATTENTE**
+
+Ce soak vérifie notamment la reprise après des coupures contrôlées ; il ne
+constitue pas un PASS Phase 10 sur ces intervalles. Le gate causal exige une
+fenêtre sans gap et une génération active unique. Une resynchronisation réussie
+après la coupure ne transforme jamais la fenêtre coupée en données complètes.
 
 ## Limites connues
 

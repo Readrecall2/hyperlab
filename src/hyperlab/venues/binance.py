@@ -2,23 +2,42 @@ from __future__ import annotations
 
 import hashlib
 import json
-import urllib.error
-import urllib.parse
-import urllib.request
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
+from threading import Lock, local
 from typing import Any, Protocol
 
+import requests
+
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
+from hyperlab.collector.telemetry import (
+    RequestBoundaryRuntimeDelta,
+    ThreadRuntimeSnapshot,
+    capture_thread_runtime_snapshot,
+    request_boundary_runtime_delta,
+)
 from hyperlab.data.schema import RecordType, instrument, latest_schema_for
-from hyperlab.venues.base import ClockMeasurement, NormalizedInstrument, measure_clock
+from hyperlab.venues.base import (
+    ClockMeasurement,
+    HttpRequestDiagnostics,
+    NormalizedInstrument,
+    measure_clock,
+)
+from hyperlab.venues.http_observability import (
+    HttpPathObservation,
+    HttpPeerPathObserver,
+    Resolver,
+    diagnose_http_paths,
+)
 
 VENUE = "binance_usdm"
 REST_BASE_URL = "https://fapi.binance.com"
-WS_BASE_URL = "wss://fstream.binance.com/stream?streams="
+WS_PUBLIC_BASE_URL = "wss://fstream.binance.com/public/stream?streams="
+WS_MARKET_BASE_URL = "wss://fstream.binance.com/market/stream?streams="
 
 # This is an executable safety boundary, not merely documentation. Paths for
 # accounts, keys, orders, positions, listen keys, transfers, or signing cannot
@@ -192,20 +211,29 @@ class BinancePublicConnector:
         except KeyError:
             raise ValueError(f"asset is not configured for Binance: {asset}") from None
 
-    def websocket_url(self, assets: tuple[str, ...], candle_intervals: tuple[str, ...]) -> str:
-        streams: list[str] = []
+    def websocket_urls(
+        self,
+        assets: tuple[str, ...],
+        candle_intervals: tuple[str, ...],
+    ) -> dict[str, str]:
+        public_streams: list[str] = []
+        market_streams: list[str] = []
         for asset in assets:
             symbol = self.instrument_for_asset(asset).source_symbol.lower()
-            streams.extend(
+            public_streams.append(f"{symbol}@depth20@100ms")
+            market_streams.extend(
                 (
-                    f"{symbol}@bookTicker",
-                    f"{symbol}@depth20@100ms",
                     f"{symbol}@aggTrade",
                     f"{symbol}@markPrice@1s",
                 )
             )
-            streams.extend(f"{symbol}@kline_{interval}" for interval in candle_intervals)
-        return WS_BASE_URL + "/".join(streams)
+            market_streams.extend(
+                f"{symbol}@kline_{interval}" for interval in candle_intervals
+            )
+        return {
+            "public": WS_PUBLIC_BASE_URL + "/".join(public_streams),
+            "market": WS_MARKET_BASE_URL + "/".join(market_streams),
+        }
 
     def parse_message(self, envelope: WireEnvelope) -> ParsedMessage:
         return parse_binance_message(envelope, self._by_symbol)
@@ -270,6 +298,7 @@ def _wire_record(
         {
             "connection_epoch": envelope.connection_epoch,
             "arrival_sequence": envelope.arrival_sequence,
+            "capture_epoch_id": envelope.capture_epoch_id,
             "channel": channel,
             "message_asset": asset,
             "raw_message": envelope.raw_message,
@@ -305,23 +334,69 @@ def parse_binance_message(
         _wire_record(envelope, channel=channel, asset=asset, is_json=True)
     ]
     issues: list[str] = []
+    stream_types: list[tuple[str, object]] = []
+    if "st" in root:
+        stream_types.append(("wrapper", root["st"]))
+    if data is not None and "st" in data:
+        stream_types.append(("data", data["st"]))
+    if any(
+        not (
+            (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+            or (isinstance(value, str) and value == "1")
+        )
+        for _, value in stream_types
+    ):
+        observed = ",".join(
+            f"{location}={value!r}" for location, value in stream_types
+        )
+        issues.append(f"invalid_stream_type:expected=1:{observed}")
+        return ParsedMessage(channel, tuple(records), tuple(issues))
     if channel is None or data is None:
         issues.append("invalid_combined_stream_envelope")
         return ParsedMessage(channel, tuple(records), tuple(issues))
     if normalized is None:
         issues.append(f"unknown_symbol:{source_symbol or 'missing'}")
         return ParsedMessage(channel, tuple(records), tuple(issues))
+    channel_symbol, separator, _stream_kind = channel.partition("@")
+    if not separator or channel_symbol.upper() != source_symbol:
+        issues.append(
+            "stream_symbol_mismatch:"
+            f"channel={channel_symbol or 'missing'}:payload={source_symbol or 'missing'}"
+        )
+        return ParsedMessage(channel, tuple(records), tuple(issues))
     try:
         event = str(data.get("e", ""))
-        if event == "bookTicker" or channel.endswith("@bookTicker"):
+        if channel.endswith("@bookTicker"):
+            if event != "bookTicker":
+                raise ValueError(
+                    f"event/channel mismatch: expected bookTicker, observed {event or 'missing'}"
+                )
             records.append(_parse_bbo(data, envelope, normalized))
-        elif event == "depthUpdate" and "@depth20" in channel:
+        elif "@depth20" in channel:
+            if event != "depthUpdate":
+                raise ValueError(
+                    f"event/channel mismatch: expected depthUpdate, observed {event or 'missing'}"
+                )
+            records.append(_parse_bbo_from_depth(data, envelope, normalized))
             records.extend(_parse_l2_snapshot(data, envelope, normalized))
-        elif event == "aggTrade" or channel.endswith("@aggTrade"):
+        elif channel.endswith("@aggTrade"):
+            if event != "aggTrade":
+                raise ValueError(
+                    f"event/channel mismatch: expected aggTrade, observed {event or 'missing'}"
+                )
             records.append(_parse_trade(data, envelope, normalized))
-        elif event == "kline" or "@kline_" in channel:
+        elif "@kline_" in channel:
+            if event != "kline":
+                raise ValueError(
+                    f"event/channel mismatch: expected kline, observed {event or 'missing'}"
+                )
             records.append(_parse_candle(data, envelope, normalized))
-        elif event == "markPriceUpdate" or "@markPrice" in channel:
+        elif "@markPrice" in channel:
+            if event != "markPriceUpdate":
+                raise ValueError(
+                    "event/channel mismatch: "
+                    f"expected markPriceUpdate, observed {event or 'missing'}"
+                )
             records.append(_parse_mark_price(data, envelope, normalized))
         else:
             issues.append(f"unknown_channel:{channel}")
@@ -353,6 +428,46 @@ def _parse_bbo(
             "bid_quantity": normalized.normalize_quantity(data["B"]),
             "ask_price": _required_decimal(data["a"]),
             "ask_quantity": normalized.normalize_quantity(data["A"]),
+        }
+    )
+    return ParsedRecord(RecordType.BBO, normalized.asset, row)
+
+
+def _parse_bbo_from_depth(
+    data: Mapping[str, Any],
+    envelope: WireEnvelope,
+    normalized: NormalizedInstrument,
+) -> ParsedRecord:
+    """Derive exact BBO from the first levels of one complete top-20 frame."""
+
+    bids = _sequence(data["b"], label="partial depth bids")
+    asks = _sequence(data["a"], label="partial depth asks")
+    if not bids or not asks:
+        raise ValueError("Binance partial depth BBO requires non-empty bid and ask sides")
+    bid = _sequence(bids[0], label="partial depth best bid")
+    ask = _sequence(asks[0], label="partial depth best ask")
+    if len(bid) != 2 or len(ask) != 2:
+        raise ValueError("Binance partial depth BBO levels must contain price and quantity")
+    transaction_time = _datetime_ms(data.get("T", data["E"]))
+    exchange_time = _datetime_ms(data["E"])
+    update_id = int(str(data["u"]))
+    if update_id < 0:
+        raise ValueError("Binance L2 update sequence cannot be negative")
+    row = _common(
+        RecordType.BBO,
+        normalized.asset,
+        envelope,
+        event_time=transaction_time,
+        exchange_time=exchange_time,
+        source_sequence=update_id,
+    )
+    row.update(
+        {
+            "update_id": f"{normalized.source_symbol}:{update_id}",
+            "bid_price": _required_decimal(bid[0]),
+            "bid_quantity": normalized.normalize_quantity(bid[1]),
+            "ask_price": _required_decimal(ask[0]),
+            "ask_quantity": normalized.normalize_quantity(ask[1]),
         }
     )
     return ParsedRecord(RecordType.BBO, normalized.asset, row)
@@ -436,6 +551,15 @@ def _parse_trade(
     aggregate_id = int(str(data["a"]))
     price = _required_decimal(data["p"])
     quantity = normalized.normalize_quantity(data["q"])
+    buyer_is_maker = data["m"]
+    if aggregate_id < 0:
+        raise ValueError("Binance aggregate trade ID cannot be negative")
+    if price <= 0:
+        raise ValueError("Binance aggregate trade price must be positive")
+    if quantity <= 0:
+        raise ValueError("Binance aggregate trade quantity must be positive")
+    if not isinstance(buyer_is_maker, bool):
+        raise ValueError("Binance aggregate trade maker flag must be boolean")
     row = _common(
         RecordType.TRADE,
         normalized.asset,
@@ -447,11 +571,13 @@ def _parse_trade(
     row.update(
         {
             "trade_id": f"{normalized.source_symbol}:agg:{aggregate_id}",
-            "aggressor_side": "sell" if bool(data["m"]) else "buy",
+            "aggressor_side": "sell" if buyer_is_maker else "buy",
             "price": price,
             "quantity": quantity,
             "quote_quantity": price * quantity,
             "is_liquidation": None,
+            "connection_epoch": envelope.connection_epoch,
+            "arrival_sequence": envelope.arrival_sequence,
         }
     )
     return ParsedRecord(RecordType.TRADE, normalized.asset, row)
@@ -533,20 +659,591 @@ class JsonGetTransport(Protocol):
     def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any: ...
 
 
-class UrllibJsonTransport:
-    def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
-        query = urllib.parse.urlencode({key: str(value) for key, value in params.items()})
-        request_url = url if not query else f"{url}?{query}"
-        request = urllib.request.Request(
-            request_url,
-            method="GET",
-            headers={"User-Agent": "HyperLab/0.2 public-market-data"},
+@dataclass(slots=True)
+class _PendingHttpDiagnostics:
+    url: str
+    urllib3_counters_before: tuple[int, int] | None
+    counters_before_completion_sequence: int
+    requests_session_reused: bool
+    requests_session_request_ordinal: int
+    diagnostic_prepare_ms: float
+    counter_baseline_current: bool = False
+    lock_requested_at: float | None = None
+    lock_acquired_at: float | None = None
+    get_started_at: float | None = None
+    get_completed_at: float | None = None
+    decode_started_at: float | None = None
+    decode_completed_at: float | None = None
+    response: Any | None = None
+    outcome: str = "success"
+    failure_stage: str | None = None
+    exception_type: str | None = None
+    completion_sequence: int | None = None
+    path_observation: HttpPathObservation | None = None
+    path_observed_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TransportIdentityEvidence:
+    urllib3_connection_identity: str | None
+    tls_socket_identity: str | None
+    tls_session_reused: bool | None
+
+
+class BinancePublicHttpRequestError(RuntimeError):
+    """Public HTTP failure carrying timings captured outside clock validity logic."""
+
+    def __init__(
+        self,
+        original_exception: Exception,
+        *,
+        request_sent_time: datetime,
+        response_received_time: datetime,
+        http_diagnostics: HttpRequestDiagnostics,
+    ) -> None:
+        self.original_exception = original_exception
+        self.request_sent_time = request_sent_time
+        self.response_received_time = response_received_time
+        self.http_diagnostics = http_diagnostics
+        detail = str(original_exception).strip()
+        reason = type(original_exception).__name__ if not detail else (
+            f"{type(original_exception).__name__}: {detail}"
         )
+        super().__init__(f"Binance public HTTP request failed: {reason}")
+
+
+class _TransportDiagnosticsState(local):
+    value: _PendingHttpDiagnostics | None
+
+    def __init__(self) -> None:
+        self.value = None
+
+
+class RequestsJsonTransport:
+    """Keyless GET transport with one reusable HTTPS connection pool."""
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._session = session or requests.Session()
+        self._session.trust_env = False
+        self._session.auth = None
+        self._session.headers.clear()
+        self._session.cookies.clear()
+        self._session.params.clear()
+        self._session.proxies.clear()
+        self._session.cert = None
+        self._session.verify = True
+        self._lock = Lock()
+        self._closed = False
+        self._monotonic = monotonic
+        self._diagnostics = _TransportDiagnosticsState()
+        self._diagnostics_lock = Lock()
+        self._session_requests_prepared = 0
+        self._last_urllib3_connection_identity: str | None = None
+        self._last_tls_socket_identity: str | None = None
+        self._urllib3_connection_first_observed_at: float | None = None
+        self._tls_socket_first_observed_at: float | None = None
+        self._completed_request_sequence = 0
+        self._peer_path_observer = HttpPeerPathObserver()
+
+    def _pool_snapshot(self, url: str) -> tuple[int, int] | None:
+        """Return urllib3 connection-object-created and request-started counters."""
         try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Binance public HTTP error {exc.code}") from exc
+            adapter = self._session.get_adapter(url)
+            manager = getattr(adapter, "poolmanager", None)
+            pools = getattr(manager, "pools", None)
+            container = getattr(pools, "_container", None)
+            lock = getattr(pools, "lock", None)
+            if container is None or lock is None:
+                return None
+            with lock:
+                pool_values = tuple(container.values())
+            return (
+                sum(int(pool.num_connections) for pool in pool_values),
+                sum(int(pool.num_requests) for pool in pool_values),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _elapsed_ms(response: Any) -> float | None:
+        try:
+            elapsed = response.elapsed
+            value = float(elapsed.total_seconds()) * 1_000
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return value if value >= 0 else None
+
+    def prepare_diagnostics(self, url: str) -> None:
+        """Capture optional pool state before the authoritative request timestamp."""
+
+        prepare_started_at = self._monotonic()
+        with self._lock:
+            counters_before_completion_sequence = self._completed_request_sequence
+            counters_before = self._pool_snapshot(url)
+        with self._diagnostics_lock:
+            self._session_requests_prepared += 1
+            session_request_ordinal = self._session_requests_prepared
+            session_reused = session_request_ordinal > 1
+        prepare_completed_at = self._monotonic()
+        self._diagnostics.value = _PendingHttpDiagnostics(
+            url=url,
+            urllib3_counters_before=counters_before,
+            counters_before_completion_sequence=counters_before_completion_sequence,
+            requests_session_reused=session_reused,
+            requests_session_request_ordinal=session_request_ordinal,
+            diagnostic_prepare_ms=max(prepare_completed_at - prepare_started_at, 0.0) * 1_000,
+        )
+
+    @staticmethod
+    def _mark_failure(
+        pending: _PendingHttpDiagnostics,
+        *,
+        stage: str,
+        error: Exception,
+    ) -> None:
+        pending.outcome = "failure"
+        pending.failure_stage = stage
+        pending.exception_type = type(error).__name__
+
+    @staticmethod
+    def _duration_ms(started: float | None, completed: float | None) -> float | None:
+        if started is None or completed is None:
+            return None
+        return max(completed - started, 0.0) * 1_000
+
+    @staticmethod
+    def _opaque_identity(value: object | None) -> str | None:
+        if value is None:
+            return None
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}:{id(value):x}"
+
+    @staticmethod
+    def _connection_from_pool_queue(raw: Any) -> object | None:
+        """Read one unambiguous idle connection without removing it from the pool."""
+
+        try:
+            pool = getattr(raw, "_pool", None)
+            connection_queue = getattr(pool, "pool", None)
+            mutex = getattr(connection_queue, "mutex", None)
+            queue_values = getattr(connection_queue, "queue", None)
+            if mutex is None or queue_values is None:
+                return None
+            with mutex:
+                connections = tuple(
+                    connection for connection in queue_values if connection is not None
+                )
+            if len(connections) == 1:
+                return connections[0]
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _transport_identity_evidence(cls, response: Any | None) -> _TransportIdentityEvidence:
+        """Inspect retained response objects after the authoritative receive timestamp."""
+
+        try:
+            raw = getattr(response, "raw", None)
+            connection = cls._connection_from_pool_queue(raw)
+            if connection is None:
+                connection = getattr(raw, "connection", None)
+            if connection is None:
+                connection = getattr(raw, "_connection", None)
+            socket = getattr(connection, "sock", None)
+            if socket is None:
+                original_response = getattr(raw, "_original_response", None)
+                file_pointer = getattr(original_response, "fp", None)
+                raw_file_pointer = getattr(file_pointer, "raw", None)
+                socket = getattr(raw_file_pointer, "_sock", None)
+            session_reused = getattr(socket, "session_reused", None)
+            if not isinstance(session_reused, bool):
+                session_reused = None
+            return _TransportIdentityEvidence(
+                urllib3_connection_identity=cls._opaque_identity(connection),
+                tls_socket_identity=cls._opaque_identity(socket),
+                tls_session_reused=session_reused,
+            )
+        except Exception:
+            return _TransportIdentityEvidence(None, None, None)
+
+    @staticmethod
+    def _identity_observation(
+        identity: str | None,
+        last_identity: str | None,
+        first_observed_at: float | None,
+        observed_at: float | None,
+    ) -> tuple[bool | None, str | None, float | None, float | None]:
+        if identity is None:
+            return None, None, None, None
+        reused = None if last_identity is None else identity == last_identity
+        if observed_at is None:
+            return reused, identity, None, None
+        if reused is True and first_observed_at is not None:
+            if observed_at < first_observed_at:
+                return reused, identity, observed_at, None
+            return (
+                reused,
+                identity,
+                first_observed_at,
+                (observed_at - first_observed_at) * 1_000,
+            )
+        return reused, identity, observed_at, 0.0
+
+    def _connection_reuse_evidence(
+        self,
+        evidence: _TransportIdentityEvidence,
+        *,
+        connection_observed_at: float | None,
+        socket_observed_at: float | None,
+    ) -> tuple[bool | None, bool | None, float | None, float | None]:
+        with self._diagnostics_lock:
+            (
+                connection_reused,
+                self._last_urllib3_connection_identity,
+                self._urllib3_connection_first_observed_at,
+                connection_observed_age_ms,
+            ) = self._identity_observation(
+                evidence.urllib3_connection_identity,
+                self._last_urllib3_connection_identity,
+                self._urllib3_connection_first_observed_at,
+                connection_observed_at,
+            )
+            (
+                socket_reused,
+                self._last_tls_socket_identity,
+                self._tls_socket_first_observed_at,
+                socket_observed_age_ms,
+            ) = self._identity_observation(
+                evidence.tls_socket_identity,
+                self._last_tls_socket_identity,
+                self._tls_socket_first_observed_at,
+                socket_observed_at,
+            )
+        return (
+            connection_reused,
+            socket_reused,
+            connection_observed_age_ms,
+            socket_observed_age_ms,
+        )
+
+    def _capture_response_path(
+        self,
+        pending: _PendingHttpDiagnostics,
+        response: Any,
+    ) -> Any:
+        try:
+            observation = self._peer_path_observer.observe_response(response)
+        except Exception:
+            return response
+        pending.path_observation = observation
+        return response
+
+    def _response_hook(
+        self,
+        pending: _PendingHttpDiagnostics,
+    ) -> Callable[..., Any]:
+        def observe(response: Any, *_args: Any, **_kwargs: Any) -> Any:
+            return self._capture_response_path(pending, response)
+
+        return observe
+
+    def _get_json_under_transport_lock(
+        self,
+        pending: _PendingHttpDiagnostics,
+        url: str,
+        params: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> Any:
+        pending.lock_acquired_at = self._monotonic()
+        pending.counter_baseline_current = (
+            pending.counters_before_completion_sequence
+            == self._completed_request_sequence
+        )
+        if self._closed:
+            error = RuntimeError("Binance public HTTP transport is closed")
+            self._mark_failure(pending, stage="transport_lock", error=error)
+            raise error
+
+        pending.get_started_at = self._monotonic()
+        try:
+            response = self._session.get(
+                url,
+                params={key: str(value) for key, value in params.items()},
+                timeout=timeout_seconds,
+                headers={"User-Agent": "HyperLab/0.2 public-market-data"},
+                allow_redirects=False,
+                hooks={'response': [self._response_hook(pending)]},
+            )
+        except Exception as exc:
+            pending.get_completed_at = self._monotonic()
+            self._mark_failure(pending, stage="session_get", error=exc)
+            raise
+        pending.get_completed_at = self._monotonic()
+        if pending.path_observation is None:
+            response = self._capture_response_path(pending, response)
+        if pending.path_observation is not None:
+            pending.path_observed_at = pending.get_completed_at
+        pending.response = response
+
+        try:
+            if 300 <= response.status_code < 400:
+                error = RuntimeError(
+                    f"Binance public HTTP redirect refused: {response.status_code}"
+                )
+                self._mark_failure(pending, stage="http_status", error=error)
+                raise error
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            error = RuntimeError(f"Binance public HTTP error {response.status_code}")
+            self._mark_failure(pending, stage="http_status", error=error)
+            raise error from exc
+        except Exception as exc:
+            if pending.outcome != "failure":
+                self._mark_failure(pending, stage="http_status", error=exc)
+            raise
+
+        pending.decode_started_at = self._monotonic()
+        try:
+            payload = response.json()
+        except Exception as exc:
+            pending.decode_completed_at = self._monotonic()
+            self._mark_failure(pending, stage="json_decode", error=exc)
+            raise
+        pending.decode_completed_at = self._monotonic()
+        return payload
+
+    def get_json(self, url: str, params: Mapping[str, object], timeout_seconds: float) -> Any:
+        pending = self._diagnostics.value
+        if (
+            pending is None
+            or pending.url != url
+            or pending.lock_requested_at is not None
+        ):
+            # Direct transport callers have no authoritative clock boundary.
+            self.prepare_diagnostics(url)
+            pending = self._diagnostics.value
+        if pending is None:
+            raise RuntimeError("HTTP diagnostics preparation failed")
+
+        pending.lock_requested_at = self._monotonic()
+        try:
+            with self._lock:
+                try:
+                    return self._get_json_under_transport_lock(
+                        pending,
+                        url,
+                        params,
+                        timeout_seconds,
+                    )
+                finally:
+                    self._completed_request_sequence += 1
+                    pending.completion_sequence = self._completed_request_sequence
+        except Exception as exc:
+            if pending.outcome != "failure":
+                self._mark_failure(pending, stage="transport_lock", error=exc)
+            raise
+
+    def consume_diagnostics(self) -> HttpRequestDiagnostics | None:
+        """Finalize diagnostics after the authoritative receive timestamp."""
+
+        pending = self._diagnostics.value
+        self._diagnostics.value = None
+        if pending is None:
+            return None
+        finalize_started_at = self._monotonic()
+
+        with self._lock:
+            finalization_completion_sequence = self._completed_request_sequence
+            post_request_observation_current = (
+                pending.completion_sequence is not None
+                and pending.completion_sequence == finalization_completion_sequence
+            )
+            if post_request_observation_current:
+                counters_after = self._pool_snapshot(pending.url)
+                path_observation = pending.path_observation
+                fallback_evidence = self._transport_identity_evidence(pending.response)
+                fallback_observed_at = self._monotonic()
+                if path_observation is None:
+                    evidence = fallback_evidence
+                    connection_observed_at = (
+                        fallback_observed_at
+                        if fallback_evidence.urllib3_connection_identity is not None
+                        else None
+                    )
+                    socket_observed_at = (
+                        fallback_observed_at
+                        if fallback_evidence.tls_socket_identity is not None
+                        else None
+                    )
+                else:
+                    connection_observed_from_path = (
+                        path_observation.urllib3_connection_identity is not None
+                    )
+                    socket_observed_from_path = (
+                        path_observation.tls_socket_identity is not None
+                    )
+                    evidence = _TransportIdentityEvidence(
+                        urllib3_connection_identity=(
+                            path_observation.urllib3_connection_identity
+                            or fallback_evidence.urllib3_connection_identity
+                        ),
+                        tls_socket_identity=(
+                            path_observation.tls_socket_identity
+                            or fallback_evidence.tls_socket_identity
+                        ),
+                        tls_session_reused=(
+                            path_observation.tls_session_reused
+                            if path_observation.tls_session_reused is not None
+                            else fallback_evidence.tls_session_reused
+                        ),
+                    )
+                    connection_observed_at = (
+                        pending.path_observed_at
+                        if connection_observed_from_path
+                        else (
+                            fallback_observed_at
+                            if fallback_evidence.urllib3_connection_identity
+                            is not None
+                            else None
+                        )
+                    )
+                    socket_observed_at = (
+                        pending.path_observed_at
+                        if socket_observed_from_path
+                        else (
+                            fallback_observed_at
+                            if fallback_evidence.tls_socket_identity is not None
+                            else None
+                        )
+                    )
+                (
+                    connection_reused,
+                    socket_reused,
+                    connection_observed_age_ms,
+                    socket_observed_age_ms,
+                ) = self._connection_reuse_evidence(
+                    evidence,
+                    connection_observed_at=connection_observed_at,
+                    socket_observed_at=socket_observed_at,
+                )
+            else:
+                counters_after = None
+                evidence = _TransportIdentityEvidence(None, None, None)
+                connection_reused, socket_reused = None, None
+                connection_observed_age_ms, socket_observed_age_ms = None, None
+
+        counters_before = pending.urllib3_counters_before
+        counter_window_current = (
+            post_request_observation_current and pending.counter_baseline_current
+        )
+        connection_objects_created_delta = (
+            counters_after[0] - counters_before[0]
+            if counter_window_current
+            and counters_before is not None
+            and counters_after is not None
+            else None
+        )
+        requests_started_delta = (
+            counters_after[1] - counters_before[1]
+            if counter_window_current
+            and counters_before is not None
+            and counters_after is not None
+            else None
+        )
+        new_connection_object = (
+            None
+            if connection_objects_created_delta is None
+            or connection_objects_created_delta < 0
+            else connection_objects_created_delta > 0
+        )
+        tls_session_reused = (
+            evidence.tls_session_reused if socket_reused is not True else None
+        )
+        transport_lock_wait_ms = self._duration_ms(
+            pending.lock_requested_at,
+            pending.lock_acquired_at,
+        )
+        adapter_header_elapsed_ms = self._elapsed_ms(pending.response)
+        session_get_total_ms = self._duration_ms(
+            pending.get_started_at,
+            pending.get_completed_at,
+        )
+        json_decode_ms = self._duration_ms(
+            pending.decode_started_at,
+            pending.decode_completed_at,
+        )
+        path_observation = pending.path_observation
+        finalize_completed_at = self._monotonic()
+        return HttpRequestDiagnostics(
+            transport_lock_wait_ms=transport_lock_wait_ms,
+            requests_adapter_header_elapsed_ms=adapter_header_elapsed_ms,
+            session_get_total_ms=session_get_total_ms,
+            json_decode_ms=json_decode_ms,
+            pool_connections_before=(
+                None if counters_before is None else counters_before[0]
+            ),
+            pool_connections_after=(
+                None if counters_after is None else counters_after[0]
+            ),
+            pool_connection_delta=connection_objects_created_delta,
+            pool_requests_before=(
+                None if counters_before is None else counters_before[1]
+            ),
+            pool_requests_after=(
+                None if counters_after is None else counters_after[1]
+            ),
+            pool_request_delta=requests_started_delta,
+            new_pool_connection_created=new_connection_object,
+            outcome=pending.outcome,
+            failure_stage=pending.failure_stage,
+            exception_type=pending.exception_type,
+            requests_session_reused=pending.requests_session_reused,
+            requests_session_request_ordinal=(
+                pending.requests_session_request_ordinal
+            ),
+            urllib3_connection_identity=evidence.urllib3_connection_identity,
+            urllib3_connection_reused=connection_reused,
+            urllib3_connection_observed_age_ms=connection_observed_age_ms,
+            tls_socket_identity=evidence.tls_socket_identity,
+            tls_socket_reused=socket_reused,
+            tls_socket_observed_age_ms=socket_observed_age_ms,
+            tls_session_reused=tls_session_reused,
+            diagnostic_prepare_ms=pending.diagnostic_prepare_ms,
+            diagnostic_finalize_ms=max(
+                finalize_completed_at - finalize_started_at,
+                0.0,
+            )
+            * 1_000,
+            request_completion_sequence=pending.completion_sequence,
+            finalization_completion_sequence=finalization_completion_sequence,
+            post_request_observation_current=post_request_observation_current,
+            peer_ip=None if path_observation is None else path_observation.peer_ip,
+            peer_port=None if path_observation is None else path_observation.peer_port,
+            socket_family=(
+                None if path_observation is None else path_observation.socket_family
+            ),
+            response_cloudfront_pop=(
+                None
+                if path_observation is None
+                else path_observation.response_cloudfront_pop
+            ),
+            response_cache=(
+                None if path_observation is None else path_observation.response_cache
+            ),
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._session.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +1251,7 @@ class TimedPayload:
     payload: Any
     request_sent_time: datetime
     response_received_time: datetime
+    http_diagnostics: HttpRequestDiagnostics | None = None
 
 
 class BinancePublicRestClient:
@@ -565,24 +1263,144 @@ class BinancePublicRestClient:
         timeout_seconds: float = 15.0,
         transport: JsonGetTransport | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        thread_runtime_snapshot: Callable[
+            [str],
+            ThreadRuntimeSnapshot,
+        ] = capture_thread_runtime_snapshot,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self.timeout_seconds = timeout_seconds
-        self.transport = transport or UrllibJsonTransport()
+        self.transport = transport or RequestsJsonTransport()
+        self._closed = False
         self.clock = clock
+        self._thread_runtime_snapshot = thread_runtime_snapshot
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.transport, "close", None)
+        if callable(close):
+            close()
+
+    @staticmethod
+    def _attach_failure_diagnostics(
+        error: Exception,
+        *,
+        request_sent_time: datetime,
+        response_received_time: datetime,
+        http_diagnostics: HttpRequestDiagnostics,
+    ) -> bool:
+        """Preserve the transport exception type when it accepts annotations."""
+
+        try:
+            setattr(error, "request_sent_time", request_sent_time)  # noqa: B010
+            setattr(error, "response_received_time", response_received_time)  # noqa: B010
+            setattr(error, "http_diagnostics", http_diagnostics)  # noqa: B010
+        except Exception:
+            return False
+        return True
+
+    def _capture_request_boundary_snapshot(
+        self,
+        position: str,
+    ) -> ThreadRuntimeSnapshot | None:
+        try:
+            snapshot = self._thread_runtime_snapshot(position)
+        except Exception:
+            return None
+        return snapshot if isinstance(snapshot, ThreadRuntimeSnapshot) else None
+
+    @staticmethod
+    def _with_request_boundary_runtime(
+        diagnostics: HttpRequestDiagnostics | None,
+        start: ThreadRuntimeSnapshot | None,
+        end: ThreadRuntimeSnapshot | None,
+    ) -> HttpRequestDiagnostics | None:
+        if diagnostics is None:
+            return None
+        try:
+            delta: RequestBoundaryRuntimeDelta = request_boundary_runtime_delta(
+                start,
+                end,
+            )
+            return replace(
+                diagnostics,
+                request_boundary_monotonic_elapsed_ms=(
+                    delta.request_boundary_monotonic_elapsed_ms
+                ),
+                request_boundary_thread_cpu_ms=(
+                    delta.request_boundary_thread_cpu_ms
+                ),
+                request_boundary_thread_runqueue_wait_ms=(
+                    delta.request_boundary_thread_runqueue_wait_ms
+                ),
+                request_boundary_thread_timeslice_delta=(
+                    delta.request_boundary_thread_timeslice_delta
+                ),
+            )
+        except Exception:
+            return diagnostics
 
     def _get(self, path: str, params: Mapping[str, object] | None = None) -> TimedPayload:
+        if self._closed:
+            raise RuntimeError("Binance public REST client is closed")
         if path not in PUBLIC_GET_PATHS:
             raise ValueError(f"Binance endpoint is outside the public market-data allowlist: {path}")
+        url = REST_BASE_URL + path
+        prepare_diagnostics = getattr(self.transport, "prepare_diagnostics", None)
+        if callable(prepare_diagnostics):
+            prepare_diagnostics(url)
+
+        boundary_start = self._capture_request_boundary_snapshot("start")
         sent = self.clock()
-        payload = self.transport.get_json(
-            REST_BASE_URL + path,
-            {} if params is None else params,
-            self.timeout_seconds,
-        )
+        try:
+            payload = self.transport.get_json(
+                url,
+                {} if params is None else params,
+                self.timeout_seconds,
+            )
+        except Exception as exc:
+            received = self.clock()
+            boundary_end = self._capture_request_boundary_snapshot("end")
+            diagnostics = None
+            consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
+            if callable(consume_diagnostics):
+                diagnostics = consume_diagnostics()
+            diagnostics = self._with_request_boundary_runtime(
+                diagnostics,
+                boundary_start,
+                boundary_end,
+            )
+            if diagnostics is None:
+                raise
+            if self._attach_failure_diagnostics(
+                exc,
+                request_sent_time=sent,
+                response_received_time=received,
+                http_diagnostics=diagnostics,
+            ):
+                raise
+            raise BinancePublicHttpRequestError(
+                exc,
+                request_sent_time=sent,
+                response_received_time=received,
+                http_diagnostics=diagnostics,
+            ) from exc
+
         received = self.clock()
-        return TimedPayload(payload, sent, received)
+        boundary_end = self._capture_request_boundary_snapshot("end")
+        diagnostics = None
+        consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
+        if callable(consume_diagnostics):
+            diagnostics = consume_diagnostics()
+        diagnostics = self._with_request_boundary_runtime(
+            diagnostics,
+            boundary_start,
+            boundary_end,
+        )
+        return TimedPayload(payload, sent, received, diagnostics)
 
     def exchange_info(self) -> TimedPayload:
         return self._get("/fapi/v1/exchangeInfo")
@@ -595,6 +1413,7 @@ class BinancePublicRestClient:
             request_sent_time=timed.request_sent_time,
             response_received_time=timed.response_received_time,
             server_time=_datetime_ms(server["serverTime"]),
+            http_diagnostics=timed.http_diagnostics,
         )
 
     def funding_history(self, symbol: str, start_ms: int, end_ms: int) -> TimedPayload:
@@ -653,7 +1472,114 @@ class BinancePublicRestClient:
         )
 
 
-def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRecord:
+def diagnose_binance_http_paths(
+    *,
+    samples: int = 10,
+    fresh_sample_count: int = 1,
+    interval_seconds: float = 1.0,
+    timeout_seconds: float = 15.0,
+    client_factory: Callable[[], Any] | None = None,
+    resolver: Resolver | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    runtime_status: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    if client_factory is None:
+
+        def factory() -> BinancePublicRestClient:
+            return BinancePublicRestClient(timeout_seconds=timeout_seconds)
+
+    else:
+        factory = client_factory
+    arguments: dict[str, Any] = {
+        "samples": samples,
+        "fresh_sample_count": fresh_sample_count,
+        "interval_seconds": interval_seconds,
+        "client_factory": factory,
+        "sleeper": sleeper,
+        "runtime_status": runtime_status,
+    }
+    if resolver is not None:
+        arguments["resolver"] = resolver
+    return diagnose_http_paths(**arguments)
+
+
+def _positive_milliseconds(value: timedelta, *, label: str) -> int:
+    milliseconds = Decimal(str(value.total_seconds())) * 1_000
+    if milliseconds <= 0 or milliseconds != milliseconds.to_integral_value():
+        raise ValueError(f"{label} must be a positive whole number of milliseconds")
+    return int(milliseconds)
+
+
+def _optional_non_negative_milliseconds(
+    value: Decimal | float | None,
+    *,
+    label: str,
+) -> Decimal | None:
+    result = _decimal(value, required=False)
+    if result is not None and result < 0:
+        raise ValueError(f"{label} must be non-negative")
+    if result is None:
+        return None
+    try:
+        return result.quantize(Decimal("0.000000000000000001"))
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} exceeds the durable decimal range") from exc
+
+
+def clock_record(
+    measurement: ClockMeasurement,
+    observation_id: str,
+    *,
+    connection_id: str | None = None,
+    connection_epoch: int | None = None,
+    capture_epoch_id: str | None = None,
+    sampling_interval: timedelta = timedelta(seconds=10),
+    max_age: timedelta = timedelta(seconds=15),
+    max_uncertainty_ms: Decimal = Decimal("50"),
+    clock_schedule_overdue_ms: Decimal | float | None = None,
+    single_flight_blocked_ms: Decimal | float | None = None,
+    executor_submit_to_worker_start_ms: Decimal | float | None = None,
+    worker_completion_to_supervisor_drain_ms: Decimal | float | None = None,
+) -> ParsedRecord:
+    sampling_interval_ms = _positive_milliseconds(
+        sampling_interval,
+        label="clock sampling interval",
+    )
+    max_age_ms = _positive_milliseconds(max_age, label="clock maximum age")
+    if max_age < sampling_interval:
+        raise ValueError("clock maximum age cannot be shorter than the sampling interval")
+    if not max_uncertainty_ms.is_finite() or max_uncertainty_ms < 0:
+        raise ValueError("clock maximum uncertainty must be finite and non-negative")
+    if connection_epoch is not None and connection_epoch < 1:
+        raise ValueError("connection_epoch must be positive when present")
+    if connection_id is not None and not connection_id.strip():
+        raise ValueError("connection_id must be non-empty when present")
+    if capture_epoch_id is not None and not capture_epoch_id.strip():
+        raise ValueError("capture_epoch_id must be non-empty when present")
+    diagnostics = measurement.http_diagnostics
+
+    missing_identity = (
+        connection_id is None or connection_epoch is None or capture_epoch_id is None
+    )
+    uncertainty_exceeded = measurement.drift_uncertainty_ms > max_uncertainty_ms
+    if missing_identity:
+        sample_status = "invalid"
+        invalid_reason = "missing active capture identity"
+    elif uncertainty_exceeded:
+        sample_status = "invalid"
+        invalid_reason = (
+            "clock uncertainty exceeds threshold: "
+            f"{measurement.drift_uncertainty_ms}ms > {max_uncertainty_ms}ms"
+        )
+    else:
+        sample_status = "valid"
+        invalid_reason = None
+    causal_valid_from = (
+        measurement.response_received_time if sample_status == "valid" else None
+    )
+    causal_valid_until = (
+        measurement.response_received_time + max_age if sample_status == "valid" else None
+    )
     row = {
         "schema_version": latest_schema_for(RecordType.CLOCK_SYNC).version,
         "record_type": RecordType.CLOCK_SYNC.value,
@@ -663,7 +1589,7 @@ def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRe
         "exchange_time": measurement.server_time,
         "received_time": measurement.response_received_time,
         "source_sequence": None,
-        "connection_id": None,
+        "connection_id": connection_id,
         "request_sent_time": measurement.request_sent_time,
         "response_received_time": measurement.response_received_time,
         "server_time": measurement.server_time,
@@ -671,6 +1597,130 @@ def clock_record(measurement: ClockMeasurement, observation_id: str) -> ParsedRe
         "estimated_clock_drift_ms": measurement.estimated_clock_drift_ms,
         "drift_uncertainty_ms": measurement.drift_uncertainty_ms,
         "observation_id": observation_id,
+        "connection_epoch": connection_epoch,
+        "capture_epoch_id": capture_epoch_id,
+        "causal_valid_from": causal_valid_from,
+        "causal_valid_until": causal_valid_until,
+        "sample_status": sample_status,
+        "invalid_reason": invalid_reason,
+        "sampling_interval_ms": sampling_interval_ms,
+        "max_age_ms": max_age_ms,
+        "max_uncertainty_ms": max_uncertainty_ms,
+        "clock_schedule_overdue_ms": _optional_non_negative_milliseconds(
+            clock_schedule_overdue_ms,
+            label="clock schedule overdue",
+        ),
+        "single_flight_blocked_ms": _optional_non_negative_milliseconds(
+            single_flight_blocked_ms,
+            label="single flight blocked",
+        ),
+        "executor_submit_to_worker_start_ms": _optional_non_negative_milliseconds(
+            executor_submit_to_worker_start_ms,
+            label="executor submit to worker start",
+        ),
+        "worker_completion_to_supervisor_drain_ms": _optional_non_negative_milliseconds(
+            worker_completion_to_supervisor_drain_ms,
+            label="worker completion to supervisor drain",
+        ),
+        "transport_lock_wait_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.transport_lock_wait_ms,
+            label="transport lock wait",
+        ),
+        "requests_adapter_header_elapsed_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.requests_adapter_header_elapsed_ms,
+            label="Requests adapter header elapsed",
+        ),
+        "session_get_total_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.session_get_total_ms,
+            label="session get total",
+        ),
+        "json_decode_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.json_decode_ms,
+            label="JSON decode",
+        ),
+        "diagnostic_prepare_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.diagnostic_prepare_ms,
+            label="diagnostic prepare",
+        ),
+        "diagnostic_finalize_ms": _optional_non_negative_milliseconds(
+            None if diagnostics is None else diagnostics.diagnostic_finalize_ms,
+            label="diagnostic finalize",
+        ),
+        "new_urllib3_connection_object_created": (
+            None if diagnostics is None else diagnostics.new_urllib3_connection_object_created
+        ),
+        "requests_session_reused": (
+            None if diagnostics is None else diagnostics.requests_session_reused
+        ),
+        "urllib3_connection_identity": (
+            None if diagnostics is None else diagnostics.urllib3_connection_identity
+        ),
+        "urllib3_connection_reused": (
+            None if diagnostics is None else diagnostics.urllib3_connection_reused
+        ),
+        "tls_socket_identity": (
+            None if diagnostics is None else diagnostics.tls_socket_identity
+        ),
+        "tls_socket_reused": None if diagnostics is None else diagnostics.tls_socket_reused,
+        "tls_session_reused": None if diagnostics is None else diagnostics.tls_session_reused,
+        "post_request_observation_current": (
+            None if diagnostics is None else diagnostics.post_request_observation_current
+        ),
+        "peer_ip": None if diagnostics is None else diagnostics.peer_ip,
+        "peer_port": None if diagnostics is None else diagnostics.peer_port,
+        "socket_family": None if diagnostics is None else diagnostics.socket_family,
+        "response_cloudfront_pop": (
+            None if diagnostics is None else diagnostics.response_cloudfront_pop
+        ),
+        "response_cache": None if diagnostics is None else diagnostics.response_cache,
+        "request_boundary_monotonic_elapsed_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_monotonic_elapsed_ms,
+                label="request boundary monotonic elapsed",
+            )
+        ),
+        "request_boundary_thread_cpu_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.request_boundary_thread_cpu_ms,
+            label="request boundary thread CPU",
+        ),
+        "request_boundary_thread_runqueue_wait_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_thread_runqueue_wait_ms,
+                label="request boundary thread runqueue wait",
+            )
+        ),
+        "request_boundary_thread_timeslice_delta": (
+            None
+            if diagnostics is None
+            else diagnostics.request_boundary_thread_timeslice_delta
+        ),
+        "requests_session_request_ordinal": (
+            None
+            if diagnostics is None
+            else diagnostics.requests_session_request_ordinal
+        ),
+        "urllib3_connection_observed_age_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.urllib3_connection_observed_age_ms,
+                label="urllib3 connection observed age",
+            )
+        ),
+        "tls_socket_observed_age_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.tls_socket_observed_age_ms,
+            label="TLS socket observed age",
+        ),
     }
     return ParsedRecord(RecordType.CLOCK_SYNC, "GLOBAL", row)
 

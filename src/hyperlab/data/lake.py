@@ -4,13 +4,15 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import date as Date
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import quote, unquote
 
 import pyarrow as pa
@@ -18,6 +20,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from hyperlab.data.schema import (
+    BREAKING_SCHEMA_TRANSITIONS,
     SCHEMA_VERSION_METADATA,
     RecordType,
     SchemaSpec,
@@ -26,6 +29,7 @@ from hyperlab.data.schema import (
 )
 
 MANIFEST_FORMAT_VERSION = 1
+DEFAULT_PARQUET_BATCH_SIZE = 1_024
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ASSET = re.compile(r"^[A-Za-z0-9@%][A-Za-z0-9@%._/+:-]{0,127}$")
 _CANDLE_INTERVAL = re.compile(r"^([1-9][0-9]*)(s|m|h|d|w)$")
@@ -447,6 +451,76 @@ def read_hashed_table(
     )
 
 
+def iter_hashed_batches(
+    root: Path,
+    manifest: PartitionManifest,
+    *,
+    columns: Sequence[str] | None = None,
+    batch_size: int = DEFAULT_PARQUET_BATCH_SIZE,
+) -> Iterator[pa.RecordBatch]:
+    """Yield projected Parquet batches after hashing one open file descriptor.
+
+    The file is hashed and size-checked before the first batch is exposed. The
+    same descriptor is then rewound for Parquet decoding, so a pathname swap
+    cannot substitute different bytes between integrity verification and read.
+    Memory retained by this iterator is bounded by one hash block, Arrow decoder
+    state and the caller-selected positive ``batch_size``.
+    """
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("Parquet batch_size must be a positive integer")
+
+    selected_columns = None if columns is None else list(columns)
+    data_path = root / manifest.relative_data_path
+    try:
+        stream = data_path.open("rb")
+    except FileNotFoundError:
+        raise PartitionValidationError(f"partition data file not found: {data_path.name}") from None
+
+    with stream:
+        digest = hashlib.sha256()
+        size_bytes = 0
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+            size_bytes += len(block)
+        del block
+
+        actual_hash = digest.hexdigest()
+        del digest
+        if actual_hash != manifest.sha256:
+            raise PartitionValidationError(
+                "CORRUPT_PARTITION [hash_mismatch] "
+                f"partition={manifest.relative_data_path.as_posix()} "
+                f"expected_sha256={manifest.sha256} actual_sha256={actual_hash}"
+            )
+        if size_bytes != manifest.size_bytes:
+            raise PartitionValidationError(f"size mismatch for {manifest.data_file}")
+
+        try:
+            parquet_file: pq.ParquetFile | None = None
+            try:
+                stream.seek(0)
+                parquet_file = pq.ParquetFile(stream, pre_buffer=False)
+                batch_iterator = parquet_file.iter_batches(
+                    batch_size=batch_size,
+                    columns=selected_columns,
+                    use_threads=False,
+                )
+                try:
+                    for batch in batch_iterator:
+                        try:
+                            yield batch
+                        finally:
+                            del batch
+                finally:
+                    del batch_iterator
+            finally:
+                if parquet_file is not None:
+                    parquet_file.close(force=True)
+        except Exception as exc:
+            raise PartitionValidationError(f"invalid Parquet file {data_path.name}: {exc}") from None
+
+
 def _timestamp_iso(epoch_ns: int) -> str:
     seconds, nanoseconds = divmod(epoch_ns, 1_000_000_000)
     base = datetime.fromtimestamp(seconds, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -703,6 +777,12 @@ def _require_non_negative(table: pa.Table, *names: str) -> None:
             raise PartitionValidationError(f"{name} must be non-negative")
 
 
+def _require_positive_when_present(table: pa.Table, *names: str) -> None:
+    for name in names:
+        if any(value is not None and value <= 0 for value in table.column(name).to_pylist()):
+            raise PartitionValidationError(f"{name} must be positive when present")
+
+
 def _require_closed_vocabulary(table: pa.Table, name: str, allowed: frozenset[str]) -> None:
     observed = {str(value) for value in table.column(name).to_pylist()}
     invalid = sorted(observed - allowed)
@@ -777,7 +857,7 @@ def _validate_l2_metadata(table: pa.Table, key: PartitionKey) -> None:
             )
 
 
-def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
+def _validate_semantics(table: pa.Table, key: PartitionKey, spec: SchemaSpec) -> None:
     record_type = key.record_type
     if record_type == RecordType.INSTRUMENT_METADATA:
         _require_closed_vocabulary(
@@ -832,6 +912,13 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
             "payload_sha256",
         )
         _require_optional_non_empty_strings(table, "channel")
+        _require_positive_when_present(
+            table,
+            "connection_epoch",
+            "arrival_sequence",
+        )
+        if spec.version >= 2:
+            _require_optional_non_empty_strings(table, "capture_epoch_id")
         if table.column("source_sequence").null_count != table.num_rows:
             raise PartitionValidationError(
                 "wire_message source_sequence must remain null; use arrival_sequence"
@@ -895,6 +982,12 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
         if any(value <= 0 for value in table.column("quantity").to_pylist()):
             raise PartitionValidationError("trade quantity must be positive")
         _require_non_negative(table, "quote_quantity")
+        if spec.version >= 2:
+            _require_positive_when_present(
+                table,
+                "connection_epoch",
+                "arrival_sequence",
+            )
     elif record_type == RecordType.FUNDING:
         _require_non_empty_strings(table, "rate_kind")
         _require_positive_prices(table, "mark_price", "oracle_price")
@@ -921,6 +1014,13 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
             "event_kind",
             frozenset({"connect", "disconnect", "gap", "resync_start", "resync_complete"}),
         )
+        if spec.version >= 2:
+            _require_positive_when_present(table, "connection_epoch")
+            _require_optional_non_empty_strings(
+                table,
+                "capture_epoch_id",
+                "socket_role",
+            )
     elif record_type == RecordType.INSTRUMENT_LIFECYCLE:
         _require_closed_vocabulary(table, "instrument_kind", frozenset({"spot", "perp"}))
         _require_closed_vocabulary(
@@ -952,6 +1052,168 @@ def _validate_semantics(table: pa.Table, key: PartitionKey) -> None:
                 raise PartitionValidationError("clock sync request must be sent before its response")
             if uncertainty * 2 != round_trip:
                 raise PartitionValidationError("clock drift uncertainty must equal half the round trip")
+        if spec.version >= 2:
+            _validate_clock_sync_v2(table)
+        if spec.version >= 3:
+            _validate_clock_sync_v3(table)
+        if spec.version >= 4:
+            _validate_clock_sync_v4(table)
+
+
+def _validate_clock_sync_v2(table: pa.Table) -> None:
+    _require_closed_vocabulary(
+        table,
+        "sample_status",
+        frozenset({"valid", "invalid"}),
+    )
+    _require_optional_non_empty_strings(
+        table,
+        "capture_epoch_id",
+        "invalid_reason",
+    )
+    _require_non_negative(table, "max_uncertainty_ms")
+    _require_positive_when_present(table, "connection_epoch")
+    columns = {
+        name: table.column(name).to_pylist()
+        for name in (
+            "connection_id",
+            "connection_epoch",
+            "capture_epoch_id",
+            "received_time",
+            "response_received_time",
+            "drift_uncertainty_ms",
+            "causal_valid_from",
+            "causal_valid_until",
+            "sample_status",
+            "invalid_reason",
+            "sampling_interval_ms",
+            "max_age_ms",
+            "max_uncertainty_ms",
+        )
+    }
+    for values in zip(*columns.values(), strict=True):
+        row = dict(zip(columns, values, strict=True))
+        sampling_interval_ms = row["sampling_interval_ms"]
+        max_age_ms = row["max_age_ms"]
+        max_uncertainty_ms = row["max_uncertainty_ms"]
+        if sampling_interval_ms is None or int(sampling_interval_ms) <= 0:
+            raise PartitionValidationError("sampling_interval_ms must be positive")
+        if max_age_ms is None or int(max_age_ms) <= 0:
+            raise PartitionValidationError("max_age_ms must be positive")
+        if int(sampling_interval_ms) > int(max_age_ms):
+            raise PartitionValidationError(
+                "sampling_interval_ms must not exceed max_age_ms"
+            )
+        if max_uncertainty_ms is None:
+            raise PartitionValidationError("max_uncertainty_ms must be present")
+        if row["received_time"] != row["response_received_time"]:
+            raise PartitionValidationError(
+                "received_time must equal response_received_time for clock sync"
+            )
+
+        if row["sample_status"] == "valid":
+            for identity in ("connection_id", "connection_epoch", "capture_epoch_id"):
+                if row[identity] is None or (
+                    isinstance(row[identity], str) and not row[identity].strip()
+                ):
+                    raise PartitionValidationError(
+                        f"{identity} must be present for valid clock coverage"
+                    )
+            if row["drift_uncertainty_ms"] > max_uncertainty_ms:
+                raise PartitionValidationError(
+                    "valid clock uncertainty exceeds max_uncertainty_ms"
+                )
+            if row["invalid_reason"] is not None:
+                raise PartitionValidationError(
+                    "invalid_reason must be null for valid clock coverage"
+                )
+            expected_from = row["response_received_time"]
+            if row["causal_valid_from"] != expected_from:
+                raise PartitionValidationError(
+                    "causal_valid_from must equal response_received_time"
+                )
+            expected_until = expected_from + timedelta(
+                milliseconds=int(max_age_ms)
+            )
+            if row["causal_valid_until"] != expected_until:
+                raise PartitionValidationError(
+                    "causal_valid_until must equal causal_valid_from plus max_age_ms"
+                )
+            continue
+
+        if row["causal_valid_from"] is not None or row["causal_valid_until"] is not None:
+            raise PartitionValidationError(
+                "invalid clock sample must not claim a causal validity interval"
+            )
+        if row["invalid_reason"] is None or not str(row["invalid_reason"]).strip():
+            raise PartitionValidationError(
+                "invalid_reason must be present for invalid clock sample"
+            )
+
+
+def _validate_clock_sync_v3(table: pa.Table) -> None:
+    _require_non_negative(
+        table,
+        "clock_schedule_overdue_ms",
+        "single_flight_blocked_ms",
+        "executor_submit_to_worker_start_ms",
+        "worker_completion_to_supervisor_drain_ms",
+        "transport_lock_wait_ms",
+        "requests_adapter_header_elapsed_ms",
+        "session_get_total_ms",
+        "json_decode_ms",
+        "diagnostic_prepare_ms",
+        "diagnostic_finalize_ms",
+    )
+    _require_positive_when_present(table, "peer_port")
+    _require_optional_non_empty_strings(
+        table,
+        "urllib3_connection_identity",
+        "tls_socket_identity",
+        "peer_ip",
+        "socket_family",
+        "response_cloudfront_pop",
+        "response_cache",
+    )
+
+
+def _validate_clock_sync_v4(table: pa.Table) -> None:
+    _require_non_negative(
+        table,
+        "request_boundary_monotonic_elapsed_ms",
+        "request_boundary_thread_cpu_ms",
+        "request_boundary_thread_runqueue_wait_ms",
+        "request_boundary_thread_timeslice_delta",
+        "urllib3_connection_observed_age_ms",
+        "tls_socket_observed_age_ms",
+    )
+    _require_positive_when_present(table, "requests_session_request_ordinal")
+    for (
+        connection_identity,
+        connection_age_ms,
+        socket_identity,
+        socket_age_ms,
+        observation_current,
+    ) in zip(
+        table.column("urllib3_connection_identity").to_pylist(),
+        table.column("urllib3_connection_observed_age_ms").to_pylist(),
+        table.column("tls_socket_identity").to_pylist(),
+        table.column("tls_socket_observed_age_ms").to_pylist(),
+        table.column("post_request_observation_current").to_pylist(),
+        strict=True,
+    ):
+        if connection_age_ms is not None and (
+            connection_identity is None or observation_current is not True
+        ):
+            raise PartitionValidationError(
+                "urllib3 connection observed age requires a current connection identity"
+            )
+        if socket_age_ms is not None and (
+            socket_identity is None or observation_current is not True
+        ):
+            raise PartitionValidationError(
+                "TLS socket observed age requires a current socket identity"
+            )
 
 
 def _analyze_table(
@@ -979,7 +1241,7 @@ def _analyze_table(
     _require_partition_value(table, "record_type", _record_type_value(key.record_type))
     _require_partition_value(table, "venue", key.venue)
     _require_partition_value(table, "asset", key.asset)
-    _validate_semantics(table, key)
+    _validate_semantics(table, key, spec)
     _validate_l2_metadata(table, key)
 
     event_dates = {
@@ -1090,35 +1352,55 @@ def _publish_exclusive(temporary: Path, target: Path, *, expected_bytes: bytes |
             raise PartitionExistsError(f"refusing to overwrite immutable file: {target.name}") from None
     finally:
         temporary.unlink(missing_ok=True)
-        _fsync_directory(target.parent)
+
+
+def _flush_and_fsync(stream: BinaryIO) -> None:
+    """Flush Python buffers and force one regular file to stable storage."""
+
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def _fsync_file(path: Path) -> None:
+    """Force a closed producer's file contents and metadata to stable storage."""
+
+    with path.open("r+b") as stream:
+        _flush_and_fsync(stream)
 
 
 def _fsync_directory(path: Path) -> None:
-    """Persist directory entries on Linux; Windows has no portable directory fsync."""
+    """Persist directory-entry changes where directory fsync is supported."""
 
     if os.name == "nt":
+        # Python cannot portably open a Windows directory for os.fsync(). The
+        # regular files are still fsynced; Linux production additionally gets
+        # the directory durability barrier below.
         return
-    descriptor = os.open(path, os.O_RDONLY)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def _mkdir_parents_durable(root: Path, leaf: Path) -> None:
-    """Create a partition path and persist every new directory entry on Linux."""
+def _missing_directories(root: Path, leaf: Path) -> tuple[Path, ...]:
+    """Return missing directories from leaf upward, bounded by root."""
 
-    canonical_root = root.resolve()
-    _require_under_root(canonical_root, leaf, label="partition leaf")
     missing: list[Path] = []
     current = leaf
-    while not current.exists():
-        missing.append(current)
-        if current.parent == current:
-            raise PartitionValidationError("partition path has no existing ancestor")
+    while True:
+        if not current.exists():
+            missing.append(current)
+        if current == root:
+            return tuple(missing)
         current = current.parent
-    for directory in reversed(missing):
-        directory.mkdir()
+
+
+def _fsync_created_directory_entries(created: tuple[Path, ...]) -> None:
+    """Persist each newly created directory entry in its parent directory."""
+
+    for directory in created:
         _fsync_directory(directory.parent)
 
 
@@ -1138,51 +1420,118 @@ def _schema_spec_for_write(key: PartitionKey, table: pa.Table) -> SchemaSpec:
         raise PartitionValidationError(str(exc)) from None
 
 
+_TimingObserver = Callable[[str, int], None]
+
+
+def _observe_timing(
+    observer: _TimingObserver | None,
+    stage: str,
+    started_ns: int,
+    monotonic_ns: Callable[[], int],
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(stage, max(monotonic_ns() - started_ns, 0))
+    except Exception:
+        # Storage observability must never change immutable publication semantics.
+        return
+
+
 def write_partition(
     root: Path,
     key: PartitionKey,
     table: pa.Table,
     expected_interval: timedelta | None = None,
+    *,
+    _timing_observer: _TimingObserver | None = None,
+    _monotonic_ns: Callable[[], int] = time.monotonic_ns,
 ) -> PartitionManifest:
     """Validate and atomically publish one immutable, content-addressed Parquet file."""
 
-    spec = _schema_spec_for_write(key, table)
-    expected_interval_ns, stream_key = _stream_definition(
-        table,
-        key,
-        _interval_ns(expected_interval),
-    )
-    analysis = _analyze_table(
-        table,
-        key,
-        spec,
-        expected_interval_ns=expected_interval_ns,
-    )
+    analysis_started_ns = _monotonic_ns()
+    try:
+        spec = _schema_spec_for_write(key, table)
+        expected_interval_ns, stream_key = _stream_definition(
+            table,
+            key,
+            _interval_ns(expected_interval),
+        )
+        analysis = _analyze_table(
+            table,
+            key,
+            spec,
+            expected_interval_ns=expected_interval_ns,
+        )
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "partition_analysis",
+            analysis_started_ns,
+            _monotonic_ns,
+        )
     canonical_root = root.resolve()
-    leaf = key.path(root)
-    _require_under_root(canonical_root, leaf, label="partition leaf")
-    _mkdir_parents_durable(root, leaf)
-    _require_under_root(canonical_root, leaf, label="partition leaf")
+    leaf = _require_under_root(
+        canonical_root,
+        key.path(root),
+        label="partition leaf",
+    )
+    missing_directories = _missing_directories(canonical_root, leaf)
+    leaf.mkdir(parents=True, exist_ok=True)
+    leaf = _require_under_root(canonical_root, leaf, label="partition leaf")
+    directory_fsync_started_ns = _monotonic_ns()
+    try:
+        _fsync_created_directory_entries(missing_directories)
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "partition_directory_fsync",
+            directory_fsync_started_ns,
+            _monotonic_ns,
+        )
     temporary = leaf / f".{uuid.uuid4().hex}.parquet.tmp"
     _require_under_root(canonical_root, temporary, label="temporary Parquet")
     try:
-        pq.write_table(
-            table.combine_chunks(),
-            temporary,
-            compression="zstd",
-            version="2.6",
-            data_page_version="2.0",
-            use_dictionary=False,
-            write_statistics=True,
-            row_group_size=65_536,
-            store_schema=True,
-        )
-        # PyArrow closes the file before returning, but a close alone does not make
-        # the bytes durable across abrupt power loss.  Sync before publishing the
-        # content-addressed name, then sync the directory in _publish_exclusive.
-        with temporary.open("r+b") as stream:
-            os.fsync(stream.fileno())
-        digest = _sha256(temporary)
+        parquet_started_ns = _monotonic_ns()
+        try:
+            pq.write_table(
+                table.combine_chunks(),
+                temporary,
+                compression="zstd",
+                version="2.6",
+                data_page_version="2.0",
+                use_dictionary=False,
+                write_statistics=True,
+                row_group_size=65_536,
+                store_schema=True,
+            )
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_write",
+                parquet_started_ns,
+                _monotonic_ns,
+            )
+        parquet_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_file(temporary)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_fsync",
+                parquet_fsync_started_ns,
+                _monotonic_ns,
+            )
+        hash_started_ns = _monotonic_ns()
+        try:
+            digest = _sha256(temporary)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "parquet_hash",
+                hash_started_ns,
+                _monotonic_ns,
+            )
         data_file = f"part-{digest}.parquet"
         data_path = leaf / data_file
         _require_under_root(canonical_root, data_path, label="partition data")
@@ -1198,7 +1547,26 @@ def write_partition(
             expected_interval_ns=expected_interval_ns,
             stream_key=stream_key,
         )
-        _publish_exclusive(temporary, data_path)
+        publish_started_ns = _monotonic_ns()
+        try:
+            _publish_exclusive(temporary, data_path)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "partition_publish",
+                publish_started_ns,
+                _monotonic_ns,
+            )
+        directory_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_directory(leaf)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "data_directory_fsync",
+                directory_fsync_started_ns,
+                _monotonic_ns,
+            )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1210,16 +1578,52 @@ def write_partition(
     try:
         with manifest_temporary.open("xb") as stream:
             stream.write(manifest_bytes)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _publish_exclusive(
-            manifest_temporary,
-            manifest_path,
-            expected_bytes=manifest_bytes,
-        )
+            fsync_started_ns = _monotonic_ns()
+            try:
+                _flush_and_fsync(stream)
+            finally:
+                _observe_timing(
+                    _timing_observer,
+                    "manifest_fsync",
+                    fsync_started_ns,
+                    _monotonic_ns,
+                )
+        publish_started_ns = _monotonic_ns()
+        try:
+            _publish_exclusive(
+                manifest_temporary,
+                manifest_path,
+                expected_bytes=manifest_bytes,
+            )
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "partition_publish",
+                publish_started_ns,
+                _monotonic_ns,
+            )
+        directory_fsync_started_ns = _monotonic_ns()
+        try:
+            _fsync_directory(leaf)
+        finally:
+            _observe_timing(
+                _timing_observer,
+                "manifest_directory_fsync",
+                directory_fsync_started_ns,
+                _monotonic_ns,
+            )
     finally:
         manifest_temporary.unlink(missing_ok=True)
-    return validate_partition(manifest_path)
+    validation_started_ns = _monotonic_ns()
+    try:
+        return validate_partition(manifest_path)
+    finally:
+        _observe_timing(
+            _timing_observer,
+            "immediate_validation",
+            validation_started_ns,
+            _monotonic_ns,
+        )
 
 
 def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest:
@@ -1235,7 +1639,9 @@ def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest
         raise PartitionValidationError(f"invalid orphan Parquet path: {data_path.name}")
     manifest_path = resolved_data_path.with_name(f"{resolved_data_path.stem}.manifest.json")
     if manifest_path.exists():
-        return validate_partition(manifest_path)
+        existing = validate_partition(manifest_path)
+        _fsync_directory(manifest_path.parent)
+        return existing
 
     payload = resolved_data_path.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
@@ -1277,9 +1683,9 @@ def recover_partition_manifest(root: Path, data_path: Path) -> PartitionManifest
     try:
         with temporary.open("xb") as stream:
             stream.write(manifest_bytes)
-            stream.flush()
-            os.fsync(stream.fileno())
+            _flush_and_fsync(stream)
         _publish_exclusive(temporary, manifest_path, expected_bytes=manifest_bytes)
+        _fsync_directory(manifest_path.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return validate_partition(manifest_path)
@@ -1568,6 +1974,16 @@ class _CrossSegmentRow:
     l2_last_sequence: int | None
 
 
+def _schema_compatibility_family(record_type: RecordType | str, version: int) -> int:
+    normalized = RecordType(_record_type_value(record_type))
+    breaking_candidates = [
+        candidate
+        for (transition_type, _previous, candidate) in BREAKING_SCHEMA_TRANSITIONS
+        if transition_type == normalized and candidate <= version
+    ]
+    return max(breaking_candidates, default=1)
+
+
 def _cross_segment_gaps(
     root: Path,
     manifests: tuple[PartitionManifest, ...],
@@ -1589,7 +2005,10 @@ def _cross_segment_gaps(
             manifest.partition.venue,
             manifest.partition.asset,
             manifest.partition.record_type,
-            manifest.schema_version,
+            _schema_compatibility_family(
+                manifest.partition.record_type,
+                manifest.schema_version,
+            ),
             manifest.stream_key,
         )
         grouped.setdefault(stream, []).append(manifest)
@@ -1612,13 +2031,16 @@ def _cross_segment_gaps(
                 "inconsistent gap cadence in stream: "
                 f"{sample.venue}/{sample.asset}/{_record_type_value(sample.record_type)}"
             )
-        spec = schema_for(sample.record_type, group[0].schema_version)
         expected_interval_ns = next(iter(intervals))
+        compatibility_family = _schema_compatibility_family(
+            sample.record_type,
+            group[0].schema_version,
+        )
         dataset_key = (
             sample.venue,
             sample.asset,
             sample.record_type,
-            group[0].schema_version,
+            compatibility_family,
         )
         seen_primary_keys = primary_keys_by_dataset.setdefault(dataset_key, set())
         is_l2 = sample.record_type in {
@@ -1629,6 +2051,7 @@ def _cross_segment_gaps(
         stream_rows: list[_CrossSegmentRow] = []
 
         for manifest in group:
+            spec = schema_for(sample.record_type, manifest.schema_version)
             table = read_hashed_table(root, manifest)
             l2_definition = _L2_METADATA_DEFINITIONS.get(RecordType(_record_type_value(sample.record_type)))
             if l2_definition is not None:

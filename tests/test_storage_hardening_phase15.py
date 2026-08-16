@@ -151,6 +151,32 @@ def test_disk_reserve_failure_keeps_pending_rows_and_fails_closed(
         sink.close()
 
 
+def test_partial_flush_disk_reserve_failure_keeps_pending_rows_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lake"
+    sink = BatchingLakeSink(
+        root,
+        batch_size=1,
+        queue_capacity=2,
+        min_free_bytes=0,
+        min_free_percent=0,
+    )
+    sink.add(_wire_record(1))
+    assert sink.should_flush is True
+    usage = namedtuple("DiskUsage", "total used free")(10_000, 9_999, 1)
+    monkeypatch.setattr(storage_module.shutil, "disk_usage", lambda _path: usage)
+    sink._min_free_bytes = 2
+    try:
+        with pytest.raises(StorageCapacityError, match="reserve exhausted"):
+            sink.flush_ready()
+        assert sink.pending_count == 1
+        assert discover_partitions(root) == ()
+    finally:
+        sink.close()
+
+
 def test_valid_interrupted_parquet_is_recovered_and_invalid_temp_fails_startup(tmp_path: Path) -> None:
     source = tmp_path / "source"
     writer = BatchingLakeSink(

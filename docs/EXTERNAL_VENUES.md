@@ -1,6 +1,6 @@
 # Venue de référence publique — Binance USDⓈ-M Futures
 
-Dernière vérification documentaire : 13 août 2026.
+Dernière vérification documentaire : 14 août 2026.
 
 ## Choix et périmètre de sécurité
 
@@ -15,13 +15,16 @@ juridictions.
 allowlist fermée : heure serveur, métadonnées, BBO, trades agrégés, funding et
 candles. Il ne possède aucun paramètre de clé, signature ou compte. Toute route
 ordre, position, compte, listen key, transfert ou authentification est rejetée
-avant le transport. Le WebSocket utilise uniquement les market streams publics.
+avant le transport. Le WebSocket utilise uniquement les flux publics Binance :
+`/public/stream` pour `depth20@100ms`, dont le BBO et le L2 sont dérivés du même
+wire, et `/market/stream` pour `aggTrade`, mark et candles. Ces deux sockets sont
+supervisés comme une seule génération de capture.
 
 Commande de collecte simultanée avec Hyperliquid :
 
 ```powershell
 .\.venv\Scripts\python.exe -m hyperlab collect-multi-venue `
-  --assets BTC,ETH `
+  --assets "BTC,ETH" `
   --candle-intervals 1m `
   --duration-seconds 600
 ```
@@ -42,27 +45,73 @@ pour l'audit du writer, la commande longue et les contrôles post-capture.
 | Besoin | Surface publique | Normalisation |
 |---|---|---|
 | identité et tailles | `GET /fapi/v1/exchangeInfo` | `BTCUSDT → BTC`, linéaire, quantité en BTC, tick/step conservés |
-| BBO | `<symbol>@bookTicker` | prix USDT par base, quantités en unité de base, `u` conservé |
-| L2 | `<symbol>@depth20@100ms` | snapshot top-20 complet, deux côtés, dernier update ID, epoch de carnet et niveaux ordonnés |
-| trades | `<symbol>@aggTrade` | ID agrégé, prix, quantité de base, côté agresseur dérivé de `m` |
+| BBO + L2 | `/public/stream` : `<symbol>@depth20@100ms` | un seul wire produit atomiquement le BBO des premiers niveaux, l'état de carnet et le snapshot top-20 complet ; dernier update ID, epoch et niveaux ordonnés conservés |
+| trades | `/market/stream` : `<symbol>@aggTrade` | ID agrégé, prix, quantité de base, côté agresseur dérivé de `m` |
 | funding courant | `<symbol>@markPrice@1s` | taux conservé ; index présent seulement dans le wire brut |
 | funding réalisé | `GET /fapi/v1/fundingRate` | règlement et mark Binance ; cadence ajustée issue de `fundingInfo`, sinon minimum observé sur au moins deux règlements |
 | candles | REST `klines` + `<symbol>@kline_<interval>` | OHLCV, révisions et finalité source WebSocket |
-| horloge | `GET /fapi/v1/time` | RTT, drift par midpoint et incertitude `RTT / 2` |
+| horloge | `GET /fapi/v1/time`, toutes les 5 s | RTT, drift par midpoint, incertitude `RTT / 2` et validité causale bornée |
 
 Les payloads WebSocket bruts sont conservés avec horodatage de réception,
-connexion, epoch et séquence d'arrivée. Les lignes normalisées conservent aussi
-le timestamp source lorsqu'il existe. La latence réseau corrigée est une
-**estimation** : `received - source + (local_midpoint - server)`. Elle reste
+connexion physique, epoch, séquence d'arrivée et génération de capture. Chaque
+trade normalisé conserve les temps `T`/`E`, le temps de réception et la lignée
+physique de son wire brut. Les autres lignes normalisées conservent aussi le
+timestamp source lorsqu'il existe. La latence réseau corrigée est une
+**estimation** : `received - source - (local_midpoint - server)`. Elle reste
 signée et n'est jamais ramenée artificiellement à zéro.
 
 Le snapshot top-20 est enregistré sans fabriquer les niveaux absents et sans le
 transformer artificiellement en delta. Le premier snapshot de chaque actif après
-connexion produit `resync_start` et `resync_complete`, associés à son
-`book_epoch_id` et à son `snapshot_id`. Les flux BBO et L2 sont surveillés
-séparément pour chaque actif ; leur silence au-delà du seuil de staleness
-provoque un gap historique et une reconnexion, même si d'autres canaux continuent
-à recevoir des messages.
+génération produit `resync_start` et `resync_complete`, associés à son
+`book_epoch_id` et à son `snapshot_id`. Les snapshots exacts suivants ne
+rafraîchissent la couverture que dans cette même connexion publique, epoch et
+carnet déjà armés. Il n'existe aucun abonnement `bookTicker` séparé : les
+surfaces logiques BBO et L2 de chaque actif sont prouvées par le même wire
+`depth20@100ms`. Leur silence, ou celui d'`aggTrade`, au-delà du seuil de
+staleness provoque un gap historique, la fermeture des deux sockets et une
+reconnexion commune, même si d'autres canaux continuent à recevoir des messages.
+
+Une mesure d'horloge ne devient causale qu'à sa réception. Avec les seuils par
+défaut, `drift_uncertainty_ms <= 50` produit l'intervalle semi-ouvert
+`[response_received_time, response_received_time + 15 s)`. Une incertitude plus
+forte reste persistée `INVALID` et ne crée aucun intervalle ; elle ne retire pas
+un intervalle accepté antérieur encore causalement vivant. Au plus une pointe
+haute-RTT consécutive peut être franchie si les observations acceptées de la même
+génération maintiennent la couverture. Une mesure valide remet la série à zéro ;
+la deuxième probe rejetée consécutive ouvre une outage à son temps de réponse,
+même si l'intervalle antérieur de 15 secondes reste vivant. L'outage se termine à
+la prochaine mesure acceptée de la même génération, qui peut rétablir la preuve
+pour les données marché ultérieures sans valider rétroactivement le trou.
+
+La cadence est vérifiée indépendamment sur le `request_sent_time` de chaque
+ligne `clock_sync` v2 liée à l'identité publique de la génération. Une ligne
+`INVALID`, y compris une pointe haute-RTT isolée, atteste qu'une tentative a
+été lancée mais ne devient jamais une preuve d'horloge. Deux lancements peuvent
+être séparés de 10 000 ms au maximum, sans epsilon ; un écart strictement
+supérieur reste fatal. Le même plafond s'applique de l'activation liée de la
+génération à sa première tentative, puis de la dernière tentative à l'événement
+terminal lié ou à la fin de fenêtre. Les intervalles causaux et les bandes
+d'offset continuent d'utiliser exclusivement les observations acceptées ; une
+violation de cadence échoue séparément sans fabriquer un trou causal.
+
+Le gate échoue lorsque l'assessment causal intersecte cette outage. Une outage
+pré-fenêtre récupérée avant l'assessment reste rapportée mais n'invalide pas les
+données ultérieures. Absence de récupération, expiration d'âge après une seule
+rejection, tentative manquante au-delà de 10 secondes, absence de mesure valide,
+discontinuité d'offset, échec de requête, identité/policy invalide, déconnexion
+ou changement de
+génération restent fatals. Aucune interpolation ne relie un vrai trou. Les
+anciennes lignes `clock_sync` v1 restent lisibles mais ne fournissent aucune
+couverture causale à l'audit strict.
+
+Le client REST réutilise une session HTTPS dédiée afin de ne pas rejouer
+DNS/TCP/TLS à chaque échantillon ; il ignore les identifiants, cookies, proxies
+et certificats ambiants, et refuse les redirections. Le RTT observé reste mesuré
+en entier et le seuil de 50 ms n'est pas relâché. La commande read-only
+`diagnose-binance-http` compare passivement la résolution A/AAAA du système, une
+à trois connexions neuves, une session persistante et le dernier pair runtime :
+IP/port sélectionné, famille IPv4/IPv6, POP CloudFront et cache. Elle n'impose
+aucune IP, ne remplace pas le DNS et ne reconnecte pas la session du collecteur.
 
 ## Identité, mark, index et oracle
 

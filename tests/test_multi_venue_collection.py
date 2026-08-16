@@ -17,6 +17,7 @@ from hyperlab.collector.storage import (
     CoordinatedLakeWriter,
     CoordinatedWriterError,
 )
+from hyperlab.collector.writer_worker import CoordinatedWriterWorker, WriterWorkerSink
 from hyperlab.data.lake import discover_partitions, validate_partition
 from hyperlab.data.schema import RecordType
 
@@ -137,6 +138,61 @@ def test_coordinated_writer_serializes_concurrent_venues_without_dedup_collision
     reopened.close()
 
 
+def test_writer_worker_drains_concurrent_multirow_frames_with_exact_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "worker-lake"
+    writer = CoordinatedWriterWorker(
+        root,
+        venues=VENUES,
+        batch_size=200,
+        queue_capacity=500,
+    )
+    hyperliquid = writer.client("hyperliquid")
+    binance = writer.client("binance_usdm")
+    producers_ready = threading.Barrier(2)
+
+    def ingest(venue: str, sink: WriterWorkerSink) -> tuple[int, int]:
+        admitted = 0
+        for start in range(0, 100, 4):
+            frame = tuple(_trade(venue, index) for index in range(start, start + 4))
+            admitted += sink.add_many(frame)
+        producers_ready.wait(timeout=5)
+        return admitted, sink.flush().row_count
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(
+                future.result()
+                for future in (
+                    executor.submit(ingest, "hyperliquid", hyperliquid),
+                    executor.submit(ingest, "binance_usdm", binance),
+                )
+            )
+        assert results == ((100, 100), (100, 100))
+        snapshot = writer.metrics_snapshot()
+        assert snapshot["outstanding_rows"] == 0
+        venues = snapshot["venues"]
+        assert isinstance(venues, dict)
+        assert venues["hyperliquid"]["frames_processed"] == 25
+        assert venues["binance_usdm"]["frames_processed"] == 25
+        assert venues["hyperliquid"]["durable_rows"] == 100
+        assert venues["binance_usdm"]["durable_rows"] == 100
+    finally:
+        hyperliquid.close()
+        binance.close()
+        writer.close()
+
+    manifests = [validate_partition(path) for path in discover_partitions(root)]
+    assert sum(manifest.row_count for manifest in manifests) == 200
+    observed = {
+        (str(row["venue"]), str(row["trade_id"]))
+        for manifest in manifests
+        for row in pq.ParquetFile(root / manifest.relative_data_path).read().to_pylist()
+    }
+    assert observed == {(venue, f"shared-trade-{index}") for venue in VENUES for index in range(100)}
+
+
 def test_coordinated_writer_does_not_flush_inside_one_source_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -154,19 +210,19 @@ def test_coordinated_writer_does_not_flush_inside_one_source_snapshot(
     first_add_entered = threading.Event()
     allow_batch_to_finish = threading.Event()
     flush_attempted = threading.Event()
-    original_add = writer._sink.add
+    original_add = writer._sink._add
     add_calls = 0
 
-    def blocking_add(record: ParsedRecord) -> bool:
+    def blocking_add(record: ParsedRecord, *, journal: object) -> bool:
         nonlocal add_calls
-        accepted = original_add(record)
+        accepted = original_add(record, journal=journal)
         add_calls += 1
         if add_calls == 1:
             first_add_entered.set()
             assert allow_batch_to_finish.wait(timeout=5)
         return accepted
 
-    monkeypatch.setattr(writer._sink, "add", blocking_add)
+    monkeypatch.setattr(writer._sink, "_add", blocking_add)
 
     def peer_flush() -> object:
         flush_attempted.set()

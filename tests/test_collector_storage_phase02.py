@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from collections import OrderedDict
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -15,7 +17,14 @@ from hyperlab.collector.bootstrap import parse_bootstrap
 from hyperlab.collector.models import ParsedRecord, WireEnvelope
 from hyperlab.collector.parser import parse_websocket_message
 from hyperlab.collector.storage import BatchingLakeSink
-from hyperlab.data.lake import discover_partitions, inventory_partitions, validate_partition
+from hyperlab.data.lake import (
+    PartitionKey,
+    discover_partitions,
+    inventory_partitions,
+    validate_partition,
+    write_partition,
+)
+from hyperlab.data.schema import RecordType, schema_for
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
@@ -97,6 +106,41 @@ def _trade_record(sequence: int) -> ParsedRecord:
     return records[0]
 
 
+def _candle_record(
+    asset: str,
+    observation_id: str,
+    *,
+    close: str,
+) -> ParsedRecord:
+    return ParsedRecord(
+        RecordType.CANDLE,
+        asset,
+        {
+            "schema_version": 2,
+            "record_type": RecordType.CANDLE.value,
+            "venue": "hyperliquid",
+            "asset": asset,
+            "event_time": NOW,
+            "exchange_time": NOW,
+            "received_time": NOW,
+            "source_sequence": None,
+            "connection_id": "observation-lru-test",
+            "interval": "1m",
+            "open_time": NOW,
+            "close_time": NOW + timedelta(minutes=1) - timedelta(milliseconds=1),
+            "open": Decimal("1"),
+            "high": Decimal("2"),
+            "low": Decimal("0.5"),
+            "close": Decimal(close),
+            "base_volume": Decimal("10"),
+            "quote_volume": Decimal("10"),
+            "trade_count": 1,
+            "is_final": True,
+            "observation_id": observation_id,
+        },
+    )
+
+
 def test_batch_is_not_visible_before_flush_and_partition_publish_is_atomic(tmp_path: Path) -> None:
     sink = BatchingLakeSink(tmp_path / "lake", batch_size=2, queue_capacity=4)
     assert sink.add(_wire_record(2)) is True
@@ -160,6 +204,172 @@ def test_queue_overflow_is_explicit_and_does_not_drop_pending_records(tmp_path: 
     result = sink.flush()
     assert result.row_count == 2
     assert sink.pending_count == 0
+
+
+class _CopyForbiddenRecentCache(OrderedDict[object, None]):
+    def copy(self) -> _CopyForbiddenRecentCache:
+        raise AssertionError("atomic add_many must not clone the historical recent-key cache")
+
+
+def test_atomic_add_many_cost_does_not_scale_with_historical_recent_cache(
+    tmp_path: Path,
+) -> None:
+    """A high-rate frame may journal its own mutations, never all prior keys."""
+
+    sink = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=500,
+        queue_capacity=10_000,
+        persistent_dedup=False,
+    )
+    historical = _CopyForbiddenRecentCache(
+        (
+            (RecordType.WIRE_MESSAGE, ("historical", sequence)),
+            None,
+        )
+        for sequence in range(100_000)
+    )
+    sink._recent = historical
+    try:
+        assert sink.add_many((_wire_record(1),)) == 1
+        assert sink.pending_count == 1
+    finally:
+        sink.close()
+
+
+def test_atomic_add_many_refreshes_lru_hits_without_copying_history(
+    tmp_path: Path,
+) -> None:
+    sink = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=10,
+        queue_capacity=20,
+        recent_key_capacity=2,
+        persistent_dedup=False,
+    )
+    first = _wire_record(1)
+    second = _wire_record(2)
+    third = _wire_record(3)
+    try:
+        assert sink.add(first) is True
+        assert sink.add(second) is True
+
+        # The hit makes first most-recent, so admitting third must evict second.
+        assert sink.add_many((first, third)) == 1
+        result = sink.flush()
+        assert (result.row_count, result.duplicate_count) == (3, 1)
+
+        assert sink.add(first) is False
+        assert sink.add(second) is True
+    finally:
+        sink.close()
+
+
+def test_atomic_observation_revision_preserves_lru_and_exact_rollback_order(
+    tmp_path: Path,
+) -> None:
+    sink = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=10,
+        queue_capacity=20,
+        recent_key_capacity=2,
+        persistent_dedup=False,
+    )
+    bitcoin = _candle_record("BTC", "btc-first", close="1")
+    ether = _candle_record("ETH", "eth-first", close="1")
+    bitcoin_revision = _candle_record(
+        "BTC",
+        "btc-revision",
+        close="1.5",
+    )
+    solana = _candle_record("SOL", "sol-first", close="1")
+
+    def observation_head(record: ParsedRecord) -> tuple[str, str]:
+        signature = storage_module._observation_signature(
+            record.record_type,
+            record.row,
+        )
+        assert signature is not None
+        return (signature[0], signature[1])
+
+    bitcoin_head = observation_head(bitcoin)
+    ether_head = observation_head(ether)
+    solana_head = observation_head(solana)
+    malformed_source = _wire_record(9)
+    malformed = ParsedRecord(
+        malformed_source.record_type,
+        malformed_source.asset,
+        {**malformed_source.row, "event_time": "not-a-datetime"},
+    )
+
+    try:
+        assert sink.add_many((bitcoin, ether)) == 2
+        before_observations = list(sink._observations.items())
+        before_pending = list(sink._pending_observations.items())
+
+        with pytest.raises(ValueError, match="event_time must be a datetime"):
+            sink.add_many((bitcoin_revision, solana, malformed))
+
+        assert list(sink._observations.items()) == before_observations
+        assert list(sink._pending_observations.items()) == before_pending
+
+        # Revising BTC refreshes it, so admitting SOL evicts untouched ETH.
+        assert sink.add_many((bitcoin_revision, solana)) == 2
+        assert list(sink._observations) == [
+            bitcoin_head,
+            solana_head,
+        ]
+        # Pending SQLite observations retain ETH and use last-touch order.
+        assert list(sink._pending_observations) == [
+            ether_head,
+            bitcoin_head,
+            solana_head,
+        ]
+    finally:
+        sink.close()
+
+
+def test_atomic_add_many_restores_all_mutated_state_after_late_validation_error(
+    tmp_path: Path,
+) -> None:
+    sink = BatchingLakeSink(
+        tmp_path / "lake",
+        batch_size=10,
+        queue_capacity=20,
+        persistent_dedup=False,
+    )
+    assert sink.add(_wire_record(1)) is True
+    before = {
+        "groups": {key: group.copy() for key, group in sink._groups.items()},
+        "recent": list(sink._recent.items()),
+        "observations": list(sink._observations.items()),
+        "pending_observations": list(sink._pending_observations.items()),
+        "pending_stable_primary_keys": sink._pending_stable_primary_keys.copy(),
+        "pending_count": sink._pending_count,
+        "duplicate_count": sink._duplicate_count,
+        "high_water": sink.high_water,
+    }
+    malformed_source = _wire_record(3)
+    malformed = ParsedRecord(
+        malformed_source.record_type,
+        malformed_source.asset,
+        {**malformed_source.row, "event_time": "not-a-datetime"},
+    )
+
+    try:
+        with pytest.raises(ValueError, match="event_time must be a datetime"):
+            sink.add_many((_trade_record(2), malformed))
+
+        assert {key: group.copy() for key, group in sink._groups.items()} == before["groups"]
+        assert list(sink._recent.items()) == before["recent"]
+        assert list(sink._observations.items()) == before["observations"]
+        assert list(sink._pending_observations.items()) == before["pending_observations"]
+        assert sink._pending_stable_primary_keys == before["pending_stable_primary_keys"]
+        assert sink._pending_count == before["pending_count"]
+        assert sink._duplicate_count == before["duplicate_count"]
+        assert sink.high_water == before["high_water"]
+    finally:
+        sink.close()
 
 
 def test_failed_atomic_publish_keeps_the_batch_pending(
@@ -342,3 +552,29 @@ def test_trade_primary_key_is_deduplicated_after_restart_and_index_rebuild(
         assert empty_source.flush().row_count == 1
     finally:
         empty_source.close()
+
+
+def test_trade_primary_key_remains_deduplicated_across_v1_to_v2_migration(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    current = _trade_record(1)
+    legacy_row = dict(current.row)
+    legacy_row["schema_version"] = 1
+    legacy_row.pop("connection_epoch")
+    legacy_row.pop("arrival_sequence")
+    write_partition(
+        root,
+        PartitionKey("hyperliquid", NOW.date(), "BTC", RecordType.TRADE),
+        pa.Table.from_pylist(
+            [legacy_row],
+            schema=schema_for(RecordType.TRADE, version=1).schema,
+        ),
+    )
+
+    sink = BatchingLakeSink(root, batch_size=1, queue_capacity=2)
+    try:
+        assert sink.add(_trade_record(2)) is False
+        assert sink.flush().row_count == 0
+    finally:
+        sink.close()

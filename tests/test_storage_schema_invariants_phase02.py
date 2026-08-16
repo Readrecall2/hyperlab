@@ -306,7 +306,7 @@ def test_persistent_dedup_rebuild_normalizes_decimals_and_allows_correction(
         for row in pq.ParquetFile(parquet_path).read().to_pylist()
     )
     with sqlite3.connect(index_path) as rebuilt_index:
-        assert rebuilt_index.execute("PRAGMA user_version").fetchone() == (3,)
+        assert rebuilt_index.execute("PRAGMA user_version").fetchone() == (4,)
         assert (
             rebuilt_index.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'observations'"

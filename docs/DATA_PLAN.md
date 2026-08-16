@@ -46,16 +46,15 @@ recherche. Séparément, SQLite est l'autorité opérationnelle mutable du paper
 
 ```text
 data/paper/
-  <run_id>.sqlite       journal append-only, projections et ledger
-  <run_id>.snapshot.json  vue atomique read-only pour le dashboard
+  paper.sqlite3  store multi-run : journal append-only, projections et ledger
 ```
 
 Le journal conserve la configuration figée, les décisions, contrôles de risque,
 ordres simulés, acknowledgements/rejets, fills partiels/complets, cancels,
 transitions d'état, écritures cash/positions/frais/PnL et alertes. Chaque événement
-a un identifiant déterministe, un hash de contenu et un lien au hash précédent. Le
-snapshot JSON est dérivé et reconstructible ; il ne doit jamais servir à restaurer
-ou corriger l'autorité SQLite.
+a un identifiant déterministe, un hash de contenu et un lien au hash précédent.
+La vue dashboard est dérivée et reconstruite en lecture seule depuis SQLite ; elle
+n'est ni une seconde autorité ni un fichier de restauration.
 
 Au restart, les événements sont rejoués et réconciliés avant toute nouvelle entrée.
 Les inputs de replay référencent les hashes des partitions publiques, des artefacts

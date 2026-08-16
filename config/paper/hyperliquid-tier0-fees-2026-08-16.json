@@ -1,0 +1,58 @@
+{
+  "artifact_id": "hyperliquid-public-tier0-fees",
+  "artifact_version": 2,
+  "currency": "USDC",
+  "economic_eligibility": false,
+  "fee_unit": "basis_points_of_executed_notional",
+  "observed_on": "2026-08-16",
+  "official_fee_rules": [
+    {
+      "instrument_pattern": "HL:*:perp",
+      "maker_fee_bps": "1.5",
+      "product_scope": "standard perpetuals",
+      "taker_fee_bps": "4.5"
+    },
+    {
+      "instrument_pattern": "HL:*:spot",
+      "maker_fee_bps": "4.0",
+      "product_scope": "standard spot",
+      "taker_fee_bps": "7.0"
+    }
+  ],
+  "policy": {
+    "account_or_private_data_used": false,
+    "aligned_quote_discount_assumed": false,
+    "hip3_or_growth_mode_products_in_scope": false,
+    "maker_rebate_assumed": false,
+    "referral_discount_assumed": false,
+    "staking_discount_assumed": false,
+    "tier": "public tier 0",
+    "volume_discount_assumed": false
+  },
+  "provenance": {
+    "publisher": "Hyperliquid",
+    "publisher_effective_from": null,
+    "publisher_effective_to": null,
+    "retrieved_at_utc": "2026-08-16T21:06:42Z",
+    "source_content_sha256": "03599e19f0ec9dde14132c2de784293e2e28d25629d8f34d2fb7203c9533fc5a",
+    "source_receipt_path": "config/paper/hyperliquid-fees-source-receipt-2026-08-16.json",
+    "source_receipt_sha256": "aac379af94a68b8e7253952d4e08a29c0777fd5ac1c0f523bb5836d99a398f41",
+    "source_url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees"
+  },
+  "scope": "OFFICIAL_PUBLIC_FEES_ONLY",
+  "status": "BLOCKED_INCOMPLETE_EXECUTION_CALIBRATION",
+  "use_constraints": {
+    "historical_use_before_observed_on": false,
+    "refresh_and_human_review_required_before_campaign_start": true,
+    "special_or_unreviewed_instruments_fail_closed": true,
+    "venue_page_change_invalidates_frozen_campaign": true
+  },
+  "unresolved_calibration": [
+    "executable bid/ask spread by required instrument",
+    "size- and horizon-dependent L2 slippage and capacity",
+    "ack, fill, cancel, maker-timeout, and inter-leg latency",
+    "maker queue, partial-fill, no-fill, and timeout probabilities",
+    "IOC partial-fill, no-fill, and adverse slippage",
+    "cash-and-carry funding settlement and emergency-exit treatment"
+  ]
+}

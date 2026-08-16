@@ -59,11 +59,15 @@ le résultat positif sous coûts stressés ne sont pas encore observés. Les fix
 `SYNTHETIC` valident seulement le logiciel. Voir
 [`docs/PAPER_ENGINE_PHASE12.md`](docs/PAPER_ENGINE_PHASE12.md).
 
-Le runtime continu et les commandes `paper status|replay|reconcile|run` sont
-présents. Le registre d'admission live est volontairement vide : tant qu'une
-stratégie figée et un adaptateur de flux **public normalisé** ne sont pas approuvés
-pour le même `config_hash`, `paper run` échoue fermé. Aucun mode global `paper` et
-aucune route d'ordre réelle ne sont ajoutés.
+Le runtime continu et les commandes `paper status|gate|replay|reconcile|run` sont
+présents. `paper gate` évalue en lecture seule les diagnostics Gate D internes et
+rattache les métriques à une seule tête durable stable, sans override de preuve ou
+de seuil. Dans ce checkout, il est volontairement **non autorisant** : aucune preuve
+durable ne lie encore le run au runtime/source compilé, et les octets des artefacts
+de stress, résilience et couverture ne sont pas revérifiés. Le registre runtime et
+le protocole sémantique candidat restent vides/non implémentés ; `paper run` échoue
+fermé avant les factories et le store. Aucun mode global `paper` et aucune route
+d'ordre réelle ne sont ajoutés.
 
 ## Données publiques Hyperliquid
 

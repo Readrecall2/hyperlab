@@ -9,11 +9,19 @@ from hyperlab.paper.models import (
     PaperEventType,
     PaperRunConfig,
     PaperState,
+    StoredPaperEvent,
     decimal_text,
     decimal_value,
     utc_text,
 )
-from hyperlab.paper.store import IntegrityError, PaperStore, RunNotFoundError
+from hyperlab.paper.store import (
+    ConcurrentWriteError,
+    IntegrityError,
+    IntegrityReport,
+    PaperStore,
+    RunNotFoundError,
+    RunRecord,
+)
 
 
 class PaperGateStatus(StrEnum):
@@ -44,19 +52,69 @@ class PaperGateEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PaperGateSnapshot:
+    """The exact durable head and metrics used by one Gate D evaluation."""
+
+    run_id: str
+    config_hash: str
+    event_sequence: int
+    event_head_hash: str
+    commit_sequence: int
+    commit_head_hash: str
+    projection_revision: int
+    projection_hash: str
+    completed_cycles: int
+    critical_incident_count: int
+    incident_free_days_completed: int
+    minimum_cycles_required: int
+    minimum_incident_free_days: int
+    minimum_observation_days: int
+    observation_days_completed: int
+    operational_state: PaperState
+    required_instruments: tuple[str, ...]
+    run_kind: str
+    validation_started_at: datetime
+
+    def to_metrics_dict(self) -> dict[str, object]:
+        return {
+            "commit_head_hash": self.commit_head_hash,
+            "commit_sequence": self.commit_sequence,
+            "completed_cycles": self.completed_cycles,
+            "critical_incident_count": self.critical_incident_count,
+            "event_head_hash": self.event_head_hash,
+            "event_sequence": self.event_sequence,
+            "incident_free_days_completed": self.incident_free_days_completed,
+            "minimum_cycles_required": self.minimum_cycles_required,
+            "minimum_incident_free_days": self.minimum_incident_free_days,
+            "minimum_observation_days": self.minimum_observation_days,
+            "observation_days_completed": self.observation_days_completed,
+            "operational_state": self.operational_state.value,
+            "projection_hash": self.projection_hash,
+            "projection_revision": self.projection_revision,
+            "required_instruments": list(self.required_instruments),
+            "run_kind": self.run_kind,
+            "validation_started_at": utc_text(self.validation_started_at),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PaperGateResult:
     status: PaperGateStatus
     eligible: bool
     reasons: tuple[str, ...]
     checks: dict[str, bool]
     evaluated_at: datetime
+    snapshot: PaperGateSnapshot
 
     def to_dict(self) -> dict[str, object]:
         return {
             "checks": dict(sorted(self.checks.items())),
+            "config_hash": self.snapshot.config_hash,
             "eligible": self.eligible,
             "evaluated_at": utc_text(self.evaluated_at),
+            "metrics": self.snapshot.to_metrics_dict(),
             "reasons": list(self.reasons),
+            "run_id": self.snapshot.run_id,
             "status": self.status.value,
         }
 
@@ -78,8 +136,7 @@ _REQUIRED_EXERCISES = frozenset(
 
 
 def _latest_persisted_evidence(
-    store: PaperStore,
-    run_id: str,
+    events: tuple[StoredPaperEvent, ...],
     as_of: datetime,
     config: PaperRunConfig,
 ) -> tuple[Decimal | None, bool, set[str], bool]:
@@ -106,7 +163,7 @@ def _latest_persisted_evidence(
         PaperEventType.FUNDING_POSTED,
         PaperEventType.CYCLE_COMPLETED,
     }
-    for stored in store.get_events(run_id):
+    for stored in events:
         event = stored.event
         if event.received_at > as_of:
             continue
@@ -154,6 +211,52 @@ def _latest_persisted_evidence(
     )
 
 
+def _require_stable_snapshot(
+    *,
+    before: RunRecord,
+    report: IntegrityReport,
+    run: RunRecord,
+    after: RunRecord,
+    projection_sequence: int,
+    projection_event_hash: str | None,
+    events: tuple[StoredPaperEvent, ...],
+) -> None:
+    """Reject a Gate D read if any authoritative durable anchor changed."""
+
+    report_anchor = (
+        report.event_count,
+        report.event_head_hash,
+        report.commit_count,
+        report.commit_head_hash,
+    )
+    run_anchor = (
+        run.event_sequence,
+        run.event_head_hash,
+        run.commit_sequence,
+        run.commit_head_hash,
+    )
+    events_bound = (
+        (run.event_sequence == 0 and not events)
+        or (
+            len(events) == run.event_sequence
+            and events[-1].sequence == run.event_sequence
+            and events[-1].event_hash == run.event_head_hash
+        )
+    )
+    if (
+        before != run
+        or run != after
+        or report_anchor != run_anchor
+        or projection_sequence != run.event_sequence
+        or projection_event_hash != run.event_head_hash
+        or not events_bound
+    ):
+        raise ConcurrentWriteError(
+            "paper Gate D durable head changed during read-only evaluation; "
+            "evaluate only against a stable paper journal"
+        )
+
+
 def evaluate_paper_gate(
     store: PaperStore,
     run_id: str,
@@ -164,12 +267,26 @@ def evaluate_paper_gate(
     if not isinstance(store, PaperStore):
         raise TypeError("paper gate requires the authoritative PaperStore")
     try:
-        report = store.verify_integrity(run_id)
+        before = store.get_run(run_id)
+        report = store.inspect_integrity_readonly(run_id)
+        if not report.ok:
+            raise IntegrityError(report)
         run = store.get_run(run_id)
         config = PaperRunConfig.from_dict(run.config_snapshot)
         projection = store.get_projection(run_id)
+        events = store.get_events(run_id)
+        after = store.get_run(run_id)
     except (IntegrityError, RunNotFoundError):
         raise
+    _require_stable_snapshot(
+        before=before,
+        report=report,
+        run=run,
+        after=after,
+        projection_sequence=projection.last_sequence,
+        projection_event_hash=projection.last_event_hash,
+        events=events,
+    )
     if run.config_hash != config.config_hash or run.run_id != config.run_id:
         raise ValueError("paper gate durable run is not bound to its frozen configuration")
     if projection.run_id != run_id or projection.config_hash != config.config_hash:
@@ -187,8 +304,7 @@ def evaluate_paper_gate(
     incident_free_since = last_incident or config.validation_started_at
     incident_free_duration = evidence.as_of - incident_free_since
     stressed_pnl, stress_bound, exercises, continuous_coverage = _latest_persisted_evidence(
-        store,
-        run_id,
+        events,
         evidence.as_of,
         config,
     )
@@ -213,10 +329,13 @@ def evaluate_paper_gate(
         and fresh_channels
     )
     checks = {
+        "approved_admission": False,
         "calibrated_models": config.economically_eligible,
         "config_frozen": report.ok and run.config_hash == config.config_hash,
         "continuous_observation": continuous_coverage and fresh_at_gate,
+        "durable_runtime_source_attestation": False,
         "economic_prerequisites": config.economic_prerequisites_satisfied,
+        "gate_d_artifact_bytes_verified": False,
         "incident_free_14_days": incident_free_duration >= timedelta(days=14),
         "minimum_42_days": elapsed >= timedelta(days=42),
         "minimum_cycles": projection.completed_cycles >= config.minimum_validation_cycles,
@@ -304,21 +423,71 @@ def evaluate_paper_gate(
             )
         ),
     )
+    production_blockers = (
+        (
+            "approved_admission",
+            "no durable production admission receipt is bound to this run",
+        ),
+        (
+            "durable_runtime_source_attestation",
+            (
+                "the journal does not prove creation and input by the compiled "
+                "approved runtime/source"
+            ),
+        ),
+        (
+            "gate_d_artifact_bytes_verified",
+            (
+                "stress, resilience, and coverage artifact bytes are not durably "
+                "bound and reverified"
+            ),
+        ),
+    )
+    for check, message in production_blockers:
+        if not checks[check]:
+            reasons.append(message)
     status = next((candidate for candidate in _STATUS_PRIORITY if candidate in statuses), None)
     if status is None:
-        status = PaperGateStatus.PASS
+        status = (
+            PaperGateStatus.BLOCKED_PRECONDITIONS
+            if any(not checks[name] for name, _ in production_blockers)
+            else PaperGateStatus.PASS
+        )
+    snapshot = PaperGateSnapshot(
+        run_id=run.run_id,
+        config_hash=config.config_hash,
+        event_sequence=run.event_sequence,
+        event_head_hash=run.event_head_hash,
+        commit_sequence=run.commit_sequence,
+        commit_head_hash=run.commit_head_hash,
+        projection_revision=run.projection_revision,
+        projection_hash=run.projection_hash,
+        completed_cycles=projection.completed_cycles,
+        critical_incident_count=len(projection.critical_incidents),
+        incident_free_days_completed=max(incident_free_duration.days, 0),
+        minimum_cycles_required=config.minimum_validation_cycles,
+        minimum_incident_free_days=14,
+        minimum_observation_days=42,
+        observation_days_completed=max(elapsed.days, 0),
+        operational_state=projection.state,
+        required_instruments=tuple(sorted(required_instruments)),
+        run_kind=config.run_kind,
+        validation_started_at=config.validation_started_at,
+    )
     return PaperGateResult(
         status=status,
         eligible=status is PaperGateStatus.PASS,
         reasons=tuple(reasons),
         checks=checks,
         evaluated_at=evidence.as_of,
+        snapshot=snapshot,
     )
 
 
 __all__ = [
     "PaperGateEvidence",
     "PaperGateResult",
+    "PaperGateSnapshot",
     "PaperGateStatus",
     "evaluate_paper_gate",
 ]

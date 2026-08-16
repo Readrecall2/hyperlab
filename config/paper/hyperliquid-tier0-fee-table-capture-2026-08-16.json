@@ -1,0 +1,29 @@
+{
+  "artifact_id": "hyperliquid-official-tier0-fee-table-capture",
+  "artifact_version": 1,
+  "capture_kind": "IMMUTABLE_STRUCTURED_TABLE_TRANSCRIPTION",
+  "captured_at_utc": "2026-08-16T21:06:42Z",
+  "http_etag": "56781a5dc49e37ff8294b89f85f43dce",
+  "source_content_sha256": "03599e19f0ec9dde14132c2de784293e2e28d25629d8f34d2fb7203c9533fc5a",
+  "source_url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees",
+  "table_rows": [
+    {
+      "maker_fee_percent": "0.015",
+      "market": "Perps",
+      "taker_fee_percent": "0.045",
+      "tier": "Tier 0"
+    },
+    {
+      "maker_fee_percent": "0.040",
+      "market": "Spot",
+      "taker_fee_percent": "0.070",
+      "tier": "Tier 0"
+    }
+  ],
+  "limitations": {
+    "full_decoded_page_stored": false,
+    "publisher_effective_from": null,
+    "publisher_effective_to": null,
+    "publisher_signature_available": false
+  }
+}

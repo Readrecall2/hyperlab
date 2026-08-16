@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import FrameType, MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -113,15 +113,46 @@ app.add_typer(paper_app, name="paper")
 
 @dataclass(frozen=True, slots=True)
 class _ApprovedPaperRuntimeFactories:
+    candidate_id: str
     config_hash: str
+    admission_manifest_path: Path
+    admission_manifest_sha256: str
+    admission_evidence_root: Path
     strategy_factory: Callable[[PaperRunConfig], FrozenPaperStrategy]
     source_factory: Callable[[PaperRunConfig], NormalizedPublicMarketSource]
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id.strip():
+            raise ValueError("approved paper candidate_id cannot be empty")
+        for label, digest in (
+            ("config_hash", self.config_hash),
+            ("admission_manifest_sha256", self.admission_manifest_sha256),
+        ):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(f"approved paper {label} must be a lowercase SHA-256")
+        if not isinstance(self.admission_manifest_path, Path):
+            raise TypeError("approved paper admission_manifest_path must be a Path")
+        if not isinstance(self.admission_evidence_root, Path):
+            raise TypeError("approved paper admission_evidence_root must be a Path")
 
 
 # Deliberately empty until a frozen strategy artifact and a normalized public
 # source adapter have both passed an explicit review.  The CLI never imports a
 # user-supplied module or constructs a strategy from an arbitrary name.
 _APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = MappingProxyType({})
+
+# Intentionally empty and non-authorizing. A future candidate must add a concrete
+# measured-result protocol whose canonical Gate B/C decision is derived by core;
+# merely registering a callback or returning PASS booleans must never admit it.
+_TRUSTED_PAPER_SEMANTIC_EVALUATORS: Mapping[str, None] = MappingProxyType({})
+
+
+def _production_semantic_admission_blockers(candidate_id: str) -> tuple[str, ...]:
+    if candidate_id not in _TRUSTED_PAPER_SEMANTIC_EVALUATORS:
+        return ("NO_TRUSTED_CANDIDATE_SEMANTIC_EVALUATOR",)
+    return ("SEMANTIC_EVALUATOR_PROTOCOL_NOT_IMPLEMENTED",)
 
 
 def _settings() -> Settings:
@@ -1569,14 +1600,33 @@ def _paper_database_path(database: Path | None) -> Path:
     )
 
 
+def _strict_paper_config_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_paper_config_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON number {value!r}")
+
+
 def _load_frozen_paper_config(path: Path) -> PaperRunConfig:
+    from hyperlab.backtest.protocol import canonical_json
     from hyperlab.paper.models import PaperRunConfig
 
     if not path.is_file():
         raise typer.BadParameter(f"Artefact de configuration paper introuvable: {path.resolve()}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        raw = path.read_bytes()
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_paper_config_object,
+            parse_constant=_reject_paper_config_constant,
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as error:
         raise typer.BadParameter(f"Artefact paper illisible: {error}") from None
     if not isinstance(payload, dict):
         raise typer.BadParameter("L'artefact paper doit contenir un objet JSON canonique")
@@ -1584,11 +1634,145 @@ def _load_frozen_paper_config(path: Path) -> PaperRunConfig:
         config = PaperRunConfig.from_dict(payload)
     except (KeyError, TypeError, ValueError) as error:
         raise typer.BadParameter(f"Artefact paper invalide: {error}") from None
-    if payload != config.to_dict():
+    if raw != canonical_json(config.to_dict()).encode("utf-8"):
         raise typer.BadParameter(
             "L'artefact paper n'est pas le snapshot canonique complet de PaperRunConfig"
         )
     return config
+
+
+def _verify_approved_paper_admission(
+    approval: _ApprovedPaperRuntimeFactories,
+    frozen: PaperRunConfig,
+    config_artifact: Path,
+) -> None:
+    """Reject until byte bindings and a measured semantic protocol both exist."""
+    import hashlib
+
+    from hyperlab.paper.admission import (
+        AdmissionManifestError,
+        load_admission_manifest,
+        verify_admission_manifest_file,
+    )
+
+    verification = verify_admission_manifest_file(
+        approval.admission_manifest_path,
+        evidence_root=approval.admission_evidence_root,
+    )
+    if verification.manifest_sha256 != approval.admission_manifest_sha256:
+        raise typer.BadParameter(
+            "Le manifeste d'admission paper ne correspond pas au SHA-256 approuvé"
+        )
+    if verification.blockers:
+        detail = "; ".join(
+            f"{blocker.code}@{blocker.location}" for blocker in verification.blockers
+        )
+        raise typer.BadParameter(f"Admission paper bloquée par les artefacts: {detail}")
+    try:
+        manifest = load_admission_manifest(approval.admission_manifest_path)
+        config_artifact_sha256 = hashlib.sha256(config_artifact.read_bytes()).hexdigest()
+    except (AdmissionManifestError, OSError) as error:
+        raise typer.BadParameter(f"Admission paper illisible: {error}") from None
+
+    blockers: list[str] = []
+    if manifest.candidate_id != approval.candidate_id:
+        blockers.append("candidate identity differs from the approved registration")
+    if frozen.run_kind != "VALIDATION" or not frozen.economically_eligible:
+        blockers.append("only an economically eligible VALIDATION config may be approved")
+    if frozen.economic_prerequisites_evidence_hash != manifest.evidence.gate_c_report.sha256:
+        blockers.append("frozen Gate B/C receipt differs from the bound Gate C report")
+    if frozen.strategy_hash not in {
+        artifact.sha256 for artifact in manifest.evidence.strategy
+    }:
+        blockers.append("frozen strategy hash is not among the bound strategy artifacts")
+
+    frozen_identity = manifest.identities.frozen_config
+    if frozen_identity.identity != frozen.config_hash:
+        blockers.append("frozen config identity differs from PaperRunConfig.config_hash")
+    if frozen_identity.artifact.sha256 != config_artifact_sha256:
+        blockers.append("frozen config bytes differ from the admission artifact")
+
+    source_identity = manifest.identities.market_source
+    if source_identity.identity != frozen.data_source:
+        blockers.append("public source identity differs from PaperRunConfig.data_source")
+    if source_identity.artifact.sha256 != frozen.data_hash:
+        blockers.append("public source artifact differs from PaperRunConfig.data_hash")
+
+    cost_schedule = frozen.execution.cost_schedule
+    if (
+        cost_schedule is None
+        or cost_schedule.calibration_evidence_hash
+        != manifest.identities.cost_schedule.artifact.sha256
+    ):
+        blockers.append("cost schedule evidence differs from the bound cost artifact")
+
+    calibration_hashes = {
+        artifact.sha256 for artifact in manifest.evidence.calibration
+    }
+    data_hashes = {artifact.sha256 for artifact in manifest.evidence.data}
+    required_calibrations = {
+        "data": frozen.data_calibration_evidence_hash,
+        "execution": frozen.execution.calibration_evidence_hash,
+        "maker_fill": frozen.execution.maker_fill.calibration_evidence_hash,
+    }
+    for label, digest in required_calibrations.items():
+        if digest not in calibration_hashes | data_hashes:
+            blockers.append(f"{label} calibration evidence is not byte-bound")
+
+    blockers.extend(_production_semantic_admission_blockers(manifest.candidate_id))
+
+    final_verification = verify_admission_manifest_file(
+        approval.admission_manifest_path,
+        evidence_root=approval.admission_evidence_root,
+    )
+    if (
+        final_verification.manifest_sha256 != approval.admission_manifest_sha256
+        or final_verification.blockers
+    ):
+        blockers.append("admission artifacts changed during admission verification")
+    if blockers:
+        raise typer.BadParameter("Admission paper bloquée: " + "; ".join(blockers))
+
+
+def _reverify_gate_admission(config: PaperRunConfig) -> tuple[bool, str]:
+    """Report the compiled-admission blocker for the read-only Gate diagnostic."""
+
+    from hyperlab.paper.admission import (
+        load_admission_manifest,
+        verify_admission_manifest_file,
+    )
+
+    approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
+    if approval is None or approval.config_hash != config.config_hash:
+        return False, "NO_COMPILED_APPROVAL"
+    semantic_blockers = _production_semantic_admission_blockers(approval.candidate_id)
+    if semantic_blockers:
+        return False, semantic_blockers[0]
+    try:
+        verification = verify_admission_manifest_file(
+            approval.admission_manifest_path,
+            evidence_root=approval.admission_evidence_root,
+        )
+        if (
+            verification.manifest_sha256 != approval.admission_manifest_sha256
+            or verification.blockers
+        ):
+            return False, "APPROVED_ARTIFACT_REVERIFICATION_FAILED"
+        manifest = load_admission_manifest(approval.admission_manifest_path)
+        relative = PurePosixPath(
+            manifest.identities.frozen_config.artifact.relative_path
+        )
+        config_artifact = approval.admission_evidence_root.joinpath(*relative.parts)
+        artifact_config = _load_frozen_paper_config(config_artifact)
+        if (
+            artifact_config.config_hash != config.config_hash
+            or artifact_config.run_id != config.run_id
+        ):
+            return False, "FROZEN_CONFIG_IDENTITY_MISMATCH"
+        _verify_approved_paper_admission(approval, artifact_config, config_artifact)
+    except Exception:
+        return False, "APPROVED_ADMISSION_REVERIFICATION_ERROR"
+    return True, "VERIFIED"
 
 
 def _load_stored_paper_config(database: Path, run_id: str) -> PaperRunConfig:
@@ -1682,6 +1866,49 @@ def paper_status(
             "runs": runs,
         }
     console.print_json(json.dumps(payload))
+
+
+@paper_app.command("gate")
+def paper_gate(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+) -> None:
+    """Évalue Gate D depuis le journal autoritaire sans modifier le store."""
+    from hyperlab.paper.gate import PaperGateEvidence, evaluate_paper_gate
+    from hyperlab.paper.models import PaperRunConfig
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    if not resolved.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
+    store = PaperStore(resolved, initialize=False)
+    run = store.get_run(run_id)
+    config = PaperRunConfig.from_dict(run.config_snapshot)
+    if config.config_hash != run.config_hash or config.run_id != run.run_id:
+        raise typer.BadParameter("Le snapshot paper durable ne correspond pas à son run_id")
+    _, admission_status = _reverify_gate_admission(config)
+    evaluated_at = datetime.now(tz=UTC)
+    result = evaluate_paper_gate(
+        store,
+        run_id,
+        PaperGateEvidence(as_of=evaluated_at),
+    )
+    payload = result.to_dict()
+    payload.update(
+        {
+            "admission_status": admission_status,
+            "blockers": list(result.reasons),
+            "mode": "PAPER_ONLY",
+            "orders_enabled": False,
+            "passed": result.eligible,
+        }
+    )
+    console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    if not result.eligible:
+        raise typer.Exit(2)
 
 
 @paper_app.command("replay")
@@ -1779,14 +2006,16 @@ def paper_run(
             "Aucune liaison figée stratégie + source publique n'est approuvée pour ce config_hash"
         )
 
-    strategy = approval.strategy_factory(frozen)
-    source = approval.source_factory(frozen)
+    _verify_approved_paper_admission(approval, frozen, config_artifact)
     resolved = _paper_database_path(database)
     # Approval is checked before this point, so an unapproved invocation cannot
     # create state.  An approved first run still needs the authoritative schema.
     store = PaperStore(resolved)
     runtime: PaperRuntime | None = None
+    source: NormalizedPublicMarketSource | None = None
     try:
+        strategy = approval.strategy_factory(frozen)
+        source = approval.source_factory(frozen)
         runtime = PaperRuntime(
             PaperEngine(store, frozen),
             strategy,
@@ -1807,7 +2036,7 @@ def paper_run(
     finally:
         if runtime is not None:
             _close_preserving_active_exception(runtime.close)
-        else:
+        elif source is not None:
             _close_preserving_active_exception(source.close)
         _close_preserving_active_exception(store.close)
     console.print_json(

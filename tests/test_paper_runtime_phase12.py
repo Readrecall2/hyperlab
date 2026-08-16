@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from hyperlab.backtest.protocol import canonical_json
 from hyperlab.cli import app
 from hyperlab.paper.engine import PaperEngine
 from hyperlab.paper.models import (
@@ -473,7 +474,7 @@ def test_paper_cli_status_masks_corruption_without_mutating_store(tmp_path: Path
 
 def test_paper_cli_run_fails_closed_without_static_approval(tmp_path: Path) -> None:
     artifact = tmp_path / "paper-config.json"
-    artifact.write_text(json.dumps(_config().to_dict(), sort_keys=True), encoding="utf-8")
+    artifact.write_text(canonical_json(_config().to_dict()), encoding="utf-8")
     database = tmp_path / "must-not-exist.sqlite3"
 
     result = CliRunner().invoke(

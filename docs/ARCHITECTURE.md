@@ -83,10 +83,17 @@ vérification de la chaîne, replay et réconciliation exacte. Une divergence fo
 et réconciliation avant le premier poll, cadence des timers, filtrage des
 redéliveries et arrêt propre. La CLI ne charge aucun module utilisateur ; elle ne
 peut démarrer que des factories inscrites statiquement pour le `config_hash`
-exact. Le registre est vide dans ce checkout, car aucun adaptateur live et aucune
-stratégie Phase 10/11 ne sont encore admissibles. Les commandes de statut et de
-replay restent read-only sur le store source ; le replay réexécute l'inbox dans un
-store temporaire isolé.
+exact. Le registre reste vide : aucun candidat Phase 05-09/11 n'a de preuves Gates
+B/C calibrées, et aucun protocole sémantique mesuré ne peut encore les autoriser.
+L'adaptateur générique accepte uniquement les BBO et événements de connexion
+normalisés ; les trades restent bloqués jusqu'à une identité durable aux
+redémarrages, et le raccord au writer unique n'existe pas. Les commandes de statut,
+Gate D et replay restent read-only. Gate D lie son diagnostic à une tête stable mais
+ne peut pas produire un PASS de promotion tant que l'attestation runtime/source et
+les octets des artefacts Gate D ne sont pas persistés puis revérifiés. Le replay
+réexécute l'inbox dans un store temporaire isolé. La Phase 10 n'est une dépendance
+que pour une stratégie qui consomme explicitement ses artefacts, jamais pour la
+Phase 12 entière.
 
 La machine à états contient `FLAT`, `ENTRY_PLANNED`, `LEG_1_PENDING`,
 `HEDGE_PENDING`, `HEDGED`, `EXIT_PLANNED`, `EXIT_PENDING`, `PAUSED`,

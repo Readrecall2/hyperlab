@@ -2068,18 +2068,28 @@ def test_gate_d_is_store_bound_enforces_thresholds_and_blocks_demo(
     assert demo_result.checks["calibrated_models"] is False
 
     validation, store, evidence = _gate_run(tmp_path / "pass.sqlite3")
-    passed = evaluate_paper_gate(store, validation.run_id, evidence)
-    assert passed.status is PaperGateStatus.PASS
-    assert passed.eligible is True
-    assert all(passed.checks.values())
+    non_authorizing = evaluate_paper_gate(store, validation.run_id, evidence)
+    assert non_authorizing.status is PaperGateStatus.BLOCKED_PRECONDITIONS
+    assert non_authorizing.eligible is False
+    production_checks = {
+        "approved_admission",
+        "durable_runtime_source_attestation",
+        "gate_d_artifact_bytes_verified",
+    }
+    assert all(not non_authorizing.checks[name] for name in production_checks)
+    assert all(
+        value
+        for name, value in non_authorizing.checks.items()
+        if name not in production_checks
+    )
 
     long_config, long_store, long_evidence = _gate_run(
         tmp_path / "long-window.sqlite3",
         days=57,
     )
     long_result = evaluate_paper_gate(long_store, long_config.run_id, long_evidence)
-    assert long_result.status is PaperGateStatus.PASS
-    assert long_result.eligible is True
+    assert long_result.status is PaperGateStatus.BLOCKED_PRECONDITIONS
+    assert long_result.eligible is False
 
     with pytest.raises(ValueError, match="precedes the durable paper state"):
         evaluate_paper_gate(

@@ -963,23 +963,30 @@ beaucoup plus pour les rapides
 résultat net positif sous coûts stressés
 ```
 
-Le gate lit ces preuves dans le journal vérifié : seuil de cycles figé, incidents,
-couverture continue, artefact de stress et exercices restart/déconnexion/fill
-partiel/crash. Chaque canal requis doit rester frais, l'état doit être `FLAT` ou
-`HEDGED` et le stress doit référencer le dernier préfixe économique. Une projection
-fabriquée ou des booléens passés à la fonction ne peuvent pas produire `PASS`, et
-un run de plus de huit semaines n'expire pas.
+Le gate diagnostique ces assertions dans le journal vérifié : seuil de cycles figé,
+incidents, couverture, stress et exercices restart/déconnexion/fill partiel/crash.
+Chaque canal requis doit rester frais, l'état doit être `FLAT` ou `HEDGED` et le
+stress doit référencer le dernier préfixe économique. Cependant, les octets des
+artefacts ne sont pas encore relus et la lignée runtime/source n'est pas attestée.
+Les checks correspondants restent donc faux et `PASS` est impossible dans ce
+checkout ; un run de plus de huit semaines ne sera pas expiré.
 
-Le runtime et les commandes `paper status|replay|reconcile|run` sont présents,
-mais l'admission `config_hash → stratégie + source publique normalisée` est un
-registre statique volontairement vide dans ce checkout. Faute de stratégie et
-d'adaptateur approuvés, `paper run` échoue fermé avant de créer un store.
+Le runtime et les commandes `paper status|gate|replay|reconcile|run` sont présents.
+`paper gate` lit le store en lecture seule sans override et lie les métriques à une
+tête durable stable, mais reste explicitement non autorisant. Les registres runtime
+et sémantique candidat sont vides/non implémentés. L'adaptateur public accepte des
+BBO et événements de connexion exacts ; il bloque les trades tant que leur identité
+n'est pas durable aux redémarrages et n'est pas raccordé au writer unique. Faute de
+candidat économiquement éligible et de source complète approuvée, `paper run`
+échoue fermé avant les factories et avant de créer un store.
 
 Ces critères ne sont pas encore observés dans ce checkout. Les fixtures et démos
 `SYNTHETIC`, même entièrement vertes, ne comptent ni pour la durée, ni pour les
 cycles, ni pour les 14 jours. Le statut économique Phase 12 est donc
-**`BLOCKED`**. Les prérequis inachevés des Phases 10/11 ne peuvent pas être
-réutilisés comme s'ils étaient calibrés. Voir
+**`BLOCKED`**. Une stratégie ne peut pas réutiliser les prérequis inachevés d'une
+autre phase comme s'ils étaient calibrés. La Phase 10 n'est requise que si la
+stratégie choisie consomme explicitement ses artefacts ; elle n'est pas un prérequis
+global de la Phase 12. Voir
 [`PAPER_ENGINE_PHASE12.md`](PAPER_ENGINE_PHASE12.md).
 
 ## 42. Testnet

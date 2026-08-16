@@ -12,18 +12,23 @@ constitue jamais une action exchange.
 La conformité technique du moteur ne vaut pas validation économique. Dans ce
 checkout, le statut de promotion économique reste **`BLOCKED`** : aucune fenêtre
 forward paper de 6 à 8 semaines, aucun nombre suffisant de cycles et aucune période
-de 14 jours sans incident critique ne sont encore démontrés. Les prérequis de
-données et de calibration des Phases 10 et 11 restent eux aussi fermés. Un run sur
-fixture, un modèle `SYNTHETIC` ou une hypothèse `UNCALIBRATED` sert uniquement à
-tester le logiciel.
+de 14 jours sans incident critique ne sont encore démontrés. Les données et
+calibrations propres à chaque candidat restent fermées ; la Phase 10 n'est requise
+que si la stratégie retenue en consomme un artefact. Un run sur fixture, un modèle
+`SYNTHETIC` ou une hypothèse `UNCALIBRATED` sert uniquement à tester le logiciel.
 
 Le runtime continu et le sous-groupe CLI `paper` sont implémentés, avec reprise,
-réconciliation avant admission, timers et arrêt propre. Cependant, le registre
-statique `config_hash → stratégie + adaptateur de source publique` est
-intentionnellement vide dans ce checkout : aucune stratégie Phase 10/11 et aucun
-adaptateur live n'ont encore satisfait leurs prérequis. `paper run` échoue donc
-fermé avant de créer un store. `paper status`, `paper replay` et
+réconciliation, timers et arrêt propre. Cependant, le registre statique
+`config_hash → stratégie + source publique` est intentionnellement vide, et aucun
+protocole sémantique candidat mesuré n'est implémenté. L'adaptateur générique
+BBO/connexion n'est ni raccordé au writer unique ni suffisant pour les canaux
+propres aux candidats ; les trades sont refusés tant que leur déduplication durable
+aux redémarrages n'existe pas. `paper run` échoue donc fermé avant les factories et
+avant de créer un store. `paper status`, `paper gate`, `paper replay` et
 `paper reconcile` restent disponibles pour les stores de démonstration et de test.
+`paper gate` est read-only, sans override, et publie une tête durable stable, mais
+reste non autorisant tant qu'il ne revérifie pas une attestation runtime/source et
+les octets des artefacts Gate D.
 
 ## Périmètre
 
@@ -287,11 +292,14 @@ incidents viennent du journal ; le seuil de cycles, jamais inférieur à 30, est
 dans la configuration. Chaque canal requis doit être frais et le run doit être dans
 un état opérationnel résolu (`FLAT` ou `HEDGED`). Le résultat stressé référence le
 head et la séquence du préfixe économique exact qu'il évalue ; tout événement
-économique ultérieur invalide cette preuve jusqu'à un nouveau stress. La couverture
-continue et les exercices de résilience sont eux aussi liés à des artefacts
-SHA-256. Des booléens passés par l'appelant ou une projection détachée ne peuvent
-pas produire `PASS`. Un run au-delà de huit semaines reste éligible : huit semaines
-est une cible, pas une date d'expiration.
+économique ultérieur invalide cette assertion jusqu'à un nouveau stress. Cependant,
+les méthodes actuelles acceptent encore des hashes et valeurs fournis par l'appelant
+sans relire les octets des artefacts. Le gate expose donc explicitement trois checks
+faux — admission durable, attestation runtime/source et vérification byte-bound des
+artefacts Gate D — et ne peut pas produire `PASS`. Une future implémentation devra
+persister ces preuves, dériver la couverture depuis la lignée source et les
+revérifier dans le snapshot stable. Un run au-delà de huit semaines ne sera pas
+expiré : huit semaines reste une cible, pas une date d'expiration.
 
 ## Limites connues
 
@@ -299,8 +307,9 @@ est une cible, pas une date d'expiration.
   compte ; ils restent donc des sorties du modèle, clairement étiquetées.
 - Un carnet agrégé ne prouve pas la position réelle dans la file ni la liquidité
   cachée.
-- Les stratégies Phase 10/11 ne peuvent pas emprunter des hypothèses inachevées pour
-  démarrer leur fenêtre paper.
+- Une stratégie sélectionnée ne peut pas emprunter les hypothèses inachevées d'une
+  autre phase. La Phase 10 n'est requise que si cette stratégie consomme réellement
+  un artefact Phase 10 ; elle n'est pas un prérequis global de la Phase 12.
 - Le fonctionnement pendant plusieurs semaines et l'observation de suffisamment de
   régimes ne peuvent pas être remplacés par des tests accélérés.
 - Aucun résultat Phase 12 ne constitue à lui seul une promesse de performance live.

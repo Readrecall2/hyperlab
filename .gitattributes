@@ -1,0 +1,5 @@
+# These public evidence artifacts are hashed as raw bytes by the Phase 12 audit.
+# Keep their checkout bytes stable when core.autocrlf is enabled on Windows.
+config/paper/hyperliquid-tier0-fees-2026-08-16.json text eol=lf
+config/paper/hyperliquid-fees-source-receipt-2026-08-16.json text eol=lf
+config/paper/hyperliquid-tier0-fee-table-capture-2026-08-16.json text eol=lf

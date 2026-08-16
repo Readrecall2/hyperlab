@@ -1,0 +1,49 @@
+{
+  "artifact_id": "hyperliquid-official-fees-source-receipt",
+  "artifact_version": 1,
+  "capture": {
+    "capture_kind": "DECODED_UTF8_CONTENT_RECEIPT",
+    "decoded_content_length_bytes": 12231,
+    "decoded_content_sha256": "03599e19f0ec9dde14132c2de784293e2e28d25629d8f34d2fb7203c9533fc5a",
+    "http_etag": "56781a5dc49e37ff8294b89f85f43dce",
+    "http_status": 200,
+    "media_type": "text/markdown; charset=utf-8",
+    "publisher_revision": null,
+    "raw_response_bytes_stored": false,
+    "request_accept": "text/markdown",
+    "retrieval_client": "PowerShell Invoke-WebRequest",
+    "retrieved_at_utc": "2026-08-16T21:06:42Z",
+    "source_url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees"
+  },
+  "content_addressed_table_capture": {
+    "path": "config/paper/hyperliquid-tier0-fee-table-capture-2026-08-16.json",
+    "sha256": "4bd61157e4fa02034c0e6858970c524fa8ea781dadce163b006e7ace34cbdd17"
+  },
+  "effective_interval": {
+    "historical_use_before_observation": false,
+    "observed_from_utc": "2026-08-16T21:06:42Z",
+    "observed_until_utc": null,
+    "publisher_effective_from": null,
+    "publisher_effective_to": null
+  },
+  "extracted_public_tier0_facts": [
+    {
+      "maker_fee_bps": "1.5",
+      "maker_fee_percent": "0.015",
+      "product": "standard perpetuals",
+      "table_locator": "Perps fee tiers / Tier 0 / Base rate",
+      "taker_fee_bps": "4.5",
+      "taker_fee_percent": "0.045"
+    },
+    {
+      "maker_fee_bps": "4.0",
+      "maker_fee_percent": "0.040",
+      "product": "standard spot",
+      "table_locator": "Spot fee tiers / Tier 0 / Base rate",
+      "taker_fee_bps": "7.0",
+      "taker_fee_percent": "0.070"
+    }
+  ],
+  "publisher": "Hyperliquid",
+  "scope": "SOURCE_RECEIPT_AND_EXTRACTED_PUBLIC_TIER0_FACTS"
+}

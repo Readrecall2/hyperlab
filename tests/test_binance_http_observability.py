@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import requests
 
+from hyperlab.collector.telemetry import ThreadRuntimeSnapshot
 from hyperlab.venues.binance import (
     BinancePublicHttpRequestError,
     BinancePublicRestClient,
@@ -19,6 +20,23 @@ from hyperlab.venues.binance import (
 )
 
 BASE = datetime(2026, 8, 12, 12, tzinfo=UTC)
+
+
+def _thread_runtime_snapshots(
+    *snapshots: ThreadRuntimeSnapshot,
+) -> Any:
+    remaining = iter(snapshots)
+    expected_positions = iter(
+        position
+        for _ in range(len(snapshots) // 2)
+        for position in ("start", "end")
+    )
+
+    def capture(position: str) -> ThreadRuntimeSnapshot:
+        assert position == next(expected_positions)
+        return next(remaining)
+
+    return capture
 
 
 class ControlledClock:
@@ -186,7 +204,16 @@ def test_diagnostic_introspection_is_outside_authoritative_clock_gate(
             delay_ms=25,
         ),
     )
-    client = BinancePublicRestClient(transport=transport, clock=clock.now)
+    client = BinancePublicRestClient(
+        transport=transport,
+        clock=clock.now,
+        thread_runtime_snapshot=_thread_runtime_snapshots(
+            ThreadRuntimeSnapshot(0, 1_000_000, 10_000_000, 10),
+            ThreadRuntimeSnapshot(84_000_000, 6_000_000, 19_000_000, 12),
+            ThreadRuntimeSnapshot(100_000_000, 7_000_000, 20_000_000, 13),
+            ThreadRuntimeSnapshot(184_000_000, 12_000_000, 29_000_000, 15),
+        ),
+    )
 
     try:
         measurement = client.clock_measurement()
@@ -225,10 +252,17 @@ def test_diagnostic_introspection_is_outside_authoritative_clock_gate(
     assert first_diagnostics.pool_connection_delta == 1
     assert first_diagnostics.urllib3_pool_object_delta == 1
     assert first_diagnostics.requests_session_reused is False
+    assert first_diagnostics.requests_session_request_ordinal == 1
+    assert first_diagnostics.request_boundary_monotonic_elapsed_ms == 84
+    assert first_diagnostics.request_boundary_thread_cpu_ms == 5
+    assert first_diagnostics.request_boundary_thread_runqueue_wait_ms == 9
+    assert first_diagnostics.request_boundary_thread_timeslice_delta == 2
     assert first_diagnostics.urllib3_connection_identity is not None
     assert first_diagnostics.urllib3_connection_reused is None
+    assert first_diagnostics.urllib3_connection_observed_age_ms == 0
     assert first_diagnostics.tls_socket_identity is not None
     assert first_diagnostics.tls_socket_reused is None
+    assert first_diagnostics.tls_socket_observed_age_ms == 0
     assert first_diagnostics.tls_session_reused is False
     assert first_diagnostics.request_completion_sequence == 1
     assert first_diagnostics.finalization_completion_sequence == 1
@@ -238,15 +272,60 @@ def test_diagnostic_introspection_is_outside_authoritative_clock_gate(
     assert second_diagnostics is not None
     assert second.response_received_time - second.request_sent_time == timedelta(milliseconds=84)
     assert second_diagnostics.requests_session_reused is True
+    assert second_diagnostics.requests_session_request_ordinal == 2
+    assert second_diagnostics.request_boundary_monotonic_elapsed_ms == 84
+    assert second_diagnostics.request_boundary_thread_cpu_ms == 5
+    assert second_diagnostics.request_boundary_thread_runqueue_wait_ms == 9
+    assert second_diagnostics.request_boundary_thread_timeslice_delta == 2
     assert second_diagnostics.urllib3_connection_objects_created_delta == 0
     assert second_diagnostics.urllib3_requests_started_delta == 1
     assert second_diagnostics.new_urllib3_connection_object_created is False
     assert second_diagnostics.urllib3_connection_reused is True
+    assert second_diagnostics.urllib3_connection_observed_age_ms > 0
     assert second_diagnostics.tls_socket_reused is True
+    assert second_diagnostics.tls_socket_observed_age_ms > 0
     assert second_diagnostics.tls_session_reused is None
     assert second_diagnostics.request_completion_sequence == 2
     assert second_diagnostics.finalization_completion_sequence == 2
     assert second_diagnostics.post_request_observation_current is True
+
+
+def test_request_boundary_sampler_failure_does_not_change_http_result() -> None:
+    clock = ControlledClock()
+    session = ObservedSession(
+        clock=clock,
+        connection=FakeConnection(FakeTlsSocket(session_reused=False)),
+        get_delay_ms=5,
+        decode_delay_ms=0,
+    )
+    transport = RequestsJsonTransport(
+        session=session,  # type: ignore[arg-type]
+        monotonic=clock.monotonic,
+    )
+
+    def fail_snapshot(_position: str) -> ThreadRuntimeSnapshot:
+        raise OSError("simulated profiler failure")
+
+    client = BinancePublicRestClient(
+        transport=transport,
+        clock=clock.now,
+        thread_runtime_snapshot=fail_snapshot,
+    )
+    try:
+        timed = client._get("/fapi/v1/time")
+    finally:
+        client.close()
+
+    assert timed.response_received_time - timed.request_sent_time == timedelta(
+        milliseconds=5
+    )
+    diagnostics = timed.http_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.requests_session_request_ordinal == 1
+    assert diagnostics.request_boundary_monotonic_elapsed_ms is None
+    assert diagnostics.request_boundary_thread_cpu_ms is None
+    assert diagnostics.request_boundary_thread_runqueue_wait_ms is None
+    assert diagnostics.request_boundary_thread_timeslice_delta is None
 
 
 @pytest.mark.parametrize(
@@ -296,7 +375,19 @@ def test_http_failures_retain_partial_diagnostics_outside_clock_boundary(
         "_pool_snapshot",
         _delayed_pool_snapshots(clock, ((1, 4), (1, 5)), delay_ms=9),
     )
-    client = BinancePublicRestClient(transport=transport, clock=clock.now)
+    client = BinancePublicRestClient(
+        transport=transport,
+        clock=clock.now,
+        thread_runtime_snapshot=_thread_runtime_snapshots(
+            ThreadRuntimeSnapshot(0, 1_000_000, 10_000_000, 10),
+            ThreadRuntimeSnapshot(
+                expected_boundary_ms * 1_000_000,
+                6_000_000,
+                19_000_000,
+                12,
+            ),
+        ),
+    )
 
     try:
         with pytest.raises(expected_raised_type) as raised:
@@ -328,6 +419,11 @@ def test_http_failures_retain_partial_diagnostics_outside_clock_boundary(
     assert diagnostics.urllib3_requests_started_delta == 1
     assert diagnostics.new_urllib3_connection_object_created is False
     assert diagnostics.requests_session_reused is False
+    assert diagnostics.requests_session_request_ordinal == 1
+    assert diagnostics.request_boundary_monotonic_elapsed_ms == expected_boundary_ms
+    assert diagnostics.request_boundary_thread_cpu_ms == 5
+    assert diagnostics.request_boundary_thread_runqueue_wait_ms == 9
+    assert diagnostics.request_boundary_thread_timeslice_delta == 2
     assert diagnostics.request_completion_sequence == 1
     assert diagnostics.finalization_completion_sequence == 1
     assert diagnostics.post_request_observation_current is True
@@ -449,18 +545,30 @@ def test_local_http_keepalive_exposes_real_urllib3_connection_reuse() -> None:
     assert not server_thread.is_alive()
     assert first.urllib3_connection_objects_created_delta == 1
     assert first.urllib3_requests_started_delta == 1
+    assert first.requests_session_request_ordinal == 1
     assert first.urllib3_connection_identity is not None
     assert first.urllib3_connection_reused is None
+    assert first.urllib3_connection_observed_age_ms == 0
     assert first.tls_session_reused is None
     assert first.peer_ip == "127.0.0.1"
     assert first.peer_port == server.server_address[1]
     assert first.socket_family == "AF_INET"
     assert second.urllib3_connection_objects_created_delta == 0
     assert second.urllib3_requests_started_delta == 1
+    assert second.requests_session_request_ordinal == 2
     assert second.urllib3_connection_identity == first.urllib3_connection_identity
     assert second.urllib3_connection_reused is True
+    assert second.urllib3_connection_observed_age_ms is not None
+    assert second.urllib3_connection_observed_age_ms >= 0
     assert second.tls_socket_identity == first.tls_socket_identity
     assert second.tls_socket_reused is True
+    if first.tls_socket_identity is None:
+        assert first.tls_socket_observed_age_ms is None
+        assert second.tls_socket_observed_age_ms is None
+    else:
+        assert first.tls_socket_observed_age_ms == 0
+        assert second.tls_socket_observed_age_ms is not None
+        assert second.tls_socket_observed_age_ms >= 0
     assert second.tls_session_reused is None
     assert second.peer_ip == first.peer_ip
     assert second.peer_port == first.peer_port
@@ -537,8 +645,10 @@ def test_later_request_completion_makes_post_request_evidence_indeterminate(
     assert first.new_urllib3_connection_object_created is None
     assert first.urllib3_connection_identity is None
     assert first.urllib3_connection_reused is None
+    assert first.urllib3_connection_observed_age_ms is None
     assert first.tls_socket_identity is None
     assert first.tls_socket_reused is None
+    assert first.tls_socket_observed_age_ms is None
     assert first.tls_session_reused is None
     assert second.request_completion_sequence == 2
     assert second.finalization_completion_sequence == 2

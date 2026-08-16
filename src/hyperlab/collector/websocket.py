@@ -137,6 +137,11 @@ class WebsocketClientSocket:
         self._closed = threading.Event()
         self._terminal_error: BaseException | None = None
         self._terminal_reason: str | None = None
+        self._terminal_origin: str | None = None
+        self._terminal_observed_at: datetime | None = None
+        self._terminal_observed_monotonic_ns: int | None = None
+        self._terminal_close_code: int | None = None
+        self._terminal_close_reason: str | None = None
         self._terminal_lock = threading.Lock()
         self._telemetry_lock = threading.Lock()
         self._overflow_count = 0
@@ -175,7 +180,9 @@ class WebsocketClientSocket:
             raise ValueError("timeout_seconds must be positive")
         if not self._reader_started:
             raise RuntimeError("public websocket reader has not been started")
-        self._raise_terminal_error()
+        self._raise_terminal_error(immediate_only=True)
+        if self._messages.empty():
+            self._raise_terminal_error()
         try:
             received = self._messages.get(timeout=timeout_seconds)
         except queue.Empty:
@@ -184,10 +191,29 @@ class WebsocketClientSocket:
         dequeued_monotonic_ns = self._monotonic_ns()
         if received.received_monotonic_ns is not None:
             self._dequeue_residence.observe_ns(max(dequeued_monotonic_ns - received.received_monotonic_ns, 0))
-        self._raise_terminal_error()
+        self._raise_terminal_error(immediate_only=True)
         return received
 
-    def _set_terminal_error(self, error: BaseException) -> None:
+    def _set_terminal_error(
+        self,
+        error: BaseException,
+        *,
+        origin: str,
+        observed_at: datetime | None = None,
+        observed_monotonic_ns: int | None = None,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+    ) -> None:
+        if observed_at is None:
+            try:
+                observed_at = self._clock()
+            except BaseException:
+                observed_at = None
+        if observed_monotonic_ns is None:
+            try:
+                observed_monotonic_ns = self._monotonic_ns()
+            except BaseException:
+                observed_monotonic_ns = None
         with self._terminal_lock:
             if self._terminal_error is not None:
                 return
@@ -196,11 +222,18 @@ class WebsocketClientSocket:
             self._terminal_reason = (
                 type(error).__name__ if not detail else f"{type(error).__name__}: {detail}"
             )
+            self._terminal_origin = origin
+            self._terminal_observed_at = observed_at
+            self._terminal_observed_monotonic_ns = observed_monotonic_ns
+            self._terminal_close_code = close_code
+            self._terminal_close_reason = close_reason
 
-    def _raise_terminal_error(self) -> None:
+    def _raise_terminal_error(self, *, immediate_only: bool = False) -> None:
         with self._terminal_lock:
             error = self._terminal_error
-        if error is not None:
+        if error is not None and (
+            not immediate_only or isinstance(error, WebsocketQueueOverflow)
+        ):
             raise error from None
 
     def telemetry_snapshot(self) -> dict[str, object]:
@@ -217,6 +250,17 @@ class WebsocketClientSocket:
         with self._terminal_lock:
             terminal_reason = self._terminal_reason
             terminal_type = None if self._terminal_error is None else type(self._terminal_error).__name__
+            terminal_origin = self._terminal_origin
+            terminal_observed_at = self._terminal_observed_at
+            terminal_observed_monotonic_ns = self._terminal_observed_monotonic_ns
+            terminal_close_code = self._terminal_close_code
+            terminal_close_reason = self._terminal_close_reason
+        terminal_observed_age_ms = (
+            None
+            if terminal_observed_monotonic_ns is None
+            else max(observed_monotonic_ns - terminal_observed_monotonic_ns, 0)
+            / 1_000_000
+        )
         return {
             "venue": self.venue,
             "socket_role": self.socket_role,
@@ -234,6 +278,13 @@ class WebsocketClientSocket:
             "overflow_count": overflow_count,
             "terminal_exception_type": terminal_type,
             "terminal_reason": terminal_reason,
+            "terminal_origin": terminal_origin,
+            "terminal_observed_at": (
+                None if terminal_observed_at is None else terminal_observed_at.isoformat()
+            ),
+            "terminal_observed_age_ms": terminal_observed_age_ms,
+            "terminal_close_code": terminal_close_code,
+            "terminal_close_reason": terminal_close_reason,
         }
 
     def close(self) -> None:
@@ -244,12 +295,39 @@ class WebsocketClientSocket:
             if self._reader_started and threading.current_thread() is not self._reader:
                 self._reader.join(timeout=2.0)
 
+    @staticmethod
+    def _close_frame_details(payload: object) -> tuple[int | None, str | None]:
+        if payload is None:
+            return None, None
+        if isinstance(payload, str):
+            encoded = payload.encode("utf-8", errors="replace")
+        elif isinstance(payload, (bytes, bytearray, memoryview)):
+            encoded = bytes(payload)
+        else:
+            detail = str(payload).strip()
+            return None, detail or None
+        if len(encoded) >= 2:
+            code = int.from_bytes(encoded[:2], byteorder="big")
+            reason_bytes = encoded[2:]
+        else:
+            code = None
+            reason_bytes = encoded
+        reason = reason_bytes.decode("utf-8", errors="replace").strip()
+        return code, reason or None
+
     def _read_forever(self) -> None:
         import websocket
 
         while not self._closed.is_set():
             try:
-                message = self._connection.recv()
+                recv_data = getattr(self._connection, "recv_data", None)
+                opcode: int | None = None
+                if callable(recv_data):
+                    used_recv_data = True
+                    opcode, message = recv_data()
+                else:
+                    used_recv_data = False
+                    message = self._connection.recv()
                 received_time = self._clock()
                 received_monotonic_ns = self._monotonic_ns()
                 with self._telemetry_lock:
@@ -258,21 +336,64 @@ class WebsocketClientSocket:
                 continue
             except BaseException as exc:
                 if not self._closed.is_set():
-                    self._set_terminal_error(exc)
+                    self._set_terminal_error(exc, origin="transport_exception")
+                return
+            if self._closed.is_set():
+                return
+            if used_recv_data and opcode == websocket.ABNF.OPCODE_CLOSE:
+                close_code, close_reason = self._close_frame_details(message)
+                details = []
+                if close_code is not None:
+                    details.append(f"code={close_code}")
+                if close_reason is not None:
+                    details.append(f"reason={close_reason}")
+                suffix = "" if not details else f" ({', '.join(details)})"
+                self._set_terminal_error(
+                    ConnectionError(f"public websocket closed by peer{suffix}"),
+                    origin="peer_close_frame",
+                    observed_at=received_time,
+                    observed_monotonic_ns=received_monotonic_ns,
+                    close_code=close_code,
+                    close_reason=close_reason,
+                )
+                return
+            if used_recv_data and opcode not in {
+                websocket.ABNF.OPCODE_TEXT,
+                websocket.ABNF.OPCODE_BINARY,
+            }:
+                self._set_terminal_error(
+                    TypeError(f"unexpected websocket opcode: {opcode}"),
+                    origin="unexpected_opcode",
+                    observed_at=received_time,
+                    observed_monotonic_ns=received_monotonic_ns,
+                )
                 return
             if isinstance(message, bytes):
                 try:
                     message = message.decode("utf-8")
                 except UnicodeDecodeError as exc:
-                    self._set_terminal_error(exc)
+                    self._set_terminal_error(
+                        exc,
+                        origin="invalid_utf8",
+                        observed_at=received_time,
+                        observed_monotonic_ns=received_monotonic_ns,
+                    )
                     return
             if not isinstance(message, str):
                 self._set_terminal_error(
-                    TypeError(f"unexpected websocket message type: {type(message).__name__}")
+                    TypeError(f"unexpected websocket message type: {type(message).__name__}"),
+                    origin="unexpected_message_type",
+                    observed_at=received_time,
+                    observed_monotonic_ns=received_monotonic_ns,
                 )
                 return
-            if not message:
-                self._set_terminal_error(ConnectionError("public websocket closed"))
+            if not used_recv_data and not message:
+                self._set_terminal_error(
+                    ConnectionError("public websocket closed"),
+                    origin="legacy_recv_empty",
+                    observed_at=received_time,
+                    observed_monotonic_ns=received_monotonic_ns,
+                )
                 return
             try:
                 received = ReceivedWireMessage(
@@ -281,7 +402,11 @@ class WebsocketClientSocket:
                     received_monotonic_ns=received_monotonic_ns,
                 )
             except BaseException as exc:
-                self._set_terminal_error(exc)
+                self._set_terminal_error(
+                    exc,
+                    origin="invalid_receive_timestamp",
+                    observed_monotonic_ns=received_monotonic_ns,
+                )
                 return
             try:
                 self._messages.put_nowait(received)
@@ -289,7 +414,10 @@ class WebsocketClientSocket:
                 with self._telemetry_lock:
                     self._overflow_count += 1
                 self._set_terminal_error(
-                    WebsocketQueueOverflow("bounded public websocket queue is full; local capacity exhausted")
+                    WebsocketQueueOverflow(
+                        "bounded public websocket queue is full; local capacity exhausted"
+                    ),
+                    origin="queue_overflow",
                 )
                 self._closed.set()
                 self._connection.close()

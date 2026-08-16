@@ -46,6 +46,113 @@ _STRESS_INTEGRITY_ROW_COUNT = 1_000_001
 _STRESS_TIMESTAMP_COUNT = 5_000_001
 
 
+def test_clock_forensic_evidence_is_row_bounded_after_60001_rejections() -> None:
+    accumulator = continuity_module._ClockForensicAccumulator()
+    for index in range(_STRESS_MANIFEST_COUNT):
+        observed_at = legacy_continuity.BASE + timedelta(microseconds=index)
+        row: dict[str, object] = {
+            "schema_version": 4,
+            "observation_id": f"clock-stress-{index:05d}",
+            "capture_epoch_id": "clock-stress-capture",
+            "connection_id": "clock-stress-public",
+            "connection_epoch": 1,
+            "request_sent_time": observed_at - timedelta(milliseconds=102),
+            "response_received_time": observed_at,
+            "server_time": observed_at - timedelta(milliseconds=51),
+            "received_time": observed_at,
+            "round_trip_latency_ms": Decimal("102"),
+            "estimated_clock_drift_ms": Decimal("0"),
+            "drift_uncertainty_ms": Decimal("51"),
+            "sample_status": "invalid",
+            "invalid_reason": "clock uncertainty exceeds threshold: 51ms > 50ms",
+            "causal_valid_from": None,
+            "causal_valid_until": None,
+            "sampling_interval_ms": 10_000,
+            "max_age_ms": 15_000,
+            "max_uncertainty_ms": Decimal("50"),
+        }
+        sample = accumulator.observe(row, "rejected")
+        accumulator.observe_rejection_streak(
+            "clock-stress-capture",
+            index + 1,
+            sample,
+        )
+
+    payload = accumulator.as_dict()
+
+    assert payload["schema_version_counts"] == {"4": _STRESS_MANIFEST_COUNT}
+    assert payload["outcomes"] == {
+        "valid": 0,
+        "rejected": _STRESS_MANIFEST_COUNT,
+        "hard_invalid": 0,
+    }
+    rejected = payload["rejected_evidence"]
+    assert rejected["sample_limit"] == 64
+    assert rejected["total"] == _STRESS_MANIFEST_COUNT
+    assert rejected["retained"] == 64
+    assert rejected["truncated"] == _STRESS_MANIFEST_COUNT - 64
+    assert len(rejected["samples"]) == 64
+    consecutive = payload["consecutive_rejection_evidence"]
+    assert consecutive["total"] == 1
+    assert consecutive["retained"] == 1
+    assert consecutive["truncated"] == 0
+    json.dumps(payload, sort_keys=True)
+
+
+def test_clock_forensic_pair_evidence_is_bounded_across_40_captures() -> None:
+    def forensic_payload(capture_order: Iterator[int]) -> dict[str, object]:
+        accumulator = continuity_module._ClockForensicAccumulator()
+        for capture_index in capture_order:
+            capture = f"clock-pair-capture-{capture_index:02d}"
+            for streak in (1, 2):
+                observed_at = legacy_continuity.BASE + timedelta(
+                    seconds=capture_index,
+                    microseconds=streak,
+                )
+                row: dict[str, object] = {
+                    "schema_version": 4,
+                    "observation_id": f"clock-pair-{capture_index:02d}-{streak}",
+                    "capture_epoch_id": capture,
+                    "connection_id": f"clock-pair-public-{capture_index:02d}",
+                    "connection_epoch": 1,
+                    "request_sent_time": observed_at - timedelta(milliseconds=102),
+                    "response_received_time": observed_at,
+                    "server_time": observed_at - timedelta(milliseconds=51),
+                    "received_time": observed_at,
+                    "round_trip_latency_ms": Decimal("102"),
+                    "estimated_clock_drift_ms": Decimal("0"),
+                    "drift_uncertainty_ms": Decimal("51"),
+                    "sample_status": "invalid",
+                    "invalid_reason": (
+                        "clock uncertainty exceeds threshold: 51ms > 50ms"
+                    ),
+                    "causal_valid_from": None,
+                    "causal_valid_until": None,
+                    "sampling_interval_ms": 10_000,
+                    "max_age_ms": 15_000,
+                    "max_uncertainty_ms": Decimal("50"),
+                }
+                sample = accumulator.observe(row, "rejected")
+                accumulator.observe_rejection_streak(
+                    capture,
+                    streak,
+                    sample,
+                )
+        return accumulator.as_dict()
+
+    forward = forensic_payload(iter(range(40)))
+    reverse = forensic_payload(iter(reversed(range(40))))
+    assert forward == reverse
+    consecutive = forward["consecutive_rejection_evidence"]
+    assert consecutive["total"] == 40
+    assert consecutive["retained"] == 32
+    assert consecutive["truncated"] == 8
+    assert [
+        pair["capture_epoch_id"]
+        for pair in consecutive["pairs"]
+    ] == [f"clock-pair-capture-{index:02d}" for index in range(32)]
+
+
 def test_scratch_store_preserves_and_orders_nanosecond_timestamps(
     tmp_path: Path,
 ) -> None:
@@ -202,32 +309,32 @@ def _canonical_semantic_bytes(payload: dict[str, object]) -> bytes:
         (
             "pass",
             {},
-            "398fa07dda123fab6ff9d754872913548da8cf6fac7a3aa114bc5958a7d1f07a",
+            "3844e43cbab83cd039a1748e0d53a3d676d984baf591dae2656df8632777f16a",
         ),
         (
             "missing-raw-trade",
             {"omit_binance_raw_trade": True},
-            "7dc1119d170f3b1a4b78ab945aeee9313b233ace5cad7610c7e9197809f25e51",
+            "1eb65d3633acd2e019ae05407b7302f92672b83d34c086f3e3edda0d146266c7",
         ),
         (
             "missing-resync",
             {"omit_binance_resync": True},
-            "a67cc116d38d3c06a1b937b94a8aa5ef02f293ecd2573cf40d585b56cde4780b",
+            "4fb966afe747bf368e2ceec5eea19317c674fb6d1a4789203de59a3b53f76a1d",
         ),
         (
             "isolated-rejection",
             {"invalid_clock_at": legacy_continuity.BASE + timedelta(seconds=5.5)},
-            "dbd39a52ff05063f68b551e0136839db9724eb9ce61384660cd7214e0080d7d1",
+            "93a8b2a6dc51d63d71347bc625c3ca72c8b71f050dbeacd50f8f47faca66bf38",
         ),
         (
             "delayed-trade",
             {"delayed_hyperliquid_trade": True},
-            "690036dc393076deb6649e1d14e9f32dada257a6b8c148efcf96af0eb5a8d7b1",
+            "bf278b30285f70201fed0b6db6574336b6bed9edbe27aeeeb45c1be29736a196",
         ),
         (
             "rest-bootstrap",
             {"add_hyperliquid_rest_bootstrap": True},
-            "fdcdd5357e247ee9de9717cdf55e84bbf9e120f3e35312eab1a02ab17022e3e9",
+            "e2f4174bc286882f8f12024b1239391df6d78cce08f5a4fa7460ce9bf0e2e6cd",
         ),
     ),
 )
@@ -989,7 +1096,7 @@ def test_observability_is_non_semantic_and_semantics_are_repeatable(
     second_semantic = _canonical_semantic_bytes(second)
     assert first_semantic == second_semantic
     assert hashlib.sha256(first_semantic).hexdigest() == (
-        "398fa07dda123fab6ff9d754872913548da8cf6fac7a3aa114bc5958a7d1f07a"
+        "3844e43cbab83cd039a1748e0d53a3d676d984baf591dae2656df8632777f16a"
     )
 
     first_observability = first["observability"]

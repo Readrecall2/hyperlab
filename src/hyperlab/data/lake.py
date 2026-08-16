@@ -1056,6 +1056,8 @@ def _validate_semantics(table: pa.Table, key: PartitionKey, spec: SchemaSpec) ->
             _validate_clock_sync_v2(table)
         if spec.version >= 3:
             _validate_clock_sync_v3(table)
+        if spec.version >= 4:
+            _validate_clock_sync_v4(table)
 
 
 def _validate_clock_sync_v2(table: pa.Table) -> None:
@@ -1173,6 +1175,45 @@ def _validate_clock_sync_v3(table: pa.Table) -> None:
         "response_cloudfront_pop",
         "response_cache",
     )
+
+
+def _validate_clock_sync_v4(table: pa.Table) -> None:
+    _require_non_negative(
+        table,
+        "request_boundary_monotonic_elapsed_ms",
+        "request_boundary_thread_cpu_ms",
+        "request_boundary_thread_runqueue_wait_ms",
+        "request_boundary_thread_timeslice_delta",
+        "urllib3_connection_observed_age_ms",
+        "tls_socket_observed_age_ms",
+    )
+    _require_positive_when_present(table, "requests_session_request_ordinal")
+    for (
+        connection_identity,
+        connection_age_ms,
+        socket_identity,
+        socket_age_ms,
+        observation_current,
+    ) in zip(
+        table.column("urllib3_connection_identity").to_pylist(),
+        table.column("urllib3_connection_observed_age_ms").to_pylist(),
+        table.column("tls_socket_identity").to_pylist(),
+        table.column("tls_socket_observed_age_ms").to_pylist(),
+        table.column("post_request_observation_current").to_pylist(),
+        strict=True,
+    ):
+        if connection_age_ms is not None and (
+            connection_identity is None or observation_current is not True
+        ):
+            raise PartitionValidationError(
+                "urllib3 connection observed age requires a current connection identity"
+            )
+        if socket_age_ms is not None and (
+            socket_identity is None or observation_current is not True
+        ):
+            raise PartitionValidationError(
+                "TLS socket observed age requires a current socket identity"
+            )
 
 
 def _analyze_table(

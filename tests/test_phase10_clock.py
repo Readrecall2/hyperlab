@@ -62,7 +62,7 @@ def _record(
     )
 
 
-def _table(row: dict[str, object], *, version: int = 3) -> pa.Table:
+def _table(row: dict[str, object], *, version: int = 4) -> pa.Table:
     return pa.Table.from_pylist(
         [row],
         schema=schema_for(RecordType.CLOCK_SYNC, version=version).schema,
@@ -102,7 +102,7 @@ def test_uncertainty_at_50_ms_has_a_response_causal_bounded_interval() -> None:
     row = _record(measurement, 'clock-at-threshold')
 
     assert measurement.drift_uncertainty_ms == MAX_UNCERTAINTY_MS
-    assert row['schema_version'] == 3
+    assert row['schema_version'] == 4
     assert row['connection_id'] == 'binance-connection-7'
     assert row['connection_epoch'] == 7
     assert row['capture_epoch_id'] == 'capture-epoch-7'
@@ -156,7 +156,7 @@ def test_clock_validity_never_interpolates_across_stale_or_new_epoch_periods() -
     assert uncovered == timedelta(seconds=15)
 
 
-def test_clock_sync_v1_v2_remain_valid_beside_v3_partitions(tmp_path: Path) -> None:
+def test_clock_sync_v1_v2_v3_remain_valid_beside_v4_partitions(tmp_path: Path) -> None:
     measurement = _measurement(response_delay=timedelta(milliseconds=20))
     v1_row = {
         'schema_version': 1,
@@ -176,13 +176,19 @@ def test_clock_sync_v1_v2_remain_valid_beside_v3_partitions(tmp_path: Path) -> N
         'drift_uncertainty_ms': measurement.drift_uncertainty_ms,
         'observation_id': 'legacy-clock-v1',
     }
-    v3_row = _record(measurement, 'causal-clock-v3')
+    v4_row = _record(measurement, 'causal-clock-v4')
     v2_row = {
-        name: v3_row[name]
+        name: v4_row[name]
         for name in schema_for(RecordType.CLOCK_SYNC, version=2).schema.names
     }
     v2_row['schema_version'] = 2
     v2_row['observation_id'] = 'causal-clock-v2'
+    v3_row = {
+        name: v4_row[name]
+        for name in schema_for(RecordType.CLOCK_SYNC, version=3).schema.names
+    }
+    v3_row['schema_version'] = 3
+    v3_row['observation_id'] = 'causal-clock-v3'
     key = PartitionKey('binance_usdm', BASE.date(), 'GLOBAL', RecordType.CLOCK_SYNC)
 
     v1_manifest = write_partition(tmp_path, key, _table(v1_row, version=1))
@@ -191,17 +197,19 @@ def test_clock_sync_v1_v2_remain_valid_beside_v3_partitions(tmp_path: Path) -> N
         key,
         _table(v2_row, version=2),
     )
-    v3_manifest = write_partition(tmp_path, key, _table(v3_row))
+    v3_manifest = write_partition(tmp_path, key, _table(v3_row, version=3))
+    v4_manifest = write_partition(tmp_path, key, _table(v4_row))
 
     assert v1_manifest.schema_version == 1
     assert v2_manifest.schema_version == 2
     assert v3_manifest.schema_version == 3
+    assert v4_manifest.schema_version == 4
     inventory = inventory_partitions(tmp_path)
-    assert sorted(item.schema_version for item in inventory.partitions) == [1, 2, 3]
-    assert inventory.total_rows == 3
+    assert sorted(item.schema_version for item in inventory.partitions) == [1, 2, 3, 4]
+    assert inventory.total_rows == 4
 
 
-def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path) -> None:
+def test_clock_v4_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path) -> None:
     diagnostics = HttpRequestDiagnostics(
         transport_lock_wait_ms=Decimal('2.1234567890123456789'),
         requests_adapter_header_elapsed_ms=Decimal('30'),
@@ -228,6 +236,13 @@ def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path)
         socket_family='AF_INET',
         response_cloudfront_pop='SIN2-P11',
         response_cache='Miss from cloudfront',
+        request_boundary_monotonic_elapsed_ms=Decimal('84'),
+        request_boundary_thread_cpu_ms=Decimal('5'),
+        request_boundary_thread_runqueue_wait_ms=Decimal('9'),
+        request_boundary_thread_timeslice_delta=2,
+        requests_session_request_ordinal=7,
+        urllib3_connection_observed_age_ms=Decimal('30000'),
+        tls_socket_observed_age_ms=Decimal('30000'),
     )
     measurement = _measurement(
         response_delay=timedelta(milliseconds=20),
@@ -235,7 +250,7 @@ def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path)
     )
     record = clock_record(
         measurement,
-        'joinable-clock-v3',
+        'joinable-clock-v4',
         connection_id='binance-connection-7',
         connection_epoch=7,
         capture_epoch_id='capture-epoch-7',
@@ -252,8 +267,8 @@ def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path)
     manifest = write_partition(tmp_path, key, _table(dict(record.row)))
     persisted = pq.ParquetFile(tmp_path / manifest.relative_data_path).read().to_pylist()[0]
 
-    assert manifest.schema_version == 3
-    assert persisted['observation_id'] == 'joinable-clock-v3'
+    assert manifest.schema_version == 4
+    assert persisted['observation_id'] == 'joinable-clock-v4'
     assert persisted['request_sent_time'] == measurement.request_sent_time
     assert persisted['response_received_time'] == measurement.response_received_time
     assert persisted['clock_schedule_overdue_ms'] == Decimal('4.000000000000000000')
@@ -279,6 +294,23 @@ def test_clock_v3_persists_joinable_runtime_and_http_diagnostics(tmp_path: Path)
     assert persisted['socket_family'] == 'AF_INET'
     assert persisted['response_cloudfront_pop'] == 'SIN2-P11'
     assert persisted['response_cache'] == 'Miss from cloudfront'
+    assert persisted['request_boundary_monotonic_elapsed_ms'] == Decimal(
+        '84.000000000000000000'
+    )
+    assert persisted['request_boundary_thread_cpu_ms'] == Decimal(
+        '5.000000000000000000'
+    )
+    assert persisted['request_boundary_thread_runqueue_wait_ms'] == Decimal(
+        '9.000000000000000000'
+    )
+    assert persisted['request_boundary_thread_timeslice_delta'] == 2
+    assert persisted['requests_session_request_ordinal'] == 7
+    assert persisted['urllib3_connection_observed_age_ms'] == Decimal(
+        '30000.000000000000000000'
+    )
+    assert persisted['tls_socket_observed_age_ms'] == Decimal(
+        '30000.000000000000000000'
+    )
 
 
 def test_inventory_rejects_trade_duplicate_hidden_at_v1_v2_boundary(
@@ -427,11 +459,32 @@ def test_lake_rejects_inconsistent_invalid_clock_coverage(
             {'executor_submit_to_worker_start_ms': Decimal('-1')},
             'executor_submit_to_worker_start_ms',
         ),
+        (
+            {'request_boundary_monotonic_elapsed_ms': Decimal('-1')},
+            'request_boundary_monotonic_elapsed_ms',
+        ),
+        (
+            {'request_boundary_thread_cpu_ms': Decimal('-1')},
+            'request_boundary_thread_cpu_ms',
+        ),
+        (
+            {'request_boundary_thread_runqueue_wait_ms': Decimal('-1')},
+            'request_boundary_thread_runqueue_wait_ms',
+        ),
+        ({'requests_session_request_ordinal': 0}, 'requests_session_request_ordinal'),
+        (
+            {'urllib3_connection_observed_age_ms': Decimal('1')},
+            'connection observed age',
+        ),
+        (
+            {'tls_socket_observed_age_ms': Decimal('1')},
+            'socket observed age',
+        ),
         ({'peer_port': 0}, 'peer_port'),
         ({'response_cloudfront_pop': ' '}, 'response_cloudfront_pop'),
     ],
 )
-def test_lake_rejects_invalid_clock_v3_diagnostics(
+def test_lake_rejects_invalid_clock_v4_diagnostics(
     tmp_path: Path,
     updates: dict[str, object],
     message: str,

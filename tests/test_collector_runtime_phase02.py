@@ -737,6 +737,25 @@ def test_disconnect_records_unknown_coverage_then_reconnects_with_bounded_backof
     assert failures[0]["reason"] == "ConnectionError: wire cut"
     assert failures[0]["socket"]["terminal_exception_type"] == "ConnectionError"
     assert failures[0]["will_reconnect"] is True
+    failure_snapshot = failures[0]["failure_snapshot"]
+    assert failure_snapshot["collector"]["state"] == "live"
+    assert failure_snapshot["collector"]["connection_alive"] is True
+    assert "process_cpu" in failure_snapshot["process"]
+    assert failure_snapshot["writer"]["queue"]["capacity_rows"] == config.queue_capacity
+    failure_liveness = failure_snapshot["liveness"]
+    assert failure_liveness["live"] is True
+    assert failure_liveness["connection_age_ms"] == 0.0
+    assert failure_liveness["live_duration_ms"] == 0.0
+    assert failure_liveness["pending_ack_count"] == 0
+    assert failure_liveness["pending_ack_subscriptions"] == []
+    assert failure_liveness["ping"] == {
+        "deadline_baseline_age_ms": 0.0,
+        "last_sent_age_ms": None,
+    }
+    assert failure_liveness["pong"] == {
+        "deadline_baseline_age_ms": 0.0,
+        "last_received_age_ms": None,
+    }
     assert observability["generation_reason_history"] == {
         "capacity": 32,
         "seen": 1,
@@ -747,6 +766,42 @@ def test_disconnect_records_unknown_coverage_then_reconnects_with_bounded_backof
     worker_phases = observability["worker_phases"]
     assert worker_phases["normalization_ms"]["count"] > 0
     assert worker_phases["sink_enqueue_ms"]["count"] > 0
+
+
+def test_stop_requested_interrupt_after_connect_persists_clean_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    config = _config()
+    socket = FakeSocket(timer, _ack_messages(config))
+    collector, _rest, factory, sink = _collector(tmp_path, config, timer, [socket])
+    scripted_receive = socket.receive
+
+    def stop_then_interrupt(
+        timeout_seconds: float,
+    ) -> str | ReceivedWireMessage | None:
+        if socket.items:
+            return scripted_receive(timeout_seconds)
+        collector.stop()
+        raise InterruptedError("collector stop requested")
+
+    monkeypatch.setattr(socket, "receive", stop_then_interrupt)
+    try:
+        metrics = collector.run()
+    finally:
+        collector.close()
+
+    assert metrics.state == CollectorState.STOPPED
+    assert (metrics.connections, metrics.reconnects, metrics.gaps) == (1, 0, 0)
+    assert metrics.last_failure is None
+    assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    assert socket.closed is True
+    events = _parquet_rows(sink.root, "connection_event")
+    assert [row["event_kind"] for row in events] == ["connect", "disconnect"]
+    assert events[-1]["reason"] == "collector stop requested or bounded run completed"
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    assert status["observability"]["generation_reason_history"]["seen"] == 0
 
 
 def test_backoff_resets_only_after_a_stable_live_window(tmp_path: Path) -> None:
@@ -1505,9 +1560,16 @@ def test_subscription_ack_timeout_distinguishes_fresh_and_aged_backlog(
 
     assert collector.metrics.reconnects == 0
     assert factory.connect_calls == [("mainnet", config.ws_connect_timeout_seconds)]
+    status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
+    failure = status["observability"]["reconnect_reasons_by_generation"][0]
+    failure_liveness = failure["failure_snapshot"]["liveness"]
+    assert failure_liveness["live"] is False
+    assert failure_liveness["live_duration_ms"] is None
+    assert failure_liveness["pending_ack_count"] == 1
+    assert failure_liveness["pending_ack_subscriptions"] == [
+        config.subscriptions()[-1].key
+    ]
     if expect_fatal:
-        status = json.loads((tmp_path / "runtime_status.json").read_text(encoding="utf-8"))
-        failure = status["observability"]["reconnect_reasons_by_generation"][0]
         assert failure["will_reconnect"] is False
 
 

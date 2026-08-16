@@ -318,7 +318,7 @@ def test_clock_sync_v2_appends_causal_validity_without_rewriting_v1() -> None:
     v1 = schema_for(RecordType.CLOCK_SYNC, version=1)
     v2 = schema_for(RecordType.CLOCK_SYNC, version=2)
 
-    assert latest_schema_for(RecordType.CLOCK_SYNC).version == 3
+    assert latest_schema_for(RecordType.CLOCK_SYNC).version == 4
     assert v2.schema.names == [
         *v1.schema.names,
         'connection_epoch',
@@ -382,7 +382,6 @@ def test_clock_sync_v3_appends_nullable_runtime_and_http_attribution() -> None:
         'response_cache',
     ]
 
-    assert latest_schema_for(RecordType.CLOCK_SYNC) is v3
     assert v3.schema.names == [*v2.schema.names, *diagnostic_names]
     for name in diagnostic_names[:10]:
         assert v3.schema.field(name) == pa.field(
@@ -408,6 +407,44 @@ def test_clock_sync_v3_appends_nullable_runtime_and_http_attribution() -> None:
     assert v2.schema.metadata[b'hyperlab.schema_version'] == b'2'
     assert v3.schema.metadata[b'hyperlab.schema_version'] == b'3'
     check_schema_evolution(v2, v3)
+
+
+def test_clock_sync_v4_appends_nullable_request_boundary_attribution() -> None:
+    v3 = schema_for(RecordType.CLOCK_SYNC, version=3)
+    v4 = schema_for(RecordType.CLOCK_SYNC, version=4)
+    diagnostic_names = [
+        'request_boundary_monotonic_elapsed_ms',
+        'request_boundary_thread_cpu_ms',
+        'request_boundary_thread_runqueue_wait_ms',
+        'request_boundary_thread_timeslice_delta',
+        'requests_session_request_ordinal',
+        'urllib3_connection_observed_age_ms',
+        'tls_socket_observed_age_ms',
+    ]
+
+    assert latest_schema_for(RecordType.CLOCK_SYNC) is v4
+    assert v4.schema.names == [*v3.schema.names, *diagnostic_names]
+    for name in (
+        'request_boundary_monotonic_elapsed_ms',
+        'request_boundary_thread_cpu_ms',
+        'request_boundary_thread_runqueue_wait_ms',
+        'urllib3_connection_observed_age_ms',
+        'tls_socket_observed_age_ms',
+    ):
+        assert v4.schema.field(name) == pa.field(
+            name,
+            pa.decimal128(38, 18),
+            nullable=True,
+        )
+    for name in (
+        'request_boundary_thread_timeslice_delta',
+        'requests_session_request_ordinal',
+    ):
+        assert v4.schema.field(name) == pa.field(name, pa.uint64(), nullable=True)
+    assert all(v4.schema.field(name).nullable for name in diagnostic_names)
+    assert v3.schema.metadata[b'hyperlab.schema_version'] == b'3'
+    assert v4.schema.metadata[b'hyperlab.schema_version'] == b'4'
+    check_schema_evolution(v3, v4)
 
 
 def test_capture_generation_fields_are_compatible_appends_without_rewriting_v1() -> None:
@@ -448,6 +485,7 @@ def test_registered_multiversion_transitions_are_explicitly_compatible_or_breaki
         (RecordType.CONNECTION_EVENT, 1, 2),
         (RecordType.CLOCK_SYNC, 1, 2),
         (RecordType.CLOCK_SYNC, 2, 3),
+        (RecordType.CLOCK_SYNC, 3, 4),
     }
 
     assert set(BREAKING_SCHEMA_TRANSITIONS).isdisjoint(compatible_transitions)

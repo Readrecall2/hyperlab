@@ -168,6 +168,16 @@ Une venue de référence bouge ; Hyperliquid réagit légèrement plus tard ; le
 
 Le prototype inclus utilise des barres horaires uniquement pour exercer le moteur. Une conclusion réelle exige flux sub-seconde, horloges synchronisées, mesure de latence et replay du carnet.
 
+Le gate technique Phase 10 reste `BLOCKED_PRECONDITION_NOT_MET`. La capture
+Singapore de six heures décrite par le rapport forensique demeure un `FAIL` et
+les nouveaux diagnostics ne peuvent pas la requalifier rétroactivement : une
+nouvelle collecte réelle isolée de six heures et son audit complet sont
+nécessaires. Sur Hyperliquid, ni la raison d'une fermeture pair/transport, ni la
+reconnexion, ni la resynchronisation de l'état courant ne prouvent
+l'exhaustivité de l'intervalle manquant, faute de séquence serveur et de curseur
+public de replay. Tout gap dans la fenêtre et toute multiplicité de générations
+actives restent fatals.
+
 ### 3.7 Market making
 
 Le bot place bid et ask autour d'une fair value, réduit son risque selon l'inventaire et retire ses ordres quand le flux devient toxique.

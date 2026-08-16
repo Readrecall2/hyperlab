@@ -9,8 +9,61 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadRuntimeSnapshot:
+    monotonic_ns: int
+    thread_cpu_ns: int | None
+    runqueue_wait_ns: int | None
+    timeslices: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestBoundaryRuntimeDelta:
+    request_boundary_monotonic_elapsed_ms: float | None
+    request_boundary_thread_cpu_ms: float | None
+    request_boundary_thread_runqueue_wait_ms: float | None
+    request_boundary_thread_timeslice_delta: int | None
+
+
+def _non_negative_counter_delta(start: int | None, end: int | None) -> int | None:
+    if start is None or end is None or isinstance(start, bool) or isinstance(end, bool):
+        return None
+    delta = end - start
+    return delta if delta >= 0 else None
+
+
+def request_boundary_runtime_delta(
+    start: ThreadRuntimeSnapshot | None,
+    end: ThreadRuntimeSnapshot | None,
+) -> RequestBoundaryRuntimeDelta:
+    if start is None or end is None:
+        return RequestBoundaryRuntimeDelta(None, None, None, None)
+    monotonic_ns = _non_negative_counter_delta(start.monotonic_ns, end.monotonic_ns)
+    thread_cpu_ns = _non_negative_counter_delta(start.thread_cpu_ns, end.thread_cpu_ns)
+    runqueue_wait_ns = _non_negative_counter_delta(
+        start.runqueue_wait_ns,
+        end.runqueue_wait_ns,
+    )
+    return RequestBoundaryRuntimeDelta(
+        request_boundary_monotonic_elapsed_ms=(
+            None if monotonic_ns is None else monotonic_ns / 1_000_000
+        ),
+        request_boundary_thread_cpu_ms=(
+            None if thread_cpu_ns is None else thread_cpu_ns / 1_000_000
+        ),
+        request_boundary_thread_runqueue_wait_ms=(
+            None if runqueue_wait_ns is None else runqueue_wait_ns / 1_000_000
+        ),
+        request_boundary_thread_timeslice_delta=_non_negative_counter_delta(
+            start.timeslices,
+            end.timeslices,
+        ),
+    )
 
 
 class MonotonicTimingSummary:
@@ -275,6 +328,60 @@ def _parse_schedstat(payload: str | None) -> dict[str, int] | None:
         "runqueue_wait_ns": values[1],
         "timeslices": values[2],
     }
+
+
+def _thread_cpu_time_ns() -> int | None:
+    reader = getattr(time, "thread_time_ns", None)
+    if not callable(reader):
+        return None
+    try:
+        value = int(reader())
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _linux_thread_schedstat() -> dict[str, int] | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    parsed = _parse_schedstat(_read_linux_text("/proc/thread-self/schedstat"))
+    if parsed is not None:
+        return parsed
+    native_id_reader = getattr(threading, "get_native_id", None)
+    if not callable(native_id_reader):
+        return None
+    try:
+        native_id = int(native_id_reader())
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    return _parse_schedstat(
+        _read_linux_text(f"/proc/self/task/{native_id}/schedstat")
+    )
+
+
+def capture_thread_runtime_snapshot(position: str) -> ThreadRuntimeSnapshot:
+    """Best-effort counters bracketing one authoritative request boundary."""
+
+    if position not in {"start", "end"}:
+        raise ValueError("thread runtime snapshot position must be start or end")
+    if position == "start":
+        schedstat = _linux_thread_schedstat()
+        thread_cpu_ns = _thread_cpu_time_ns()
+        monotonic_ns = time.perf_counter_ns()
+    else:
+        monotonic_ns = time.perf_counter_ns()
+        thread_cpu_ns = _thread_cpu_time_ns()
+        schedstat = _linux_thread_schedstat()
+    if thread_cpu_ns is None and schedstat is not None:
+        thread_cpu_ns = schedstat["cpu_runtime_ns"]
+    return ThreadRuntimeSnapshot(
+        monotonic_ns=monotonic_ns,
+        thread_cpu_ns=thread_cpu_ns,
+        runqueue_wait_ns=(
+            None if schedstat is None else schedstat["runqueue_wait_ns"]
+        ),
+        timeslices=None if schedstat is None else schedstat["timeslices"],
+    )
 
 
 def _parse_proc_stat_cpu(payload: str | None) -> dict[str, int] | None:

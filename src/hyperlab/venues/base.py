@@ -81,6 +81,13 @@ class HttpRequestDiagnostics:
     socket_family: str | None = None
     response_cloudfront_pop: str | None = None
     response_cache: str | None = None
+    request_boundary_monotonic_elapsed_ms: float | None = None
+    request_boundary_thread_cpu_ms: float | None = None
+    request_boundary_thread_runqueue_wait_ms: float | None = None
+    request_boundary_thread_timeslice_delta: int | None = None
+    requests_session_request_ordinal: int | None = None
+    urllib3_connection_observed_age_ms: float | None = None
+    tls_socket_observed_age_ms: float | None = None
 
     def __post_init__(self) -> None:
         timings = (
@@ -89,6 +96,11 @@ class HttpRequestDiagnostics:
             self.json_decode_ms,
             self.diagnostic_prepare_ms,
             self.diagnostic_finalize_ms,
+            self.request_boundary_monotonic_elapsed_ms,
+            self.request_boundary_thread_cpu_ms,
+            self.request_boundary_thread_runqueue_wait_ms,
+            self.urllib3_connection_observed_age_ms,
+            self.tls_socket_observed_age_ms,
         )
         if any(value is not None and value < 0 for value in timings):
             raise ValueError("HTTP diagnostic timings must be non-negative")
@@ -111,6 +123,18 @@ class HttpRequestDiagnostics:
         )
         if any(value is not None and value < 0 for value in sequences):
             raise ValueError("HTTP diagnostic completion sequences must be non-negative")
+        if self.request_boundary_thread_timeslice_delta is not None and (
+            isinstance(self.request_boundary_thread_timeslice_delta, bool)
+            or not isinstance(self.request_boundary_thread_timeslice_delta, int)
+            or self.request_boundary_thread_timeslice_delta < 0
+        ):
+            raise ValueError("request boundary timeslice delta must be a non-negative integer")
+        if self.requests_session_request_ordinal is not None and (
+            isinstance(self.requests_session_request_ordinal, bool)
+            or not isinstance(self.requests_session_request_ordinal, int)
+            or self.requests_session_request_ordinal <= 0
+        ):
+            raise ValueError("Requests session request ordinal must be a positive integer")
         if self.outcome not in {"success", "failure"}:
             raise ValueError("HTTP diagnostic outcome must be success or failure")
         if self.outcome == "success" and (self.failure_stage is not None or self.exception_type is not None):

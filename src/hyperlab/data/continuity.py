@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -40,6 +41,7 @@ MAX_CLOCK_SAMPLING_INTERVAL_MS = 10_000
 MAX_CLOCK_AGE_MS = 15_000
 MAX_CLOCK_UNCERTAINTY_MS = Decimal("50")
 MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES = 1
+_REQUIRED_WIRE_FORENSIC_SAMPLE_LIMIT = 32
 
 _REQUIRED_TYPES = frozenset(
     {
@@ -158,6 +160,7 @@ class _ClockAudit:
     offset_discontinuities: int
     offset_discontinuity_captures: frozenset[str]
     max_sample_gap_ms: float | None
+    forensics: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +173,265 @@ class _EventOutageAudit:
     unclean_in_window_disconnect_events: int
     clean_terminal_roles: Mapping[str, frozenset[str]]
     failure_events_by_capture: Mapping[str, tuple[Mapping[str, object], ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RequiredWireAudit:
+    counts: Mapping[str, int]
+    by_kind_asset: Mapping[str, Mapping[str, int]]
+    total: int
+    samples: tuple[Mapping[str, object], ...]
+
+
+@dataclass(slots=True)
+class _StreamingNumericSummary:
+    count: int = 0
+    total: Decimal = Decimal(0)
+    minimum: Decimal | None = None
+    maximum: Decimal | None = None
+
+    def observe(self, value: object) -> None:
+        try:
+            numeric = Decimal(str(value))
+        except (ArithmeticError, TypeError, ValueError):
+            return
+        if not numeric.is_finite():
+            return
+        self.count += 1
+        self.total += numeric
+        self.minimum = numeric if self.minimum is None else min(self.minimum, numeric)
+        self.maximum = numeric if self.maximum is None else max(self.maximum, numeric)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "count": self.count,
+            "min": None if self.minimum is None else float(self.minimum),
+            "mean": None if self.count == 0 else float(self.total / self.count),
+            "max": None if self.maximum is None else float(self.maximum),
+        }
+
+
+def _clock_forensic_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return _iso(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+class _ClockForensicAccumulator:
+    _OUTCOMES = ("valid", "rejected", "hard_invalid")
+
+    def __init__(self) -> None:
+        self.schema_versions: dict[int, int] = defaultdict(int)
+        self.outcomes = {outcome: 0 for outcome in self._OUTCOMES}
+        self.field_coverage = {
+            outcome: {
+                field: {"present": 0, "null": 0}
+                for field in _CLOCK_FORENSIC_FIELDS
+            }
+            for outcome in self._OUTCOMES
+        }
+        self.timing_summaries = {
+            outcome: {
+                field: _StreamingNumericSummary()
+                for field in _CLOCK_FORENSIC_TIMING_FIELDS
+            }
+            for outcome in self._OUTCOMES
+        }
+        self.counter_summaries = {
+            outcome: {
+                field: _StreamingNumericSummary()
+                for field in _CLOCK_FORENSIC_COUNTER_FIELDS
+            }
+            for outcome in self._OUTCOMES
+        }
+        self.boolean_counts = {
+            outcome: {
+                field: {"true": 0, "false": 0, "null": 0}
+                for field in _CLOCK_FORENSIC_BOOLEAN_FIELDS
+            }
+            for outcome in self._OUTCOMES
+        }
+        self.rejected_samples_seen = 0
+        self.rejected_samples: list[
+            tuple[tuple[str, str, str], Mapping[str, object]]
+        ] = []
+        self.consecutive_pairs_seen = 0
+        self.consecutive_pairs: list[
+            tuple[tuple[str, str, str], Mapping[str, object]]
+        ] = []
+        self.last_rejected_by_capture: dict[str, Mapping[str, object]] = {}
+
+    @staticmethod
+    def _sample_key(sample: Mapping[str, object]) -> tuple[str, str, str]:
+        return (
+            str(sample.get("capture_epoch_id") or ""),
+            str(sample.get("request_sent_time") or ""),
+            str(sample.get("observation_id") or ""),
+        )
+
+    @staticmethod
+    def _retain(
+        candidates: list[
+            tuple[tuple[str, str, str], Mapping[str, object]]
+        ],
+        sample: Mapping[str, object],
+        *,
+        limit: int,
+    ) -> None:
+        candidates.append((_ClockForensicAccumulator._sample_key(sample), sample))
+        candidates.sort(key=lambda candidate: candidate[0])
+        if len(candidates) > limit:
+            candidates.pop()
+
+    @staticmethod
+    def _sample(row: Mapping[str, object]) -> Mapping[str, object]:
+        fields = (
+            "schema_version",
+            "observation_id",
+            "capture_epoch_id",
+            "connection_id",
+            "connection_epoch",
+            "request_sent_time",
+            "response_received_time",
+            "server_time",
+            "received_time",
+            "causal_valid_from",
+            "causal_valid_until",
+            "round_trip_latency_ms",
+            "estimated_clock_drift_ms",
+            "drift_uncertainty_ms",
+            "sample_status",
+            "invalid_reason",
+            "sampling_interval_ms",
+            "max_age_ms",
+            "max_uncertainty_ms",
+            *_CLOCK_FORENSIC_FIELDS,
+        )
+        return {
+            field: _clock_forensic_value(row.get(field))
+            for field in fields
+        }
+
+    def observe(
+        self,
+        row: Mapping[str, object],
+        outcome: str,
+    ) -> Mapping[str, object]:
+        if outcome not in self.outcomes:
+            raise ValueError(f"unsupported clock forensic outcome: {outcome}")
+        version = int(str(row.get("schema_version", 0)))
+        self.schema_versions[version] += 1
+        self.outcomes[outcome] += 1
+        for field in _CLOCK_FORENSIC_FIELDS:
+            coverage = self.field_coverage[outcome][field]
+            value = row.get(field)
+            coverage["null" if value is None else "present"] += 1
+        for field in _CLOCK_FORENSIC_TIMING_FIELDS:
+            value = row.get(field)
+            if value is not None:
+                self.timing_summaries[outcome][field].observe(value)
+        for field in _CLOCK_FORENSIC_COUNTER_FIELDS:
+            value = row.get(field)
+            if value is not None:
+                self.counter_summaries[outcome][field].observe(value)
+        for field in _CLOCK_FORENSIC_BOOLEAN_FIELDS:
+            value = row.get(field)
+            counts = self.boolean_counts[outcome][field]
+            if value is True:
+                counts["true"] += 1
+            elif value is False:
+                counts["false"] += 1
+            else:
+                counts["null"] += 1
+        sample = self._sample(row)
+        if outcome == "rejected":
+            self.rejected_samples_seen += 1
+            self._retain(
+                self.rejected_samples,
+                sample,
+                limit=_CLOCK_FORENSIC_REJECTED_SAMPLE_LIMIT,
+            )
+        return sample
+
+    def observe_rejection_streak(
+        self,
+        capture: str,
+        streak: int,
+        sample: Mapping[str, object],
+    ) -> None:
+        previous = self.last_rejected_by_capture.get(capture)
+        if streak == MAX_CONSECUTIVE_REJECTED_CLOCK_PROBES + 1:
+            self.consecutive_pairs_seen += 1
+            pair: Mapping[str, object] = {
+                "capture_epoch_id": capture,
+                "rejections": [previous, sample],
+            }
+            self._retain(
+                self.consecutive_pairs,
+                sample={**sample, "pair": pair},
+                limit=_CLOCK_FORENSIC_CONSECUTIVE_PAIR_LIMIT,
+            )
+        self.last_rejected_by_capture[capture] = sample
+
+    def reset_rejection_streak(self, capture: str) -> None:
+        self.last_rejected_by_capture.pop(capture, None)
+
+    def as_dict(self) -> dict[str, object]:
+        pair_payloads = [
+            candidate["pair"]
+            for _, candidate in self.consecutive_pairs
+        ]
+        return {
+            "classification": "evidence_only_no_gate_override",
+            "population": (
+                "v2_plus_in_window_and_retained_boundary_rows_"
+                "excluding_cadence_only_successors"
+            ),
+            "diagnostic_fields_projected": list(_CLOCK_FORENSIC_FIELDS),
+            "schema_version_counts": {
+                str(version): count
+                for version, count in sorted(self.schema_versions.items())
+            },
+            "outcomes": dict(self.outcomes),
+            "field_coverage_by_outcome": self.field_coverage,
+            "timing_summaries_by_outcome": {
+                outcome: {
+                    field: summary.as_dict()
+                    for field, summary in summaries.items()
+                }
+                for outcome, summaries in self.timing_summaries.items()
+            },
+            "counter_summaries_by_outcome": {
+                outcome: {
+                    field: summary.as_dict()
+                    for field, summary in summaries.items()
+                }
+                for outcome, summaries in self.counter_summaries.items()
+            },
+            "boolean_counts_by_outcome": self.boolean_counts,
+            "rejected_evidence": {
+                "sample_limit": _CLOCK_FORENSIC_REJECTED_SAMPLE_LIMIT,
+                "total": self.rejected_samples_seen,
+                "retained": len(self.rejected_samples),
+                "truncated": max(
+                    self.rejected_samples_seen - len(self.rejected_samples),
+                    0,
+                ),
+                "samples": [sample for _, sample in self.rejected_samples],
+            },
+            "consecutive_rejection_evidence": {
+                "pair_limit": _CLOCK_FORENSIC_CONSECUTIVE_PAIR_LIMIT,
+                "total": self.consecutive_pairs_seen,
+                "retained": len(pair_payloads),
+                "truncated": max(
+                    self.consecutive_pairs_seen - len(pair_payloads),
+                    0,
+                ),
+                "pairs": pair_payloads,
+            },
+        }
 
 
 def _utc(value: datetime) -> datetime:
@@ -363,6 +625,54 @@ def _batch_timestamp_ns(batch: pa.RecordBatch, column: str) -> list[int]:
     return [int(value) for value in values]
 
 
+_CLOCK_FORENSIC_TIMING_FIELDS = (
+    "clock_schedule_overdue_ms",
+    "single_flight_blocked_ms",
+    "executor_submit_to_worker_start_ms",
+    "worker_completion_to_supervisor_drain_ms",
+    "transport_lock_wait_ms",
+    "requests_adapter_header_elapsed_ms",
+    "session_get_total_ms",
+    "json_decode_ms",
+    "diagnostic_prepare_ms",
+    "diagnostic_finalize_ms",
+    "request_boundary_monotonic_elapsed_ms",
+    "request_boundary_thread_cpu_ms",
+    "request_boundary_thread_runqueue_wait_ms",
+    "urllib3_connection_observed_age_ms",
+    "tls_socket_observed_age_ms",
+)
+_CLOCK_FORENSIC_COUNTER_FIELDS = (
+    "request_boundary_thread_timeslice_delta",
+    "requests_session_request_ordinal",
+)
+_CLOCK_FORENSIC_BOOLEAN_FIELDS = (
+    "new_urllib3_connection_object_created",
+    "requests_session_reused",
+    "urllib3_connection_reused",
+    "tls_socket_reused",
+    "tls_session_reused",
+    "post_request_observation_current",
+)
+_CLOCK_FORENSIC_CONTEXT_FIELDS = (
+    "urllib3_connection_identity",
+    "tls_socket_identity",
+    "peer_ip",
+    "peer_port",
+    "socket_family",
+    "response_cloudfront_pop",
+    "response_cache",
+)
+_CLOCK_FORENSIC_FIELDS = (
+    *_CLOCK_FORENSIC_TIMING_FIELDS,
+    *_CLOCK_FORENSIC_COUNTER_FIELDS,
+    *_CLOCK_FORENSIC_BOOLEAN_FIELDS,
+    *_CLOCK_FORENSIC_CONTEXT_FIELDS,
+)
+_CLOCK_FORENSIC_REJECTED_SAMPLE_LIMIT = 64
+_CLOCK_FORENSIC_CONSECUTIVE_PAIR_LIMIT = 32
+
+
 _PROJECTED_ROW_COLUMNS = frozenset(
     {
         "schema_version",
@@ -407,6 +717,7 @@ _PROJECTED_ROW_COLUMNS = frozenset(
         "observation_id",
         "request_sent_time",
         "response_received_time",
+        "server_time",
         "round_trip_latency_ms",
         "estimated_clock_drift_ms",
         "drift_uncertainty_ms",
@@ -417,6 +728,8 @@ _PROJECTED_ROW_COLUMNS = frozenset(
         "sampling_interval_ms",
         "max_age_ms",
         "max_uncertainty_ms",
+        "payload_sha256",
+        *_CLOCK_FORENSIC_FIELDS,
     }
 )
 
@@ -2433,8 +2746,15 @@ def _orphan_required_wire_counts(
     venue: str,
     assets: Sequence[str],
     lineage: _ConnectionLineage,
-) -> dict[str, int]:
+) -> _RequiredWireAudit:
     counts = {asset: 0 for asset in assets}
+    by_kind_asset = {
+        kind: {asset: 0 for asset in assets}
+        for kind in ("bbo", "l2", "trade", "unknown")
+    }
+    sample_candidates: list[
+        tuple[tuple[str, str, str, str, str, int, int], Mapping[str, object]]
+    ] = []
     type_by_kind = {
         "bbo": RecordType.BBO,
         "l2": RecordType.L2_BOOK_STATE,
@@ -2445,6 +2765,90 @@ def _orphan_required_wire_counts(
         if venue == BINANCE
         else {"bbo": "public", "l2": "public", "trade": "public"}
     )
+
+    def expected_normalized_count(
+        raw: Mapping[str, object],
+        kind: str,
+        asset: str,
+    ) -> int:
+        if venue != HYPERLIQUID or kind != "trade":
+            return 1
+        try:
+            root = json.loads(str(raw.get("raw_message")))
+            data = root["data"]
+            return sum(
+                isinstance(item, Mapping) and item.get("coin") == asset
+                for item in data
+            )
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return 0
+
+    def record_orphan(
+        raw: Mapping[str, object],
+        *,
+        asset: str,
+        kind: str,
+        reason: str,
+        expected_count: int,
+        exact_count: int | None,
+        payload_kind: str | None,
+    ) -> None:
+        counts[asset] += 1
+        by_kind_asset[kind][asset] += 1
+        received = _timestamp(
+            raw["received_time"],
+            label="orphan raw received_time",
+        )
+        raw_message = raw.get("raw_message")
+        persisted_sha256 = raw.get("payload_sha256")
+        payload_sha256 = (
+            str(persisted_sha256)
+            if isinstance(persisted_sha256, str) and persisted_sha256
+            else hashlib.sha256(str(raw_message).encode()).hexdigest()
+        )
+        connection_epoch_value = raw.get("connection_epoch")
+        arrival_sequence_value = raw.get("arrival_sequence")
+        connection_epoch = (
+            None
+            if connection_epoch_value is None
+            else int(str(connection_epoch_value))
+        )
+        arrival_sequence = (
+            None
+            if arrival_sequence_value is None
+            else int(str(arrival_sequence_value))
+        )
+        sample: Mapping[str, object] = {
+            "venue": venue,
+            "asset": asset,
+            "kind": kind,
+            "reason": reason,
+            "capture_epoch_id": raw.get("capture_epoch_id"),
+            "connection_id": raw.get("connection_id"),
+            "connection_epoch": connection_epoch,
+            "arrival_sequence": arrival_sequence,
+            "received_time": _iso(received),
+            "payload_sha256": payload_sha256,
+            "persisted_message_asset": raw.get("message_asset"),
+            "persisted_channel": raw.get("channel"),
+            "payload_kind": payload_kind,
+            "expected_normalized_count": expected_count,
+            "exact_normalized_count": exact_count,
+        }
+        key = (
+            _iso(received),
+            venue,
+            asset,
+            str(raw.get("capture_epoch_id") or ""),
+            str(raw.get("connection_id") or ""),
+            -1 if connection_epoch is None else connection_epoch,
+            -1 if arrival_sequence is None else arrival_sequence,
+        )
+        sample_candidates.append((key, sample))
+        sample_candidates.sort(key=lambda candidate: candidate[0])
+        if len(sample_candidates) > _REQUIRED_WIRE_FORENSIC_SAMPLE_LIMIT:
+            sample_candidates.pop()
+
     for raw in _all_rows(loaded, venue, RecordType.WIRE_MESSAGE):
         persisted_asset = raw.get("message_asset")
         target_assets: tuple[str, ...]
@@ -2457,7 +2861,20 @@ def _orphan_required_wire_counts(
                 next(iter(payload_asset_candidates)) if len(payload_asset_candidates) == 1 else None
             )
             if payload_asset is not None and persisted_asset != payload_asset:
-                counts[payload_asset] += 1
+                classified_kind = kind or "unknown"
+                record_orphan(
+                    raw,
+                    asset=payload_asset,
+                    kind=classified_kind,
+                    reason="message_asset_mismatch",
+                    expected_count=expected_normalized_count(
+                        raw,
+                        classified_kind,
+                        payload_asset,
+                    ),
+                    exact_count=None,
+                    payload_kind=payload_kind,
+                )
                 continue
             fallback_asset = persisted_asset if isinstance(persisted_asset, str) else None
             target = payload_asset or fallback_asset
@@ -2468,7 +2885,20 @@ def _orphan_required_wire_counts(
             primary_asset = _raw_primary_payload_asset(venue, raw)
             if requested_payload_assets and persisted_asset != primary_asset:
                 for payload_asset in requested_payload_assets:
-                    counts[payload_asset] += 1
+                    classified_kind = kind or "unknown"
+                    record_orphan(
+                        raw,
+                        asset=payload_asset,
+                        kind=classified_kind,
+                        reason="message_asset_mismatch",
+                        expected_count=expected_normalized_count(
+                            raw,
+                            classified_kind,
+                            payload_asset,
+                        ),
+                        exact_count=None,
+                        payload_kind=payload_kind,
+                    )
                 continue
             if requested_payload_assets:
                 target_assets = tuple(sorted(requested_payload_assets))
@@ -2480,7 +2910,15 @@ def _orphan_required_wire_counts(
             continue
         if payload_kind is not None and persisted_kind != payload_kind:
             for asset in target_assets:
-                counts[asset] += 1
+                record_orphan(
+                    raw,
+                    asset=asset,
+                    kind=kind,
+                    reason="persisted_channel_payload_kind_mismatch",
+                    expected_count=expected_normalized_count(raw, kind, asset),
+                    exact_count=None,
+                    payload_kind=payload_kind,
+                )
             continue
         for asset in target_assets:
             candidates = [
@@ -2500,7 +2938,15 @@ def _orphan_required_wire_counts(
                 )
             ]
             if not _wire_role_matches(raw, lineage, expected_role[kind]):
-                counts[asset] += 1
+                record_orphan(
+                    raw,
+                    asset=asset,
+                    kind=kind,
+                    reason="connection_role_lineage_mismatch",
+                    expected_count=expected_normalized_count(raw, kind, asset),
+                    exact_count=None,
+                    payload_kind=payload_kind,
+                )
                 continue
             if venue == BINANCE:
                 exact = [
@@ -2575,8 +3021,55 @@ def _orphan_required_wire_counts(
                     except (KeyError, TypeError, json.JSONDecodeError):
                         expected_count = 0
             if expected_count <= 0 or len(exact) != expected_count:
-                counts[asset] += 1
-    return counts
+                record_orphan(
+                    raw,
+                    asset=asset,
+                    kind=kind,
+                    reason="exact_normalization_count_mismatch",
+                    expected_count=expected_count,
+                    exact_count=len(exact),
+                    payload_kind=payload_kind,
+                )
+    return _RequiredWireAudit(
+        counts=counts,
+        by_kind_asset=by_kind_asset,
+        total=sum(counts.values()),
+        samples=tuple(sample for _, sample in sample_candidates),
+    )
+
+
+def _required_wire_forensics(
+    audits: Mapping[str, _RequiredWireAudit],
+) -> dict[str, object]:
+    samples = sorted(
+        (sample for audit in audits.values() for sample in audit.samples),
+        key=lambda sample: (
+            str(sample.get("received_time") or ""),
+            str(sample.get("venue") or ""),
+            str(sample.get("asset") or ""),
+            str(sample.get("kind") or ""),
+            str(sample.get("capture_epoch_id") or ""),
+            str(sample.get("connection_id") or ""),
+            int(str(sample.get("connection_epoch") or -1)),
+            int(str(sample.get("arrival_sequence") or -1)),
+        ),
+    )[:_REQUIRED_WIRE_FORENSIC_SAMPLE_LIMIT]
+    orphan_total = sum(audit.total for audit in audits.values())
+    return {
+        "classification": "evidence_only_no_economic_reuse",
+        "sample_limit": _REQUIRED_WIRE_FORENSIC_SAMPLE_LIMIT,
+        "orphan_total": orphan_total,
+        "samples_retained": len(samples),
+        "samples_truncated": max(orphan_total - len(samples), 0),
+        "by_kind_asset": {
+            venue: {
+                kind: dict(by_asset)
+                for kind, by_asset in audit.by_kind_asset.items()
+            }
+            for venue, audit in audits.items()
+        },
+        "samples": samples,
+    }
 
 
 def _orphan_normalized_l2_level_counts(
@@ -3170,6 +3663,7 @@ def _clock_intervals(
     invalid_times: dict[str, list[datetime]] = defaultdict(list)
     consecutive_rejection_times: dict[str, list[datetime]] = defaultdict(list)
     rejection_streak_by_capture: dict[str, int] = defaultdict(int)
+    clock_forensics = _ClockForensicAccumulator()
 
     def strict_policy_values(
         row: Mapping[str, object],
@@ -3244,6 +3738,7 @@ def _clock_intervals(
         if not isinstance(capture, str) or not capture:
             invalid += 1
             hard_invalid += 1
+            clock_forensics.observe(row, "hard_invalid")
             if start <= received < end:
                 in_window_invalid_events += 1
                 in_window_hard_invalid_events += 1
@@ -3286,6 +3781,7 @@ def _clock_intervals(
         if not identity_valid:
             invalid += 1
             hard_invalid += 1
+            clock_forensics.observe(row, "hard_invalid")
             identity_rejections += 1
             if start <= received < end:
                 in_window_invalid_events += 1
@@ -3302,6 +3798,7 @@ def _clock_intervals(
             if not strict_policy_valid:
                 invalid += 1
                 hard_invalid += 1
+                clock_forensics.observe(row, "hard_invalid")
                 strict_policy_rejections += 1
                 if start <= received < end:
                     in_window_invalid_events += 1
@@ -3316,6 +3813,7 @@ def _clock_intervals(
             if not isinstance(left, datetime) or not isinstance(right, datetime):
                 invalid += 1
                 hard_invalid += 1
+                clock_forensics.observe(row, "hard_invalid")
                 if start <= received < end:
                     in_window_invalid_events += 1
                     in_window_hard_invalid_events += 1
@@ -3333,9 +3831,12 @@ def _clock_intervals(
                 )
                 valid += 1
                 rejection_streak_by_capture[capture] = 0
+                clock_forensics.observe(row, "valid")
+                clock_forensics.reset_rejection_streak(capture)
             else:
                 invalid += 1
                 hard_invalid += 1
+                clock_forensics.observe(row, "hard_invalid")
                 if start <= received < end:
                     in_window_invalid_events += 1
                     in_window_hard_invalid_events += 1
@@ -3348,6 +3849,12 @@ def _clock_intervals(
                 rejected_probes += 1
                 rejection_streak = rejection_streak_by_capture[capture] + 1
                 rejection_streak_by_capture[capture] = rejection_streak
+                rejected_sample = clock_forensics.observe(row, "rejected")
+                clock_forensics.observe_rejection_streak(
+                    capture,
+                    rejection_streak,
+                    rejected_sample,
+                )
                 max_consecutive_rejected_probes = max(
                     max_consecutive_rejected_probes,
                     rejection_streak,
@@ -3360,6 +3867,7 @@ def _clock_intervals(
                     consecutive_rejection_times[capture].append(received)
                 continue
             hard_invalid += 1
+            clock_forensics.observe(row, "hard_invalid")
             if start <= received < end:
                 in_window_hard_invalid_events += 1
             invalid_times[capture].append(received)
@@ -3664,6 +4172,7 @@ def _clock_intervals(
         offset_discontinuities=offset_discontinuities,
         offset_discontinuity_captures=frozenset(offset_discontinuity_captures),
         max_sample_gap_ms=(None if max_sample_gap_ms is None else round(max_sample_gap_ms, 3)),
+        forensics=clock_forensics.as_dict(),
     )
 
 
@@ -3888,6 +4397,79 @@ def _interval_payload(intervals: Iterable[Interval]) -> list[dict[str, object]]:
     ]
 
 
+def _terminal_role_diagnostic(
+    loaded: _LoadedLake,
+    *,
+    venue: str,
+    active_captures: Sequence[str],
+    required_roles: frozenset[str],
+    outage_audit: _EventOutageAudit,
+    end: datetime,
+) -> dict[str, object]:
+    active = frozenset(active_captures)
+    latest_connect: datetime | None = None
+    latest_capture: str | None = None
+    latest_ambiguous = False
+    for row in _rows_with_boundaries(
+        loaded,
+        venue,
+        RecordType.CONNECTION_EVENT,
+    ):
+        if row.get("event_kind") != "connect":
+            continue
+        capture = row.get("capture_epoch_id")
+        if not isinstance(capture, str) or capture not in active:
+            continue
+        received = _timestamp(
+            row["received_time"],
+            label="terminal diagnostic connect received_time",
+        )
+        if received >= end:
+            continue
+        if latest_connect is None or received > latest_connect:
+            latest_connect = received
+            latest_capture = capture
+            latest_ambiguous = False
+        elif received == latest_connect and capture != latest_capture:
+            latest_ambiguous = True
+
+    if not active:
+        selection_status = "no_active_capture_generation"
+        final_capture = None
+    elif latest_connect is None or latest_capture is None:
+        selection_status = "no_connect_for_active_capture_generation"
+        final_capture = None
+    elif latest_ambiguous:
+        selection_status = "ambiguous_latest_connect"
+        final_capture = None
+    else:
+        selection_status = "selected_latest_connect"
+        final_capture = latest_capture
+
+    observed_roles = (
+        frozenset()
+        if final_capture is None
+        else outage_audit.clean_terminal_roles.get(
+            final_capture,
+            frozenset(),
+        )
+    )
+    missing_roles = required_roles - observed_roles
+    complete = (
+        selection_status == "selected_latest_connect"
+        and observed_roles == required_roles
+    )
+    return {
+        "selection_status": selection_status,
+        "active_capture_generation_count": len(active),
+        "final_capture_epoch_id": final_capture,
+        "required_roles": sorted(required_roles),
+        "observed_clean_terminal_roles": sorted(observed_roles),
+        "missing_clean_terminal_roles": sorted(missing_roles),
+        "complete": complete,
+    }
+
+
 def _intersect_many(interval_sets: Sequence[Iterable[Interval]]) -> tuple[Interval, ...]:
     if not interval_sets:
         return ()
@@ -4065,8 +4647,9 @@ def _audit_phase10_continuity_impl(
         normalized_assets,
         hyperliquid_lineage,
     )
-    orphan_required_wire_total = sum(binance_orphan_required_wire.values()) + sum(
-        hyperliquid_orphan_required_wire.values()
+    orphan_required_wire_total = (
+        binance_orphan_required_wire.total
+        + hyperliquid_orphan_required_wire.total
     )
     binance_orphan_l2_levels = _orphan_normalized_l2_level_counts(
         loaded,
@@ -4365,21 +4948,29 @@ def _audit_phase10_continuity_impl(
     requested_margin_limit = timedelta(milliseconds=MAX_CLOCK_AGE_MS)
     leading_margin_exceeded = leading_gap > requested_margin_limit
     trailing_margin_exceeded = trailing_gap > requested_margin_limit
+    terminal_role_diagnostics = {
+        BINANCE: _terminal_role_diagnostic(
+            loaded,
+            venue=BINANCE,
+            active_captures=market_active_captures,
+            required_roles=frozenset({"public", "market"}),
+            outage_audit=binance_outage_audit,
+            end=end,
+        ),
+        HYPERLIQUID: _terminal_role_diagnostic(
+            loaded,
+            venue=HYPERLIQUID,
+            active_captures=hyperliquid_active_captures,
+            required_roles=frozenset({"public"}),
+            outage_audit=hyperliquid_outage_audit,
+            end=end,
+        ),
+    }
     trailing_terminal_roles_complete = assessed_span is not None and (
         trailing_gap == timedelta()
         or (
-            len(market_active_captures) == 1
-            and binance_outage_audit.clean_terminal_roles.get(
-                market_active_captures[0],
-                frozenset(),
-            )
-            == frozenset({"public", "market"})
-            and len(hyperliquid_active_captures) == 1
-            and hyperliquid_outage_audit.clean_terminal_roles.get(
-                hyperliquid_active_captures[0],
-                frozenset(),
-            )
-            == frozenset({"public"})
+            terminal_role_diagnostics[BINANCE]["complete"] is True
+            and terminal_role_diagnostics[HYPERLIQUID]["complete"] is True
         )
     )
     trailing_terminal_incomplete = trailing_gap > timedelta() and not trailing_terminal_roles_complete
@@ -4505,6 +5096,7 @@ def _audit_phase10_continuity_impl(
             "leading_margin_within_limit": not leading_margin_exceeded,
             "trailing_margin_within_limit": not trailing_margin_exceeded,
             "trailing_terminal_roles_complete": (trailing_terminal_roles_complete),
+            "terminal_role_diagnostics": terminal_role_diagnostics,
         },
         "policy": {
             "interval_semantics": "half_open_received_time_causal",
@@ -4587,9 +5179,15 @@ def _audit_phase10_continuity_impl(
         "required_wire_lineage": {
             "orphan_required_wire_total": orphan_required_wire_total,
             "by_venue_asset": {
-                BINANCE: binance_orphan_required_wire,
-                HYPERLIQUID: hyperliquid_orphan_required_wire,
+                BINANCE: dict(binance_orphan_required_wire.counts),
+                HYPERLIQUID: dict(hyperliquid_orphan_required_wire.counts),
             },
+            "forensics": _required_wire_forensics(
+                {
+                    BINANCE: binance_orphan_required_wire,
+                    HYPERLIQUID: hyperliquid_orphan_required_wire,
+                }
+            ),
         },
         "normalized_l2_level_lineage": {
             "orphan_level_total": orphan_normalized_l2_level_total,
@@ -4605,6 +5203,7 @@ def _audit_phase10_continuity_impl(
             ],
         },
         "clock_sync": {
+            "forensics": clock_audit.forensics,
             "legacy_v1_ignored": clock_audit.legacy_samples,
             "valid_v2_samples": clock_audit.valid_samples,
             "invalid_v2_samples": clock_audit.invalid_samples,

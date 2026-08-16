@@ -341,6 +341,16 @@ class PublicCollector:
         while not self._should_stop(started, max_messages, duration_seconds):
             connection_id = f"ws-{self.metrics.connection_epoch + 1}-{self.connection_id_factory()}"
             connected = False
+            generation_liveness: dict[str, object] = {
+                "connected_at_monotonic": None,
+                "live_started_monotonic": None,
+                "last_ping_baseline_monotonic": None,
+                "last_ping_sent_monotonic": None,
+                "last_pong_baseline_monotonic": None,
+                "last_pong_received_monotonic": None,
+                "pending_ack_subscriptions": set(),
+                "live": False,
+            }
             try:
                 next_epoch = self.metrics.connection_epoch + 1
                 self._drain_rest_refresh(wait=True)
@@ -414,6 +424,7 @@ class PublicCollector:
 
                 subscriptions = self.config.subscriptions()
                 pending = {subscription.key for subscription in subscriptions}
+                generation_liveness["pending_ack_subscriptions"] = pending
                 for subscription in subscriptions:
                     socket.send_json(
                         {
@@ -425,6 +436,13 @@ class PublicCollector:
                 connected_at = self.monotonic()
                 last_ping = connected_at
                 last_pong = connected_at
+                generation_liveness.update(
+                    {
+                        "connected_at_monotonic": connected_at,
+                        "last_ping_baseline_monotonic": last_ping,
+                        "last_pong_baseline_monotonic": last_pong,
+                    }
+                )
                 last_flush = connected_at
                 last_status_publish = connected_at
                 last_rest_refresh = connected_at
@@ -469,6 +487,12 @@ class PublicCollector:
                         )
                         if parsed.is_pong:
                             last_pong = wire_received_mono
+                            generation_liveness["last_pong_baseline_monotonic"] = (
+                                wire_received_mono
+                            )
+                            generation_liveness["last_pong_received_monotonic"] = (
+                                wire_received_mono
+                            )
                             self.metrics.pongs_received += 1
                         if parsed.acknowledged_subscription is not None:
                             self.metrics.subscription_acks += 1
@@ -483,6 +507,8 @@ class PublicCollector:
                             self._publish_status()
                         self.metrics.current_backoff_seconds = 0.0
                         live = True
+                        generation_liveness["live"] = True
+                        generation_liveness["live_started_monotonic"] = observed_mono
                         self._live_since = observed_mono
                         last_flush = observed_mono
 
@@ -502,6 +528,8 @@ class PublicCollector:
                         socket.send_json({"method": "ping"})
                         self.metrics.pings_sent += 1
                         last_ping = observed_mono
+                        generation_liveness["last_ping_baseline_monotonic"] = observed_mono
+                        generation_liveness["last_ping_sent_monotonic"] = observed_mono
                     if observed_mono - last_pong > self.config.pong_timeout_seconds:
                         backlog_state, _snapshot = self._socket_backlog_state(
                             socket,
@@ -583,6 +611,7 @@ class PublicCollector:
                     connected=connected,
                     error=exc,
                     will_reconnect=False,
+                    liveness=generation_liveness,
                 )
                 self.metrics.connection_alive = False
                 if socket is not None:
@@ -602,6 +631,15 @@ class PublicCollector:
                         self._publish_status(error=f"{type(exc).__name__}: {exc}")
                     raise
                 if isinstance(exc, InterruptedError) and self._stop_requested:
+                    if connected:
+                        self._add_connection_event(
+                            connection_id,
+                            self.metrics.connection_epoch,
+                            event_kind="disconnect",
+                            reason="collector stop requested or bounded run completed",
+                        )
+                    if self.sink.pending_count:
+                        self._flush()
                     self.metrics.connection_alive = False
                     if socket is not None:
                         self._close_socket_with_telemetry(
@@ -609,8 +647,6 @@ class PublicCollector:
                             reason="collector stop requested",
                         )
                         socket = None
-                    if self.sink.pending_count:
-                        self._flush()
                     break
                 fatal_local_capacity = isinstance(
                     exc,
@@ -623,6 +659,7 @@ class PublicCollector:
                     connected=connected,
                     error=exc,
                     will_reconnect=not fatal_local_capacity,
+                    liveness=generation_liveness,
                 )
                 self.metrics.connection_alive = False
                 if socket is not None:
@@ -792,6 +829,30 @@ class PublicCollector:
             return "draining", snapshot
         return "none", snapshot
 
+    @staticmethod
+    def _safe_mapping_snapshot(
+        snapshot: Callable[[], object],
+        *,
+        label: str,
+    ) -> dict[str, object]:
+        try:
+            value = snapshot()
+        except Exception as exc:
+            return {"telemetry_error": f"{label}: {type(exc).__name__}: {exc}"}
+        if not isinstance(value, Mapping):
+            return {"telemetry_error": f"{label} snapshot is not a mapping"}
+        return dict(value)
+
+    @staticmethod
+    def _monotonic_age_ms(observed: float | None, candidate: object) -> float | None:
+        if (
+            observed is None
+            or isinstance(candidate, bool)
+            or not isinstance(candidate, (int, float))
+        ):
+            return None
+        return max(observed - float(candidate), 0.0) * 1_000
+
     def _record_generation_failure(
         self,
         *,
@@ -801,9 +862,71 @@ class PublicCollector:
         connected: bool,
         error: BaseException,
         will_reconnect: bool,
+        liveness: Mapping[str, object] | None = None,
     ) -> None:
         detail = str(error).strip()
         reason = type(error).__name__ if not detail else f"{type(error).__name__}: {detail}"
+        recorded_at = self.clock()
+        try:
+            failure_observed_monotonic = self.monotonic()
+        except Exception:
+            failure_observed_monotonic = None
+        context: Mapping[str, object] = {} if liveness is None else liveness
+        pending_value = context.get("pending_ack_subscriptions")
+        if isinstance(pending_value, (set, frozenset, list, tuple)):
+            pending_ack_subscriptions = sorted(str(value) for value in pending_value)
+        else:
+            pending_ack_subscriptions = []
+        process_snapshot = self._safe_mapping_snapshot(
+            self._runtime_telemetry.snapshot,
+            label="process runtime telemetry",
+        )
+        writer_metrics = getattr(self.sink, "metrics_snapshot", None)
+        writer_snapshot = (
+            self._safe_mapping_snapshot(writer_metrics, label="writer telemetry")
+            if callable(writer_metrics)
+            else None
+        )
+        failure_snapshot: dict[str, object] = {
+            "collector": self.metrics.as_dict(recorded_at),
+            "process": process_snapshot,
+            "writer": writer_snapshot,
+            "liveness": {
+                "collector_state": self.metrics.state.value,
+                "connected": connected,
+                "live": context.get("live") is True,
+                "connection_age_ms": self._monotonic_age_ms(
+                    failure_observed_monotonic,
+                    context.get("connected_at_monotonic"),
+                ),
+                "live_duration_ms": self._monotonic_age_ms(
+                    failure_observed_monotonic,
+                    context.get("live_started_monotonic"),
+                ),
+                "pending_ack_count": len(pending_ack_subscriptions),
+                "pending_ack_subscriptions": pending_ack_subscriptions,
+                "ping": {
+                    "deadline_baseline_age_ms": self._monotonic_age_ms(
+                        failure_observed_monotonic,
+                        context.get("last_ping_baseline_monotonic"),
+                    ),
+                    "last_sent_age_ms": self._monotonic_age_ms(
+                        failure_observed_monotonic,
+                        context.get("last_ping_sent_monotonic"),
+                    ),
+                },
+                "pong": {
+                    "deadline_baseline_age_ms": self._monotonic_age_ms(
+                        failure_observed_monotonic,
+                        context.get("last_pong_baseline_monotonic"),
+                    ),
+                    "last_received_age_ms": self._monotonic_age_ms(
+                        failure_observed_monotonic,
+                        context.get("last_pong_received_monotonic"),
+                    ),
+                },
+            },
+        }
         self._generation_failures_seen += 1
         self._generation_failures.append(
             {
@@ -811,9 +934,10 @@ class PublicCollector:
                 "connection_attempt": generation,
                 "connection_id": connection_id,
                 "connected": connected,
-                "recorded_at": self.clock().isoformat(),
+                "recorded_at": recorded_at.isoformat(),
                 "reason": reason,
                 "socket": self._socket_telemetry(socket),
+                "failure_snapshot": failure_snapshot,
                 "will_reconnect": will_reconnect,
             }
         )

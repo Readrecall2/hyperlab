@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
@@ -14,6 +14,12 @@ from typing import Any, Protocol
 import requests
 
 from hyperlab.collector.models import ParsedMessage, ParsedRecord, WireEnvelope
+from hyperlab.collector.telemetry import (
+    RequestBoundaryRuntimeDelta,
+    ThreadRuntimeSnapshot,
+    capture_thread_runtime_snapshot,
+    request_boundary_runtime_delta,
+)
 from hyperlab.data.schema import RecordType, instrument, latest_schema_for
 from hyperlab.venues.base import (
     ClockMeasurement,
@@ -659,6 +665,7 @@ class _PendingHttpDiagnostics:
     urllib3_counters_before: tuple[int, int] | None
     counters_before_completion_sequence: int
     requests_session_reused: bool
+    requests_session_request_ordinal: int
     diagnostic_prepare_ms: float
     counter_baseline_current: bool = False
     lock_requested_at: float | None = None
@@ -673,6 +680,7 @@ class _PendingHttpDiagnostics:
     exception_type: str | None = None
     completion_sequence: int | None = None
     path_observation: HttpPathObservation | None = None
+    path_observed_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,6 +745,8 @@ class RequestsJsonTransport:
         self._session_requests_prepared = 0
         self._last_urllib3_connection_identity: str | None = None
         self._last_tls_socket_identity: str | None = None
+        self._urllib3_connection_first_observed_at: float | None = None
+        self._tls_socket_first_observed_at: float | None = None
         self._completed_request_sequence = 0
         self._peer_path_observer = HttpPeerPathObserver()
 
@@ -776,14 +786,16 @@ class RequestsJsonTransport:
             counters_before_completion_sequence = self._completed_request_sequence
             counters_before = self._pool_snapshot(url)
         with self._diagnostics_lock:
-            session_reused = self._session_requests_prepared > 0
             self._session_requests_prepared += 1
+            session_request_ordinal = self._session_requests_prepared
+            session_reused = session_request_ordinal > 1
         prepare_completed_at = self._monotonic()
         self._diagnostics.value = _PendingHttpDiagnostics(
             url=url,
             urllib3_counters_before=counters_before,
             counters_before_completion_sequence=counters_before_completion_sequence,
             requests_session_reused=session_reused,
+            requests_session_request_ordinal=session_request_ordinal,
             diagnostic_prepare_ms=max(prepare_completed_at - prepare_started_at, 0.0) * 1_000,
         )
 
@@ -860,27 +872,65 @@ class RequestsJsonTransport:
         except Exception:
             return _TransportIdentityEvidence(None, None, None)
 
+    @staticmethod
+    def _identity_observation(
+        identity: str | None,
+        last_identity: str | None,
+        first_observed_at: float | None,
+        observed_at: float | None,
+    ) -> tuple[bool | None, str | None, float | None, float | None]:
+        if identity is None:
+            return None, None, None, None
+        reused = None if last_identity is None else identity == last_identity
+        if observed_at is None:
+            return reused, identity, None, None
+        if reused is True and first_observed_at is not None:
+            if observed_at < first_observed_at:
+                return reused, identity, observed_at, None
+            return (
+                reused,
+                identity,
+                first_observed_at,
+                (observed_at - first_observed_at) * 1_000,
+            )
+        return reused, identity, observed_at, 0.0
+
     def _connection_reuse_evidence(
         self,
         evidence: _TransportIdentityEvidence,
-    ) -> tuple[bool | None, bool | None]:
+        *,
+        connection_observed_at: float | None,
+        socket_observed_at: float | None,
+    ) -> tuple[bool | None, bool | None, float | None, float | None]:
         with self._diagnostics_lock:
-            connection_reused = (
-                None
-                if evidence.urllib3_connection_identity is None
-                or self._last_urllib3_connection_identity is None
-                else evidence.urllib3_connection_identity
-                == self._last_urllib3_connection_identity
+            (
+                connection_reused,
+                self._last_urllib3_connection_identity,
+                self._urllib3_connection_first_observed_at,
+                connection_observed_age_ms,
+            ) = self._identity_observation(
+                evidence.urllib3_connection_identity,
+                self._last_urllib3_connection_identity,
+                self._urllib3_connection_first_observed_at,
+                connection_observed_at,
             )
-            socket_reused = (
-                None
-                if evidence.tls_socket_identity is None
-                or self._last_tls_socket_identity is None
-                else evidence.tls_socket_identity == self._last_tls_socket_identity
+            (
+                socket_reused,
+                self._last_tls_socket_identity,
+                self._tls_socket_first_observed_at,
+                socket_observed_age_ms,
+            ) = self._identity_observation(
+                evidence.tls_socket_identity,
+                self._last_tls_socket_identity,
+                self._tls_socket_first_observed_at,
+                socket_observed_at,
             )
-            self._last_urllib3_connection_identity = evidence.urllib3_connection_identity
-            self._last_tls_socket_identity = evidence.tls_socket_identity
-        return connection_reused, socket_reused
+        return (
+            connection_reused,
+            socket_reused,
+            connection_observed_age_ms,
+            socket_observed_age_ms,
+        )
 
     def _capture_response_path(
         self,
@@ -937,6 +987,8 @@ class RequestsJsonTransport:
         pending.get_completed_at = self._monotonic()
         if pending.path_observation is None:
             response = self._capture_response_path(pending, response)
+        if pending.path_observation is not None:
+            pending.path_observed_at = pending.get_completed_at
         pending.response = response
 
         try:
@@ -1016,9 +1068,26 @@ class RequestsJsonTransport:
                 counters_after = self._pool_snapshot(pending.url)
                 path_observation = pending.path_observation
                 fallback_evidence = self._transport_identity_evidence(pending.response)
+                fallback_observed_at = self._monotonic()
                 if path_observation is None:
                     evidence = fallback_evidence
+                    connection_observed_at = (
+                        fallback_observed_at
+                        if fallback_evidence.urllib3_connection_identity is not None
+                        else None
+                    )
+                    socket_observed_at = (
+                        fallback_observed_at
+                        if fallback_evidence.tls_socket_identity is not None
+                        else None
+                    )
                 else:
+                    connection_observed_from_path = (
+                        path_observation.urllib3_connection_identity is not None
+                    )
+                    socket_observed_from_path = (
+                        path_observation.tls_socket_identity is not None
+                    )
                     evidence = _TransportIdentityEvidence(
                         urllib3_connection_identity=(
                             path_observation.urllib3_connection_identity
@@ -1034,13 +1103,40 @@ class RequestsJsonTransport:
                             else fallback_evidence.tls_session_reused
                         ),
                     )
-                connection_reused, socket_reused = self._connection_reuse_evidence(
-                    evidence
+                    connection_observed_at = (
+                        pending.path_observed_at
+                        if connection_observed_from_path
+                        else (
+                            fallback_observed_at
+                            if fallback_evidence.urllib3_connection_identity
+                            is not None
+                            else None
+                        )
+                    )
+                    socket_observed_at = (
+                        pending.path_observed_at
+                        if socket_observed_from_path
+                        else (
+                            fallback_observed_at
+                            if fallback_evidence.tls_socket_identity is not None
+                            else None
+                        )
+                    )
+                (
+                    connection_reused,
+                    socket_reused,
+                    connection_observed_age_ms,
+                    socket_observed_age_ms,
+                ) = self._connection_reuse_evidence(
+                    evidence,
+                    connection_observed_at=connection_observed_at,
+                    socket_observed_at=socket_observed_at,
                 )
             else:
                 counters_after = None
                 evidence = _TransportIdentityEvidence(None, None, None)
                 connection_reused, socket_reused = None, None
+                connection_observed_age_ms, socket_observed_age_ms = None, None
 
         counters_before = pending.urllib3_counters_before
         counter_window_current = (
@@ -1108,10 +1204,15 @@ class RequestsJsonTransport:
             failure_stage=pending.failure_stage,
             exception_type=pending.exception_type,
             requests_session_reused=pending.requests_session_reused,
+            requests_session_request_ordinal=(
+                pending.requests_session_request_ordinal
+            ),
             urllib3_connection_identity=evidence.urllib3_connection_identity,
             urllib3_connection_reused=connection_reused,
+            urllib3_connection_observed_age_ms=connection_observed_age_ms,
             tls_socket_identity=evidence.tls_socket_identity,
             tls_socket_reused=socket_reused,
+            tls_socket_observed_age_ms=socket_observed_age_ms,
             tls_session_reused=tls_session_reused,
             diagnostic_prepare_ms=pending.diagnostic_prepare_ms,
             diagnostic_finalize_ms=max(
@@ -1162,6 +1263,10 @@ class BinancePublicRestClient:
         timeout_seconds: float = 15.0,
         transport: JsonGetTransport | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        thread_runtime_snapshot: Callable[
+            [str],
+            ThreadRuntimeSnapshot,
+        ] = capture_thread_runtime_snapshot,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -1169,6 +1274,7 @@ class BinancePublicRestClient:
         self.transport = transport or RequestsJsonTransport()
         self._closed = False
         self.clock = clock
+        self._thread_runtime_snapshot = thread_runtime_snapshot
 
     def close(self) -> None:
         if self._closed:
@@ -1196,6 +1302,47 @@ class BinancePublicRestClient:
             return False
         return True
 
+    def _capture_request_boundary_snapshot(
+        self,
+        position: str,
+    ) -> ThreadRuntimeSnapshot | None:
+        try:
+            snapshot = self._thread_runtime_snapshot(position)
+        except Exception:
+            return None
+        return snapshot if isinstance(snapshot, ThreadRuntimeSnapshot) else None
+
+    @staticmethod
+    def _with_request_boundary_runtime(
+        diagnostics: HttpRequestDiagnostics | None,
+        start: ThreadRuntimeSnapshot | None,
+        end: ThreadRuntimeSnapshot | None,
+    ) -> HttpRequestDiagnostics | None:
+        if diagnostics is None:
+            return None
+        try:
+            delta: RequestBoundaryRuntimeDelta = request_boundary_runtime_delta(
+                start,
+                end,
+            )
+            return replace(
+                diagnostics,
+                request_boundary_monotonic_elapsed_ms=(
+                    delta.request_boundary_monotonic_elapsed_ms
+                ),
+                request_boundary_thread_cpu_ms=(
+                    delta.request_boundary_thread_cpu_ms
+                ),
+                request_boundary_thread_runqueue_wait_ms=(
+                    delta.request_boundary_thread_runqueue_wait_ms
+                ),
+                request_boundary_thread_timeslice_delta=(
+                    delta.request_boundary_thread_timeslice_delta
+                ),
+            )
+        except Exception:
+            return diagnostics
+
     def _get(self, path: str, params: Mapping[str, object] | None = None) -> TimedPayload:
         if self._closed:
             raise RuntimeError("Binance public REST client is closed")
@@ -1206,6 +1353,7 @@ class BinancePublicRestClient:
         if callable(prepare_diagnostics):
             prepare_diagnostics(url)
 
+        boundary_start = self._capture_request_boundary_snapshot("start")
         sent = self.clock()
         try:
             payload = self.transport.get_json(
@@ -1215,10 +1363,16 @@ class BinancePublicRestClient:
             )
         except Exception as exc:
             received = self.clock()
+            boundary_end = self._capture_request_boundary_snapshot("end")
             diagnostics = None
             consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
             if callable(consume_diagnostics):
                 diagnostics = consume_diagnostics()
+            diagnostics = self._with_request_boundary_runtime(
+                diagnostics,
+                boundary_start,
+                boundary_end,
+            )
             if diagnostics is None:
                 raise
             if self._attach_failure_diagnostics(
@@ -1236,10 +1390,16 @@ class BinancePublicRestClient:
             ) from exc
 
         received = self.clock()
+        boundary_end = self._capture_request_boundary_snapshot("end")
         diagnostics = None
         consume_diagnostics = getattr(self.transport, "consume_diagnostics", None)
         if callable(consume_diagnostics):
             diagnostics = consume_diagnostics()
+        diagnostics = self._with_request_boundary_runtime(
+            diagnostics,
+            boundary_start,
+            boundary_end,
+        )
         return TimedPayload(payload, sent, received, diagnostics)
 
     def exchange_info(self) -> TimedPayload:
@@ -1515,6 +1675,52 @@ def clock_record(
             None if diagnostics is None else diagnostics.response_cloudfront_pop
         ),
         "response_cache": None if diagnostics is None else diagnostics.response_cache,
+        "request_boundary_monotonic_elapsed_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_monotonic_elapsed_ms,
+                label="request boundary monotonic elapsed",
+            )
+        ),
+        "request_boundary_thread_cpu_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.request_boundary_thread_cpu_ms,
+            label="request boundary thread CPU",
+        ),
+        "request_boundary_thread_runqueue_wait_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_thread_runqueue_wait_ms,
+                label="request boundary thread runqueue wait",
+            )
+        ),
+        "request_boundary_thread_timeslice_delta": (
+            None
+            if diagnostics is None
+            else diagnostics.request_boundary_thread_timeslice_delta
+        ),
+        "requests_session_request_ordinal": (
+            None
+            if diagnostics is None
+            else diagnostics.requests_session_request_ordinal
+        ),
+        "urllib3_connection_observed_age_ms": (
+            _optional_non_negative_milliseconds(
+                None
+                if diagnostics is None
+                else diagnostics.urllib3_connection_observed_age_ms,
+                label="urllib3 connection observed age",
+            )
+        ),
+        "tls_socket_observed_age_ms": _optional_non_negative_milliseconds(
+            None
+            if diagnostics is None
+            else diagnostics.tls_socket_observed_age_ms,
+            label="TLS socket observed age",
+        ),
     }
     return ParsedRecord(RecordType.CLOCK_SYNC, "GLOBAL", row)
 

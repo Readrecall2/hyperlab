@@ -2227,6 +2227,13 @@ def _runtime_http_measurement() -> object:
             socket_family="AF_INET",
             response_cloudfront_pop="SIN2-P11",
             response_cache="Miss from cloudfront",
+            request_boundary_monotonic_elapsed_ms=20.25,
+            request_boundary_thread_cpu_ms=2.0,
+            request_boundary_thread_runqueue_wait_ms=4.0,
+            request_boundary_thread_timeslice_delta=2,
+            requests_session_request_ordinal=7,
+            urllib3_connection_observed_age_ms=30_000.0,
+            tls_socket_observed_age_ms=30_000.0,
         ),
     )
 
@@ -2389,6 +2396,10 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latest["json_decode_ms"] == pytest.approx(3)
         assert latest["diagnostic_prepare_ms"] == pytest.approx(1.5)
         assert latest["diagnostic_finalize_ms"] == pytest.approx(2.5)
+        assert latest["request_boundary_monotonic_elapsed_ms"] == pytest.approx(20.25)
+        assert latest["request_boundary_thread_cpu_ms"] == pytest.approx(2)
+        assert latest["request_boundary_thread_runqueue_wait_ms"] == pytest.approx(4)
+        assert latest["request_boundary_thread_timeslice_delta"] == 2
         assert latest["outcome"] == "success"
         assert latest["failed_request_boundary_duration_ms"] is None
         assert latest["urllib3_connection_objects_created_total_before"] == 1
@@ -2402,8 +2413,11 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latest["finalization_completion_sequence"] == 7
         assert latest["post_request_observation_current"] is True
         assert latest["requests_session_reused"] is True
+        assert latest["requests_session_request_ordinal"] == 7
         assert latest["urllib3_connection_reused"] is True
+        assert latest["urllib3_connection_observed_age_ms"] == pytest.approx(30_000)
         assert latest["tls_socket_reused"] is True
+        assert latest["tls_socket_observed_age_ms"] == pytest.approx(30_000)
         assert latest["tls_session_reused"] is None
         assert latest["peer_ip"] == "192.0.2.9"
         assert latest["peer_port"] == 443
@@ -2412,7 +2426,7 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latest["response_cache"] == "Miss from cloudfront"
         assert len(records) == 1
         persisted = records[0].row
-        assert persisted["schema_version"] == 3
+        assert persisted["schema_version"] == 4
         assert persisted["observation_id"] == latest["observation_id"]
         assert persisted["request_sent_time"] == BASE
         assert persisted["response_received_time"] == BASE + timedelta(milliseconds=20)
@@ -2426,9 +2440,16 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert persisted["json_decode_ms"] == Decimal("3.0")
         assert persisted["diagnostic_prepare_ms"] == Decimal("1.5")
         assert persisted["diagnostic_finalize_ms"] == Decimal("2.5")
+        assert persisted["request_boundary_monotonic_elapsed_ms"] == Decimal("20.25")
+        assert persisted["request_boundary_thread_cpu_ms"] == Decimal("2.0")
+        assert persisted["request_boundary_thread_runqueue_wait_ms"] == Decimal("4.0")
+        assert persisted["request_boundary_thread_timeslice_delta"] == 2
         assert persisted["requests_session_reused"] is True
+        assert persisted["requests_session_request_ordinal"] == 7
         assert persisted["urllib3_connection_identity"] == "urllib3-connection-1"
+        assert persisted["urllib3_connection_observed_age_ms"] == Decimal("30000.0")
         assert persisted["tls_socket_identity"] == "tls-socket-1"
+        assert persisted["tls_socket_observed_age_ms"] == Decimal("30000.0")
         assert persisted["post_request_observation_current"] is True
         assert persisted["peer_ip"] == "192.0.2.9"
         assert persisted["peer_port"] == 443
@@ -2448,9 +2469,30 @@ def test_clock_runtime_status_separates_submit_transport_and_drain_delays(
         assert latency["worker_completion_to_supervisor_drain"]["median"] == pytest.approx(15)
         assert latency["diagnostic_prepare"]["median"] == pytest.approx(1.5)
         assert latency["diagnostic_finalize"]["median"] == pytest.approx(2.5)
+        assert latency["request_boundary_monotonic_elapsed"]["median"] == pytest.approx(
+            20.25
+        )
+        assert latency["request_boundary_thread_cpu"]["median"] == pytest.approx(2)
+        assert latency["request_boundary_thread_runqueue_wait"]["median"] == pytest.approx(4)
+        assert observability["latency_scope"] == "retained_window"
+        assert observability["samples_truncated"] == 0
+        assert observability["retained_window_truncated"] is False
+        assert observability["outcomes_lifetime"] == {
+            "discarded_after_generation_close": 0,
+            "error": 0,
+            "success": 1,
+        }
+        assert observability["outcomes_retained_window"] == observability["outcomes"]
+        assert observability["thread_scheduler"] == {
+            "scope": "retained_window",
+            "request_boundary_timeslice_delta_samples": 1,
+            "request_boundary_timeslice_delta_total": 2,
+            "request_boundary_timeslice_delta_indeterminate_samples": 0,
+        }
         assert observability["in_flight"]["state"] == "idle"
         pool = observability["http_pool"]
         assert isinstance(pool, dict)
+        assert pool["scope"] == "retained_window"
         assert pool["urllib3_connection_objects_created_delta_total"] == 0
         assert pool["urllib3_requests_started_delta_total"] == 1
         assert pool["no_new_urllib3_connection_object_created_samples"] == 1
@@ -3058,6 +3100,70 @@ def test_clock_schedule_attributes_single_flight_separately_from_worker_lag(
         assert observability["single_flight_blocked_ms"]["p99_ms"] == pytest.approx(3_000)
         process = collector._runtime_telemetry.snapshot()
         assert process["scheduling"]["worker_lag_ms"]["p99_ms"] == pytest.approx(4_000)
+    finally:
+        collector.close()
+
+
+def test_clock_runtime_ring_exposes_truncation_and_preserves_lifetime_counts(
+    tmp_path: Path,
+) -> None:
+    collector = BinanceReferenceCollector(
+        ReferenceCollectorConfig(assets=("BTC",), candle_intervals=("1m",)),
+        rest=ScriptedClockRest([]),  # type: ignore[arg-type]
+        sink=BatchingLakeSink(
+            tmp_path / "clock-ring-lake",
+            batch_size=100,
+            queue_capacity=200,
+        ),
+        runtime_status_path=tmp_path / "clock-ring-status.json",
+        clock=lambda: BASE,
+        monotonic=lambda: 1.0,
+    )
+
+    try:
+        for index in range(260):
+            context = _ClockFutureContext(
+                capture_epoch_id="capture-ring",
+                connection_id="public-ring",
+                connection_epoch=1,
+                observation_id=f"clock:capture-ring:{index}",
+                submitted_at=0.0,
+                worker_started_at=0.0,
+                worker_completed_at=0.5,
+            )
+            if index < 4:
+                collector._observe_clock_execution(
+                    context,
+                    None,
+                    drained_at=1.0,
+                    error=RuntimeError(f"historical failure {index}"),
+                )
+            else:
+                collector._observe_clock_execution(
+                    context,
+                    _runtime_http_measurement(),  # type: ignore[arg-type]
+                    drained_at=1.0,
+                )
+
+        observability = collector.metrics["clock_observability"]
+        assert isinstance(observability, dict)
+        assert observability["samples_seen"] == 260
+        assert observability["samples_retained"] == 256
+        assert observability["samples_truncated"] == 4
+        assert observability["retained_window_truncated"] is True
+        assert observability["outcomes"] == {
+            "success": 256,
+            "error": 0,
+            "discarded_after_generation_close": 0,
+        }
+        assert observability["outcomes_retained_window"] == observability["outcomes"]
+        assert observability["outcomes_lifetime"] == {
+            "success": 256,
+            "error": 4,
+            "discarded_after_generation_close": 0,
+        }
+        assert observability["exception_types_retained_window"] == {}
+        assert observability["exception_types_lifetime"] == {"RuntimeError": 4}
     finally:
         collector.close()
 

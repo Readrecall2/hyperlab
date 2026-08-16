@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 from typer.testing import CliRunner
 
@@ -29,8 +30,14 @@ from hyperlab.data.continuity import (
     _wire_kind,
     audit_phase10_continuity,
 )
-from hyperlab.data.schema import RecordType
-from hyperlab.venues.base import measure_clock
+from hyperlab.data.lake import (
+    discover_partitions,
+    read_hashed_table,
+    validate_partition,
+    write_partition,
+)
+from hyperlab.data.schema import RecordType, schema_for
+from hyperlab.venues.base import HttpRequestDiagnostics, measure_clock
 from hyperlab.venues.binance import BinancePublicConnector, clock_record
 
 BASE = datetime(2026, 8, 13, 12, tzinfo=UTC)
@@ -148,10 +155,11 @@ def _hyperliquid_frame(
     arrival: int,
     capture: str,
     connection_id: str = "hyperliquid-public-1",
+    payload_time: datetime | None = None,
     one_sided_bbo: bool = False,
     empty_l2_side: bool = False,
 ) -> tuple[ParsedRecord, ...]:
-    milliseconds = int(received.timestamp() * 1_000)
+    milliseconds = int((payload_time or received).timestamp() * 1_000)
     if kind == "bbo":
         payload: object = {
             "channel": "bbo",
@@ -302,6 +310,7 @@ def _write_continuity_lake(
     mutate_binance_trade_quote: bool = False,
     invalid_clock_at: datetime | None = None,
     invalid_clock_times: tuple[datetime, ...] = (),
+    invalid_clock_diagnostics: HttpRequestDiagnostics | None = None,
     clock_failure_at: datetime | None = None,
     loose_clock_at: datetime | None = None,
     wrong_clock_identity_at: datetime | None = None,
@@ -352,6 +361,8 @@ def _write_continuity_lake(
     binance_channel_override: object = Ellipsis,
     binance_channel_kind: str = "l2",
     add_orphan_required_wire: bool = False,
+    orphan_required_wire_count: int = 0,
+    reverse_orphan_required_wires: bool = False,
     add_connect_only_capture: bool = False,
     add_half_paired_capture: bool = False,
     add_historical_connect_capture: bool = False,
@@ -365,10 +376,13 @@ def _write_continuity_lake(
         "hyperliquid_public",
     ),
     clean_disconnect_unknown_identity: bool = False,
+    clean_disconnect_second_hyperliquid_capture: bool = False,
     add_unbound_gap: bool = False,
     orphan_resync_event_kind: str | None = None,
     temporal_resync_snapshot: str | None = None,
     add_second_complete_hyperliquid_capture: bool = False,
+    add_two_replayed_hyperliquid_generations: bool = False,
+    persistent_dedup: bool = False,
     periodic_refresh_seconds: tuple[int, ...] = (),
 ) -> None:
     connector = _binance_connector()
@@ -964,16 +978,67 @@ def _write_continuity_lake(
                     )
                 )
 
-    if add_orphan_required_wire:
-        orphan_at = BASE + timedelta(seconds=8)
+    if add_two_replayed_hyperliquid_generations:
+        replayed_exchange_time = BASE + timedelta(seconds=7)
+        for generation in (2, 3):
+            generation_offset = (generation - 2) * 10
+            capture = f"hyperliquid-capture-{generation}"
+            connection = f"hyperliquid-public-{generation}"
+            records.append(
+                _hyperliquid_connection_event(
+                    received=BASE + timedelta(seconds=8 + generation_offset),
+                    capture=capture,
+                    connection_id=connection,
+                )
+            )
+            for asset_index, asset in enumerate(("BTC", "ETH")):
+                for kind, offset in (("bbo", 9.0), ("l2", 10.0), ("trade", 13.0)):
+                    arrival = {
+                        ("BTC", "bbo"): 1,
+                        ("BTC", "l2"): 2,
+                        ("ETH", "bbo"): 3,
+                        ("ETH", "l2"): 4,
+                        ("BTC", "trade"): 5,
+                        ("ETH", "trade"): 6,
+                    }[(asset, kind)]
+                    records.extend(
+                        _hyperliquid_frame(
+                            asset=asset,
+                            kind=kind,
+                            received=BASE
+                            + timedelta(
+                                seconds=(
+                                    offset
+                                    + asset_index * 2
+                                    + generation_offset
+                                )
+                            ),
+                            arrival=arrival,
+                            capture=capture,
+                            connection_id=connection,
+                            payload_time=(
+                                replayed_exchange_time
+                                if kind == "trade"
+                                else None
+                            ),
+                        )
+                    )
+
+    orphan_count = max(orphan_required_wire_count, int(add_orphan_required_wire))
+    orphan_records: list[ParsedRecord] = []
+    for orphan_index in range(orphan_count):
+        orphan_at = BASE + timedelta(
+            seconds=8,
+            microseconds=orphan_index,
+        )
         orphan = _binance_frame(
             connector,
             asset="BTC",
             kind="trade",
             received=orphan_at,
             connection_id="binance-market-1",
-            arrival=3,
-            source_sequence=1_002,
+            arrival=3_000 + orphan_index,
+            source_sequence=10_000 + orphan_index,
             capture=binance_capture,
         )[0]
         payload = json.loads(str(orphan.row["raw_message"]))
@@ -981,7 +1046,7 @@ def _write_continuity_lake(
         assert isinstance(data, dict)
         data["st"] = None
         raw_message = json.dumps(payload, separators=(",", ":"))
-        records.append(
+        orphan_records.append(
             ParsedRecord(
                 RecordType.WIRE_MESSAGE,
                 "GLOBAL",
@@ -992,6 +1057,11 @@ def _write_continuity_lake(
                 },
             )
         )
+    records.extend(
+        reversed(orphan_records)
+        if reverse_orphan_required_wires
+        else orphan_records
+    )
 
     if add_connect_only_capture or add_half_paired_capture:
         second_capture = "binance-connect-only-capture"
@@ -1073,6 +1143,16 @@ def _write_continuity_lake(
                 )
             )
         if "hyperliquid_public" in clean_disconnect_roles:
+            clean_hyperliquid_capture = (
+                "hyperliquid-capture-2"
+                if clean_disconnect_second_hyperliquid_capture
+                else hyperliquid_capture
+            )
+            clean_hyperliquid_connection = (
+                "hyperliquid-public-2"
+                if clean_disconnect_second_hyperliquid_capture
+                else "hyperliquid-public-1"
+            )
             records.append(
                 ParsedRecord(
                     RecordType.CONNECTION_EVENT,
@@ -1080,8 +1160,9 @@ def _write_continuity_lake(
                     {
                         **_hyperliquid_connection_event(
                             received=clean_disconnect_at,
-                            capture=hyperliquid_capture,
+                            capture=clean_hyperliquid_capture,
                             event_kind="disconnect",
+                            connection_id=clean_hyperliquid_connection,
                         ).row,
                         "reason": "collector stop requested or bounded run completed",
                     },
@@ -1247,6 +1328,7 @@ def _write_continuity_lake(
                     request_sent_time=rejected_at - timedelta(milliseconds=102),
                     response_received_time=rejected_at,
                     server_time=rejected_at - timedelta(milliseconds=51),
+                    http_diagnostics=invalid_clock_diagnostics,
                 ),
                 f"clock-invalid-{rejected_index}",
                 connection_id="binance-public-1",
@@ -1517,9 +1599,18 @@ def _write_continuity_lake(
             )
             break
 
-    sink = BatchingLakeSink(root, batch_size=10_000, persistent_dedup=False)
+    sink = BatchingLakeSink(
+        root,
+        batch_size=10_000,
+        persistent_dedup=persistent_dedup,
+    )
     try:
-        assert sink.add_many(records) == len(records)
+        expected_deduplicated = (
+            4
+            if persistent_dedup and add_two_replayed_hyperliquid_generations
+            else 0
+        )
+        assert sink.add_many(records) == len(records) - expected_deduplicated
         sink.flush()
     finally:
         sink.close()
@@ -1792,6 +1883,202 @@ def test_real_lake_audit_cuts_coverage_until_valid_recovery_after_second_rejecti
     ]
     assert clock["coverage_continuous"] is False
     assert "clock_sync_consecutive_rejected_probes" in payload["failure_reasons"]
+
+
+def test_clock_v4_rejection_forensics_survive_bounded_projection_without_gate_override(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    diagnostics = HttpRequestDiagnostics(
+        transport_lock_wait_ms=1.0,
+        requests_adapter_header_elapsed_ms=100.0,
+        session_get_total_ms=102.0,
+        json_decode_ms=1.0,
+        pool_connections_before=1,
+        pool_connections_after=1,
+        pool_connection_delta=0,
+        pool_requests_before=7,
+        pool_requests_after=8,
+        pool_request_delta=1,
+        new_pool_connection_created=False,
+        requests_session_reused=True,
+        urllib3_connection_identity="urllib3-connection-1",
+        urllib3_connection_reused=True,
+        tls_socket_identity="tls-socket-1",
+        tls_socket_reused=True,
+        post_request_observation_current=True,
+        peer_ip="192.0.2.9",
+        peer_port=443,
+        socket_family="AF_INET",
+        response_cloudfront_pop="SIN2-P11",
+        response_cache="Miss from cloudfront",
+        request_boundary_monotonic_elapsed_ms=102.0,
+        request_boundary_thread_cpu_ms=2.0,
+        request_boundary_thread_runqueue_wait_ms=4.0,
+        request_boundary_thread_timeslice_delta=2,
+        requests_session_request_ordinal=8,
+        urllib3_connection_observed_age_ms=30_000.0,
+        tls_socket_observed_age_ms=30_000.0,
+    )
+    _write_continuity_lake(
+        lake,
+        clock_sample_seconds=(0.5, 9.5, 19.5, 29.5),
+        invalid_clock_times=(
+            BASE + timedelta(seconds=5.5),
+            BASE + timedelta(seconds=7.5),
+        ),
+        invalid_clock_diagnostics=diagnostics,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert clock["strict_max_consecutive_rejected_probes"] == 1
+    assert clock["strict_max_sampling_interval_ms"] == 10_000
+    assert clock["strict_max_age_ms"] == 15_000
+    assert clock["strict_max_uncertainty_ms"] == 50.0
+    forensics = clock["forensics"]
+    assert forensics["classification"] == "evidence_only_no_gate_override"
+    assert forensics["population"] == (
+        "v2_plus_in_window_and_retained_boundary_rows_"
+        "excluding_cadence_only_successors"
+    )
+    assert forensics["schema_version_counts"] == {"4": 6}
+    assert forensics["outcomes"] == {
+        "valid": 4,
+        "rejected": 2,
+        "hard_invalid": 0,
+    }
+    rejected_coverage = forensics["field_coverage_by_outcome"]["rejected"]
+    assert rejected_coverage["session_get_total_ms"] == {"present": 2, "null": 0}
+    assert rejected_coverage["request_boundary_thread_runqueue_wait_ms"] == {
+        "present": 2,
+        "null": 0,
+    }
+    rejected_timings = forensics["timing_summaries_by_outcome"]["rejected"]
+    assert rejected_timings["session_get_total_ms"] == {
+        "count": 2,
+        "min": 102.0,
+        "mean": 102.0,
+        "max": 102.0,
+    }
+    assert forensics["boolean_counts_by_outcome"]["rejected"][
+        "requests_session_reused"
+    ] == {"true": 2, "false": 0, "null": 0}
+    rejected = forensics["rejected_evidence"]
+    assert rejected["total"] == 2
+    assert rejected["retained"] == 2
+    assert rejected["truncated"] == 0
+    assert [sample["observation_id"] for sample in rejected["samples"]] == [
+        "clock-invalid-1",
+        "clock-invalid-2",
+    ]
+    assert rejected["samples"][0]["requests_session_request_ordinal"] == 8
+    assert rejected["samples"][0]["response_cloudfront_pop"] == "SIN2-P11"
+    for sample in rejected["samples"]:
+        assert sample["causal_valid_from"] is None
+        assert sample["causal_valid_until"] is None
+        assert sample["sampling_interval_ms"] == 10_000
+        assert sample["max_age_ms"] == 15_000
+        assert sample["max_uncertainty_ms"] == 50.0
+    consecutive = forensics["consecutive_rejection_evidence"]
+    assert consecutive["total"] == 1
+    assert consecutive["retained"] == 1
+    assert consecutive["truncated"] == 0
+    pair = consecutive["pairs"][0]
+    assert pair["capture_epoch_id"] == "binance-capture-1"
+    assert [sample["observation_id"] for sample in pair["rejections"]] == [
+        "clock-invalid-1",
+        "clock-invalid-2",
+    ]
+    assert "clock_sync_consecutive_rejected_probes" in payload["failure_reasons"]
+    json.dumps(payload, sort_keys=True)
+
+
+def test_clock_v3_forensics_project_all_v3_fields_and_null_v4_fields(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    diagnostics = HttpRequestDiagnostics(
+        transport_lock_wait_ms=1.0,
+        requests_adapter_header_elapsed_ms=100.0,
+        session_get_total_ms=102.0,
+        json_decode_ms=1.0,
+        pool_connections_before=1,
+        pool_connections_after=1,
+        pool_connection_delta=0,
+        pool_requests_before=7,
+        pool_requests_after=8,
+        pool_request_delta=1,
+        new_pool_connection_created=False,
+        requests_session_reused=True,
+        post_request_observation_current=True,
+    )
+    _write_continuity_lake(
+        lake,
+        invalid_clock_at=BASE + timedelta(seconds=5.5),
+        invalid_clock_diagnostics=diagnostics,
+    )
+    v3_spec = schema_for(RecordType.CLOCK_SYNC, version=3)
+    clock_manifests = []
+    for manifest_path in discover_partitions(lake):
+        manifest = validate_partition(manifest_path)
+        if manifest.partition.record_type == RecordType.CLOCK_SYNC:
+            clock_manifests.append((manifest_path, manifest))
+    assert len(clock_manifests) == 1
+    for manifest_path, manifest in clock_manifests:
+        v4_table = read_hashed_table(lake, manifest)
+        v3_rows = [
+            {
+                **{
+                    field: row.get(field)
+                    for field in v3_spec.schema.names
+                },
+                "schema_version": 3,
+            }
+            for row in v4_table.to_pylist()
+        ]
+        v3_table = pa.Table.from_pylist(v3_rows, schema=v3_spec.schema)
+        (lake / manifest.relative_data_path).unlink()
+        manifest_path.unlink()
+        write_partition(lake, manifest.partition, v3_table)
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    clock = payload["clock_sync"]
+    assert isinstance(clock, dict)
+    forensics = clock["forensics"]
+    assert forensics["schema_version_counts"] == {"3": 4}
+    v2_names = set(schema_for(RecordType.CLOCK_SYNC, version=2).schema.names)
+    v3_names = set(schema_for(RecordType.CLOCK_SYNC, version=3).schema.names)
+    v4_names = set(schema_for(RecordType.CLOCK_SYNC, version=4).schema.names)
+    assert set(forensics["diagnostic_fields_projected"]) == (
+        (v3_names - v2_names) | (v4_names - v3_names)
+    )
+    rejected_coverage = forensics["field_coverage_by_outcome"]["rejected"]
+    assert rejected_coverage["session_get_total_ms"] == {"present": 1, "null": 0}
+    assert rejected_coverage["request_boundary_monotonic_elapsed_ms"] == {
+        "present": 0,
+        "null": 1,
+    }
+    rejected_sample = forensics["rejected_evidence"]["samples"][0]
+    assert rejected_sample["session_get_total_ms"] == 102.0
+    assert rejected_sample["request_boundary_monotonic_elapsed_ms"] is None
+    assert rejected_sample["sampling_interval_ms"] == 10_000
+    assert rejected_sample["max_age_ms"] == 15_000
+    assert rejected_sample["max_uncertainty_ms"] == 50.0
 
 
 def test_real_lake_audit_rejects_high_rtt_run_after_last_valid_interval_expires(
@@ -2657,6 +2944,192 @@ def test_real_lake_audit_rejects_incomplete_or_unbound_clean_shutdown(
     assert "requested_window_trailing_clean_stop_incomplete" in payload[
         "failure_reasons"
     ]
+
+
+def test_final_generation_terminal_roles_are_diagnostic_not_a_generation_bypass(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        add_second_complete_hyperliquid_capture=True,
+        clean_disconnect_at=BASE + timedelta(seconds=25),
+        clean_disconnect_second_hyperliquid_capture=True,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    assert payload["technical_capture_gate"] == "FAIL"
+    assert "hyperliquid_multiple_active_capture_generations" in payload[
+        "failure_reasons"
+    ]
+    window = payload["requested_window"]
+    assert isinstance(window, dict)
+    assert window["trailing_terminal_roles_complete"] is True
+    diagnostics = window["terminal_role_diagnostics"]
+    assert diagnostics == {
+        "binance_usdm": {
+            "selection_status": "selected_latest_connect",
+            "active_capture_generation_count": 1,
+            "final_capture_epoch_id": "binance-capture-1",
+            "required_roles": ["market", "public"],
+            "observed_clean_terminal_roles": ["market", "public"],
+            "missing_clean_terminal_roles": [],
+            "complete": True,
+        },
+        "hyperliquid": {
+            "selection_status": "selected_latest_connect",
+            "active_capture_generation_count": 2,
+            "final_capture_epoch_id": "hyperliquid-capture-2",
+            "required_roles": ["public"],
+            "observed_clean_terminal_roles": ["public"],
+            "missing_clean_terminal_roles": [],
+            "complete": True,
+        },
+    }
+
+
+def test_required_wire_orphan_forensics_are_bounded_and_exact(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(lake, add_orphan_required_wire=True)
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    required_wire = payload["required_wire_lineage"]
+    assert isinstance(required_wire, dict)
+    assert required_wire["orphan_required_wire_total"] == 1
+    forensics = required_wire["forensics"]
+    assert forensics["classification"] == "evidence_only_no_economic_reuse"
+    assert forensics["sample_limit"] == 32
+    assert forensics["orphan_total"] == 1
+    assert forensics["samples_retained"] == 1
+    assert forensics["samples_truncated"] == 0
+    assert forensics["by_kind_asset"]["binance_usdm"]["trade"]["BTC"] == 1
+    sample = forensics["samples"][0]
+    assert sample["venue"] == "binance_usdm"
+    assert sample["asset"] == "BTC"
+    assert sample["kind"] == "trade"
+    assert sample["reason"] == "exact_normalization_count_mismatch"
+    assert sample["capture_epoch_id"] == "binance-capture-1"
+    assert sample["connection_id"] == "binance-market-1"
+    assert sample["connection_epoch"] == 1
+    assert sample["arrival_sequence"] == 3_000
+    assert sample["received_time"] == (
+        BASE + timedelta(seconds=8)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    assert len(sample["payload_sha256"]) == 64
+    assert sample["expected_normalized_count"] == 1
+    assert sample["exact_normalized_count"] == 0
+
+
+def test_required_wire_orphan_forensics_are_bounded_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    reports: list[dict[str, object]] = []
+    for reverse in (False, True):
+        lake = tmp_path / f"lake-{reverse}"
+        _write_continuity_lake(
+            lake,
+            orphan_required_wire_count=40,
+            reverse_orphan_required_wires=reverse,
+        )
+        reports.append(
+            data_cli.phase10_continuity_report(
+                lake,
+                assets=("BTC", "ETH"),
+                start=BASE,
+                end=BASE + timedelta(seconds=30),
+            )
+        )
+
+    first_required_wire = reports[0]["required_wire_lineage"]
+    second_required_wire = reports[1]["required_wire_lineage"]
+    assert isinstance(first_required_wire, dict)
+    assert isinstance(second_required_wire, dict)
+    first_forensics = first_required_wire["forensics"]
+    second_forensics = second_required_wire["forensics"]
+    assert first_forensics == second_forensics
+    assert first_forensics["orphan_total"] == 40
+    assert first_forensics["samples_retained"] == 32
+    assert first_forensics["samples_truncated"] == 8
+    assert first_forensics["by_kind_asset"]["binance_usdm"]["trade"]["BTC"] == 40
+    assert [
+        sample["arrival_sequence"]
+        for sample in first_forensics["samples"]
+    ] == list(range(3_000, 3_032))
+
+
+def test_persistent_dedup_reconnect_replay_reproduces_two_orphans_per_asset(
+    tmp_path: Path,
+) -> None:
+    lake = tmp_path / "lake"
+    _write_continuity_lake(
+        lake,
+        add_two_replayed_hyperliquid_generations=True,
+        persistent_dedup=True,
+    )
+
+    payload = data_cli.phase10_continuity_report(
+        lake,
+        assets=("BTC", "ETH"),
+        start=BASE,
+        end=BASE + timedelta(seconds=30),
+    )
+
+    required_wire = payload["required_wire_lineage"]
+    assert isinstance(required_wire, dict)
+    assert required_wire["orphan_required_wire_total"] == 4
+    assert required_wire["by_venue_asset"] == {
+        "binance_usdm": {"BTC": 0, "ETH": 0},
+        "hyperliquid": {"BTC": 2, "ETH": 2},
+    }
+    forensics = required_wire["forensics"]
+    assert forensics["orphan_total"] == 4
+    assert forensics["by_kind_asset"]["hyperliquid"]["trade"] == {
+        "BTC": 2,
+        "ETH": 2,
+    }
+    samples = forensics["samples"]
+    assert len(samples) == 4
+    assert {
+        (sample["asset"], sample["capture_epoch_id"], sample["connection_id"])
+        for sample in samples
+    } == {
+        ("BTC", "hyperliquid-capture-2", "hyperliquid-public-2"),
+        ("BTC", "hyperliquid-capture-3", "hyperliquid-public-3"),
+        ("ETH", "hyperliquid-capture-2", "hyperliquid-public-2"),
+        ("ETH", "hyperliquid-capture-3", "hyperliquid-public-3"),
+    }
+    assert all(sample["kind"] == "trade" for sample in samples)
+    assert all(
+        sample["reason"] == "exact_normalization_count_mismatch"
+        for sample in samples
+    )
+    for asset in ("BTC", "ETH"):
+        hashes = {
+            sample["payload_sha256"]
+            for sample in samples
+            if sample["asset"] == asset
+        }
+        assert len(hashes) == 1
+    reasons = payload["failure_reasons"]
+    assert "required_raw_wire_without_exact_normalization" in reasons
+    assert "hyperliquid_market_raw_lineage_rejected" not in reasons
+    assert "hyperliquid_market_capture_incomplete:hyperliquid-capture-2" in reasons
+    assert "hyperliquid_market_capture_incomplete:hyperliquid-capture-3" in reasons
+    assert "hyperliquid_multiple_active_capture_generations" in reasons
 
 
 @pytest.mark.parametrize(

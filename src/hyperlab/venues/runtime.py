@@ -188,6 +188,14 @@ class BinanceReferenceCollector:
         self._clock_future_context: _ClockFutureContext | None = None
         self._clock_observations: deque[dict[str, object]] = deque(maxlen=_CLOCK_OBSERVABILITY_CAPACITY)
         self._clock_observations_seen = 0
+        self._clock_outcomes_lifetime = {
+            "success": 0,
+            "error": 0,
+            "discarded_after_generation_close": 0,
+        }
+        self._clock_exception_types_lifetime: dict[str, int] = {}
+        self._clock_http_failure_stages_lifetime: dict[str, int] = {}
+        self._clock_http_exception_types_lifetime: dict[str, int] = {}
         self._clock_schedule_overdue = MonotonicTimingSummary()
         self._clock_single_flight_blocked = MonotonicTimingSummary()
         self._runtime_telemetry = ProcessRuntimeTelemetry(
@@ -738,6 +746,26 @@ class BinanceReferenceCollector:
             ("diagnostic_prepare", "diagnostic_prepare_ms"),
             ("diagnostic_finalize", "diagnostic_finalize_ms"),
             (
+                "request_boundary_monotonic_elapsed",
+                "request_boundary_monotonic_elapsed_ms",
+            ),
+            (
+                "request_boundary_thread_cpu",
+                "request_boundary_thread_cpu_ms",
+            ),
+            (
+                "request_boundary_thread_runqueue_wait",
+                "request_boundary_thread_runqueue_wait_ms",
+            ),
+            (
+                "urllib3_connection_observed_age",
+                "urllib3_connection_observed_age_ms",
+            ),
+            (
+                "tls_socket_observed_age",
+                "tls_socket_observed_age_ms",
+            ),
+            (
                 "worker_completion_to_supervisor_drain",
                 "worker_completion_to_supervisor_drain_ms",
             ),
@@ -776,28 +804,86 @@ class BinanceReferenceCollector:
         current_observation_flags = [
             observation.get("post_request_observation_current") for observation in self._clock_observations
         ]
+        retained_outcomes = {
+            label: sum(
+                observation.get("outcome") == label
+                for observation in self._clock_observations
+            )
+            for label in (
+                "success",
+                "error",
+                "discarded_after_generation_close",
+            )
+        }
+
+        def retained_category_counts(field: str) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for observation in self._clock_observations:
+                value = observation.get(field)
+                if isinstance(value, str) and value:
+                    counts[value] = counts.get(value, 0) + 1
+            return dict(sorted(counts.items()))
+
+        samples_truncated = max(
+            self._clock_observations_seen - len(self._clock_observations),
+            0,
+        )
+        timeslice_deltas = [
+            int(value)
+            for observation in self._clock_observations
+            if isinstance(
+                (value := observation.get(
+                    "request_boundary_thread_timeslice_delta"
+                )),
+                int,
+            )
+            and not isinstance(value, bool)
+        ]
         return {
             "capacity": _CLOCK_OBSERVABILITY_CAPACITY,
             "samples_seen": self._clock_observations_seen,
             "samples_retained": len(self._clock_observations),
+            "samples_truncated": samples_truncated,
+            "retained_window_truncated": samples_truncated > 0,
             "latest": (dict(self._clock_observations[-1]) if self._clock_observations else None),
             "in_flight": self._clock_in_flight_payload(),
-            "outcomes": {
-                "success": sum(
-                    observation.get("outcome") == "success" for observation in self._clock_observations
-                ),
-                "error": sum(
-                    observation.get("outcome") == "error" for observation in self._clock_observations
-                ),
-                "discarded_after_generation_close": sum(
-                    observation.get("outcome") == "discarded_after_generation_close"
-                    for observation in self._clock_observations
-                ),
-            },
+            "outcomes": dict(retained_outcomes),
+            "outcomes_retained_window": retained_outcomes,
+            "outcomes_lifetime": dict(sorted(self._clock_outcomes_lifetime.items())),
+            "exception_types_retained_window": retained_category_counts(
+                "exception_type"
+            ),
+            "exception_types_lifetime": dict(
+                sorted(self._clock_exception_types_lifetime.items())
+            ),
+            "http_failure_stages_retained_window": retained_category_counts(
+                "http_failure_stage"
+            ),
+            "http_failure_stages_lifetime": dict(
+                sorted(self._clock_http_failure_stages_lifetime.items())
+            ),
+            "http_exception_types_retained_window": retained_category_counts(
+                "http_exception_type"
+            ),
+            "http_exception_types_lifetime": dict(
+                sorted(self._clock_http_exception_types_lifetime.items())
+            ),
             "clock_schedule_overdue_ms": self._clock_schedule_overdue.as_dict(),
             "single_flight_blocked_ms": self._clock_single_flight_blocked.as_dict(),
+            "latency_scope": "retained_window",
             "latency_ms": latency_ms,
+            "thread_scheduler": {
+                "scope": "retained_window",
+                "request_boundary_timeslice_delta_samples": len(
+                    timeslice_deltas
+                ),
+                "request_boundary_timeslice_delta_total": sum(timeslice_deltas),
+                "request_boundary_timeslice_delta_indeterminate_samples": (
+                    len(self._clock_observations) - len(timeslice_deltas)
+                ),
+            },
             "http_pool": {
+                "scope": "retained_window",
                 "urllib3_connection_objects_created_delta_total": sum(connection_deltas),
                 "urllib3_requests_started_delta_total": sum(request_deltas),
                 "new_urllib3_connection_object_created_samples": (new_connection_flags.count(True)),
@@ -905,6 +991,26 @@ class BinanceReferenceCollector:
             "json_decode_ms": (None if diagnostics is None else diagnostics.json_decode_ms),
             "diagnostic_prepare_ms": (None if diagnostics is None else diagnostics.diagnostic_prepare_ms),
             "diagnostic_finalize_ms": (None if diagnostics is None else diagnostics.diagnostic_finalize_ms),
+            "request_boundary_monotonic_elapsed_ms": (
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_monotonic_elapsed_ms
+            ),
+            "request_boundary_thread_cpu_ms": (
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_thread_cpu_ms
+            ),
+            "request_boundary_thread_runqueue_wait_ms": (
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_thread_runqueue_wait_ms
+            ),
+            "request_boundary_thread_timeslice_delta": (
+                None
+                if diagnostics is None
+                else diagnostics.request_boundary_thread_timeslice_delta
+            ),
             "urllib3_connection_objects_created_total_before": (
                 None if diagnostics is None else diagnostics.urllib3_connection_objects_created_total_before
             ),
@@ -939,14 +1045,29 @@ class BinanceReferenceCollector:
             "http_failure_stage": (None if diagnostics is None else diagnostics.failure_stage),
             "http_exception_type": (None if diagnostics is None else diagnostics.exception_type),
             "requests_session_reused": (None if diagnostics is None else diagnostics.requests_session_reused),
+            "requests_session_request_ordinal": (
+                None
+                if diagnostics is None
+                else diagnostics.requests_session_request_ordinal
+            ),
             "urllib3_connection_identity": (
                 None if diagnostics is None else diagnostics.urllib3_connection_identity
             ),
             "urllib3_connection_reused": (
                 None if diagnostics is None else diagnostics.urllib3_connection_reused
             ),
+            "urllib3_connection_observed_age_ms": (
+                None
+                if diagnostics is None
+                else diagnostics.urllib3_connection_observed_age_ms
+            ),
             "tls_socket_identity": (None if diagnostics is None else diagnostics.tls_socket_identity),
             "tls_socket_reused": (None if diagnostics is None else diagnostics.tls_socket_reused),
+            "tls_socket_observed_age_ms": (
+                None
+                if diagnostics is None
+                else diagnostics.tls_socket_observed_age_ms
+            ),
             "tls_session_reused": (None if diagnostics is None else diagnostics.tls_session_reused),
             "peer_ip": None if diagnostics is None else diagnostics.peer_ip,
             "peer_port": None if diagnostics is None else diagnostics.peer_port,
@@ -958,6 +1079,15 @@ class BinanceReferenceCollector:
         }
         self._clock_observations.append(observation)
         self._clock_observations_seen += 1
+        for field, lifetime_counts in (
+            ("outcome", self._clock_outcomes_lifetime),
+            ("exception_type", self._clock_exception_types_lifetime),
+            ("http_failure_stage", self._clock_http_failure_stages_lifetime),
+            ("http_exception_type", self._clock_http_exception_types_lifetime),
+        ):
+            value = observation.get(field)
+            if isinstance(value, str) and value:
+                lifetime_counts[value] = lifetime_counts.get(value, 0) + 1
         self.metrics["clock_observability"] = self._clock_observability_payload()
         return observation
 

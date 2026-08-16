@@ -48,6 +48,15 @@ class FakeConnection:
         self._closed.set()
 
 
+class FakeRecvDataConnection(FakeConnection):
+    def recv_data(self) -> tuple[int, object]:
+        result = super().recv()
+        assert isinstance(result, tuple) and len(result) == 2
+        opcode, payload = result
+        assert isinstance(opcode, int)
+        return opcode, payload
+
+
 def test_background_reader_accepts_text_and_decodes_bytes() -> None:
     connected_at = datetime(2026, 8, 12, 11, 59, 59, 999000, tzinfo=UTC)
     first_received_at = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
@@ -237,6 +246,72 @@ def test_non_utc_receive_timestamp_becomes_a_visible_terminal_error() -> None:
         socket.close()
 
 
+def test_close_opcode_preserves_peer_details_after_draining_accepted_fifo() -> None:
+    connection = FakeRecvDataConnection(
+        iter(
+            (
+                (websocket.ABNF.OPCODE_TEXT, "accepted-before-close"),
+                (websocket.ABNF.OPCODE_CLOSE, b"\x03\xe9maintenance"),
+            )
+        )
+    )
+    socket = WebsocketClientSocket(connection, queue_capacity=2)
+    try:
+        socket._reader.join(timeout=0.5)
+        assert not socket._reader.is_alive()
+        assert socket._messages.qsize() == 1
+        received = socket.receive(0.2)
+        assert received is not None
+        assert received.raw_message == "accepted-before-close"
+        with pytest.raises(ConnectionError, match=r"code=1001.*reason=maintenance"):
+            socket.receive(0.2)
+        telemetry = socket.telemetry_snapshot()
+        assert telemetry["terminal_origin"] == "peer_close_frame"
+        assert telemetry["terminal_close_code"] == 1001
+        assert telemetry["terminal_close_reason"] == "maintenance"
+        assert telemetry["terminal_observed_at"] is not None
+        assert float(str(telemetry["terminal_observed_age_ms"])) >= 0
+    finally:
+        socket.close()
+
+
+def test_transport_error_surfaces_only_after_accepted_fifo_is_drained() -> None:
+    connection = FakeConnection(
+        iter(("accepted-before-reset", ConnectionResetError("wire reset")))
+    )
+    socket = WebsocketClientSocket(connection, queue_capacity=2)
+    try:
+        socket._reader.join(timeout=0.5)
+        assert not socket._reader.is_alive()
+        received = socket.receive(0.2)
+        assert received is not None
+        assert received.raw_message == "accepted-before-reset"
+        with pytest.raises(ConnectionResetError, match="wire reset"):
+            socket.receive(0.2)
+        assert socket.telemetry_snapshot()["terminal_origin"] == "transport_exception"
+    finally:
+        socket.close()
+
+
+def test_legacy_empty_recv_remains_a_visible_close_after_fifo_drain() -> None:
+    connection = FakeConnection(iter(("accepted-before-empty", "")))
+    socket = WebsocketClientSocket(connection, queue_capacity=2)
+    try:
+        socket._reader.join(timeout=0.5)
+        assert not socket._reader.is_alive()
+        received = socket.receive(0.2)
+        assert received is not None
+        assert received.raw_message == "accepted-before-empty"
+        with pytest.raises(ConnectionError, match="public websocket closed"):
+            socket.receive(0.2)
+        telemetry = socket.telemetry_snapshot()
+        assert telemetry["terminal_origin"] == "legacy_recv_empty"
+        assert telemetry["terminal_close_code"] is None
+        assert telemetry["terminal_close_reason"] is None
+    finally:
+        socket.close()
+
+
 def test_bounded_queue_saturation_fails_before_processing_the_backlog() -> None:
     connection = FakeConnection(iter(("first", "overflow")))
     socket = WebsocketClientSocket(connection, queue_capacity=1)
@@ -252,6 +327,9 @@ def test_bounded_queue_saturation_fails_before_processing_the_backlog() -> None:
         assert telemetry["queue_high_water"] == 1
         assert telemetry["overflow_count"] == 1
         assert telemetry["terminal_exception_type"] == "WebsocketQueueOverflow"
+        assert telemetry["terminal_origin"] == "queue_overflow"
+        assert telemetry["terminal_observed_at"] is not None
+        assert float(str(telemetry["terminal_observed_age_ms"])) >= 0
         assert "local capacity exhausted" in str(telemetry["terminal_reason"])
         assert telemetry["oldest_message_age_ms"] is not None
     finally:

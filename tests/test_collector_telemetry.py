@@ -9,6 +9,8 @@ from hyperlab.collector.telemetry import (
     MonotonicTimingSummary,
     ProcessRuntimeTelemetry,
     SchedulingWatchdog,
+    ThreadRuntimeSnapshot,
+    request_boundary_runtime_delta,
 )
 
 
@@ -50,6 +52,79 @@ def test_monotonic_timing_summary_rejects_invalid_durations() -> None:
         summary.observe_seconds(float("inf"))
     with pytest.raises(ValueError, match="end precedes start"):
         summary.observe_since(2, ended_monotonic_ns=1)
+
+
+def test_request_boundary_runtime_delta_separates_wall_cpu_and_runqueue() -> None:
+    start = ThreadRuntimeSnapshot(
+        monotonic_ns=10_000_000,
+        thread_cpu_ns=3_000_000,
+        runqueue_wait_ns=5_000_000,
+        timeslices=4,
+    )
+    end = ThreadRuntimeSnapshot(
+        monotonic_ns=94_000_000,
+        thread_cpu_ns=8_000_000,
+        runqueue_wait_ns=14_000_000,
+        timeslices=6,
+    )
+
+    delta = request_boundary_runtime_delta(start, end)
+
+    assert delta.request_boundary_monotonic_elapsed_ms == 84.0
+    assert delta.request_boundary_thread_cpu_ms == 5.0
+    assert delta.request_boundary_thread_runqueue_wait_ms == 9.0
+    assert delta.request_boundary_thread_timeslice_delta == 2
+
+
+def test_request_boundary_runtime_delta_is_nullable_on_missing_or_regressed_counters() -> None:
+    start = ThreadRuntimeSnapshot(10, 20, None, 5)
+    end = ThreadRuntimeSnapshot(9, 19, None, 4)
+
+    delta = request_boundary_runtime_delta(start, end)
+
+    assert delta.request_boundary_monotonic_elapsed_ms is None
+    assert delta.request_boundary_thread_cpu_ms is None
+    assert delta.request_boundary_thread_runqueue_wait_ms is None
+    assert delta.request_boundary_thread_timeslice_delta is None
+    assert request_boundary_runtime_delta(None, end) == (
+        telemetry_module.RequestBoundaryRuntimeDelta(None, None, None, None)
+    )
+
+
+def test_thread_runtime_snapshot_uses_linux_current_thread_schedstat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def read_linux_text(path: str) -> str | None:
+        calls.append("schedstat")
+        assert path == "/proc/thread-self/schedstat"
+        return "7000000 11000000 13\n"
+
+    def thread_cpu_ns() -> int:
+        calls.append("thread_cpu")
+        return 17_000_000
+
+    def perf_counter_ns() -> int:
+        calls.append("monotonic")
+        return 23_000_000
+
+    monkeypatch.setattr(telemetry_module.sys, "platform", "linux")
+    monkeypatch.setattr(telemetry_module, "_read_linux_text", read_linux_text)
+    monkeypatch.setattr(telemetry_module.time, "thread_time_ns", thread_cpu_ns)
+    monkeypatch.setattr(telemetry_module.time, "perf_counter_ns", perf_counter_ns)
+
+    start = telemetry_module.capture_thread_runtime_snapshot("start")
+    assert calls == ["schedstat", "thread_cpu", "monotonic"]
+    assert start == ThreadRuntimeSnapshot(23_000_000, 17_000_000, 11_000_000, 13)
+
+    calls.clear()
+    end = telemetry_module.capture_thread_runtime_snapshot("end")
+    assert calls == ["monotonic", "thread_cpu", "schedstat"]
+    assert end == start
+
+    with pytest.raises(ValueError, match="position"):
+        telemetry_module.capture_thread_runtime_snapshot("middle")
 
 
 def test_process_runtime_snapshot_separates_cpu_and_scheduling_lag() -> None:

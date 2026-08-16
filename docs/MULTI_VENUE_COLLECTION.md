@@ -290,6 +290,13 @@ cadence ; aucune logique de chevauchement n'a été modifiée. Cette collecte re
 un FAIL historique et la Phase 10 reste `BLOCKED_PRECONDITION_NOT_MET` jusqu'à
 un nouveau smoke Singapore réel.
 
+La collecte réelle isolée de six heures qui a motivé ce durcissement est
+désormais historique et reste elle aussi un `FAIL`. Les diagnostics ajoutés
+peuvent attribuer les causes d'un futur run ; ils ne peuvent ni compléter ses
+preuves absentes, ni requalifier rétroactivement ses gaps ou ses wires
+orphelins. Une nouvelle collecte isolée de six heures et un nouvel audit sont
+requis pour obtenir une nouvelle décision technique.
+
 ## Flux simultanés BTC/ETH
 
 | Venue | Flux publics conservés |
@@ -335,6 +342,15 @@ analytique strict de 30 secondes des trades peut faire échouer le gate aval san
 déclarer le socket ou l'abonnement mort. Aucun délai, seuil, backoff, capacité de
 socket ou capacité du writer n'est relevé.
 
+Une fermeture pair/transport ordinaire conserve son terminal en attente pendant
+que le superviseur draine en FIFO les frames déjà admises. Cela prévient une
+perte locale de frames reçues ; `queue_overflow` reste immédiatement fatal et
+ne promet aucun drainage. Ce mécanisme et la télémétrie de fermeture sont
+uniquement forensiques. Sans séquence serveur Hyperliquid ni curseur public de
+replay, la fermeture, la reconnexion et la resynchronisation de l'état courant
+ne certifient jamais l'intervalle manquant. Tout gap qui intersecte la fenêtre
+demandée et plusieurs générations Hyperliquid actives restent fatals.
+
 Les snapshots L2 de restauration REST et leur BBO dérivé portent une provenance
 `rest:` explicite. L'audit ne les traite pas comme du wire WebSocket uniquement
 si l'identité REST, le groupe complet de niveaux et les prix/quantités du
@@ -353,16 +369,31 @@ uniquement l'union des intervalles acceptés de la même génération éligible.
 
 Le schéma append-only `clock_sync` v3 réutilise le même `observation_id` créé
 avant soumission dans l'état in-flight, l'observation runtime et la ligne durable.
-Ses champs nullables relient le retard de cadence et de single-flight, les délais
-executor/drain, les phases HTTP déjà mesurées, les identités et réutilisations de
-session/connexion/socket, le pair IP/port/famille et le POP/cache CloudFront. Les
-partitions v1/v2 restent lisibles sans réécriture ; les seuils de 50 ms et 10 s,
-l'âge causal de 15 s, la règle de rejection consécutive et l'anneau runtime de
-256 entrées restent inchangés. La v3 n'ajoute aucun historique durable DNS ou
-d'exception HTTP sans temps serveur, ni télémétrie hôte (ordonnanceur,
-mémoire/GC/OOM ou pression writer) ou âge de connexion/origine.
+Il relie le retard de cadence et de single-flight, les délais executor/drain, les
+phases HTTP, les identités de session/connexion/socket, le pair IP/port/famille
+et le POP/cache CloudFront. La v4 ajoute sept champs nullables :
+`request_boundary_monotonic_elapsed_ms`, `request_boundary_thread_cpu_ms`,
+`request_boundary_thread_runqueue_wait_ms`,
+`request_boundary_thread_timeslice_delta`,
+`requests_session_request_ordinal`, `urllib3_connection_observed_age_ms` et
+`tls_socket_observed_age_ms`.
 
-La conformité de cadence est un contrôle séparé. Chaque ligne `clock_sync` v2 ou v3
+Le temps monotone et le CPU du thread encadrent la même frontière requête
+préparée vers réponse reçue. Sous Linux, le wait runqueue et le delta de
+timeslices proviennent de `/proc/thread-self/schedstat` ; ils restent `null`
+ailleurs ou lorsque les compteurs sont indisponibles ou régressent. L'ordinal de
+session est 1-based. Les deux âges d'identité mesurent le temps écoulé depuis la
+première observation dans ce processus du même objet opaque ; ils ne prétendent
+pas mesurer l'âge réel de création, de handshake ou du socket. Les partitions
+v1/v2/v3 restent lisibles sans réécriture.
+
+Ces champs v4 et leur projection `clock_sync.forensics` servent uniquement à
+l'attribution. Ils ne créditent aucune cadence, ne créent aucune couverture
+causale et ne promeuvent aucune probe rejetée. Les seuils restent exactement
+10 secondes de cadence, 15 secondes d'âge causal, 50 ms d'incertitude et au plus
+une rejection consécutive ; l'anneau runtime reste borné à 256 entrées.
+
+La conformité de cadence est un contrôle séparé. Chaque ligne `clock_sync` v2, v3 ou v4
 persistée et liée exactement à la génération et au wire public compte comme une
 tentative au temps `request_sent_time`, qu'elle soit `VALID` ou `INVALID`.
 Le contrôle couvre la génération active, de son activation liée ou du début de
@@ -419,6 +450,18 @@ la sortie des deux threads, chaque collecteur ferme son socket et publie son ét
 et Binance ferme ses deux sockets physiques requis (`public` et `market`). Le
 writer commun effectue ensuite le flush final et libère le root lock une seule fois.
 
+Un arrêt borné connecté persiste d'abord le `disconnect` propre
+`collector stop requested or bounded run completed`, sans fabriquer de gap,
+puis flushe et ferme. Le rapport détaille la sélection de la génération finale
+dans `requested_window.terminal_role_diagnostics.{binance_usdm,hyperliquid}`
+avec `selection_status`, `active_capture_generation_count`,
+`final_capture_epoch_id`, `required_roles`,
+`observed_clean_terminal_roles`, `missing_clean_terminal_roles` et `complete`.
+Pour une marge terminale non évaluée, cette preuve explique
+`trailing_terminal_roles_complete`. Elle reste distincte du gate de multiplicité :
+un arrêt propre de la dernière génération ne rend jamais admissibles plusieurs
+générations actives et n'efface aucun gap.
+
 Les statuts restent séparés :
 
 - `data/runtime_status.json` pour Hyperliquid ;
@@ -438,6 +481,11 @@ one-generation run does not lose its queue high-water evidence.
   admission time, plus Hyperliquid REST worker materialization and batched apply.
 - socket telemetry reports reader identity/state, queue depth/capacity/high-water,
   enqueue delay, dequeue residence/oldest age, overflow count, and terminal reason.
+  Exact terminal evidence is exposed as `terminal_origin`,
+  `terminal_observed_at`, `terminal_observed_age_ms`, `terminal_close_code` and
+  `terminal_close_reason`. Ordinary peer/transport terminals surface after FIFO
+  drain of admitted frames; this is loss prevention and attribution, not coverage
+  certification.
 - Binance `clock_observability` separates executor dispatch, authoritative clock
   RTT, HTTP adapter/header and request/decode phases, future drain delay, and
   best-effort HTTP keep-alive/TLS evidence. It reports urllib3 connection objects
@@ -446,6 +494,16 @@ one-generation run does not lose its queue high-water evidence.
   selected peer IP/port, socket family and allowlisted `X-Amz-Cf-Pop`/`X-Cache`
   response headers. Ambiguous observations remain null. Only the authoritative
   persisted RTT still feeds uncertainty and the unchanged 50 ms gate.
+  `outcomes_lifetime` covers the process lifetime; `outcomes_retained_window`,
+  `samples_truncated` and `retained_window_truncated` describe the bounded ring.
+  The legacy `outcomes` alias, `latency_scope`, `thread_scheduler.scope` and
+  `http_pool.scope` all refer to `retained_window`. The persisted continuity
+  report exposes `clock_sync.forensics.classification` as
+  `evidence_only_no_gate_override`, plus schema counts, field coverage,
+  timing/counter/boolean summaries and bounded rejected/consecutive evidence.
+  `population` précise que cette synthèse couvre les lignes v2+ dans la fenêtre
+  et les frontières retenues, mais pas les seuls successeurs réservés au contrôle
+  de cadence.
 - `diagnose-binance-http` takes one passive system DNS snapshot, a bounded number
   of fresh connections and one persistent session. It compares their actual
   peers/POP with `clock_observability.latest` from the isolated runtime status.
@@ -465,6 +523,11 @@ one-generation run does not lose its queue high-water evidence.
   collateral closes, exact exception/reason, queue/writer/clock state, and whether
   a reconnect was attempted. The continuity report persists corresponding
   `failure_events_by_capture_generation` evidence.
+  Each Hyperliquid runtime entry also retains `failure_snapshot` with collector, process,
+  writer and liveness evidence (`collector_state`, `connected`, `live`,
+  `connection_age_ms`, `live_duration_ms`, `pending_ack_count`,
+  `pending_ack_subscriptions`, `ping`, `pong`). These snapshots remain
+  attribution-only.
 
 ## Smoke test causal de 10 minutes
 
@@ -571,7 +634,7 @@ jq -s '{
 }' "$PHASE10_SMOKE_DIR/runtime_status.json" \
    "$PHASE10_SMOKE_DIR/runtime_status_binance_usdm.json"
 jq '{technical_capture_gate, failure_reasons, binance_trades,
-    connection_lineage, connection_events, clock_sync,
+    connection_lineage, connection_events, required_wire_lineage, clock_sync,
     clock_rejection_policy: {
       rejected_probe_samples: .clock_sync.rejected_probe_samples,
       consecutive_rejection_violations:
@@ -716,6 +779,17 @@ Les critères de PASS sont cumulatifs et exacts :
   `required_wire_lineage.orphan_required_wire_total == 0`,
   `normalized_l2_level_lineage.orphan_level_total == 0` et
   `binance_l2_resync.missing_count == 0` ;
+  `required_wire_lineage.forensics.classification` vaut
+  `evidence_only_no_economic_reuse` et ses échantillons sont bornés par
+  `sample_limit == 32`. `by_kind_asset` et `samples` exposent les raisons
+  `message_asset_mismatch`, `persisted_channel_payload_kind_mismatch`,
+  `connection_role_lineage_mismatch` ou
+  `exact_normalization_count_mismatch`. Le matcher exige la normalisation exacte
+  du même wire, de la même connexion, du même `received_time` et de la même
+  `arrival_sequence`. Une déduplication persistante par `trade_id` peut expliquer
+  un replay sans seconde ligne canonique, mais l'audit ne réutilise jamais le
+  duplicat comme observation économique et ne l'emploie pas pour effacer
+  l'orphelin : tout total orphelin positif reste fatal ;
 - `clock_sync.valid_v2_samples > 0`,
   `clock_sync.hard_invalid_v2_samples == 0`, les
   compteurs d'échec, de policy/identity rejection, de cadence et de
@@ -741,9 +815,17 @@ Les critères de PASS sont cumulatifs et exacts :
   cadence, mais
   `clock_sync.sample_spacing_violation_capture_generations != []` fait
   toujours échouer le gate et doit donc valoir `[]` pour un PASS ;
+  `clock_sync.forensics` est une synthèse evidence-only. Ses champs v4, âges
+  d'identité, deltas CPU/runqueue/timeslice, ordinal de session, résumés et
+  échantillons rejetés bornés n'entrent jamais dans la décision technique ;
 - `requested_window.leading_margin_within_limit == true`,
   `requested_window.trailing_margin_within_limit == true` et
   `requested_window.trailing_terminal_roles_complete == true` ;
+  si `trailing_unassessed_seconds > 0`, les diagnostics terminaux doivent
+  sélectionner sans ambiguïté la génération finale de chaque venue et rapporter
+  tous les rôles propres requis. Même alors,
+  `active_capture_generation_count` ne remplace pas le contrôle séparé qui rend
+  plusieurs générations actives fatales ;
 - `strict_phase_10_overlap.duration_seconds > 0` et la durée est strictement
   positive séparément pour BTC et ETH.
 
@@ -752,6 +834,27 @@ plus 30 secondes après son `received_time`. Ce TTL opérationnel borne la
 fraîcheur pour l'audit ; il ne prétend pas inférer une cadence de trades propre à
 la venue. Aucun PASS technique ne lance ni ne débloque l'analyse économique de
 Phase 10.
+
+## Rerun forensique isolé de six heures
+
+Le run réel de six heures désormais historique reste `FAIL` ; le nouveau code ne
+peut pas le transformer en PASS. Après la validation locale, refaire d''abord le
+smoke isolé de 10 minutes, puis un run isolé de 2 heures, chacun sur une nouvelle
+racine, afin de valider le déploiement v4, les terminaux et la stabilité. Ces deux
+étapes ne remplacent pas la preuve de six heures. Reprendre ensuite intégralement
+le protocole Linux ou PowerShell isolé ci-dessus avec une troisième nouvelle
+racine `HYPERLAB_DATA_DIR`, sans autre writer ni inventaire sur cette racine, et
+remplacer uniquement `--duration-seconds 600` par
+`--duration-seconds 21600`. Ne jamais pointer un rerun vers la capture
+historique ou vers un lake partagé.
+
+Enregistrer indépendamment les bornes UTC, conserver la racine additive et
+exécuter le même audit `data continuity` borné. Un rapport `FAIL` reste un
+résultat forensique : ne pas fusionner des générations, réutiliser des
+duplicats, ignorer des gaps ou modifier 10 s/15 s/50 ms/max consecutive = 1
+pour obtenir un PASS. Cette revalidation de six heures ne remplace pas la
+capture longue de 24 heures ci-dessous.
+
 ## Commande longue destinée à la Phase 10
 
 Après un PASS réel du smoke isolé seulement, la capture de 24 heures conserve le
@@ -847,8 +950,11 @@ stable ou de rentabilité, et ne débloquent pas à eux seuls la Phase 10.
 - Binance fournit ici vingt niveaux par côté, pas le carnet complet au-delà de
   cette profondeur.
 - Les trades Binance sont agrégés par ordre taker.
-- Une reconnexion peut laisser une fenêtre de couverture inconnue ; elle reste
-  visible dans le wire, les epochs et les événements de connexion.
+- Une fermeture pair/transport et sa reconnexion peuvent laisser une fenêtre de
+  couverture inconnue ; elles restent visibles dans le wire, les epochs, les
+  événements de connexion et la télémétrie terminale. Le drainage FIFO et la
+  resynchronisation d'état ne certifient pas cette fenêtre en l'absence de
+  séquence ou de replay publics.
 - Les horloges source appartiennent à chaque venue. Toute analyse future devra
   rester causale sur `received_time` et tenir compte des mesures de drift.
 - Ce patch ne réalise aucune analyse économique lead-lag.

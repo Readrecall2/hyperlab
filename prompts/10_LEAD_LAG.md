@@ -66,6 +66,29 @@ policy invalide, ou
 une génération active sans mesure valide reste fatal. Il est interdit
 d'interpoler ou de promouvoir une mesure rejetée.
 
+Pour Hyperliquid, une fermeture attribuée au pair ou au transport, suivie d'une
+reconnexion et d'une resynchronisation REST, ne certifie jamais l'intervalle
+manquant : les abonnements publics n'exposent ni séquence serveur exploitable ni
+curseur public de replay. Les diagnostics de fermeture et le drainage FIFO
+servent uniquement à attribuer la cause et à préserver les frames déjà reçues.
+Tout `gap` qui intersecte la fenêtre demandée reste fatal, tout comme plusieurs
+générations de capture actives. La preuve des rôles terminaux propres de la
+génération finale est un diagnostic distinct ; elle ne peut ni effacer un gap ni
+rendre admissibles plusieurs générations actives.
+
+Chaque wire brut requis doit conserver une normalisation exacte. L'audit peut
+publier une raison et des échantillons bornés pour les wires orphelins, mais un
+duplicat ne peut jamais être réutilisé comme observation économique pour combler
+la lignée. Toute preuve orpheline garde le gate en échec.
+
+Les diagnostics `clock_sync` v4 de timing, d'ordonnancement et de chemin de
+session, ainsi que leur synthèse forensique, sont uniquement attributifs. Ils ne
+modifient ni la cadence maximale de 10 secondes, ni l'âge causal de 15 secondes,
+ni l'incertitude maximale de 50 ms, ni la limite d'une seule rejection
+consécutive. Une capture historique en échec ne peut pas être requalifiée ; seule
+une nouvelle collecte réelle isolée et son audit complet peuvent fournir une
+nouvelle décision technique.
+
 La collecte doit aussi démontrer un débit writer durable confortablement
 supérieur au pic Binance avec résidence de file bornée. Il est interdit de faire
 passer ce gate en augmentant les capacités 10 000/20 000, en relâchant une

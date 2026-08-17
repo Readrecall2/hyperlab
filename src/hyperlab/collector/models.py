@@ -27,6 +27,14 @@ VALID_CANDLE_INTERVALS = frozenset(
         "1w",
     }
 )
+PUBLIC_SUBSCRIPTION_CHANNELS = (
+    "activeAssetCtx",
+    "bbo",
+    "l2Book",
+    "trades",
+    "candle",
+)
+_PUBLIC_SUBSCRIPTION_CHANNEL_SET = frozenset(PUBLIC_SUBSCRIPTION_CHANNELS)
 
 
 class CollectorState(StrEnum):
@@ -86,7 +94,7 @@ class PublicSubscription:
     interval: str | None = None
 
     def __post_init__(self) -> None:
-        if self.channel not in {"activeAssetCtx", "bbo", "candle", "l2Book", "trades"}:
+        if self.channel not in _PUBLIC_SUBSCRIPTION_CHANNEL_SET:
             raise ValueError(f"unsupported public channel: {self.channel}")
         if not self.coin or any(key in self.coin.lower() for key in ("0x", "user", "wallet")):
             raise ValueError("coin must be a public market symbol")
@@ -125,7 +133,11 @@ class CollectorConfig:
     network: str = "mainnet"
     assets: tuple[str, ...] = ("BTC",)
     candle_intervals: tuple[str, ...] = ("1m",)
+    subscription_channels: tuple[str, ...] = PUBLIC_SUBSCRIPTION_CHANNELS
+    collect_funding_history: bool = True
     batch_size: int = 500
+    reconnect_on_rest_refresh_failure: bool = False
+    critical_funding_history: bool = False
     flush_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 20.0
     pong_timeout_seconds: float = 45.0
@@ -145,11 +157,30 @@ class CollectorConfig:
             raise ValueError(f"unsupported network: {self.network}")
         if not self.assets or len(set(self.assets)) != len(self.assets):
             raise ValueError("assets must be a non-empty unique list")
-        if not self.candle_intervals or len(set(self.candle_intervals)) != len(self.candle_intervals):
-            raise ValueError("candle_intervals must be a non-empty unique list")
+        if not self.subscription_channels or len(set(self.subscription_channels)) != len(
+            self.subscription_channels
+        ):
+            raise ValueError("subscription_channels must be a non-empty unique list")
+        invalid_channels = sorted(set(self.subscription_channels) - _PUBLIC_SUBSCRIPTION_CHANNEL_SET)
+        if invalid_channels:
+            raise ValueError(f"unsupported public subscription channels: {invalid_channels}")
+        has_candles = "candle" in self.subscription_channels
+        if has_candles and (
+            not self.candle_intervals or len(set(self.candle_intervals)) != len(self.candle_intervals)
+        ):
+            raise ValueError("candle_intervals must be a non-empty unique list when candle is subscribed")
+        if not has_candles and self.candle_intervals:
+            raise ValueError("candle_intervals must be empty when candle is not subscribed")
         invalid_intervals = sorted(set(self.candle_intervals) - VALID_CANDLE_INTERVALS)
         if invalid_intervals:
             raise ValueError(f"unsupported candle intervals: {invalid_intervals}")
+        boolean_policies = {
+            "collect_funding_history": self.collect_funding_history,
+            "critical_funding_history": self.critical_funding_history,
+            "reconnect_on_rest_refresh_failure": self.reconnect_on_rest_refresh_failure,
+        }
+        if any(type(value) is not bool for value in boolean_policies.values()):
+            raise ValueError("collector boolean policies must be boolean")
         for asset in self.assets:
             PublicSubscription(channel="activeAssetCtx", coin=asset)
         positive = {
@@ -180,19 +211,29 @@ class CollectorConfig:
 
     @property
     def subscription_count(self) -> int:
-        return len(self.assets) * (4 + len(self.candle_intervals))
+        non_candle_channels = sum(channel != "candle" for channel in self.subscription_channels)
+        candle_count = len(self.candle_intervals) if "candle" in self.subscription_channels else 0
+        return len(self.assets) * (non_candle_channels + candle_count)
+
+    @property
+    def rest_refresh_enabled(self) -> bool:
+        return self.collect_funding_history or "candle" in self.subscription_channels
 
     def subscriptions(self) -> tuple[PublicSubscription, ...]:
         result: list[PublicSubscription] = []
         for coin in self.assets:
-            result.extend(
-                PublicSubscription(channel=channel, coin=coin)
-                for channel in ("activeAssetCtx", "bbo", "l2Book", "trades")
-            )
-            result.extend(
-                PublicSubscription(channel="candle", coin=coin, interval=interval)
-                for interval in self.candle_intervals
-            )
+            for channel in self.subscription_channels:
+                if channel == "candle":
+                    result.extend(
+                        PublicSubscription(
+                            channel="candle",
+                            coin=coin,
+                            interval=interval,
+                        )
+                        for interval in self.candle_intervals
+                    )
+                else:
+                    result.append(PublicSubscription(channel=channel, coin=coin))
         return tuple(result)
 
 

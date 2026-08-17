@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from itertools import zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import cast
@@ -19,6 +20,7 @@ from hyperlab.paper.models import (
     DecisionIntent,
     LedgerEntry,
     MarketEvent,
+    MarketExecutionPolicy,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -29,11 +31,14 @@ from hyperlab.paper.models import (
     PaperProjection,
     PaperRunConfig,
     PaperState,
+    StoredPaperEvent,
     TimeInForce,
     decimal_text,
+    decimal_value,
     deterministic_id,
     ensure_json_object,
     keyed_uniform,
+    parse_utc,
     require_transition,
     utc_text,
 )
@@ -118,16 +123,11 @@ class PaperEngine:
                 restored = self.replay()
             except ValueError:
                 damaged = self.projection()
-                self.reconcile(
-                    as_of=damaged.last_received_at
-                    or self.config.validation_started_at
-                )
+                self.reconcile(as_of=damaged.last_received_at or self.config.validation_started_at)
                 raise
             errors = self._ledger_reconciliation_errors(restored)
             if errors:
-                self.reconcile(
-                    as_of=restored.last_received_at or self.config.validation_started_at
-                )
+                self.reconcile(as_of=restored.last_received_at or self.config.validation_started_at)
                 raise ValueError("paper ledger does not reconcile: " + "; ".join(errors))
 
         input_id = deterministic_id("paper_input_run_started", self.run_id)
@@ -187,20 +187,134 @@ class PaperEngine:
             raise RunConflictError("durable paper projection has a different frozen config hash")
         return projection
 
+    def start_runtime_session(
+        self,
+        *,
+        as_of: datetime,
+        session_id: str,
+        generation: int,
+        replaces_unclosed_session_id: str | None = None,
+    ) -> PaperCommandResult:
+        """Persist one OS-lease-bound runtime admission session."""
+
+        started_at = parse_utc(utc_text(as_of))
+        session = self._evidence_hash(session_id, label="runtime session_id")
+        replacement = (
+            self._evidence_hash(
+                replaces_unclosed_session_id,
+                label="replaces_unclosed_session_id",
+            )
+            if replaces_unclosed_session_id is not None
+            else None
+        )
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            raise ValueError("runtime session generation must be a positive integer")
+        input_id = deterministic_id(
+            "paper_runtime_session_start_input",
+            self.run_id,
+            session,
+        )
+        payload = {
+            "generation": generation,
+            "input_type": "RUNTIME_SESSION_STARTED",
+            "replaces_unclosed_session_id": replacement,
+            "session_id": session,
+            "started_at": utc_text(started_at),
+        }
+        duplicate = self._deduplicate(input_id, payload)
+        if duplicate is not None:
+            return duplicate
+        projection = self.projection()
+        active_session = projection.runtime_session_id if projection.runtime_session_active else None
+        if replacement != active_session:
+            raise ValueError("runtime session replacement differs from durable active session")
+        if generation != projection.runtime_session_generation + 1:
+            raise ValueError("runtime session generation must advance by exactly one")
+        if projection.last_received_at is not None and started_at < projection.last_received_at:
+            raise ValueError("runtime session start precedes durable paper state")
+        event = self._event(
+            PaperEventType.RUNTIME_SESSION_STARTED,
+            at=started_at,
+            received_at=started_at,
+            causation_id=session,
+            correlation_id=input_id,
+            payload=payload,
+        )
+        return self._commit(
+            input_id=input_id,
+            input_payload=payload,
+            base=projection,
+            events=(event,),
+        )
+
+    def stop_runtime_session(
+        self,
+        *,
+        as_of: datetime,
+        session_id: str,
+        generation: int,
+        reason: str,
+    ) -> PaperCommandResult:
+        """Persist a clean runtime stop while the exact OS lease is still held."""
+
+        stopped_at = parse_utc(utc_text(as_of))
+        session = self._evidence_hash(session_id, label="runtime session_id")
+        normalized_reason = reason.strip().upper()
+        if normalized_reason not in {"NORMAL_COMPLETION", "COOPERATIVE_STOP"}:
+            raise ValueError("unsupported clean runtime session stop reason")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            raise ValueError("runtime session generation must be a positive integer")
+        input_id = deterministic_id(
+            "paper_runtime_session_stop_input",
+            self.run_id,
+            session,
+        )
+        payload = {
+            "generation": generation,
+            "input_type": "RUNTIME_SESSION_STOPPED",
+            "reason": normalized_reason,
+            "session_id": session,
+            "stopped_at": utc_text(stopped_at),
+        }
+        duplicate = self._deduplicate(input_id, payload)
+        if duplicate is not None:
+            return duplicate
+        projection = self.projection()
+        if (
+            not projection.runtime_session_active
+            or projection.runtime_session_id != session
+            or projection.runtime_session_generation != generation
+        ):
+            raise ValueError("runtime session stop differs from durable active session")
+        if projection.last_received_at is not None and stopped_at < projection.last_received_at:
+            raise ValueError("runtime session stop precedes durable paper state")
+        event = self._event(
+            PaperEventType.RUNTIME_SESSION_STOPPED,
+            at=stopped_at,
+            received_at=stopped_at,
+            causation_id=session,
+            correlation_id=input_id,
+            payload=payload,
+        )
+        return self._commit(
+            input_id=input_id,
+            input_payload=payload,
+            base=projection,
+            events=(event,),
+        )
+
     def submit_decision(
         self,
         decision: DecisionIntent,
         market: MarketEvent | Mapping[str, MarketEvent],
+        *,
+        processed_at: datetime | None = None,
     ) -> PaperCommandResult:
         if decision.run_id != self.run_id:
             raise ValueError("decision belongs to another paper run")
         if decision.strategy_name != self.config.strategy_name:
             raise ValueError("decision strategy differs from the frozen strategy")
-        markets = (
-            {market.instrument: market}
-            if isinstance(market, MarketEvent)
-            else dict(market)
-        )
+        markets = {market.instrument: market} if isinstance(market, MarketEvent) else dict(market)
         if not markets or any(key != value.instrument for key, value in markets.items()):
             raise ValueError("decision markets must be keyed by their canonical instrument")
         by_id = {item.event_id: item for item in markets.values()}
@@ -213,16 +327,22 @@ class PaperEngine:
             raise ValueError("every supplied market must appear in observed_event_ids")
         if any(order.instrument not in markets for order in decision.orders):
             raise ValueError("every order requires a same-instrument public market observation")
+        processed = parse_utc(utc_text(processed_at or decision.decided_at))
+        if processed < decision.decided_at:
+            raise ValueError("decision processing time cannot precede decided_at")
         input_payload = {
             "decision": decision.to_dict(),
             "input_type": "STRATEGY_DECISION",
             "markets": [markets[key].to_dict() for key in sorted(markets)],
+            "processed_at": utc_text(processed),
         }
         duplicate = self._deduplicate(decision.decision_id, input_payload)
         if duplicate is not None:
             return duplicate
 
         projection = self.projection()
+        if projection.last_received_at is not None and processed < projection.last_received_at:
+            raise ValueError("decision processing time cannot precede durable paper state")
         if projection.state is PaperState.MANUAL_REVIEW:
             raise IntegrityError(self.store.verify_integrity(self.run_id, raise_on_error=False))
         if decision.action is DecisionAction.ENTRY and projection.state is not PaperState.FLAT:
@@ -233,9 +353,7 @@ class PaperEngine:
             PaperState.REDUCE_ONLY,
             PaperState.EMERGENCY_FLATTEN,
         }:
-            raise ValueError(
-                "EXIT decisions require HEDGED, PAUSED, REDUCE_ONLY, or EMERGENCY_FLATTEN"
-            )
+            raise ValueError("EXIT decisions require HEDGED, PAUSED, REDUCE_ONLY, or EMERGENCY_FLATTEN")
 
         events: list[PaperEvent] = []
         working = projection.clone()
@@ -243,8 +361,8 @@ class PaperEngine:
         def emit(event_type: PaperEventType, payload: Mapping[str, object]) -> PaperEvent:
             event = self._event(
                 event_type,
-                at=decision.decided_at,
-                received_at=decision.received_at,
+                at=processed,
+                received_at=processed,
                 causation_id=decision.decision_id,
                 correlation_id=decision.decision_id,
                 payload=payload,
@@ -264,9 +382,7 @@ class PaperEngine:
             )
 
         planning_state = (
-            PaperState.ENTRY_PLANNED
-            if decision.action is DecisionAction.ENTRY
-            else PaperState.EXIT_PLANNED
+            PaperState.ENTRY_PLANNED if decision.action is DecisionAction.ENTRY else PaperState.EXIT_PLANNED
         )
         protective_exit_state = (
             working.state
@@ -308,6 +424,8 @@ class PaperEngine:
                         projected_gross_notional=risk.projected_gross_notional,
                         projected_net_notional=risk.projected_net_notional,
                         projected_instrument_notional=risk.projected_instrument_notional,
+                        projected_instrument_quantity=risk.projected_instrument_quantity,
+                        projected_active_orders=risk.projected_active_orders,
                         risk_reducing=risk.risk_reducing,
                     )
             if not risk.accepted:
@@ -322,12 +440,12 @@ class PaperEngine:
                         severity=AlertSeverity.WARNING,
                         message="; ".join(risk.reasons),
                         causation_id=order.order_id,
-                        at=decision.decided_at,
+                        at=processed,
                     ),
                 )
                 continue
             accepted += 1
-            ack_due = decision.decided_at + timedelta(
+            ack_due = processed + timedelta(
                 milliseconds=(
                     self.config.execution.ack_latency_ms
                     + (order.leg_number - 1) * self.config.execution.leg_delay_ms
@@ -341,20 +459,23 @@ class PaperEngine:
                     "risk": risk.to_dict(),
                 },
             )
-            if ack_due <= decision.decided_at:
+            if ack_due <= processed:
                 self._ack_or_reject(
                     working,
                     events,
                     order,
                     order_market,
                     decision.decision_id,
-                    received_at=decision.received_at,
+                    received_at=processed,
                 )
 
         if decision.action is DecisionAction.ENTRY:
             target = PaperState.LEG_1_PENDING if accepted else PaperState.FLAT
-        elif protective_exit_state is PaperState.EMERGENCY_FLATTEN:
-            target = PaperState.EMERGENCY_FLATTEN
+        elif protective_exit_state in {
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.REDUCE_ONLY,
+        }:
+            target = protective_exit_state
         elif protective_exit_state is not None:
             target = PaperState.EXIT_PENDING if accepted else protective_exit_state
         else:
@@ -371,12 +492,46 @@ class PaperEngine:
             events=tuple(events),
         )
 
-    def process_market(self, market: MarketEvent) -> PaperCommandResult:
-        input_payload = {"input_type": "PUBLIC_MARKET_EVENT", "market": market.to_dict()}
-        duplicate = self._deduplicate(market.event_id, input_payload)
+    def process_market(
+        self,
+        market: MarketEvent,
+        *,
+        processed_at: datetime | None = None,
+        execution_policy: MarketExecutionPolicy | str = MarketExecutionPolicy.EXECUTE,
+    ) -> PaperCommandResult:
+        processed = parse_utc(utc_text(processed_at or market.received_at))
+        if processed < market.received_at:
+            raise ValueError("market processing time cannot precede source received_at")
+        policy = MarketExecutionPolicy(execution_policy)
+        input_payload = {
+            "execution_policy": policy.value,
+            "input_type": "PUBLIC_MARKET_EVENT",
+            "market": market.to_dict(),
+            "processed_at": utc_text(processed),
+        }
+        durable = self.store.get_input(self.run_id, market.event_id)
+        duplicate_payload: Mapping[str, object] = input_payload
+        if (
+            durable is not None
+            and durable.payload.get("input_type") == "PUBLIC_MARKET_EVENT"
+            and durable.payload.get("market") == market.to_dict()
+        ):
+            duplicate_payload = durable.payload
+        duplicate = self._deduplicate(market.event_id, duplicate_payload)
         if duplicate is not None:
             return duplicate
         projection = self.projection()
+        previous_market = projection.last_market_received_at_by_instrument.get(market.instrument)
+        if previous_market is not None and market.received_at < previous_market:
+            raise ValueError("public market source chronology regressed for instrument")
+        if projection.last_received_at is not None and processed < projection.last_received_at:
+            raise ValueError("market processing time cannot precede durable paper state")
+        if (
+            policy is MarketExecutionPolicy.EXECUTE
+            and projection.last_public_source_received_at is not None
+            and market.received_at < projection.last_public_source_received_at
+        ):
+            raise ValueError("executable market cannot precede the public source receipt watermark")
         events: list[PaperEvent] = []
         working = projection.clone()
 
@@ -388,8 +543,8 @@ class PaperEngine:
         ) -> PaperEvent:
             event = self._event(
                 event_type,
-                at=market.received_at,
-                received_at=market.received_at,
+                at=processed,
+                received_at=processed,
                 causation_id=causation_id or market.event_id,
                 correlation_id=causation_id or market.event_id,
                 payload=payload,
@@ -401,24 +556,40 @@ class PaperEngine:
 
         if market.stale or market.gap:
             code = "MARKET_GAP" if market.gap else "STALE_MARKET_DATA"
+            emit(
+                PaperEventType.PUBLIC_SOURCE_HEALTH_RECORDED,
+                {
+                    "gap": market.gap,
+                    "instrument": market.instrument,
+                    "market_event_id": market.event_id,
+                    "source_connection_epoch": market.source_connection_epoch,
+                    "source_connection_id": market.source_connection_id,
+                    "source_event_kind": market.source_event_kind,
+                    "source_received_at": utc_text(market.received_at),
+                    "stale": market.stale,
+                    "tradable": market.tradable,
+                    "execution_policy": policy.value,
+                },
+            )
             episode_id = deterministic_id(
                 "paper_market_gap_episode" if market.gap else "paper_stale_feed_episode",
                 self.run_id,
-                utc_text(
-                    working.last_market_received_at
-                    or self.config.validation_started_at
-                ),
+                utc_text(working.last_market_received_at or self.config.validation_started_at),
             )
             alert_payload = self._alert_payload(
                 code=code,
                 severity=AlertSeverity.CRITICAL,
                 message="matching stopped because public market state is not trustworthy",
                 causation_id=episode_id,
-                at=market.received_at,
+                at=processed,
             )
             if not self._alert_is_durable(str(alert_payload["alert_id"])):
                 emit(PaperEventType.ALERT_RAISED, alert_payload)
-            if working.state not in {PaperState.MANUAL_REVIEW, PaperState.PAUSED}:
+            if working.state not in {
+                PaperState.EMERGENCY_FLATTEN,
+                PaperState.MANUAL_REVIEW,
+                PaperState.PAUSED,
+            }:
                 emit(
                     PaperEventType.STATE_TRANSITIONED,
                     self._transition_payload(working.state, PaperState.PAUSED, code),
@@ -426,9 +597,36 @@ class PaperEngine:
             self._protect_entry_orders(
                 working,
                 events,
-                at=market.received_at,
+                at=processed,
                 causation_id=market.event_id,
                 reason=code,
+            )
+            return self._commit(
+                input_id=market.event_id,
+                input_payload=input_payload,
+                base=projection,
+                events=tuple(events),
+            )
+
+        if not market.tradable:
+            # Connection-health frames deliberately carry the last public book
+            # for source observability. They are not executable observations:
+            # persist explicit health evidence without changing marks, risk,
+            # orders, positions, fees, or PnL.
+            emit(
+                PaperEventType.PUBLIC_SOURCE_HEALTH_RECORDED,
+                {
+                    "gap": market.gap,
+                    "instrument": market.instrument,
+                    "market_event_id": market.event_id,
+                    "source_connection_epoch": market.source_connection_epoch,
+                    "source_connection_id": market.source_connection_id,
+                    "source_event_kind": market.source_event_kind,
+                    "source_received_at": utc_text(market.received_at),
+                    "stale": market.stale,
+                    "tradable": False,
+                    "execution_policy": policy.value,
+                },
             )
             return self._commit(
                 input_id=market.event_id,
@@ -442,45 +640,24 @@ class PaperEngine:
             {
                 "instrument": market.instrument,
                 "price": decimal_text((market.bid_price + market.ask_price) / Decimal(2)),
+                "source_received_at": utc_text(market.received_at),
+                "execution_policy": policy.value,
+                "execution_suppressed": policy is not MarketExecutionPolicy.EXECUTE,
             },
         )
 
-        current_equity = working.equity
-        protective_reason: str | None = None
-        protective_code: str | None = None
-        if working.session_start_equity - current_equity >= self.config.risk.max_daily_loss:
-            protective_reason = "daily loss limit reached"
-            protective_code = "DAILY_LOSS_LIMIT"
-        elif working.peak_equity - current_equity >= self.config.risk.max_drawdown:
-            protective_reason = "drawdown limit reached"
-            protective_code = "DRAWDOWN_LIMIT"
-        if protective_reason is not None and working.positions and working.state not in {
-            PaperState.REDUCE_ONLY,
-            PaperState.EMERGENCY_FLATTEN,
-            PaperState.MANUAL_REVIEW,
-        }:
-            assert protective_code is not None
-            emit(
-                PaperEventType.ALERT_RAISED,
-                self._alert_payload(
-                    code=protective_code,
-                    severity=AlertSeverity.CRITICAL,
-                    message=(
-                        f"{protective_reason}; equity={decimal_text(current_equity)}; "
-                        f"peak={decimal_text(working.peak_equity)}; "
-                        f"session_start={decimal_text(working.session_start_equity)}"
-                    ),
-                    causation_id=market.event_id,
-                    at=market.received_at,
-                ),
-            )
-            emit(
-                PaperEventType.STATE_TRANSITIONED,
-                self._transition_payload(
-                    working.state,
-                    PaperState.REDUCE_ONLY,
-                    protective_reason,
-                ),
+        self._apply_protective_risk_state(
+            working,
+            events,
+            at=processed,
+            causation_id=market.event_id,
+        )
+        if policy is not MarketExecutionPolicy.EXECUTE:
+            return self._commit(
+                input_id=market.event_id,
+                input_payload=input_payload,
+                base=projection,
+                events=tuple(events),
             )
 
         if working.state in {
@@ -491,7 +668,7 @@ class PaperEngine:
             self._protect_entry_orders(
                 working,
                 events,
-                at=market.received_at,
+                at=processed,
                 causation_id=market.event_id,
                 reason=f"state {working.state.value}",
             )
@@ -502,11 +679,8 @@ class PaperEngine:
             if order.status is OrderStatus.CANCEL_PENDING:
                 timeout_wins = (
                     order.expires_at is not None
-                    and order.expires_at <= market.received_at
-                    and (
-                        order.cancel_effective_at is None
-                        or order.expires_at <= order.cancel_effective_at
-                    )
+                    and order.expires_at <= processed
+                    and (order.cancel_effective_at is None or order.expires_at <= order.cancel_effective_at)
                 )
                 if timeout_wins:
                     emit(
@@ -519,10 +693,7 @@ class PaperEngine:
                         causation_id=order.intent.order_id,
                     )
                     continue
-                if (
-                    order.cancel_effective_at is not None
-                    and order.cancel_effective_at <= market.received_at
-                ):
+                if order.cancel_effective_at is not None and order.cancel_effective_at <= processed:
                     emit(
                         PaperEventType.ORDER_CANCELLED,
                         {"order_id": order.intent.order_id},
@@ -535,7 +706,7 @@ class PaperEngine:
             if (
                 order.status is OrderStatus.RISK_ACCEPTED
                 and order.active_at is not None
-                and order.active_at <= market.received_at
+                and order.active_at <= processed
             ):
                 if order.action is DecisionAction.ENTRY and working.state in {
                     PaperState.PAUSED,
@@ -547,6 +718,7 @@ class PaperEngine:
                         events,
                         order,
                         market,
+                        processed_at=processed,
                         reason=f"state {working.state.value} blocks new exposure",
                     )
                 else:
@@ -556,6 +728,7 @@ class PaperEngine:
                         order.intent,
                         market,
                         market.event_id,
+                        received_at=processed,
                     )
 
         liquidity = _MarketLiquidity.from_market(market)
@@ -566,18 +739,13 @@ class PaperEngine:
                 OrderStatus.CANCEL_PENDING,
             }:
                 continue
-            if (
-                order.action is DecisionAction.ENTRY
-                and working.state
-                in {
-                    PaperState.PAUSED,
-                    PaperState.REDUCE_ONLY,
-                    PaperState.EMERGENCY_FLATTEN,
-                }
-                and order.status is not OrderStatus.CANCEL_PENDING
-            ):
+            if order.action is DecisionAction.ENTRY and working.state in {
+                PaperState.PAUSED,
+                PaperState.REDUCE_ONLY,
+                PaperState.EMERGENCY_FLATTEN,
+            }:
                 continue
-            if order.expires_at is not None and order.expires_at <= market.received_at:
+            if order.expires_at is not None and order.expires_at <= processed:
                 terminal = (
                     PaperEventType.ORDER_NO_FILL
                     if order.filled_quantity == 0
@@ -592,13 +760,25 @@ class PaperEngine:
             if order.intent.created_at >= market.received_at:
                 continue
             if order.active_at is None or (
-                order.active_at + timedelta(milliseconds=self.config.execution.fill_latency_ms)
-                > market.received_at
+                order.active_at + timedelta(milliseconds=self.config.execution.fill_latency_ms) > processed
             ):
                 continue
-            self._match_order(working, events, order, market, liquidity)
+            self._match_order(
+                working,
+                events,
+                order,
+                market,
+                liquidity,
+                processed_at=processed,
+            )
 
-        self._derive_lifecycle(working, events, market)
+        self._derive_lifecycle(working, events, market, processed_at=processed)
+        self._apply_protective_risk_state(
+            working,
+            events,
+            at=processed,
+            causation_id=market.event_id,
+        )
         return self._commit(
             input_id=market.event_id,
             input_payload=input_payload,
@@ -654,38 +834,255 @@ class PaperEngine:
         amount: Decimal,
         occurred_at: datetime,
         source_event_id: str,
+        funding_rate: Decimal | None = None,
+        funding_interval_seconds: int | None = None,
+        rate_kind: str | None = None,
+        mark_price: Decimal | None = None,
+        source_mark_price: Decimal | None = None,
+        oracle_price: Decimal | None = None,
+        position_quantity: Decimal | None = None,
+        mark_source: str | None = None,
+        source_observation_id: str | None = None,
+        received_at: datetime | None = None,
+        processed_at: datetime | None = None,
+        applicability: str = "APPLIED",
+        source_activation_cutoff: datetime | None = None,
     ) -> PaperCommandResult:
-        input_id = deterministic_id(
-            "paper_funding_input",
-            self.run_id,
-            source_event_id,
+        normalized_amount = decimal_value(amount, label="funding amount")
+        received = received_at or occurred_at
+        processed = parse_utc(utc_text(processed_at or received))
+        processed_text = utc_text(processed)
+        occurred_text = utc_text(occurred_at)
+        received_text = utc_text(received)
+        if received < occurred_at:
+            raise ValueError("funding received_at cannot precede funding_time")
+        if processed < received:
+            raise ValueError("funding processing time cannot precede source received_at")
+
+        normalized_applicability = applicability.strip().upper()
+        if normalized_applicability not in {"APPLIED", "PRE_ACTIVATION_IGNORED"}:
+            raise ValueError("unsupported funding applicability")
+        activation_text = utc_text(source_activation_cutoff) if source_activation_cutoff is not None else None
+        if source_activation_cutoff is not None:
+            first_reconciliation = next(
+                iter(
+                    self.store.iter_inputs(
+                        self.run_id,
+                        input_type="RECONCILE",
+                    )
+                ),
+                None,
+            )
+            if first_reconciliation is None or first_reconciliation.payload.get("as_of") != activation_text:
+                raise ValueError("funding source activation cutoff differs from first durable reconciliation")
+        if normalized_applicability == "PRE_ACTIVATION_IGNORED":
+            if source_activation_cutoff is None or occurred_at >= source_activation_cutoff:
+                raise ValueError("pre-activation funding requires a later durable source activation cutoff")
+        elif source_activation_cutoff is not None and occurred_at < source_activation_cutoff:
+            raise ValueError("funding before source activation cannot be applied")
+
+        required_metadata_values = (
+            funding_rate,
+            funding_interval_seconds,
+            rate_kind,
+            position_quantity,
+            mark_source,
+            source_observation_id,
+            received_at,
         )
-        payload = {
-            "amount": decimal_text(amount),
+        detailed = (
+            mark_price is not None
+            or source_mark_price is not None
+            or source_activation_cutoff is not None
+            or normalized_applicability != "APPLIED"
+            or any(value is not None for value in required_metadata_values)
+        )
+        if detailed and any(value is None for value in required_metadata_values):
+            raise ValueError("detailed public funding requires complete calculation metadata")
+
+        normalized_rate: Decimal | None = None
+        normalized_mark: Decimal | None = None
+        normalized_source_mark: Decimal | None = None
+        normalized_oracle: Decimal | None = None
+        normalized_position: Decimal | None = None
+        normalized_rate_kind: str | None = None
+        normalized_mark_source: str | None = None
+        normalized_observation: str | None = None
+        if detailed:
+            assert funding_rate is not None
+            assert funding_interval_seconds is not None
+            assert rate_kind is not None
+            assert position_quantity is not None
+            assert mark_source is not None
+            assert source_observation_id is not None
+            if (
+                isinstance(funding_interval_seconds, bool)
+                or not isinstance(funding_interval_seconds, int)
+                or funding_interval_seconds <= 0
+            ):
+                raise ValueError("funding_interval_seconds must be a positive integer")
+            normalized_rate = decimal_value(funding_rate, label="funding_rate")
+            normalized_position = decimal_value(position_quantity, label="funding position")
+            if mark_price is not None:
+                normalized_mark = decimal_value(
+                    mark_price,
+                    label="funding mark",
+                    positive=True,
+                )
+            elif normalized_position != 0 and normalized_applicability != "PRE_ACTIVATION_IGNORED":
+                raise ValueError("non-flat applied funding requires a positive mark")
+            normalized_rate_kind = rate_kind.strip()
+            normalized_mark_source = mark_source.strip()
+            normalized_observation = source_observation_id.strip()
+            if not normalized_rate_kind or any(char.isspace() for char in normalized_rate_kind):
+                raise ValueError("funding rate_kind must be a stable identifier")
+            if not normalized_mark_source or any(char.isspace() for char in normalized_mark_source):
+                raise ValueError("funding mark_source must be a stable identifier")
+            if not normalized_observation or any(char.isspace() for char in normalized_observation):
+                raise ValueError("funding source_observation_id must be a stable identifier")
+        if source_mark_price is not None:
+            normalized_source_mark = decimal_value(
+                source_mark_price,
+                label="funding source_mark_price",
+                positive=True,
+            )
+        if oracle_price is not None:
+            normalized_oracle = decimal_value(
+                oracle_price,
+                label="funding oracle_price",
+                positive=True,
+            )
+
+        input_id = deterministic_id("paper_funding_input", self.run_id, source_event_id)
+        payload: dict[str, object] = {
+            "amount": decimal_text(normalized_amount),
             "input_type": "PUBLIC_FUNDING_SETTLEMENT",
             "instrument": instrument,
-            "occurred_at": utc_text(occurred_at),
+            "occurred_at": occurred_text,
             "source_event_id": source_event_id,
+            "processed_at": processed_text,
         }
+        if detailed:
+            assert normalized_rate is not None
+            assert normalized_position is not None
+            assert normalized_rate_kind is not None
+            assert normalized_mark_source is not None
+            assert normalized_observation is not None
+            assert funding_interval_seconds is not None
+            payload.update(
+                {
+                    "applicability": normalized_applicability,
+                    "funding_interval_seconds": funding_interval_seconds,
+                    "funding_rate": decimal_text(normalized_rate),
+                    "mark_source": normalized_mark_source,
+                    "oracle_price": (
+                        decimal_text(normalized_oracle) if normalized_oracle is not None else None
+                    ),
+                    "position_quantity": decimal_text(normalized_position),
+                    "rate_kind": normalized_rate_kind,
+                    "received_at": received_text,
+                    "source_activation_cutoff": activation_text,
+                    "source_mark_price": (
+                        decimal_text(normalized_source_mark) if normalized_source_mark is not None else None
+                    ),
+                    "source_observation_id": normalized_observation,
+                }
+            )
+            if normalized_mark is not None:
+                payload["mark_price"] = decimal_text(normalized_mark)
+
         duplicate = self._deduplicate(input_id, payload)
         if duplicate is not None:
             return duplicate
         projection = self.projection()
-        if instrument not in projection.positions:
-            raise ValueError("funding cannot be posted without an open simulated position")
+        if projection.last_received_at is not None and processed < projection.last_received_at:
+            raise ValueError("funding processing time cannot precede durable paper state")
+        current_position = projection.positions.get(instrument, Decimal(0))
+        if detailed:
+            assert normalized_rate is not None
+            assert normalized_position is not None
+            historical = self.store.get_projection_before_received_at(
+                self.run_id,
+                before=occurred_at,
+            )
+            historical_position = (
+                historical.positions.get(instrument, Decimal(0)) if historical is not None else Decimal(0)
+            )
+            if normalized_applicability == "PRE_ACTIVATION_IGNORED":
+                if normalized_position != 0 or normalized_amount != 0:
+                    raise ValueError("pre-activation funding must record zero Paper exposure and amount")
+            else:
+                if normalized_position != historical_position:
+                    raise ValueError("funding position differs from durable position before settlement")
+                expected_amount = Decimal(0)
+                if normalized_position != 0:
+                    assert normalized_mark is not None
+                    expected_amount = -(normalized_position * normalized_mark * normalized_rate)
+                if normalized_amount != expected_amount:
+                    raise ValueError("funding amount differs from rate, mark, and position")
+            if normalized_mark_source == "PUBLIC_SETTLEMENT_MARK":
+                if normalized_source_mark is None or normalized_mark != normalized_source_mark:
+                    raise ValueError("public settlement mark source is not exact")
+            elif normalized_mark_source == "PUBLIC_SETTLEMENT_ORACLE":
+                if normalized_oracle is None or normalized_mark != normalized_oracle:
+                    raise ValueError("public settlement oracle source is not exact")
+            elif normalized_mark_source == "DURABLE_PUBLIC_BBO_MID":
+                historical_mark = (
+                    historical.public_bbo_mids.get(instrument) if historical is not None else None
+                )
+                historical_mark_at = (
+                    historical.public_bbo_received_at_by_instrument.get(instrument)
+                    if historical is not None
+                    else None
+                )
+                if (
+                    normalized_mark is None
+                    or historical_mark_at is None
+                    or normalized_mark != historical_mark
+                ):
+                    raise ValueError("durable BBO funding mark is not exact")
+                if historical_mark_at > occurred_at:
+                    raise ValueError("durable BBO funding mark is after funding_time")
+                if occurred_at - historical_mark_at > timedelta(seconds=self.config.risk.stale_after_seconds):
+                    raise ValueError("durable BBO funding mark is stale at funding_time")
+            elif normalized_mark_source == "FLAT_NO_MARK":
+                if normalized_mark is not None or normalized_position != 0:
+                    raise ValueError("FLAT_NO_MARK requires zero position and no mark")
+            else:
+                raise ValueError("unsupported funding mark_source")
+        elif current_position == 0 and normalized_amount != 0:
+            raise ValueError("non-zero funding cannot be posted while flat")
+
+        event_payload = dict(payload)
+        event_payload.pop("input_type")
+        event_payload["funding_time"] = event_payload.pop("occurred_at")
+        event_payload["source_received_at"] = received_text
         event = self._event(
             PaperEventType.FUNDING_POSTED,
-            at=occurred_at,
-            received_at=occurred_at,
+            # Public REST settlement history is necessarily observed after the
+            # economic funding timestamp. Apply it only at causal receipt time
+            # while retaining the exact funding_time in the immutable payload.
+            at=processed,
+            received_at=processed,
             causation_id=source_event_id,
             correlation_id=input_id,
-            payload={"amount": decimal_text(amount), "instrument": instrument},
+            payload=event_payload,
         )
+        working = projection.clone()
+        events = [event]
+        apply_event(working, event)
+        self._apply_protective_risk_state(
+            working,
+            events,
+            at=processed,
+            causation_id=source_event_id,
+        )
+
         return self._commit(
             input_id=input_id,
             input_payload=payload,
             base=projection,
-            events=(event,),
+            events=tuple(events),
         )
 
     @staticmethod
@@ -743,9 +1140,7 @@ class PaperEngine:
         if normalized not in allowed:
             raise ValueError(f"resilience exercise must be one of {sorted(allowed)}")
         artifact = self._evidence_hash(artifact_hash, label="resilience artifact_hash")
-        input_id = deterministic_id(
-            "paper_resilience_exercise_input", self.run_id, normalized, artifact
-        )
+        input_id = deterministic_id("paper_resilience_exercise_input", self.run_id, normalized, artifact)
         payload = {
             "artifact_hash": artifact,
             "config_hash": self.config.config_hash,
@@ -795,6 +1190,8 @@ class PaperEngine:
             "window_end": utc_text(window_end),
             "window_start": utc_text(window_start),
         }
+        if self.config.schema_version >= 2:
+            payload["recorded_at"] = utc_text(recorded_at)
         duplicate = self._deduplicate(input_id, payload)
         if duplicate is not None:
             return duplicate
@@ -843,9 +1240,7 @@ class PaperEngine:
         last_market = working.last_market_received_at
         required_instruments = set(self.config.required_instruments)
         required_instruments.update(working.positions)
-        required_instruments.update(
-            order.intent.instrument for order in working.active_orders
-        )
+        required_instruments.update(order.intent.instrument for order in working.active_orders)
         stale_instruments = sorted(
             instrument
             for instrument in required_instruments
@@ -864,6 +1259,19 @@ class PaperEngine:
             or as_of - last_market > timedelta(seconds=self.config.risk.stale_after_seconds)
             or bool(stale_instruments)
         )
+        pending_states = {
+            PaperState.LEG_1_PENDING,
+            PaperState.HEDGE_PENDING,
+            PaperState.EXIT_PENDING,
+        }
+        unhedged = bool(working.positions) and (
+            working.state in pending_states
+            or (working.state is PaperState.PAUSED and working.suspended_from in pending_states)
+        )
+        state_since = working.state_since or self.config.validation_started_at
+        unhedged_timed_out = unhedged and as_of - state_since >= timedelta(
+            seconds=self.config.risk.unhedged_timeout_seconds
+        )
         if feed_stale:
             stale_payload = self._alert_payload(
                 code="STALE_MARKET_DATA",
@@ -871,8 +1279,7 @@ class PaperEngine:
                 message=(
                     "no fresh normalized public market event before the frozen timeout"
                     if not stale_instruments
-                    else "stale normalized public market channels: "
-                    + ", ".join(stale_instruments)
+                    else "stale normalized public market channels: " + ", ".join(stale_instruments)
                 ),
                 causation_id=deterministic_id(
                     "paper_stale_feed_episode",
@@ -883,13 +1290,31 @@ class PaperEngine:
             )
             if not self._alert_is_durable(str(stale_payload["alert_id"])):
                 emit(PaperEventType.ALERT_RAISED, stale_payload)
-            if working.state not in {PaperState.PAUSED, PaperState.MANUAL_REVIEW}:
+            if working.state not in {
+                PaperState.PAUSED,
+                PaperState.MANUAL_REVIEW,
+                PaperState.EMERGENCY_FLATTEN,
+            }:
+                target = PaperState.EMERGENCY_FLATTEN if unhedged_timed_out else PaperState.PAUSED
                 emit(
                     PaperEventType.STATE_TRANSITIONED,
                     self._transition_payload(
                         working.state,
-                        PaperState.PAUSED,
-                        "stale public market feed",
+                        target,
+                        (
+                            "unhedged timeout with stale public market feed"
+                            if unhedged_timed_out
+                            else "stale public market feed"
+                        ),
+                    ),
+                )
+            elif working.state is PaperState.PAUSED and unhedged_timed_out:
+                emit(
+                    PaperEventType.STATE_TRANSITIONED,
+                    self._transition_payload(
+                        working.state,
+                        PaperState.EMERGENCY_FLATTEN,
+                        "unhedged timeout while public market feed remained paused",
                     ),
                 )
             self._protect_entry_orders(
@@ -900,15 +1325,7 @@ class PaperEngine:
                 reason="stale public market feed",
             )
 
-        state_since = working.state_since or self.config.validation_started_at
-        unhedged = working.state in {
-            PaperState.LEG_1_PENDING,
-            PaperState.HEDGE_PENDING,
-            PaperState.EXIT_PENDING,
-        } and bool(working.positions)
-        if unhedged and as_of - state_since >= timedelta(
-            seconds=self.config.risk.unhedged_timeout_seconds
-        ):
+        if unhedged_timed_out:
             emit(
                 PaperEventType.ALERT_RAISED,
                 self._alert_payload(
@@ -921,14 +1338,259 @@ class PaperEngine:
                     at=as_of,
                 ),
             )
-            emit(
-                PaperEventType.STATE_TRANSITIONED,
-                self._transition_payload(
-                    working.state,
-                    PaperState.EMERGENCY_FLATTEN,
-                    "unhedged timeout",
+            if working.state is not PaperState.EMERGENCY_FLATTEN:
+                emit(
+                    PaperEventType.STATE_TRANSITIONED,
+                    self._transition_payload(
+                        working.state,
+                        PaperState.EMERGENCY_FLATTEN,
+                        "unhedged timeout",
+                    ),
+                )
+        self._apply_protective_risk_state(
+            working,
+            events,
+            at=as_of,
+            causation_id=input_id,
+        )
+        return self._commit(
+            input_id=input_id,
+            input_payload=payload,
+            base=projection,
+            events=tuple(events),
+        )
+
+    def pause(
+        self,
+        *,
+        as_of: datetime,
+        reason: str,
+        operator_artifact_hash: str,
+        origin: str = "OPERATOR",
+    ) -> PaperCommandResult:
+        """Persist an operator, public-source, or runtime-failure pause."""
+
+        artifact = self._evidence_hash(
+            operator_artifact_hash,
+            label="operator artifact_hash",
+        )
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("pause reason cannot be empty")
+        normalized_origin = origin.strip().upper()
+        if normalized_origin not in {
+            "OPERATOR",
+            "PUBLIC_SOURCE_FAILURE",
+            "PAPER_RUNTIME_FAILURE",
+        }:
+            raise ValueError("unsupported paper pause origin")
+        input_type, input_domain = {
+            "OPERATOR": ("OPERATOR_PAUSE", "paper_pause_input"),
+            "PUBLIC_SOURCE_FAILURE": (
+                "PUBLIC_SOURCE_FAILURE",
+                "paper_source_failure_input",
+            ),
+            "PAPER_RUNTIME_FAILURE": (
+                "PAPER_RUNTIME_FAILURE",
+                "paper_runtime_failure_input",
+            ),
+        }[normalized_origin]
+        input_id = deterministic_id(input_domain, self.run_id, artifact)
+        payload = {
+            "as_of": utc_text(as_of),
+            "input_type": input_type,
+            "operator_artifact_hash": artifact,
+            "reason": normalized_reason,
+        }
+        duplicate = self._deduplicate(input_id, payload)
+        if duplicate is not None:
+            return duplicate
+        projection = self.projection()
+        if projection.state is PaperState.MANUAL_REVIEW:
+            raise ValueError("MANUAL_REVIEW cannot be replaced by an operator pause")
+        if projection.state is PaperState.PAUSED and normalized_origin == "OPERATOR":
+            raise ValueError("paper run is already PAUSED")
+
+        working = projection.clone()
+        events: list[PaperEvent] = []
+        alert = self._event(
+            PaperEventType.ALERT_RAISED,
+            at=as_of,
+            received_at=as_of,
+            causation_id=artifact,
+            correlation_id=input_id,
+            payload=self._alert_payload(
+                code=input_type,
+                severity=(
+                    AlertSeverity.WARNING if normalized_origin == "OPERATOR" else AlertSeverity.CRITICAL
                 ),
+                message=normalized_reason,
+                causation_id=artifact,
+                at=as_of,
+            ),
+            ordinal=len(events),
+        )
+        apply_event(working, alert)
+        events.append(alert)
+        self._protect_entry_orders(
+            working,
+            events,
+            at=as_of,
+            causation_id=artifact,
+            reason=(
+                "operator pause"
+                if normalized_origin == "OPERATOR"
+                else (
+                    "terminal public source failure"
+                    if normalized_origin == "PUBLIC_SOURCE_FAILURE"
+                    else "terminal paper runtime failure"
+                )
+            ),
+        )
+        if working.state not in {PaperState.EMERGENCY_FLATTEN, PaperState.PAUSED}:
+            transition = self._event(
+                PaperEventType.STATE_TRANSITIONED,
+                at=as_of,
+                received_at=as_of,
+                causation_id=artifact,
+                correlation_id=input_id,
+                payload=self._transition_payload(
+                    working.state,
+                    PaperState.PAUSED,
+                    normalized_reason,
+                ),
+                ordinal=len(events),
             )
+            apply_event(working, transition)
+            events.append(transition)
+        return self._commit(
+            input_id=input_id,
+            input_payload=payload,
+            base=projection,
+            events=tuple(events),
+        )
+
+    def kill(
+        self,
+        *,
+        as_of: datetime,
+        reason: str,
+        operator_artifact_hash: str,
+    ) -> PaperCommandResult:
+        """Irreversibly latch MANUAL_REVIEW and terminate all simulated orders."""
+
+        artifact = self._evidence_hash(
+            operator_artifact_hash,
+            label="operator artifact_hash",
+        )
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("kill reason cannot be empty")
+        input_id = deterministic_id("paper_kill_input", self.run_id, artifact)
+        payload = {
+            "as_of": utc_text(as_of),
+            "input_type": "PAPER_KILL",
+            "operator_artifact_hash": artifact,
+            "reason": normalized_reason,
+        }
+        duplicate = self._deduplicate(input_id, payload)
+        if duplicate is not None:
+            return duplicate
+        projection = self.projection()
+        if projection.state is PaperState.MANUAL_REVIEW:
+            raise ValueError("paper run is already latched in MANUAL_REVIEW")
+
+        working = projection.clone()
+        events: list[PaperEvent] = []
+        alert = self._event(
+            PaperEventType.ALERT_RAISED,
+            at=as_of,
+            received_at=as_of,
+            causation_id=artifact,
+            correlation_id=input_id,
+            payload=self._alert_payload(
+                code="PAPER_KILL",
+                severity=AlertSeverity.CRITICAL,
+                message=normalized_reason,
+                causation_id=artifact,
+                at=as_of,
+            ),
+            ordinal=len(events),
+        )
+        apply_event(working, alert)
+        events.append(alert)
+
+        for order in self._ordered_orders(working):
+            if order.status is OrderStatus.RISK_ACCEPTED:
+                terminal = self._event(
+                    PaperEventType.ORDER_REJECTED,
+                    at=as_of,
+                    received_at=as_of,
+                    causation_id=artifact,
+                    correlation_id=order.intent.decision_id,
+                    payload={
+                        "order_id": order.intent.order_id,
+                        "reason": "operator kill before simulated acknowledgement",
+                    },
+                    ordinal=len(events),
+                )
+                apply_event(working, terminal)
+                events.append(terminal)
+            elif order.status in {OrderStatus.ACKED, OrderStatus.PARTIALLY_FILLED}:
+                requested = self._event(
+                    PaperEventType.CANCEL_REQUESTED,
+                    at=as_of,
+                    received_at=as_of,
+                    causation_id=artifact,
+                    correlation_id=order.intent.decision_id,
+                    payload={
+                        "cancel_effective_at": utc_text(as_of),
+                        "order_id": order.intent.order_id,
+                        "reason": "operator kill",
+                    },
+                    ordinal=len(events),
+                )
+                apply_event(working, requested)
+                events.append(requested)
+                cancelled = self._event(
+                    PaperEventType.ORDER_CANCELLED,
+                    at=as_of,
+                    received_at=as_of,
+                    causation_id=artifact,
+                    correlation_id=order.intent.decision_id,
+                    payload={"order_id": order.intent.order_id},
+                    ordinal=len(events),
+                )
+                apply_event(working, cancelled)
+                events.append(cancelled)
+            elif order.status is OrderStatus.CANCEL_PENDING:
+                cancelled = self._event(
+                    PaperEventType.ORDER_CANCELLED,
+                    at=as_of,
+                    received_at=as_of,
+                    causation_id=artifact,
+                    correlation_id=order.intent.decision_id,
+                    payload={"order_id": order.intent.order_id},
+                    ordinal=len(events),
+                )
+                apply_event(working, cancelled)
+                events.append(cancelled)
+
+        transition = self._event(
+            PaperEventType.STATE_TRANSITIONED,
+            at=as_of,
+            received_at=as_of,
+            causation_id=artifact,
+            correlation_id=input_id,
+            payload=self._transition_payload(
+                working.state,
+                PaperState.MANUAL_REVIEW,
+                f"operator kill: {normalized_reason}",
+            ),
+            ordinal=len(events),
+        )
+        apply_event(working, transition)
+        events.append(transition)
         return self._commit(
             input_id=input_id,
             input_payload=payload,
@@ -941,15 +1603,39 @@ class PaperEngine:
         *,
         as_of: datetime,
         review_artifact_hash: str,
+        reviewed_critical_incident_count: int,
+        reviewed_last_critical_incident_at: datetime | None,
+        recovery_mode: str,
     ) -> PaperCommandResult:
-        """Explicit audited recovery after fresh data and exact reconciliation."""
+        """Explicit audited recovery bound to the exact critical-incident head."""
 
         artifact = self._evidence_hash(review_artifact_hash, label="review artifact_hash")
+        if (
+            isinstance(reviewed_critical_incident_count, bool)
+            or not isinstance(reviewed_critical_incident_count, int)
+            or reviewed_critical_incident_count < 0
+        ):
+            raise ValueError("reviewed_critical_incident_count must be a non-negative integer")
+        reviewed_at = (
+            parse_utc(utc_text(reviewed_last_critical_incident_at))
+            if reviewed_last_critical_incident_at is not None
+            else None
+        )
+        if (reviewed_critical_incident_count == 0) != (reviewed_at is None):
+            raise ValueError("reviewed_last_critical_incident_at must match the reviewed incident count")
+        normalized_mode = recovery_mode.strip().upper()
+        if normalized_mode not in {"STANDARD", "OFFLINE_UNCLOSED_SESSION"}:
+            raise ValueError("unsupported paper resume recovery_mode")
         input_id = deterministic_id("paper_resume_input", self.run_id, artifact)
         payload = {
             "as_of": utc_text(as_of),
             "input_type": "RESUME_AFTER_REVIEW",
+            "recovery_mode": normalized_mode,
             "review_artifact_hash": artifact,
+            "reviewed_critical_incident_count": reviewed_critical_incident_count,
+            "reviewed_last_critical_incident_at": (
+                utc_text(reviewed_at) if reviewed_at is not None else None
+            ),
         }
         duplicate = self._deduplicate(input_id, payload)
         if duplicate is not None:
@@ -960,10 +1646,67 @@ class PaperEngine:
             raise ValueError("resume_from_pause requires PAUSED state")
         if not projection.reconciled:
             raise ValueError("resume_from_pause requires exact reconciliation")
-        if projection.last_market_received_at is None or as_of - projection.last_market_received_at > timedelta(
-            seconds=self.config.risk.stale_after_seconds
+        if (
+            projection.critical_incident_count != reviewed_critical_incident_count
+            or projection.last_critical_incident_at != reviewed_at
         ):
-            raise ValueError("resume_from_pause requires a fresh normalized public market")
+            raise ValueError("reviewed critical-incident summary differs from durable projection")
+
+        if normalized_mode == "OFFLINE_UNCLOSED_SESSION":
+            session_id = projection.runtime_session_id
+            if not projection.runtime_session_active or session_id is None:
+                raise ValueError("offline unclosed-session recovery requires an active durable session")
+            failure_artifact = deterministic_id(
+                "paper_runtime_failure_v1",
+                self.run_id,
+                self.config.config_hash,
+                "UNCLOSED_RUNTIME_SESSION",
+                "UnclosedRuntimeSessionError",
+                session_id,
+            )
+            failure = self.store.get_input(
+                self.run_id,
+                deterministic_id(
+                    "paper_runtime_failure_input",
+                    self.run_id,
+                    failure_artifact,
+                ),
+            )
+            expected_reason = (
+                "terminal paper runtime failure: UNCLOSED_RUNTIME_SESSION: UnclosedRuntimeSessionError"
+            )
+            latest_critical = self.store.get_latest_alert(self.run_id, severity="CRITICAL")
+            if (
+                failure is None
+                or failure.payload.get("input_type") != "PAPER_RUNTIME_FAILURE"
+                or failure.payload.get("operator_artifact_hash") != failure_artifact
+                or failure.payload.get("reason") != expected_reason
+                or latest_critical is None
+                or latest_critical.commit_sequence != failure.commit_sequence
+                or reviewed_at is None
+                or failure.payload.get("as_of") != utc_text(reviewed_at)
+            ):
+                raise ValueError(
+                    "offline recovery requires the latest reviewed incident to be "
+                    "the durable unclosed-session failure"
+                )
+        else:
+            stale_after = timedelta(seconds=self.config.risk.stale_after_seconds)
+            required = self.config.required_instruments
+            if required:
+                missing_or_stale = tuple(
+                    instrument
+                    for instrument in required
+                    if instrument not in projection.public_bbo_mids
+                    or (market_at := projection.public_bbo_received_at_by_instrument.get(instrument)) is None
+                    or market_at > as_of
+                    or as_of - market_at > stale_after
+                )
+                if missing_or_stale:
+                    raise ValueError(
+                        "resume_from_pause requires a fresh uninterrupted public "
+                        "BBO for every required instrument"
+                    )
         if any(
             order.action is DecisionAction.ENTRY and order.status.active
             for order in projection.orders.values()
@@ -979,7 +1722,11 @@ class PaperEngine:
             payload=self._transition_payload(
                 projection.state,
                 target,
-                "explicit reviewed recovery",
+                (
+                    "offline reviewed unclosed-session recovery"
+                    if normalized_mode == "OFFLINE_UNCLOSED_SESSION"
+                    else "explicit reviewed recovery"
+                ),
             ),
         )
         return self._commit(
@@ -997,8 +1744,11 @@ class PaperEngine:
         reason: str,
     ) -> PaperCommandResult:
         projection = self.projection()
-        if projection.state is not PaperState.EMERGENCY_FLATTEN:
-            raise ValueError("emergency_flatten requires EMERGENCY_FLATTEN state")
+        if projection.state not in {
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.REDUCE_ONLY,
+        }:
+            raise ValueError("automatic flatten requires a protective paper state")
         if not projection.positions:
             raise ValueError("emergency_flatten requires an open simulated position")
         if any(instrument not in markets for instrument in projection.positions):
@@ -1051,7 +1801,7 @@ class PaperEngine:
 
     def replay(self) -> PaperProjection:
         run = self.store.get_run(self.run_id)
-        events = self.store.get_events(self.run_id)
+        events = self.store.iter_events(self.run_id)
         replayed = replay_projection(
             run_id=self.run_id,
             config_hash=self.config.config_hash,
@@ -1068,9 +1818,9 @@ class PaperEngine:
     def verify_input_replay(self) -> PaperProjection:
         """Re-run the canonical inbox through a fresh engine and compare outputs exactly."""
 
-        source_inputs = self.store.get_inputs(self.run_id)
-        source_events = self.store.get_events(self.run_id)
-        source_ledger = self.store.get_ledger_entries(self.run_id)
+        source_inputs = self.store.iter_inputs(self.run_id)
+        legacy_source_events = iter(self.store.iter_events(self.run_id))
+        legacy_source_event: StoredPaperEvent | None = None
         with TemporaryDirectory(prefix="hyperlab-paper-replay-") as directory:
             replay_store = PaperStore(Path(directory) / "paper-replay.sqlite3")
             replay_engine = PaperEngine(replay_store, self.config)
@@ -1080,17 +1830,41 @@ class PaperEngine:
                 input_type = str(payload.get("input_type", ""))
                 if input_type == "RUN_START":
                     continue
+                if input_type == "RUNTIME_SESSION_STARTED":
+                    raw_replacement = payload.get("replaces_unclosed_session_id")
+                    replay_engine.start_runtime_session(
+                        as_of=parse_utc(str(payload["started_at"])),
+                        session_id=str(payload["session_id"]),
+                        generation=int(str(payload["generation"])),
+                        replaces_unclosed_session_id=(
+                            str(raw_replacement) if raw_replacement is not None else None
+                        ),
+                    )
+                    continue
+                if input_type == "RUNTIME_SESSION_STOPPED":
+                    replay_engine.stop_runtime_session(
+                        as_of=parse_utc(str(payload["stopped_at"])),
+                        session_id=str(payload["session_id"]),
+                        generation=int(str(payload["generation"])),
+                        reason=str(payload["reason"]),
+                    )
+                    continue
                 if input_type == "PUBLIC_MARKET_EVENT":
                     raw_market = payload.get("market")
                     if not isinstance(raw_market, Mapping):
                         raise ValueError("replay market input lacks market payload")
-                    replay_engine.process_market(MarketEvent.from_dict(raw_market))
+                    market = MarketEvent.from_dict(raw_market)
+                    replay_engine.process_market(
+                        market,
+                        processed_at=parse_utc(
+                            str(payload.get("processed_at", utc_text(market.received_at)))
+                        ),
+                        execution_policy=str(payload.get("execution_policy", "EXECUTE")),
+                    )
                 elif input_type == "STRATEGY_DECISION":
                     raw_decision = payload.get("decision")
                     raw_markets = payload.get("markets")
-                    if not isinstance(raw_decision, Mapping) or not isinstance(
-                        raw_markets, Sequence
-                    ):
+                    if not isinstance(raw_decision, Mapping) or not isinstance(raw_markets, Sequence):
                         raise ValueError("replay decision input is incomplete")
                     decision = DecisionIntent.from_dict(raw_decision)
                     markets = {
@@ -1099,7 +1873,13 @@ class PaperEngine:
                         if isinstance(item, Mapping)
                         for market in (MarketEvent.from_dict(item),)
                     }
-                    replay_engine.submit_decision(decision, markets)
+                    replay_engine.submit_decision(
+                        decision,
+                        markets,
+                        processed_at=parse_utc(
+                            str(payload.get("processed_at", utc_text(decision.decided_at)))
+                        ),
+                    )
                 elif input_type == "CANCEL_REQUEST":
                     replay_engine.request_cancel(
                         str(payload["order_id"]),
@@ -1116,18 +1896,75 @@ class PaperEngine:
                             str(payload["occurred_at"]).replace("Z", "+00:00")
                         ),
                         source_event_id=str(payload["source_event_id"]),
+                        funding_rate=(
+                            Decimal(str(payload["funding_rate"]))
+                            if payload.get("funding_rate") is not None
+                            else None
+                        ),
+                        funding_interval_seconds=(
+                            int(str(payload["funding_interval_seconds"]))
+                            if payload.get("funding_interval_seconds") is not None
+                            else None
+                        ),
+                        rate_kind=(
+                            str(payload["rate_kind"]) if payload.get("rate_kind") is not None else None
+                        ),
+                        mark_price=(
+                            Decimal(str(payload["mark_price"]))
+                            if payload.get("mark_price") is not None
+                            else None
+                        ),
+                        source_mark_price=(
+                            Decimal(str(payload["source_mark_price"]))
+                            if payload.get("source_mark_price") is not None
+                            else None
+                        ),
+                        oracle_price=(
+                            Decimal(str(payload["oracle_price"]))
+                            if payload.get("oracle_price") is not None
+                            else None
+                        ),
+                        position_quantity=(
+                            Decimal(str(payload["position_quantity"]))
+                            if payload.get("position_quantity") is not None
+                            else None
+                        ),
+                        mark_source=(
+                            str(payload["mark_source"]) if payload.get("mark_source") is not None else None
+                        ),
+                        source_observation_id=(
+                            str(payload["source_observation_id"])
+                            if payload.get("source_observation_id") is not None
+                            else None
+                        ),
+                        received_at=(
+                            datetime.fromisoformat(str(payload["received_at"]).replace("Z", "+00:00"))
+                            if payload.get("received_at") is not None
+                            else None
+                        ),
+                        processed_at=parse_utc(
+                            str(
+                                payload.get(
+                                    "processed_at", payload.get("received_at", payload["occurred_at"])
+                                )
+                            )
+                        ),
+                        applicability=str(payload.get("applicability", "APPLIED")),
+                        source_activation_cutoff=(
+                            datetime.fromisoformat(
+                                str(payload["source_activation_cutoff"]).replace("Z", "+00:00")
+                            )
+                            if payload.get("source_activation_cutoff") is not None
+                            else None
+                        ),
                     )
                 elif input_type == "TIMER":
                     replay_engine.process_timer(
-                        as_of=datetime.fromisoformat(
-                            str(payload["as_of"]).replace("Z", "+00:00")
-                        )
+                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
                     )
                 elif input_type == "RECONCILE":
                     replay_engine.reconcile(
-                        as_of=datetime.fromisoformat(
-                            str(payload["as_of"]).replace("Z", "+00:00")
-                        )
+                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
                     )
                 elif input_type == "STRESS_RESULT":
                     replay_engine.record_stress_result(
@@ -1146,44 +1983,94 @@ class PaperEngine:
                         ),
                     )
                 elif input_type == "OBSERVATION_COVERAGE":
-                    # The event timestamp is the durable received time; the
-                    # evidence payload intentionally keeps only its covered window.
-                    source_event = next(
-                        item.event
-                        for item in source_events
-                        if item.event.correlation_id == record.input_id
-                    )
+                    raw_recorded_at = payload.get("recorded_at")
+                    if isinstance(raw_recorded_at, str):
+                        recorded_at = parse_utc(raw_recorded_at)
+                    elif self.config.schema_version == 1:
+                        target_sequence = record.first_event_sequence
+                        if target_sequence is None:
+                            raise ValueError("legacy observation coverage input has no durable event")
+                        while legacy_source_event is None or legacy_source_event.sequence < target_sequence:
+                            try:
+                                legacy_source_event = next(legacy_source_events)
+                            except StopIteration as error:
+                                raise ValueError("legacy observation coverage event is missing") from error
+                        if (
+                            legacy_source_event.sequence != target_sequence
+                            or legacy_source_event.event.correlation_id != record.input_id
+                        ):
+                            raise ValueError("legacy observation coverage event differs from its input")
+                        recorded_at = legacy_source_event.event.received_at
+                    else:
+                        raise ValueError("schema-v2 observation coverage lacks recorded_at")
                     replay_engine.record_observation_coverage(
                         artifact_hash=str(payload["artifact_hash"]),
                         window_start=datetime.fromisoformat(
                             str(payload["window_start"]).replace("Z", "+00:00")
                         ),
-                        window_end=datetime.fromisoformat(
-                            str(payload["window_end"]).replace("Z", "+00:00")
-                        ),
+                        window_end=datetime.fromisoformat(str(payload["window_end"]).replace("Z", "+00:00")),
                         continuous=bool(payload["continuous"]),
-                        recorded_at=source_event.received_at,
+                        recorded_at=recorded_at,
+                    )
+                elif input_type in {
+                    "OPERATOR_PAUSE",
+                    "PUBLIC_SOURCE_FAILURE",
+                    "PAPER_RUNTIME_FAILURE",
+                }:
+                    replay_engine.pause(
+                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00")),
+                        reason=str(payload["reason"]),
+                        operator_artifact_hash=str(payload["operator_artifact_hash"]),
+                        origin={
+                            "OPERATOR_PAUSE": "OPERATOR",
+                            "PUBLIC_SOURCE_FAILURE": "PUBLIC_SOURCE_FAILURE",
+                            "PAPER_RUNTIME_FAILURE": "PAPER_RUNTIME_FAILURE",
+                        }[input_type],
+                    )
+                elif input_type == "PAPER_KILL":
+                    replay_engine.kill(
+                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00")),
+                        reason=str(payload["reason"]),
+                        operator_artifact_hash=str(payload["operator_artifact_hash"]),
                     )
                 elif input_type == "RESUME_AFTER_REVIEW":
                     replay_engine.resume_from_pause(
-                        as_of=datetime.fromisoformat(
-                            str(payload["as_of"]).replace("Z", "+00:00")
-                        ),
+                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00")),
                         review_artifact_hash=str(payload["review_artifact_hash"]),
+                        reviewed_critical_incident_count=cast(
+                            int,
+                            payload["reviewed_critical_incident_count"],
+                        ),
+                        reviewed_last_critical_incident_at=(
+                            parse_utc(cast(str, payload["reviewed_last_critical_incident_at"]))
+                            if isinstance(
+                                payload.get("reviewed_last_critical_incident_at"),
+                                str,
+                            )
+                            else None
+                        ),
+                        recovery_mode=str(payload["recovery_mode"]),
                     )
                 else:
                     raise ValueError(f"unsupported durable replay input type {input_type!r}")
 
-            replay_events = replay_store.get_events(self.run_id)
-            if [(event.hash_payload(), event.event_hash) for event in replay_events] != [
-                (event.hash_payload(), event.event_hash) for event in source_events
-            ]:
-                raise ValueError("canonical input replay produced different paper events")
-            replay_ledger = replay_store.get_ledger_entries(self.run_id)
-            if [entry.entry for entry in replay_ledger] != [
-                entry.entry for entry in source_ledger
-            ]:
-                raise ValueError("canonical input replay produced a different ledger")
+            for source_event, replay_event in zip_longest(
+                self.store.iter_events(self.run_id),
+                replay_store.iter_events(self.run_id),
+            ):
+                if (
+                    source_event is None
+                    or replay_event is None
+                    or source_event.hash_payload() != replay_event.hash_payload()
+                    or source_event.event_hash != replay_event.event_hash
+                ):
+                    raise ValueError("canonical input replay produced different paper events")
+            for source_entry, replay_entry in zip_longest(
+                self.store.iter_ledger_entries(self.run_id),
+                replay_store.iter_ledger_entries(self.run_id),
+            ):
+                if source_entry is None or replay_entry is None or source_entry.entry != replay_entry.entry:
+                    raise ValueError("canonical input replay produced a different ledger")
             replayed = replay_store.get_projection(self.run_id)
             if replayed.to_dict() != self.projection().to_dict():
                 raise ValueError("canonical input replay produced a different projection")
@@ -1299,7 +2186,7 @@ class PaperEngine:
 
     def _ledger_reconciliation_errors(self, projection: PaperProjection) -> tuple[str, ...]:
         balances: dict[str, Decimal] = {}
-        for entry in self.store.get_ledger_entries(self.run_id):
+        for entry in self.store.iter_ledger_entries(self.run_id):
             balances[entry.account] = balances.get(entry.account, Decimal(0)) + entry.amount
         errors: list[str] = []
         if balances.get("asset:cash", Decimal(0)) != projection.cash:
@@ -1429,9 +2316,7 @@ class PaperEngine:
         }
 
     def _alert_is_durable(self, alert_id: str) -> bool:
-        return any(
-            alert.alert_id == alert_id for alert in self.store.get_alerts(self.run_id)
-        )
+        return self.store.contains_alert(self.run_id, alert_id)
 
     @staticmethod
     def _ordered_orders(projection: PaperProjection) -> tuple[PaperOrder, ...]:
@@ -1453,12 +2338,13 @@ class PaperEngine:
         order: PaperOrder,
         market: MarketEvent,
         *,
+        processed_at: datetime,
         reason: str,
     ) -> None:
         event = self._event(
             PaperEventType.ORDER_REJECTED,
-            at=market.received_at,
-            received_at=market.received_at,
+            at=processed_at,
+            received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=order.intent.decision_id,
             payload={"order_id": order.intent.order_id, "reason": reason},
@@ -1466,6 +2352,152 @@ class PaperEngine:
         )
         apply_event(projection, event)
         events.append(event)
+
+    def _apply_protective_risk_state(
+        self,
+        projection: PaperProjection,
+        events: list[PaperEvent],
+        *,
+        at: datetime,
+        causation_id: str,
+    ) -> bool:
+        if not projection.positions or projection.state in {
+            PaperState.REDUCE_ONLY,
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.MANUAL_REVIEW,
+        }:
+            return False
+
+        notionals: dict[str, Decimal] = {}
+        missing_marks: list[str] = []
+        signed_net = Decimal(0)
+        gross = Decimal(0)
+        for instrument, quantity in sorted(projection.positions.items()):
+            mark = projection.public_bbo_mids.get(instrument)
+            if mark is None:
+                missing_marks.append(instrument)
+                continue
+            notional = quantity * mark
+            notionals[instrument] = abs(notional)
+            gross += abs(notional)
+            signed_net += notional
+        net = abs(signed_net)
+
+        code: str | None = None
+        reason: str | None = None
+        detail: str | None = None
+        if missing_marks:
+            code = "MISSING_PUBLIC_BBO_MARK"
+            reason = "open position lacks a durable public BBO valuation"
+            detail = "missing=" + ",".join(missing_marks)
+        elif gross > self.config.risk.max_gross_notional:
+            code = "MARKED_GROSS_NOTIONAL_LIMIT"
+            reason = "marked gross notional limit exceeded"
+            detail = f"gross={decimal_text(gross)}; limit={decimal_text(self.config.risk.max_gross_notional)}"
+        elif net > self.config.risk.max_net_notional:
+            code = "MARKED_NET_NOTIONAL_LIMIT"
+            reason = "marked net notional limit exceeded"
+            detail = f"net={decimal_text(net)}; limit={decimal_text(self.config.risk.max_net_notional)}"
+        else:
+            breached_instrument = next(
+                (
+                    (instrument, notional)
+                    for instrument, notional in sorted(notionals.items())
+                    if notional > self.config.risk.max_instrument_notional
+                ),
+                None,
+            )
+            if breached_instrument is not None:
+                instrument, notional = breached_instrument
+                code = "MARKED_INSTRUMENT_NOTIONAL_LIMIT"
+                reason = "marked instrument notional limit exceeded"
+                detail = (
+                    f"instrument={instrument}; notional={decimal_text(notional)}; "
+                    f"limit={decimal_text(self.config.risk.max_instrument_notional)}"
+                )
+
+        current_equity = projection.equity
+        if (
+            code is None
+            and projection.session_start_equity - current_equity >= self.config.risk.max_daily_loss
+        ):
+            code = "DAILY_LOSS_LIMIT"
+            reason = "daily loss limit reached"
+            detail = (
+                f"equity={decimal_text(current_equity)}; "
+                f"session_start={decimal_text(projection.session_start_equity)}"
+            )
+        elif code is None and projection.peak_equity - current_equity >= self.config.risk.max_drawdown:
+            code = "DRAWDOWN_LIMIT"
+            reason = "drawdown limit reached"
+            detail = f"equity={decimal_text(current_equity)}; peak={decimal_text(projection.peak_equity)}"
+        if code is None or reason is None or detail is None:
+            return False
+
+        episode_started_at = projection.state_since or at
+        episode_id = deterministic_id(
+            "paper_protective_risk_episode_v1",
+            self.run_id,
+            code,
+            projection.state.value,
+            utc_text(episode_started_at),
+        )
+        alert_payload = self._alert_payload(
+            code=code,
+            severity=AlertSeverity.CRITICAL,
+            message=f"{reason}; {detail}",
+            causation_id=episode_id,
+            at=at,
+        )
+        alert_id = str(alert_payload["alert_id"])
+        pending_alert = any(
+            event.event_type is PaperEventType.ALERT_RAISED and event.payload.get("alert_id") == alert_id
+            for event in events
+        )
+        if not pending_alert and not self._alert_is_durable(alert_id):
+            alert = self._event(
+                PaperEventType.ALERT_RAISED,
+                at=at,
+                received_at=at,
+                causation_id=causation_id,
+                correlation_id=causation_id,
+                payload=alert_payload,
+                ordinal=len(events),
+            )
+            apply_event(projection, alert)
+            events.append(alert)
+        if projection.state is PaperState.PAUSED:
+            self._protect_entry_orders(
+                projection,
+                events,
+                at=at,
+                causation_id=causation_id,
+                reason=reason,
+            )
+            return True
+        transition = self._event(
+            PaperEventType.STATE_TRANSITIONED,
+            at=at,
+            received_at=at,
+            causation_id=causation_id,
+            correlation_id=causation_id,
+            payload=self._transition_payload(
+                projection.state,
+                PaperState.REDUCE_ONLY,
+                reason,
+            ),
+            ordinal=len(events),
+        )
+        apply_event(projection, transition)
+        events.append(transition)
+        self._protect_entry_orders(
+            projection,
+            events,
+            at=at,
+            causation_id=causation_id,
+            reason=reason,
+        )
+        return True
 
     def _protect_entry_orders(
         self,
@@ -1538,14 +2570,13 @@ class PaperEngine:
         *,
         received_at: datetime | None = None,
     ) -> None:
-        at = max(market.received_at, intent.created_at)
-        command_received_at = received_at or market.received_at
+        command_received_at = received_at or max(market.received_at, intent.created_at)
+        if command_received_at < market.received_at or command_received_at < intent.created_at:
+            raise ValueError("acknowledgement processing time cannot precede order or market")
+        at = command_received_at
         if intent.order_type is PaperOrderType.MAKER and (
             (intent.side is OrderSide.BUY and cast(Decimal, intent.limit_price) >= market.ask_price)
-            or (
-                intent.side is OrderSide.SELL
-                and cast(Decimal, intent.limit_price) <= market.bid_price
-            )
+            or (intent.side is OrderSide.SELL and cast(Decimal, intent.limit_price) <= market.bid_price)
         ):
             event = self._event(
                 PaperEventType.ORDER_REJECTED,
@@ -1578,6 +2609,91 @@ class PaperEngine:
         apply_event(projection, event)
         events.append(event)
 
+    def _fill_hard_cap_reasons(
+        self,
+        projection: PaperProjection,
+        order: PaperOrder,
+        *,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+    ) -> tuple[str, ...]:
+        """Recheck risk-increasing exposure at the actual adverse fill price."""
+
+        intent = order.intent
+        if intent.reduce_only:
+            return ()
+        limits = self.config.risk
+        reasons: list[str] = []
+        prior_notional = (order.average_fill_price or Decimal(0)) * order.filled_quantity
+        order_notional = prior_notional + fill_quantity * fill_price
+        if order_notional > limits.max_order_notional:
+            reasons.append("actual fill notional exceeds max_order_notional")
+
+        positions = dict(projection.positions)
+        signed_fill = cast(OrderSide, intent.side).sign * fill_quantity
+        positions[intent.instrument] = positions.get(intent.instrument, Decimal(0)) + signed_fill
+        if positions[intent.instrument] == 0:
+            positions.pop(intent.instrument)
+
+        public_mid = projection.public_bbo_mids.get(intent.instrument)
+        fill_valuation = max(fill_price, public_mid or fill_price)
+        current_gross = Decimal(0)
+        current_net = Decimal(0)
+        current_instrument = Decimal(0)
+        for instrument, quantity in positions.items():
+            mark = (
+                fill_valuation
+                if instrument == intent.instrument
+                else projection.public_bbo_mids.get(instrument)
+            )
+            if mark is None:
+                reasons.append(f"missing public BBO mark for position {instrument}")
+                continue
+            notional = quantity * mark
+            current_gross += abs(notional)
+            current_net += notional
+            if instrument == intent.instrument:
+                current_instrument += abs(notional)
+
+        reserved_gross = Decimal(0)
+        reserved_net = Decimal(0)
+        reserved_instrument = Decimal(0)
+        reserved_instrument_quantity = Decimal(0)
+        for pending in projection.active_orders:
+            remaining = pending.remaining_quantity
+            if pending.intent.order_id == intent.order_id:
+                remaining -= fill_quantity
+            if remaining <= 0:
+                continue
+            pending_mark = pending.intent.limit_price or projection.public_bbo_mids.get(
+                pending.intent.instrument
+            )
+            if pending.intent.instrument == intent.instrument:
+                pending_mark = max(pending_mark or fill_valuation, fill_valuation)
+            if pending_mark is None:
+                reasons.append(f"missing public BBO mark for pending order {pending.intent.order_id}")
+                continue
+            pending_notional = remaining * pending_mark
+            reserved_gross += pending_notional
+            reserved_net += cast(OrderSide, pending.intent.side).sign * pending_notional
+            if pending.intent.instrument == intent.instrument:
+                reserved_instrument += pending_notional
+                reserved_instrument_quantity += remaining
+
+        projected_gross = current_gross + reserved_gross
+        projected_net = abs(current_net + reserved_net)
+        projected_instrument = current_instrument + reserved_instrument
+        projected_quantity = abs(positions.get(intent.instrument, Decimal(0))) + reserved_instrument_quantity
+        if projected_gross > limits.max_gross_notional:
+            reasons.append("actual-fill gross notional exceeds max_gross_notional")
+        if projected_net > limits.max_net_notional:
+            reasons.append("actual-fill net notional exceeds max_net_notional")
+        if projected_instrument > limits.max_instrument_notional:
+            reasons.append("actual-fill instrument notional exceeds max_instrument_notional")
+        if projected_quantity > limits.max_position_quantity:
+            reasons.append("actual-fill quantity exceeds max_position_quantity")
+        return tuple(reasons)
+
     def _match_order(
         self,
         projection: PaperProjection,
@@ -1585,6 +2701,8 @@ class PaperEngine:
         order: PaperOrder,
         market: MarketEvent,
         liquidity: _MarketLiquidity,
+        *,
+        processed_at: datetime,
     ) -> None:
         intent = order.intent
         side = cast(OrderSide, intent.side)
@@ -1603,6 +2721,7 @@ class PaperEngine:
                         events,
                         order,
                         market,
+                        processed_at=processed_at,
                         reason=reason,
                     )
                 elif intent.time_in_force is TimeInForce.IOC:
@@ -1611,14 +2730,15 @@ class PaperEngine:
                         events,
                         order,
                         market,
+                        processed_at=processed_at,
                         filled=order.filled_quantity > 0,
                         reason=reason,
                     )
                 else:
                     expiry = self._event(
                         PaperEventType.ORDER_EXPIRED,
-                        at=market.received_at,
-                        received_at=market.received_at,
+                        at=processed_at,
+                        received_at=processed_at,
                         causation_id=market.event_id,
                         correlation_id=intent.decision_id,
                         payload={"order_id": intent.order_id, "reason": reason},
@@ -1628,8 +2748,8 @@ class PaperEngine:
                     events.append(expiry)
                 alert = self._event(
                     PaperEventType.ALERT_RAISED,
-                    at=market.received_at,
-                    received_at=market.received_at,
+                    at=processed_at,
+                    received_at=processed_at,
                     causation_id=market.event_id,
                     correlation_id=intent.decision_id,
                     payload=self._alert_payload(
@@ -1637,7 +2757,7 @@ class PaperEngine:
                         severity=AlertSeverity.CRITICAL,
                         message=reason,
                         causation_id=intent.order_id,
-                        at=market.received_at,
+                        at=processed_at,
                     ),
                     ordinal=len(events),
                 )
@@ -1646,8 +2766,8 @@ class PaperEngine:
                 if projection.state not in {PaperState.PAUSED, PaperState.MANUAL_REVIEW}:
                     transition = self._event(
                         PaperEventType.STATE_TRANSITIONED,
-                        at=market.received_at,
-                        received_at=market.received_at,
+                        at=processed_at,
+                        received_at=processed_at,
                         causation_id=market.event_id,
                         correlation_id=intent.decision_id,
                         payload=self._transition_payload(
@@ -1668,13 +2788,15 @@ class PaperEngine:
                 or (current < 0 and intent.side is not OrderSide.BUY)
             ):
                 if intent.time_in_force is TimeInForce.IOC:
-                    self._terminal_ioc(projection, events, order, market, filled=False)
+                    self._terminal_ioc(
+                        projection, events, order, market, processed_at=processed_at, filled=False
+                    )
                 return
             quantity_cap = min(quantity_cap, abs(current))
         elif intent.time_in_force is TimeInForce.IOC and intent.leg_number > 1:
             quantity_cap = self._hedge_quantity_cap(projection, order)
             if quantity_cap <= 0:
-                self._terminal_ioc(projection, events, order, market, filled=False)
+                self._terminal_ioc(projection, events, order, market, processed_at=processed_at, filled=False)
                 return
         is_maker = intent.order_type is PaperOrderType.MAKER
         if is_maker:
@@ -1701,15 +2823,11 @@ class PaperEngine:
                 return
             requested_notional = quantity_cap * cast(Decimal, intent.limit_price)
             participation = float(requested_notional / (depth * cast(Decimal, intent.limit_price)))
-            maker_probability = self.config.execution.maker_fill.probability(
-                participation=participation
-            )
+            maker_probability = self.config.execution.maker_fill.probability(participation=participation)
             maker_draw = keyed_uniform(
                 self.config.seed,
                 purpose="maker_fill",
-                identity=deterministic_id(
-                    "paper_maker_attempt", intent.order_id, market.event_id
-                ),
+                identity=deterministic_id("paper_maker_attempt", intent.order_id, market.event_id),
             )
             if maker_draw >= maker_probability:
                 return
@@ -1741,12 +2859,12 @@ class PaperEngine:
                 )
             )
             if ioc_draw >= ioc_probability:
-                self._terminal_ioc(projection, events, order, market, filled=False)
+                self._terminal_ioc(projection, events, order, market, processed_at=processed_at, filled=False)
                 return
             top = market.ask_price if intent.side is OrderSide.BUY else market.bid_price
             depth = liquidity.taker_depth_remaining[side]
             if depth <= 0:
-                self._terminal_ioc(projection, events, order, market, filled=False)
+                self._terminal_ioc(projection, events, order, market, processed_at=processed_at, filled=False)
                 return
             slippage_model = self.config.execution.slippage
             taker_fee = self.config.execution.taker_fee_bps
@@ -1775,7 +2893,7 @@ class PaperEngine:
             )
 
         if quantity <= 0:
-            self._terminal_ioc(projection, events, order, market, filled=False)
+            self._terminal_ioc(projection, events, order, market, processed_at=processed_at, filled=False)
             return
         if is_maker and cost_rule is not None:
             fee_bps = Decimal(
@@ -1786,6 +2904,83 @@ class PaperEngine:
                     )
                 )
             )
+        hard_cap_reasons = self._fill_hard_cap_reasons(
+            projection,
+            order,
+            fill_quantity=quantity,
+            fill_price=price,
+        )
+        if hard_cap_reasons:
+            reason = "fill-time hard risk rejection: " + "; ".join(hard_cap_reasons)
+            if intent.time_in_force is TimeInForce.IOC:
+                self._terminal_ioc(
+                    projection,
+                    events,
+                    order,
+                    market,
+                    processed_at=processed_at,
+                    filled=order.filled_quantity > 0,
+                    reason=reason,
+                )
+            else:
+                terminal = self._event(
+                    (
+                        PaperEventType.ORDER_NO_FILL
+                        if order.filled_quantity == 0
+                        else PaperEventType.ORDER_EXPIRED
+                    ),
+                    at=processed_at,
+                    received_at=processed_at,
+                    causation_id=market.event_id,
+                    correlation_id=intent.decision_id,
+                    payload={"order_id": intent.order_id, "reason": reason},
+                    ordinal=len(events),
+                )
+                apply_event(projection, terminal)
+                events.append(terminal)
+            alert_causation = deterministic_id("paper_fill_hard_cap", intent.order_id, market.event_id)
+            alert = self._event(
+                PaperEventType.ALERT_RAISED,
+                at=processed_at,
+                received_at=processed_at,
+                causation_id=alert_causation,
+                correlation_id=intent.decision_id,
+                payload=self._alert_payload(
+                    code="FILL_HARD_CAP_REJECTED",
+                    severity=AlertSeverity.CRITICAL,
+                    message=reason,
+                    causation_id=alert_causation,
+                    at=processed_at,
+                ),
+                ordinal=len(events),
+            )
+            apply_event(projection, alert)
+            events.append(alert)
+            if projection.state not in {PaperState.PAUSED, PaperState.MANUAL_REVIEW}:
+                transition = self._event(
+                    PaperEventType.STATE_TRANSITIONED,
+                    at=processed_at,
+                    received_at=processed_at,
+                    causation_id=alert_causation,
+                    correlation_id=intent.decision_id,
+                    payload=self._transition_payload(
+                        projection.state,
+                        PaperState.PAUSED,
+                        "actual fill price crossed a frozen hard risk cap",
+                    ),
+                    ordinal=len(events),
+                )
+                apply_event(projection, transition)
+                events.append(transition)
+            self._protect_entry_orders(
+                projection,
+                events,
+                at=processed_at,
+                causation_id=alert_causation,
+                reason="fill-time hard risk rejection",
+            )
+            return
+
         fee = quantity * price * fee_bps / Decimal(10_000)
         if is_maker:
             liquidity.maker_trade_remaining -= quantity
@@ -1798,8 +2993,8 @@ class PaperEngine:
         )
         event = self._event(
             PaperEventType.ORDER_FILLED if full else PaperEventType.ORDER_PARTIALLY_FILLED,
-            at=market.received_at,
-            received_at=market.received_at,
+            at=processed_at,
+            received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=intent.decision_id,
             payload={
@@ -1810,6 +3005,7 @@ class PaperEngine:
                 "liquidity": "MAKER" if is_maker else "TAKER",
                 "order_id": intent.order_id,
                 "slippage_bps": decimal_text(slippage_bps),
+                "source_market_received_at": utc_text(market.received_at),
             },
             ordinal=len(events),
         )
@@ -1817,7 +3013,7 @@ class PaperEngine:
         events.append(event)
         refreshed = projection.orders[intent.order_id]
         if intent.time_in_force is TimeInForce.IOC and refreshed.remaining_quantity > 0:
-            self._terminal_ioc(projection, events, refreshed, market, filled=True)
+            self._terminal_ioc(projection, events, refreshed, market, processed_at=processed_at, filled=True)
 
     def _terminal_ioc(
         self,
@@ -1826,14 +3022,15 @@ class PaperEngine:
         order: PaperOrder,
         market: MarketEvent,
         *,
+        processed_at: datetime,
         filled: bool,
         reason: str = "IOC remainder expired",
     ) -> None:
         event_type = PaperEventType.ORDER_EXPIRED if filled else PaperEventType.ORDER_NO_FILL
         event = self._event(
             event_type,
-            at=market.received_at,
-            received_at=market.received_at,
+            at=processed_at,
+            received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=order.intent.decision_id,
             payload={"order_id": order.intent.order_id, "reason": reason},
@@ -1863,9 +3060,7 @@ class PaperEngine:
         ]
         if not earlier:
             return Decimal(0)
-        completion = min(
-            sibling.filled_quantity / sibling.intent.quantity for sibling in earlier
-        )
+        completion = min(sibling.filled_quantity / sibling.intent.quantity for sibling in earlier)
         allowed_total = order.intent.quantity * completion
         return max(
             Decimal(0),
@@ -1877,6 +3072,8 @@ class PaperEngine:
         projection: PaperProjection,
         events: list[PaperEvent],
         market: MarketEvent,
+        *,
+        processed_at: datetime,
     ) -> None:
         if projection.state in {PaperState.MANUAL_REVIEW, PaperState.PAUSED}:
             return
@@ -1915,13 +3112,17 @@ class PaperEngine:
                 target = PaperState.FLAT
                 complete_cycle = True
             elif exit_orders and not active and projection.positions:
-                target = PaperState.EMERGENCY_FLATTEN
+                target = (
+                    projection.state
+                    if projection.state in {PaperState.REDUCE_ONLY, PaperState.EMERGENCY_FLATTEN}
+                    else PaperState.EMERGENCY_FLATTEN
+                )
 
         if target is not None and target is not projection.state:
             transition = self._event(
                 PaperEventType.STATE_TRANSITIONED,
-                at=market.received_at,
-                received_at=market.received_at,
+                at=processed_at,
+                received_at=processed_at,
                 causation_id=market.event_id,
                 correlation_id=market.event_id,
                 payload=self._transition_payload(projection.state, target, "order lifecycle update"),
@@ -1932,14 +3133,15 @@ class PaperEngine:
         if complete_cycle:
             cycle = self._event(
                 PaperEventType.CYCLE_COMPLETED,
-                at=market.received_at,
-                received_at=market.received_at,
+                at=processed_at,
+                received_at=processed_at,
                 causation_id=market.event_id,
                 correlation_id=market.event_id,
-                payload={"completed_at": utc_text(market.received_at)},
+                payload={"completed_at": utc_text(processed_at)},
                 ordinal=len(events),
             )
             apply_event(projection, cycle)
             events.append(cycle)
+
 
 __all__ = ["PaperCommandResult", "PaperEngine"]

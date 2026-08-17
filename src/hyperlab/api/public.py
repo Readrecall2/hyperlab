@@ -14,6 +14,8 @@ from typing import Any, Protocol
 _FUNDING_PAGE_SIZE = 500
 _CANDLE_PAGE_SIZE = 5_000
 _MAX_PUBLIC_INFO_RESPONSE_BYTES = 64 * 1024 * 1024
+PUBLIC_INFO_REDIRECTS_ALLOWED = False
+PUBLIC_INFO_REQUIRED_HTTP_STATUS = 200
 _PUBLIC_INFO_URLS = {
     "mainnet": "https://api.hyperliquid.xyz",
     "testnet": "https://api.hyperliquid-testnet.xyz",
@@ -42,6 +44,22 @@ class PublicInfo(Protocol):
     def post(self, url_path: str, payload: Any = None) -> Any: ...
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject every HTTP redirect instead of following an unbound endpoint."""
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 class _StdlibPublicInfo:
     """Minimal public-only HTTP client; it contains no wallet or order API."""
 
@@ -52,6 +70,7 @@ class _StdlibPublicInfo:
             raise ValueError("public API timeout must be positive")
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
     def post(self, url_path: str, payload: Any = None) -> Any:
         if url_path != "/info" or not isinstance(payload, Mapping):
@@ -62,8 +81,9 @@ class _StdlibPublicInfo:
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
+        expected_url = f"{self._base_url}/info"
         request = urllib.request.Request(
-            f"{self._base_url}/info",
+            expected_url,
             data=body,
             headers={
                 "Accept": "application/json",
@@ -73,7 +93,17 @@ class _StdlibPublicInfo:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
+                final_url = response.geturl()
+                status = response.getcode()
+                if final_url != expected_url:
+                    raise RuntimeError(
+                        "Hyperliquid public Info response URL differs from the allowlisted request"
+                    )
+                if type(status) is not int or status != PUBLIC_INFO_REQUIRED_HTTP_STATUS:
+                    raise RuntimeError(
+                        "Hyperliquid public Info response did not return exact HTTP 200"
+                    )
                 encoded = response.read(_MAX_PUBLIC_INFO_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"Hyperliquid public Info HTTP error: {exc.code}") from None

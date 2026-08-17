@@ -24,6 +24,8 @@ class RiskDecision:
     projected_gross_notional: Decimal
     projected_net_notional: Decimal
     projected_instrument_notional: Decimal
+    projected_instrument_quantity: Decimal
+    projected_active_orders: int
     risk_reducing: bool
 
     def to_dict(self) -> dict[str, object]:
@@ -32,6 +34,8 @@ class RiskDecision:
             "order_notional": decimal_text(self.order_notional),
             "projected_gross_notional": decimal_text(self.projected_gross_notional),
             "projected_instrument_notional": decimal_text(self.projected_instrument_notional),
+            "projected_instrument_quantity": decimal_text(self.projected_instrument_quantity),
+            "projected_active_orders": self.projected_active_orders,
             "projected_net_notional": decimal_text(self.projected_net_notional),
             "reasons": list(self.reasons),
             "risk_reducing": self.risk_reducing,
@@ -55,8 +59,7 @@ def is_risk_reducing(projection: PaperProjection, order: OrderIntent) -> bool:
         (
             cast(OrderSide, pending.intent.side).sign * pending.remaining_quantity
             for pending in projection.active_orders
-            if pending.intent.instrument == order.instrument
-            and pending.intent.reduce_only
+            if pending.intent.instrument == order.instrument and pending.intent.reduce_only
         ),
         Decimal(0),
     )
@@ -65,9 +68,7 @@ def is_risk_reducing(projection: PaperProjection, order: OrderIntent) -> bool:
         return False
     signed = cast(OrderSide, order.side).sign * order.quantity
     projected = available + signed
-    return abs(projected) <= abs(available) and (
-        projected == 0 or (projected > 0) == (available > 0)
-    )
+    return abs(projected) <= abs(available) and (projected == 0 or (projected > 0) == (available > 0))
 
 
 def evaluate_order_risk(
@@ -86,20 +87,23 @@ def evaluate_order_risk(
     order_notional = order.quantity * price
     reducing = is_risk_reducing(projection, order)
     reasons: list[str] = []
+    projected_active_orders = len(projection.active_orders) + 1
 
     if projection.state is PaperState.MANUAL_REVIEW:
         reasons.append("manual review blocks every new simulated order")
     if order.reduce_only and not reducing:
         reasons.append("reduce_only order would not reduce the existing position")
-    if projection.state in {
-        PaperState.PAUSED,
-        PaperState.REDUCE_ONLY,
-        PaperState.EMERGENCY_FLATTEN,
-    } and not reducing:
+    if (
+        projection.state
+        in {
+            PaperState.PAUSED,
+            PaperState.REDUCE_ONLY,
+            PaperState.EMERGENCY_FLATTEN,
+        }
+        and not reducing
+    ):
         reasons.append(f"state {projection.state.value} permits risk reduction only")
-    if order.created_at - market.received_at > timedelta(
-        seconds=limits.stale_after_seconds
-    ) and not reducing:
+    if order.created_at - market.received_at > timedelta(seconds=limits.stale_after_seconds) and not reducing:
         reasons.append("public market observation is older than stale_after_seconds")
     if (market.stale or market.gap) and not reducing:
         reasons.append("stale or gapped market data blocks new exposure")
@@ -107,6 +111,10 @@ def evaluate_order_risk(
         reasons.append("non-tradable instrument permits flattening only")
     if order_notional > limits.max_order_notional and not reducing:
         reasons.append("order notional exceeds max_order_notional")
+    if order.quantity > limits.max_order_quantity and not reducing:
+        reasons.append("order quantity exceeds max_order_quantity")
+    if projected_active_orders > limits.max_concurrent_orders and not reducing:
+        reasons.append("active orders exceed max_concurrent_orders")
 
     current_equity = projection.equity
     if projection.session_start_equity - current_equity >= limits.max_daily_loss and not reducing:
@@ -128,6 +136,7 @@ def evaluate_order_risk(
     reserved_gross = Decimal(0)
     reserved_net = Decimal(0)
     reserved_instrument = Decimal(0)
+    reserved_instrument_quantity = Decimal(0)
     for pending in projection.active_orders:
         pending_price = (
             price
@@ -142,13 +151,14 @@ def evaluate_order_risk(
         reserved_net += cast(OrderSide, pending.intent.side).sign * pending_notional
         if pending.intent.instrument == order.instrument:
             reserved_instrument += pending_notional
+            reserved_instrument_quantity += pending.remaining_quantity
 
     existing_instrument = abs(projection.positions.get(order.instrument, Decimal(0)) * price)
+    existing_quantity = abs(projection.positions.get(order.instrument, Decimal(0)))
     projected_gross = current_gross + reserved_gross + order_notional
-    projected_net = abs(
-        current_net + reserved_net + cast(OrderSide, order.side).sign * order_notional
-    )
+    projected_net = abs(current_net + reserved_net + cast(OrderSide, order.side).sign * order_notional)
     projected_instrument = existing_instrument + reserved_instrument + order_notional
+    projected_instrument_quantity = existing_quantity + reserved_instrument_quantity + order.quantity
 
     if not reducing:
         if projected_gross > limits.max_gross_notional:
@@ -157,6 +167,8 @@ def evaluate_order_risk(
             reasons.append("worst-case net notional exceeds max_net_notional")
         if projected_instrument > limits.max_instrument_notional:
             reasons.append("worst-case instrument notional exceeds max_instrument_notional")
+        if projected_instrument_quantity > limits.max_position_quantity:
+            reasons.append("worst-case instrument quantity exceeds max_position_quantity")
 
     return RiskDecision(
         accepted=not reasons,
@@ -165,6 +177,8 @@ def evaluate_order_risk(
         projected_gross_notional=projected_gross,
         projected_net_notional=projected_net,
         projected_instrument_notional=projected_instrument,
+        projected_instrument_quantity=projected_instrument_quantity,
+        projected_active_orders=projected_active_orders,
         risk_reducing=reducing,
     )
 

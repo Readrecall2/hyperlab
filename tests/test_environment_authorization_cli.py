@@ -205,13 +205,12 @@ def test_gate_model_check_issues_only_a_ready_paper_receipt_and_is_read_only(
     assert after == before
 
 
-def test_gate_model_check_rejects_self_asserted_files_without_compiled_verifiers(
+def test_gate_model_check_rejects_self_asserted_files_semantically(
     tmp_path: Path,
 ) -> None:
-    assert not any(
-        environment is EnvironmentClass.PAPER
-        for environment, _purpose, _check in authorization_module._COMPILED_EVIDENCE_VERIFIERS
-    )
+    assert authorization_module.compiled_evidence_verifier_status(
+        EnvironmentClass.PAPER
+    )["complete"] is True
     manifest = _manifest(tmp_path, EnvironmentClass.PAPER)
     manifest_path = tmp_path / "self-asserted-readiness.json"
     manifest_path.write_bytes(manifest.canonical_json_bytes())
@@ -230,11 +229,11 @@ def test_gate_model_check_rejects_self_asserted_files_without_compiled_verifiers
     assert result.exit_code == 2, result.output
     payload = json.loads(result.stdout)
     assert payload["status"] == "BLOCKED"
-    assert payload["semantic_verifiers"]["complete"] is False
+    assert payload["semantic_verifiers"]["complete"] is True
     assert "receipt" not in payload
     assert {
         blocker["code"] for blocker in payload["blockers"]
-    } == {"NO_COMPILED_EVIDENCE_VERIFIER"}
+    } == {"EVIDENCE_SEMANTIC_VERIFICATION_FAILED"}
 
 
 def test_gate_model_check_blocks_malformed_environment_identity_without_receipt(

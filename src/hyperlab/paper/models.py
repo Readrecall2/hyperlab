@@ -20,13 +20,31 @@ _CALIBRATION_STATUSES = frozenset({"CALIBRATED", "UNCALIBRATED", "SYNTHETIC", "T
 _ACTIVE_ORDER_STATUSES = frozenset(
     {"RISK_ACCEPTED", "ACKED", "CANCEL_PENDING", "PARTIALLY_FILLED"}
 )
-PAPER_ENGINE_BUILD_HASH = canonical_sha256(
+_PAPER_ENGINE_BUILD_HASH_V2 = canonical_sha256(
     {
         "component": "hyperlab.paper",
         "execution_semantics": "phase12-event-sourced-v2",
         "schema_version": 1,
     }
 )
+PAPER_ENGINE_BUILD_HASH = canonical_sha256(
+    {
+        "component": "hyperlab.paper",
+        "execution_semantics": "phase12-live-public-paper-v9-protective-risk-runtime-env-bound",
+        "schema_version": 3,
+    }
+)
+
+
+def _current_release_code_sha256() -> str:
+    from hyperlab.environment_authorization import current_paper_release_code_sha256
+
+    return current_paper_release_code_sha256()
+def _current_runtime_environment_sha256() -> str:
+    from hyperlab.environment_authorization import current_paper_runtime_environment_sha256
+
+    return current_paper_runtime_environment_sha256()
+
 
 
 def _utc(value: datetime, *, label: str) -> datetime:
@@ -310,6 +328,12 @@ class TimeInForce(StrEnum):
     IOC = "IOC"
 
 
+class MarketExecutionPolicy(StrEnum):
+    EXECUTE = "EXECUTE"
+    BOOTSTRAP_OBSERVE_ONLY = "BOOTSTRAP_OBSERVE_ONLY"
+    SOURCE_CHRONOLOGY_OBSERVE_ONLY = "SOURCE_CHRONOLOGY_OBSERVE_ONLY"
+
+
 class OrderStatus(StrEnum):
     PLANNED = "PLANNED"
     RISK_ACCEPTED = "RISK_ACCEPTED"
@@ -329,6 +353,8 @@ class OrderStatus(StrEnum):
 
 class PaperEventType(StrEnum):
     RUN_STARTED = "RUN_STARTED"
+    RUNTIME_SESSION_STARTED = "RUNTIME_SESSION_STARTED"
+    RUNTIME_SESSION_STOPPED = "RUNTIME_SESSION_STOPPED"
     DECISION_RECORDED = "DECISION_RECORDED"
     ORDER_PLANNED = "ORDER_PLANNED"
     RISK_ACCEPTED = "RISK_ACCEPTED"
@@ -342,6 +368,7 @@ class PaperEventType(StrEnum):
     ORDER_EXPIRED = "ORDER_EXPIRED"
     ORDER_NO_FILL = "ORDER_NO_FILL"
     MARK_RECORDED = "MARK_RECORDED"
+    PUBLIC_SOURCE_HEALTH_RECORDED = "PUBLIC_SOURCE_HEALTH_RECORDED"
     FUNDING_POSTED = "FUNDING_POSTED"
     TIMER_TICKED = "TIMER_TICKED"
     CYCLE_COMPLETED = "CYCLE_COMPLETED"
@@ -366,6 +393,9 @@ class PaperRiskLimits:
     max_net_notional: Decimal = Decimal("100000")
     max_instrument_notional: Decimal = Decimal("50000")
     max_order_notional: Decimal = Decimal("25000")
+    max_position_quantity: Decimal = Decimal("1000000")
+    max_order_quantity: Decimal = Decimal("1000000")
+    max_concurrent_orders: int = 1000
     max_daily_loss: Decimal = Decimal("5000")
     max_drawdown: Decimal = Decimal("10000")
     stale_after_seconds: int = 30
@@ -377,6 +407,8 @@ class PaperRiskLimits:
             "max_net_notional",
             "max_instrument_notional",
             "max_order_notional",
+            "max_position_quantity",
+            "max_order_quantity",
             "max_daily_loss",
             "max_drawdown",
         ):
@@ -385,7 +417,11 @@ class PaperRiskLimits:
                 name,
                 decimal_value(getattr(self, name), label=name, positive=True),
             )
-        for name in ("stale_after_seconds", "unhedged_timeout_seconds"):
+        for name in (
+            "max_concurrent_orders",
+            "stale_after_seconds",
+            "unhedged_timeout_seconds",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -398,6 +434,9 @@ class PaperRiskLimits:
             "max_instrument_notional": decimal_text(self.max_instrument_notional),
             "max_net_notional": decimal_text(self.max_net_notional),
             "max_order_notional": decimal_text(self.max_order_notional),
+            "max_concurrent_orders": self.max_concurrent_orders,
+            "max_order_quantity": decimal_text(self.max_order_quantity),
+            "max_position_quantity": decimal_text(self.max_position_quantity),
             "stale_after_seconds": self.stale_after_seconds,
             "unhedged_timeout_seconds": self.unhedged_timeout_seconds,
         }
@@ -418,6 +457,15 @@ class PaperRiskLimits:
             max_order_notional=decimal_value(
                 str(value.get("max_order_notional", "25000")), label="max_order_notional"
             ),
+            max_position_quantity=decimal_value(
+                str(value.get("max_position_quantity", "1000000")),
+                label="max_position_quantity",
+            ),
+            max_order_quantity=decimal_value(
+                str(value.get("max_order_quantity", "1000000")),
+                label="max_order_quantity",
+            ),
+            max_concurrent_orders=int(str(value.get("max_concurrent_orders", 1000))),
             max_daily_loss=decimal_value(
                 str(value.get("max_daily_loss", "5000")), label="max_daily_loss"
             ),
@@ -702,6 +750,10 @@ class PaperRunConfig:
     economic_prerequisites_evidence_hash: str | None = None
     required_instruments: tuple[str, ...] = ()
     engine_build_hash: str = PAPER_ENGINE_BUILD_HASH
+    release_code_sha256: str = field(default_factory=_current_release_code_sha256)
+    runtime_environment_sha256: str = field(default_factory=_current_runtime_environment_sha256)
+    runtime_timer_interval_seconds: float = 1.0
+    runtime_source_poll_timeout_seconds: float = 0.25
     minimum_validation_cycles: int = 30
     schema_version: int = 2
     environment: str = "PAPER"
@@ -792,13 +844,43 @@ class PaperRunConfig:
             markers = ("placeholder", "synthetic", "uncalibrated", "default", "toy")
             if any(marker in source.casefold() for marker in markers):
                 raise ValueError("CALIBRATED paper data requires a non-placeholder source")
+        normalized_build_hash = _digest(
+            self.engine_build_hash,
+            label="engine_build_hash",
+        )
+        expected_build_hash = (
+            _PAPER_ENGINE_BUILD_HASH_V2
+            if self.schema_version == 1
+            else PAPER_ENGINE_BUILD_HASH
+        )
+        if self.schema_version == 1 and normalized_build_hash == PAPER_ENGINE_BUILD_HASH:
+            normalized_build_hash = _PAPER_ENGINE_BUILD_HASH_V2
+        object.__setattr__(self, "engine_build_hash", normalized_build_hash)
+        if self.engine_build_hash != expected_build_hash:
+            raise ValueError("paper configuration targets a different execution-engine build")
         object.__setattr__(
             self,
-            "engine_build_hash",
-            _digest(self.engine_build_hash, label="engine_build_hash"),
+            "release_code_sha256",
+            _digest(self.release_code_sha256, label="release_code_sha256"),
         )
-        if self.engine_build_hash != PAPER_ENGINE_BUILD_HASH:
-            raise ValueError("paper configuration targets a different execution-engine build")
+        object.__setattr__(
+            self,
+            "runtime_environment_sha256",
+            _digest(self.runtime_environment_sha256, label="runtime_environment_sha256"),
+        )
+        for name in (
+            "runtime_timer_interval_seconds",
+            "runtime_source_poll_timeout_seconds",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a finite positive number")
+            object.__setattr__(self, name, float(value))
         if (
             isinstance(self.minimum_validation_cycles, bool)
             or not isinstance(self.minimum_validation_cycles, int)
@@ -825,6 +907,14 @@ class PaperRunConfig:
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
+        risk_snapshot = self.risk.to_dict()
+        if self.schema_version == 1:
+            for key in (
+                "max_concurrent_orders",
+                "max_order_quantity",
+                "max_position_quantity",
+            ):
+                risk_snapshot.pop(key)
         payload: dict[str, JsonValue] = {
             "data_calibration_evidence_hash": self.data_calibration_evidence_hash,
             "data_calibration_status": self.data_calibration_status,
@@ -840,7 +930,7 @@ class PaperRunConfig:
             "minimum_validation_cycles": self.minimum_validation_cycles,
             "parameters": cast(dict[str, JsonValue], json.loads(canonical_json(self.parameters))),
             "required_instruments": list(self.required_instruments),
-            "risk": self.risk.to_dict(),
+            "risk": risk_snapshot,
             "run_kind": self.run_kind,
             "schema_version": self.schema_version,
             "seed": self.seed,
@@ -850,6 +940,12 @@ class PaperRunConfig:
         }
         if self.schema_version >= 2:
             payload["environment"] = self.environment
+            payload["release_code_sha256"] = self.release_code_sha256
+            payload["runtime_environment_sha256"] = self.runtime_environment_sha256
+            payload["runtime_source_poll_timeout_seconds"] = (
+                self.runtime_source_poll_timeout_seconds
+            )
+            payload["runtime_timer_interval_seconds"] = self.runtime_timer_interval_seconds
         return payload
 
     @property
@@ -873,8 +969,42 @@ class PaperRunConfig:
         if isinstance(raw_schema_version, bool):
             raise ValueError("paper configuration schema_version must be 1 or 2")
         schema_version = int(str(raw_schema_version))
+        if schema_version not in {1, 2}:
+            raise ValueError("paper configuration schema_version must be 1 or 2")
         if schema_version == 2 and "environment" not in value:
             raise ValueError("schema v2 paper configuration requires explicit environment PAPER")
+        if schema_version == 2:
+            missing_snapshot_fields = tuple(
+                field_name
+                for field_name in (
+                    "release_code_sha256",
+                    "runtime_environment_sha256",
+                    "runtime_source_poll_timeout_seconds",
+                    "runtime_timer_interval_seconds",
+                )
+                if field_name not in value
+            )
+            if missing_snapshot_fields:
+                raise ValueError(
+                    "schema v2 paper configuration requires explicit release/environment/cadence fields: "
+                    + ", ".join(missing_snapshot_fields)
+                )
+        release_code_sha256 = (
+            str(value["release_code_sha256"])
+            if "release_code_sha256" in value
+            else _current_release_code_sha256()
+        )
+        runtime_environment_sha256 = (
+            str(value["runtime_environment_sha256"])
+            if "runtime_environment_sha256" in value
+            else _current_runtime_environment_sha256()
+        )
+        runtime_timer_interval_seconds = float(
+            str(value.get("runtime_timer_interval_seconds", 1.0))
+        )
+        runtime_source_poll_timeout_seconds = float(
+            str(value.get("runtime_source_poll_timeout_seconds", 0.25))
+        )
         return cls(
             strategy_name=str(value["strategy_name"]),
             strategy_hash=str(value["strategy_hash"]),
@@ -909,7 +1039,20 @@ class PaperRunConfig:
                     Sequence[object], value.get("required_instruments", ())
                 )
             ),
-            engine_build_hash=str(value.get("engine_build_hash", PAPER_ENGINE_BUILD_HASH)),
+            engine_build_hash=str(
+                value.get(
+                    "engine_build_hash",
+                    (
+                        _PAPER_ENGINE_BUILD_HASH_V2
+                        if schema_version == 1
+                        else PAPER_ENGINE_BUILD_HASH
+                    ),
+                )
+            ),
+            release_code_sha256=release_code_sha256,
+            runtime_timer_interval_seconds=runtime_timer_interval_seconds,
+            runtime_source_poll_timeout_seconds=runtime_source_poll_timeout_seconds,
+            runtime_environment_sha256=runtime_environment_sha256,
             minimum_validation_cycles=int(str(value.get("minimum_validation_cycles", 30))),
         )
 
@@ -1087,6 +1230,7 @@ class DecisionIntent:
     observed_event_ids: tuple[str, ...]
     orders: tuple[OrderIntent, ...]
     ordinal: int = 0
+    signal: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "decision_id", _digest(self.decision_id, label="decision_id"))
@@ -1122,11 +1266,19 @@ class DecisionIntent:
             raise ValueError("EXIT decisions require reduce_only orders")
         if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or self.ordinal < 0:
             raise ValueError("decision ordinal must be a non-negative integer")
+        if not isinstance(self.signal, Mapping):
+            raise TypeError("decision signal must be a mapping")
+        object.__setattr__(
+            self,
+            "signal",
+            frozen_json_mapping(self.signal, label="decision signal"),
+        )
         expected_id = self.identifier(
             run_id=self.run_id,
             market_event_id=self.market_event_id,
             action=cast(DecisionAction, self.action),
             ordinal=self.ordinal,
+            signal=self.signal,
         )
         if self.decision_id != expected_id:
             raise ValueError("decision_id does not match the deterministic decision payload")
@@ -1139,9 +1291,12 @@ class DecisionIntent:
         market_event_id: str,
         action: DecisionAction | str,
         ordinal: int,
+        signal: Mapping[str, object] | None = None,
     ) -> str:
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
             raise ValueError("decision ordinal must be a non-negative integer")
+        if signal:
+            return deterministic_id("paper_decision", run_id, market_event_id, str(action), ordinal, signal)
         return deterministic_id("paper_decision", run_id, market_event_id, str(action), ordinal)
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -1156,18 +1311,26 @@ class DecisionIntent:
             "received_at": utc_text(self.received_at),
             "run_id": self.run_id,
             "strategy_name": self.strategy_name,
+            **(
+                {"signal": cast(dict[str, JsonValue], json.loads(canonical_json(self.signal)))}
+                if self.signal else {}
+            ),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> DecisionIntent:
         raw_orders = value.get("orders")
         raw_observed = value.get("observed_event_ids")
+        raw_signal = value.get("signal", {})
         if not isinstance(raw_orders, Sequence) or isinstance(raw_orders, (str, bytes)):
             raise ValueError("decision orders must be an array")
         if not isinstance(raw_observed, Sequence) or isinstance(
             raw_observed, (str, bytes)
         ):
             raise ValueError("decision observed_event_ids must be an array")
+        if not isinstance(raw_signal, Mapping):
+            raise ValueError("decision signal must be an object")
+
         return cls(
             decision_id=str(value["decision_id"]),
             run_id=str(value["run_id"]),
@@ -1183,6 +1346,7 @@ class DecisionIntent:
                 if isinstance(item, Mapping)
             ),
             ordinal=int(str(value.get("ordinal", 0))),
+            signal=cast(Mapping[str, object], raw_signal),
         )
 
 
@@ -1203,6 +1367,9 @@ class MarketEvent:
     stale: bool = False
     gap: bool = False
     tradable: bool = True
+    source_event_kind: str | None = None
+    source_connection_id: str | None = None
+    source_connection_epoch: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_id", _digest(self.event_id, label="market event_id"))
@@ -1228,6 +1395,26 @@ class MarketEvent:
             or self.capture_ordinal < 0
         ):
             raise ValueError("capture_ordinal must be a non-negative integer")
+        if self.source_event_kind is not None:
+            object.__setattr__(
+                self,
+                "source_event_kind",
+                _identifier(self.source_event_kind, label="source_event_kind"),
+            )
+        if self.source_connection_id is not None:
+            object.__setattr__(
+                self,
+                "source_connection_id",
+                _identifier(self.source_connection_id, label="source_connection_id"),
+            )
+        if (self.source_connection_id is None) != (self.source_connection_epoch is None):
+            raise ValueError("source connection id and epoch must be supplied together")
+        if self.source_connection_epoch is not None and (
+            isinstance(self.source_connection_epoch, bool)
+            or not isinstance(self.source_connection_epoch, int)
+            or self.source_connection_epoch < 0
+        ):
+            raise ValueError("source_connection_epoch must be a non-negative integer")
         if (self.trade_price is None) != (self.trade_quantity is None):
             raise ValueError("trade_price and trade_quantity must be supplied together")
         if self.trade_price is not None:
@@ -1294,6 +1481,9 @@ class MarketEvent:
         stale: bool = False,
         gap: bool = False,
         tradable: bool = True,
+        source_event_kind: str | None = None,
+        source_connection_id: str | None = None,
+        source_connection_epoch: int | None = None,
     ) -> MarketEvent:
         return cls(
             event_id=cls.identifier(
@@ -1316,6 +1506,9 @@ class MarketEvent:
             stale=stale,
             gap=gap,
             tradable=tradable,
+            source_event_kind=source_event_kind,
+            source_connection_id=source_connection_id,
+            source_connection_epoch=source_connection_epoch,
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -1333,6 +1526,9 @@ class MarketEvent:
             "instrument": self.instrument,
             "received_at": utc_text(self.received_at),
             "source_sequence": self.source_sequence,
+            **({"source_event_kind": self.source_event_kind} if self.source_event_kind else {}),
+            **({"source_connection_id": self.source_connection_id} if self.source_connection_id else {}),
+            **({"source_connection_epoch": self.source_connection_epoch} if self.source_connection_epoch is not None else {}),
             "stale": self.stale,
             "tradable": self.tradable,
             "trade_price": decimal_text(self.trade_price) if self.trade_price is not None else None,
@@ -1372,6 +1568,21 @@ class MarketEvent:
             aggressor_side=(
                 str(value["aggressor_side"])
                 if value.get("aggressor_side") is not None
+                else None
+            ),
+            source_event_kind=(
+                str(value["source_event_kind"])
+                if value.get("source_event_kind") is not None
+                else None
+            ),
+            source_connection_id=(
+                str(value["source_connection_id"])
+                if value.get("source_connection_id") is not None
+                else None
+            ),
+            source_connection_epoch=(
+                int(str(value["source_connection_epoch"]))
+                if value.get("source_connection_epoch") is not None
                 else None
             ),
             stale=bool(value.get("stale", False)),
@@ -1671,7 +1882,12 @@ class PaperProjection:
     cost_basis: dict[str, Decimal] = field(default_factory=dict)
     inventory_value: dict[str, Decimal] = field(default_factory=dict)
     marks: dict[str, Decimal] = field(default_factory=dict)
+    public_bbo_mids: dict[str, Decimal] = field(default_factory=dict)
+    public_bbo_received_at_by_instrument: dict[str, datetime] = field(
+        default_factory=dict
+    )
     orders: dict[str, PaperOrder] = field(default_factory=dict)
+    archived_order_count: int = 0
     decisions: int = 0
     completed_cycles: int = 0
     current_entry_decision_id: str | None = None
@@ -1679,8 +1895,14 @@ class PaperProjection:
     peak_equity: Decimal = Decimal("NaN")
     session_start_equity: Decimal = Decimal("NaN")
     session_date: str | None = None
-    critical_incidents: list[datetime] = field(default_factory=list)
+    critical_incident_count: int = 0
+    last_critical_incident_at: datetime | None = None
+    runtime_session_generation: int = 0
+    runtime_session_id: str | None = None
+    runtime_session_started_at: datetime | None = None
+    runtime_session_stopped_at: datetime | None = None
     last_received_at: datetime | None = None
+    last_public_source_received_at: datetime | None = None
     last_market_received_at: datetime | None = None
     last_market_received_at_by_instrument: dict[str, datetime] = field(
         default_factory=dict
@@ -1749,8 +1971,32 @@ class PaperProjection:
             instrument: decimal_value(value, label=f"marks.{instrument}", positive=True)
             for instrument, value in self.marks.items()
         }
+        self.public_bbo_mids = {
+            instrument: decimal_value(
+                value,
+                label=f"public_bbo_mids.{instrument}",
+                positive=True,
+            )
+            for instrument, value in self.public_bbo_mids.items()
+        }
+        self.public_bbo_received_at_by_instrument = {
+            instrument: _utc(received_at, label=f"public BBO {instrument}")
+            for instrument, received_at in self.public_bbo_received_at_by_instrument.items()
+        }
+        if set(self.public_bbo_mids) != set(
+            self.public_bbo_received_at_by_instrument
+        ):
+            raise ValueError(
+                "public BBO mid and source-received timestamp keys must match"
+            )
         if any(key != order.intent.order_id for key, order in self.orders.items()):
             raise ValueError("paper order projection keys must equal their deterministic order IDs")
+        if (
+            isinstance(self.archived_order_count, bool)
+            or not isinstance(self.archived_order_count, int)
+            or self.archived_order_count < 0
+        ):
+            raise ValueError("archived_order_count must be a non-negative integer")
         if self.current_entry_decision_id is not None:
             self.current_entry_decision_id = _digest(
                 self.current_entry_decision_id,
@@ -1761,11 +2007,76 @@ class PaperProjection:
                 self.current_exit_decision_id,
                 label="current_exit_decision_id",
             )
-        self.critical_incidents = [
-            _utc(value, label="critical incident") for value in self.critical_incidents
-        ]
+        if (
+            isinstance(self.critical_incident_count, bool)
+            or not isinstance(self.critical_incident_count, int)
+            or self.critical_incident_count < 0
+        ):
+            raise ValueError("critical_incident_count must be a non-negative integer")
+        if self.last_critical_incident_at is not None:
+            self.last_critical_incident_at = _utc(
+                self.last_critical_incident_at,
+                label="last_critical_incident_at",
+            )
+        if (self.critical_incident_count == 0) != (
+            self.last_critical_incident_at is None
+        ):
+            raise ValueError(
+                "last_critical_incident_at must be present exactly when "
+                "critical_incident_count is positive"
+            )
+        if (
+            isinstance(self.runtime_session_generation, bool)
+            or not isinstance(self.runtime_session_generation, int)
+            or self.runtime_session_generation < 0
+        ):
+            raise ValueError(
+                "runtime_session_generation must be a non-negative integer"
+            )
+        if self.runtime_session_id is not None:
+            self.runtime_session_id = _digest(
+                self.runtime_session_id,
+                label="runtime_session_id",
+            )
+        if self.runtime_session_started_at is not None:
+            self.runtime_session_started_at = _utc(
+                self.runtime_session_started_at,
+                label="runtime_session_started_at",
+            )
+        if self.runtime_session_stopped_at is not None:
+            self.runtime_session_stopped_at = _utc(
+                self.runtime_session_stopped_at,
+                label="runtime_session_stopped_at",
+            )
+        if self.runtime_session_generation == 0:
+            if any(
+                value is not None
+                for value in (
+                    self.runtime_session_id,
+                    self.runtime_session_started_at,
+                    self.runtime_session_stopped_at,
+                )
+            ):
+                raise ValueError(
+                    "runtime session fields require a positive generation"
+                )
+        elif self.runtime_session_id is None or self.runtime_session_started_at is None:
+            raise ValueError(
+                "positive runtime session generation requires identity and start time"
+            )
+        if (
+            self.runtime_session_stopped_at is not None
+            and self.runtime_session_started_at is not None
+            and self.runtime_session_stopped_at < self.runtime_session_started_at
+        ):
+            raise ValueError("runtime session stop cannot precede its start")
         if self.last_received_at is not None:
             self.last_received_at = _utc(self.last_received_at, label="last_received_at")
+        if self.last_public_source_received_at is not None:
+            self.last_public_source_received_at = _utc(
+                self.last_public_source_received_at,
+                label="last_public_source_received_at",
+            )
         if self.last_market_received_at is not None:
             self.last_market_received_at = _utc(
                 self.last_market_received_at,
@@ -1783,6 +2094,23 @@ class PaperProjection:
                 raise ValueError(
                     "last_market_received_at must equal the latest per-instrument market time"
                 )
+        if (
+            self.last_public_source_received_at is not None
+            and self.last_received_at is not None
+            and self.last_public_source_received_at > self.last_received_at
+        ):
+            raise ValueError(
+                "public source receipt time cannot exceed durable processing time"
+            )
+        if self.public_bbo_received_at_by_instrument:
+            latest_public_bbo = max(
+                self.public_bbo_received_at_by_instrument.values()
+            )
+            if (
+                self.last_public_source_received_at is not None
+                and latest_public_bbo > self.last_public_source_received_at
+            ):
+                raise ValueError("public BBO time exceeds the public source watermark")
         if (
             isinstance(self.last_sequence, bool)
             or not isinstance(self.last_sequence, int)
@@ -1810,15 +2138,24 @@ class PaperProjection:
     def active_orders(self) -> tuple[PaperOrder, ...]:
         return tuple(order for order in self.orders.values() if order.status.active)
 
+    @property
+    def runtime_session_active(self) -> bool:
+        return (
+            self.runtime_session_generation > 0
+            and self.runtime_session_id is not None
+            and self.runtime_session_stopped_at is None
+        )
+
     def to_dict(self) -> dict[str, JsonValue]:
         return {
+            "archived_order_count": self.archived_order_count,
             "cash": decimal_text(self.cash),
             "completed_cycles": self.completed_cycles,
             "config_hash": self.config_hash,
             "cost_basis": {
                 key: decimal_text(value) for key, value in sorted(self.cost_basis.items())
             },
-            "critical_incidents": [utc_text(value) for value in self.critical_incidents],
+            "critical_incident_count": self.critical_incident_count,
             "current_entry_decision_id": self.current_entry_decision_id,
             "current_exit_decision_id": self.current_exit_decision_id,
             "decisions": self.decisions,
@@ -1827,7 +2164,17 @@ class PaperProjection:
             "inventory_value": {
                 key: decimal_text(value) for key, value in sorted(self.inventory_value.items())
             },
+            "last_critical_incident_at": (
+                utc_text(self.last_critical_incident_at)
+                if self.last_critical_incident_at is not None
+                else None
+            ),
             "last_event_hash": self.last_event_hash,
+            "last_public_source_received_at": (
+                utc_text(self.last_public_source_received_at)
+                if self.last_public_source_received_at is not None
+                else None
+            ),
             "last_market_received_at": (
                 utc_text(self.last_market_received_at)
                 if self.last_market_received_at is not None
@@ -1844,6 +2191,16 @@ class PaperProjection:
             ),
             "last_sequence": self.last_sequence,
             "marks": {key: decimal_text(value) for key, value in sorted(self.marks.items())},
+            "public_bbo_mids": {
+                key: decimal_text(value)
+                for key, value in sorted(self.public_bbo_mids.items())
+            },
+            "public_bbo_received_at_by_instrument": {
+                instrument: utc_text(received_at)
+                for instrument, received_at in sorted(
+                    self.public_bbo_received_at_by_instrument.items()
+                )
+            },
             "orders": {key: value.to_dict() for key, value in sorted(self.orders.items())},
             "peak_equity": decimal_text(self.peak_equity),
             "positions": {
@@ -1852,7 +2209,19 @@ class PaperProjection:
             "realized_pnl": decimal_text(self.realized_pnl),
             "reconciled": self.reconciled,
             "run_id": self.run_id,
-            "schema_version": 1,
+            "runtime_session_generation": self.runtime_session_generation,
+            "runtime_session_id": self.runtime_session_id,
+            "runtime_session_started_at": (
+                utc_text(self.runtime_session_started_at)
+                if self.runtime_session_started_at is not None
+                else None
+            ),
+            "runtime_session_stopped_at": (
+                utc_text(self.runtime_session_stopped_at)
+                if self.runtime_session_stopped_at is not None
+                else None
+            ),
+            "schema_version": 3,
             "session_start_equity": decimal_text(self.session_start_equity),
             "session_date": self.session_date,
             "state": self.state.value,
@@ -1874,6 +2243,77 @@ class PaperProjection:
             if not isinstance(raw, Mapping):
                 raise ValueError(f"projection {name} must be an object")
             return {str(key): decimal_value(str(item), label=f"{name}.{key}") for key, item in raw.items()}
+
+        def non_negative_count(name: str, default: int) -> int:
+            raw = value.get(name, default)
+            if isinstance(raw, bool):
+                raise ValueError(f"projection {name} must be a non-negative integer")
+            try:
+                parsed = int(str(raw))
+            except ValueError as error:
+                raise ValueError(
+                    f"projection {name} must be a non-negative integer"
+                ) from error
+            if parsed < 0:
+                raise ValueError(f"projection {name} must be a non-negative integer")
+            return parsed
+
+        raw_schema_version = value.get("schema_version", 1)
+        if isinstance(raw_schema_version, bool):
+            raise ValueError("projection schema_version must be 1, 2, or 3")
+        schema_version = int(str(raw_schema_version))
+        if schema_version not in {1, 2, 3}:
+            raise ValueError("projection schema_version must be 1, 2, or 3")
+
+        legacy_incidents: list[datetime] = []
+        if schema_version == 1:
+            raw_incidents = value.get("critical_incidents", [])
+            if not isinstance(raw_incidents, Sequence) or isinstance(
+                raw_incidents, (str, bytes)
+            ):
+                raise ValueError("projection critical_incidents must be an array")
+            legacy_incidents = [parse_utc(str(item)) for item in raw_incidents]
+        elif "critical_incidents" in value:
+            raise ValueError("projection schema v2/v3 cannot contain critical_incidents")
+        runtime_session_fields = {
+            "runtime_session_generation",
+            "runtime_session_id",
+            "runtime_session_started_at",
+            "runtime_session_stopped_at",
+        }
+        if schema_version < 3 and runtime_session_fields.intersection(value):
+            raise ValueError(
+                "projection schema v1/v2 cannot contain runtime session fields"
+            )
+
+        derived_incident_count = len(legacy_incidents)
+        derived_last_incident = max(legacy_incidents, default=None)
+        critical_incident_count = non_negative_count(
+            "critical_incident_count",
+            derived_incident_count,
+        )
+        raw_last_incident = value.get("last_critical_incident_at")
+        last_critical_incident_at = (
+            parse_utc(str(raw_last_incident))
+            if raw_last_incident is not None
+            else derived_last_incident
+        )
+        if (
+            schema_version == 1
+            and "critical_incident_count" in value
+            and critical_incident_count != derived_incident_count
+        ):
+            raise ValueError(
+                "legacy critical_incidents differ from critical_incident_count"
+            )
+        if (
+            schema_version == 1
+            and "last_critical_incident_at" in value
+            and last_critical_incident_at != derived_last_incident
+        ):
+            raise ValueError(
+                "legacy critical_incidents differ from last_critical_incident_at"
+            )
 
         raw_orders = value.get("orders", {})
         if not isinstance(raw_orders, Mapping):
@@ -1902,11 +2342,13 @@ class PaperProjection:
             cost_basis=decimal_map("cost_basis"),
             inventory_value=decimal_map("inventory_value"),
             marks=decimal_map("marks"),
+            public_bbo_mids=decimal_map("public_bbo_mids"),
             orders={
                 str(key): PaperOrder.from_dict(cast(Mapping[str, object], item))
                 for key, item in raw_orders.items()
                 if isinstance(item, Mapping)
             },
+            archived_order_count=non_negative_count("archived_order_count", 0),
             decisions=int(str(value.get("decisions", 0))),
             completed_cycles=int(str(value.get("completed_cycles", 0))),
             current_entry_decision_id=(
@@ -1927,12 +2369,35 @@ class PaperProjection:
                 label="session_start_equity",
             ),
             session_date=(str(value["session_date"]) if value.get("session_date") else None),
-            critical_incidents=[
-                parse_utc(str(item)) for item in cast(Sequence[object], value.get("critical_incidents", []))
-            ],
+            critical_incident_count=critical_incident_count,
+            last_critical_incident_at=last_critical_incident_at,
+            runtime_session_generation=non_negative_count(
+                "runtime_session_generation",
+                0,
+            ),
+            runtime_session_id=(
+                str(value["runtime_session_id"])
+                if value.get("runtime_session_id") is not None
+                else None
+            ),
+            runtime_session_started_at=(
+                parse_utc(str(value["runtime_session_started_at"]))
+                if value.get("runtime_session_started_at") is not None
+                else None
+            ),
+            runtime_session_stopped_at=(
+                parse_utc(str(value["runtime_session_stopped_at"]))
+                if value.get("runtime_session_stopped_at") is not None
+                else None
+            ),
             last_received_at=(
                 parse_utc(str(value["last_received_at"]))
                 if value.get("last_received_at") is not None
+                else None
+            ),
+            last_public_source_received_at=(
+                parse_utc(str(value["last_public_source_received_at"]))
+                if value.get("last_public_source_received_at") is not None
                 else None
             ),
             last_market_received_at=(
@@ -1945,6 +2410,13 @@ class PaperProjection:
                 for instrument, received_at in cast(
                     Mapping[str, object],
                     value.get("last_market_received_at_by_instrument", {}),
+                ).items()
+            },
+            public_bbo_received_at_by_instrument={
+                str(instrument): parse_utc(str(received_at))
+                for instrument, received_at in cast(
+                    Mapping[str, object],
+                    value.get("public_bbo_received_at_by_instrument", {}),
                 ).items()
             },
             last_sequence=int(str(value.get("last_sequence", 0))),

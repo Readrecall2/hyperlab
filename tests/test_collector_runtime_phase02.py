@@ -1773,3 +1773,171 @@ def test_periodic_flush_requests_async_durability_without_blocking_runtime(
         assert sink.flush_requests == 1
     finally:
         collector.close()
+
+class _FailSecondFundingCallRest(FakeRest):
+    def __init__(self) -> None:
+        super().__init__()
+        self.funding_attempts = 0
+
+    def funding_history(
+        self,
+        asset: str,
+        start_ms: int,
+        end_ms: int | None = None,
+    ) -> object:
+        self.funding_attempts += 1
+        if self.funding_attempts == 2:
+            self.funding_calls.append((asset, start_ms, end_ms))
+            raise ConnectionError("fixture refresh failure")
+        return super().funding_history(asset, start_ms, end_ms)
+
+
+class _MissingInitialFundingRest(FakeRest):
+    def __init__(self) -> None:
+        super().__init__()
+        self.funding_attempts = 0
+
+    def funding_history(
+        self,
+        asset: str,
+        start_ms: int,
+        end_ms: int | None = None,
+    ) -> object:
+        self.funding_attempts += 1
+        if self.funding_attempts == 1:
+            self.funding_calls.append((asset, start_ms, end_ms))
+            return []
+        return super().funding_history(asset, start_ms, end_ms)
+
+
+def _paper_policy_config(**overrides: Any) -> CollectorConfig:
+    values: dict[str, Any] = {
+        "candle_intervals": (),
+        "subscription_channels": ("bbo",),
+        "collect_funding_history": True,
+        "reconnect_on_rest_refresh_failure": True,
+        "critical_funding_history": True,
+        "rest_refresh_interval_seconds": 1.0,
+        "heartbeat_interval_seconds": 100.0,
+        "pong_timeout_seconds": 200.0,
+        "stale_after_seconds": 100.0,
+        "backoff_initial_seconds": 0.1,
+        "backoff_max_seconds": 0.1,
+        "backoff_jitter_ratio": 0.0,
+    }
+    values.update(overrides)
+    return _config(**values)
+
+
+def test_paper_rest_refresh_failure_forces_exact_reconnect_and_resync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timer = ControlledTime()
+    config = _paper_policy_config()
+    rest = _FailSecondFundingCallRest()
+    first = FakeSocket(timer, [*_ack_messages(config), (None, 1.1)])
+    second = FakeSocket(timer, _ack_messages(config))
+    collector, _resolved_rest, factory, sink = _collector(
+        tmp_path,
+        config,
+        timer,
+        [first, second],
+        rest=rest,
+        sleeper=lambda _delay: None,
+    )
+
+    def materialize_synchronously(
+        connection_id: str,
+        connection_epoch: int,
+        query_end: datetime,
+    ) -> None:
+        future: Future[tuple[ParsedRecord, ...]] = Future()
+        try:
+            future.set_result(
+                collector._materialize_rest_refresh(
+                    connection_id=f"sync-{connection_id}",
+                    connection_epoch=connection_epoch,
+                    history_hours=2,
+                    query_end=query_end,
+                )
+            )
+        except BaseException as exc:
+            future.set_exception(exc)
+        collector._rest_future = future
+
+    monkeypatch.setattr(collector, "_schedule_rest_refresh", materialize_synchronously)
+    try:
+        metrics = collector.run(max_messages=2)
+    finally:
+        collector.close()
+
+    assert rest.funding_attempts == 3
+    assert (metrics.connections, metrics.reconnects, metrics.resyncs) == (2, 1, 1)
+    assert metrics.gaps == 2
+    assert metrics.last_error is None
+    assert first.closed is True
+    assert second.closed is True
+    assert factory.connect_calls == [
+        ("mainnet", config.ws_connect_timeout_seconds),
+        ("mainnet", config.ws_connect_timeout_seconds),
+    ]
+    events = _parquet_rows(sink.root, "connection_event")
+    assert {
+        int(row["connection_epoch"])
+        for row in events
+        if row["event_kind"] == "resync_start"
+    } == {2}
+    assert {int(row["connection_epoch"]) for row in events if row["event_kind"] == "resync_complete"} == {2}
+    assert any("REST refresh failed" in str(row["reason"]) for row in events)
+    assert {int(row["connection_epoch"]) for row in events if row["event_kind"] == "connect"} == {
+        1,
+        2,
+    }
+
+
+def test_paper_missing_funding_is_critical_even_with_fresh_bbo_and_recovers_after_reconnect(
+    tmp_path: Path,
+) -> None:
+    timer = ControlledTime()
+    config = _paper_policy_config(rest_refresh_interval_seconds=300.0)
+    rest = _MissingInitialFundingRest()
+    fresh_bbo = (
+        Path(__file__).parent / "fixtures" / "hyperliquid" / "ws_bbo.json"
+    ).read_text(encoding="utf-8")
+    first = FakeSocket(timer, [(fresh_bbo, 0.0), *_ack_messages(config)])
+    second = FakeSocket(timer, _ack_messages(config))
+    collector, _resolved_rest, factory, sink = _collector(
+        tmp_path,
+        config,
+        timer,
+        [first, second],
+        rest=rest,
+        sleeper=lambda _delay: None,
+    )
+    try:
+        metrics = collector.run(max_messages=3)
+    finally:
+        collector.close()
+
+    assert rest.funding_attempts == 2
+    assert (metrics.connections, metrics.reconnects, metrics.resyncs) == (2, 1, 1)
+    assert metrics.gaps == 1
+    assert metrics.stale_channels == ()
+    assert metrics.last_error is None
+    assert factory.connect_calls == [
+        ("mainnet", config.ws_connect_timeout_seconds),
+        ("mainnet", config.ws_connect_timeout_seconds),
+    ]
+    events = _parquet_rows(sink.root, "connection_event")
+    first_failure = next(
+        row
+        for row in events
+        if row["event_kind"] == "disconnect"
+        and "stale critical public streams" in str(row["reason"])
+    )
+    assert "fundingHistory:BTC" in str(first_failure["reason"])
+    second_connect = next(
+        row for row in events if row["event_kind"] == "connect" and row["connection_epoch"] == 2
+    )
+    assert second_connect["connection_id"] != first_failure["connection_id"]

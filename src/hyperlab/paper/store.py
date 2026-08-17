@@ -94,6 +94,7 @@ _REQUIRED_SCHEMA_TABLES = frozenset(
 _REQUIRED_HOT_PATH_INDEXES = frozenset(
     {
         "paper_alerts_commit_idx",
+        "paper_alerts_run_severity_sequence_idx",
         "paper_events_input_idx",
         "paper_ledger_transactions_input_idx",
     }
@@ -170,6 +171,22 @@ class RunRecord:
     projection_revision: int
     projection_hash: str
 
+    @property
+    def head_identity(self) -> tuple[str, str, str, int, str, int, str, int, str]:
+        """Return the exact mutable durable-head identity for coherent reads."""
+
+        return (
+            self.run_id,
+            self.config_hash,
+            self.status,
+            self.event_sequence,
+            self.event_head_hash,
+            self.commit_sequence,
+            self.commit_head_hash,
+            self.projection_revision,
+            self.projection_hash,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class InputRecord:
@@ -210,6 +227,22 @@ class StoredEventRecord:
             "run_id": self.run_id,
             "sequence": self.sequence,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionHistoryRecord:
+    """One immutable projection revision returned by a bounded read query."""
+
+    run_id: str
+    revision: int
+    input_id: str | None
+    event_sequence: int
+    event_head_hash: str
+    status: str
+    projection: dict[str, JsonValue]
+    utc_date: str
+    projection_hash: str
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +303,22 @@ class IntegrityReport:
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+class _IntegrityIssueCollector:
+    """Retain the first deterministic occurrence of each finite issue code."""
+
+    def __init__(self) -> None:
+        self._by_code: dict[str, IntegrityIssue] = {}
+
+    def add(self, code: str, detail: str) -> None:
+        self._by_code.setdefault(code, IntegrityIssue(code, detail))
+
+    def __len__(self) -> int:
+        return len(self._by_code)
+
+    def freeze(self) -> tuple[IntegrityIssue, ...]:
+        return tuple(self._by_code.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +512,8 @@ CREATE TABLE paper_commits (
 CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id);
 CREATE INDEX paper_ledger_event_idx ON paper_ledger_entries(run_id, event_id);
 CREATE INDEX paper_alerts_sequence_idx ON paper_alerts(run_id, event_sequence, alert_id);
+CREATE INDEX paper_alerts_run_severity_sequence_idx
+    ON paper_alerts(run_id, severity, event_sequence DESC);
 CREATE INDEX paper_ledger_transactions_input_idx
     ON paper_ledger_transactions(run_id, input_id);
 CREATE INDEX paper_alerts_commit_idx ON paper_alerts(run_id, commit_sequence);
@@ -776,6 +827,12 @@ class PaperStore:
         if self._fault_injector is not None:
             self._fault_injector(stage)
 
+    @staticmethod
+    def _observe_integrity_buffer(name: str, size: int) -> None:
+        """Test instrumentation hook for bounded verifier working sets."""
+
+        del name, size
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.path,
@@ -841,9 +898,7 @@ class PaperStore:
                 f"paper store schema {version} is not supported by schema {SCHEMA_VERSION} code"
             )
         try:
-            row = connection.execute(
-                "SELECT version FROM paper_schema WHERE singleton=1"
-            ).fetchone()
+            row = connection.execute("SELECT version FROM paper_schema WHERE singleton=1").fetchone()
         except sqlite3.DatabaseError as error:
             raise SchemaVersionError("paper store schema metadata is missing") from error
         if row is None or int(row[0]) != SCHEMA_VERSION:
@@ -954,9 +1009,7 @@ class PaperStore:
                         issues=(),
                     )
                     connection.commit()
-                    raise RunConflictError(
-                        "run_id already exists with a different immutable configuration"
-                    )
+                    raise RunConflictError("run_id already exists with a different immutable configuration")
                 connection.execute(
                     """
                     INSERT INTO paper_runs (
@@ -1033,9 +1086,7 @@ class PaperStore:
         normalized_run_id = _identifier(run_id, label="run_id")
         normalized_input_id = _identifier(input_id, label="input_id")
         _input, input_json, input_hash = _canonical_record(input_payload, label="input_payload")
-        if expected_sequence is not None and (
-            isinstance(expected_sequence, bool) or expected_sequence < 0
-        ):
+        if expected_sequence is not None and (isinstance(expected_sequence, bool) or expected_sequence < 0):
             raise ValueError("expected_sequence must be a non-negative integer or None")
         self._inject("before_begin")
         with self._connect() as connection:
@@ -1136,17 +1187,13 @@ class PaperStore:
                 )
                 resulting_sequence = current_sequence + len(prepared_events)
                 resulting_event_head = (
-                    prepared_events[-1].event_hash
-                    if prepared_events
-                    else str(run["event_head_hash"])
+                    prepared_events[-1].event_hash if prepared_events else str(run["event_head_hash"])
                 )
                 prepared_ledger = self._prepare_ledger(
                     connection,
                     normalized_run_id,
                     ledger_entries,
-                    known_event_sequences={
-                        event.event_id: event.sequence for event in prepared_events
-                    },
+                    known_event_sequences={event.event_id: event.sequence for event in prepared_events},
                 )
                 if prepared_ledger and not prepared_events:
                     raise LedgerImbalanceError(
@@ -1540,9 +1587,7 @@ class PaperStore:
                 str(durable["payload_json"]),
                 label="durable projection",
             )
-            working = PaperProjection.from_dict(
-                cast(Mapping[str, object], durable_payload)
-            )
+            working = PaperProjection.from_dict(cast(Mapping[str, object], durable_payload))
         except (KeyError, TypeError, ValueError) as error:
             raise AppendConflictError(
                 f"durable projection cannot be reconstructed for replay: {error}"
@@ -1561,9 +1606,7 @@ class PaperStore:
                     "durable projection event head does not continue into the supplied events"
                 )
             try:
-                expected_ledger.extend(
-                    self._expected_ledger_entries(run_id, working, event)
-                )
+                expected_ledger.extend(self._expected_ledger_entries(run_id, working, event))
                 apply_event(working, event)
             except (KeyError, TypeError, ValueError) as error:
                 raise AppendConflictError(
@@ -1572,9 +1615,7 @@ class PaperStore:
             working.last_sequence = prepared.sequence
             working.last_event_hash = prepared.event_hash
 
-        expected_ledger_json = canonical_json(
-            [entry.to_dict() for entry in expected_ledger]
-        )
+        expected_ledger_json = canonical_json([entry.to_dict() for entry in expected_ledger])
         supplied_ledger_json = canonical_json(
             [
                 _record_dict(entry, label=f"ledger_entries[{index}]")
@@ -1582,9 +1623,7 @@ class PaperStore:
             ]
         )
         if supplied_ledger_json != expected_ledger_json:
-            raise AppendConflictError(
-                "supplied ledger entries differ from exact reducer-derived entries"
-            )
+            raise AppendConflictError("supplied ledger entries differ from exact reducer-derived entries")
         expected_alerts_json = canonical_json(
             [
                 _record_dict(event.payload, label="ALERT_RAISED payload")
@@ -1593,15 +1632,10 @@ class PaperStore:
             ]
         )
         supplied_alerts_json = canonical_json(
-            [
-                _record_dict(alert, label=f"alerts[{index}]")
-                for index, alert in enumerate(alerts)
-            ]
+            [_record_dict(alert, label=f"alerts[{index}]") for index, alert in enumerate(alerts)]
         )
         if supplied_alerts_json != expected_alerts_json:
-            raise AppendConflictError(
-                "supplied alerts differ from exact ALERT_RAISED event payloads"
-            )
+            raise AppendConflictError("supplied alerts differ from exact ALERT_RAISED event payloads")
         replayed_projection_json = canonical_json(working.to_dict())
         if supplied_projection_json != replayed_projection_json:
             raise AppendConflictError(
@@ -1635,18 +1669,14 @@ class PaperStore:
             if payload_run_id is not None and payload_run_id != run_id:
                 raise ValueError(f"event {event_id!r} belongs to a different run")
             if event_id in seen:
-                raise IdempotencyConflictError(
-                    f"event_id {event_id!r} is duplicated within a new input"
-                )
+                raise IdempotencyConflictError(f"event_id {event_id!r} is duplicated within a new input")
             seen[event_id] = payload_hash
             existing = connection.execute(
                 "SELECT payload_hash, payload_json FROM paper_events WHERE run_id=? AND event_id=?",
                 (run_id, event_id),
             ).fetchone()
             if existing is not None:
-                raise IdempotencyConflictError(
-                    f"event_id {event_id!r} already belongs to a durable input"
-                )
+                raise IdempotencyConflictError(f"event_id {event_id!r} already belongs to a durable input")
             sequence = start_sequence + len(result) + 1
             chained_hash = _event_hash(
                 sequence=sequence,
@@ -1725,14 +1755,10 @@ class PaperStore:
                 )
             raw_event_id = payload.get("event_id")
             event_id = (
-                _identifier(raw_event_id, label="ledger event_id")
-                if raw_event_id is not None
-                else None
+                _identifier(raw_event_id, label="ledger event_id") if raw_event_id is not None else None
             )
             if event_id is None or event_id not in known_event_sequences:
-                raise AppendConflictError(
-                    "ledger entries must reference an event appended by the same input"
-                )
+                raise AppendConflictError("ledger entries must reference an event appended by the same input")
             entry = _PreparedLedgerEntry(
                 transaction_id=transaction_id,
                 entry_index=len(grouped[transaction_id]),
@@ -1809,22 +1835,16 @@ class PaperStore:
                 label="alert code",
             )
             if alert_id in seen:
-                raise IdempotencyConflictError(
-                    f"alert_id {alert_id!r} is duplicated within a new input"
-                )
+                raise IdempotencyConflictError(f"alert_id {alert_id!r} is duplicated within a new input")
             seen[alert_id] = payload_hash
             existing = connection.execute(
                 "SELECT payload_hash, payload_json FROM paper_alerts WHERE run_id=? AND alert_id=?",
                 (run_id, alert_id),
             ).fetchone()
             if existing is not None:
-                raise IdempotencyConflictError(
-                    f"alert_id {alert_id!r} already belongs to a durable input"
-                )
+                raise IdempotencyConflictError(f"alert_id {alert_id!r} already belongs to a durable input")
             if alert_id not in known_alert_sequences:
-                raise AppendConflictError(
-                    "alerts must be backed by an ALERT_RAISED event in the same input"
-                )
+                raise AppendConflictError("alerts must be backed by an ALERT_RAISED event in the same input")
             result.append(
                 _PreparedAlert(
                     alert_id=alert_id,
@@ -1866,11 +1886,7 @@ class PaperStore:
         )
         if projection_head is not None and projection_head != event_head_hash:
             raise ValueError("projection event head differs from the durable event head")
-        if (
-            "last_event_hash" in projection
-            and projection["last_event_hash"] is None
-            and event_sequence != 0
-        ):
+        if "last_event_hash" in projection and projection["last_event_hash"] is None and event_sequence != 0:
             raise ValueError("a non-empty projection must bind its last_event_hash")
 
     def verify_integrity(
@@ -1884,10 +1900,13 @@ class PaperStore:
             self._verify_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
             try:
-                if connection.execute(
-                    "SELECT 1 FROM paper_runs WHERE run_id=?",
-                    (normalized_run_id,),
-                ).fetchone() is None:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM paper_runs WHERE run_id=?",
+                        (normalized_run_id,),
+                    ).fetchone()
+                    is None
+                ):
                     raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
                 issues = self._collect_integrity_issues(connection, normalized_run_id)
                 if issues:
@@ -1921,6 +1940,38 @@ class PaperStore:
             if run is None:
                 raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
             issues = self._collect_integrity_issues(connection, normalized_run_id)
+            return self._report(connection, normalized_run_id, issues)
+
+    def inspect_head_integrity_readonly(self, run_id: str) -> IntegrityReport:
+        """Validate current and append-head anchors through query-only SQLite.
+
+        This interactive contract is independent of retained journal length. It
+        validates the current run/config, event and projection heads, immutable
+        projection-history head, and either genesis or the latest inbox/commit
+        with its directly bound events, ledger rows, alerts, and predecessor
+        anchors. Work is bounded by one immutable commit rather than full run
+        history.
+
+        It does not authenticate earlier journal rows, verify the complete hash
+        chains, or perform deterministic replay. Stop the runtime writer before
+        using full replay/reconciliation and inspect_integrity_readonly for
+        those stopped-runtime operations.
+        """
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        with self._read_connection() as connection:
+            self._verify_schema(connection)
+            run = connection.execute(
+                "SELECT * FROM paper_runs WHERE run_id=?",
+                (normalized_run_id,),
+            ).fetchone()
+            if run is None:
+                raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
+            issues = self._collect_append_head_issues(
+                connection,
+                normalized_run_id,
+                run,
+            )
             return self._report(connection, normalized_run_id, issues)
 
     def check_integrity(self, run_id: str) -> IntegrityReport:
@@ -1971,7 +2022,8 @@ class PaperStore:
                 """
                 SELECT name FROM sqlite_master
                 WHERE type='index' AND name IN (
-                    'paper_alerts_commit_idx', 'paper_events_input_idx',
+                    'paper_alerts_commit_idx', 'paper_alerts_run_severity_sequence_idx',
+                    'paper_events_input_idx',
                     'paper_ledger_transactions_input_idx'
                 )
                 """
@@ -2100,9 +2152,8 @@ class PaperStore:
                 issue("PROJECTION_EVENT_HEAD", "projection and run event heads differ")
             if str(projection["projection_hash"]) != str(run["projection_hash"]):
                 issue("PROJECTION_RUN_HASH", "projection and run hashes differ")
-            if (
-                str(projection["status"]) != str(run["status"])
-                or str(projection["effective_status"]) != str(run["status"])
+            if str(projection["status"]) != str(run["status"]) or str(projection["effective_status"]) != str(
+                run["status"]
             ):
                 issue("RUN_PROJECTION_STATE", "run and projection states differ")
 
@@ -2477,10 +2528,11 @@ class PaperStore:
         connection: sqlite3.Connection,
         run_id: str,
     ) -> tuple[IntegrityIssue, ...]:
-        issues: list[IntegrityIssue] = []
+        issues = _IntegrityIssueCollector()
 
         def issue(code: str, detail: str) -> None:
-            issues.append(IntegrityIssue(code, detail))
+            issues.add(code, detail)
+            self._observe_integrity_buffer("issue_codes", len(issues))
 
         run = connection.execute(
             "SELECT * FROM paper_runs WHERE run_id=?",
@@ -2507,13 +2559,12 @@ class PaperStore:
         event_rows = connection.execute(
             "SELECT * FROM paper_events WHERE run_id=? ORDER BY sequence",
             (run_id,),
-        ).fetchall()
+        )
         expected_sequence = 0
-        event_by_input: dict[str, list[str]] = defaultdict(list)
-        known_event_ids: set[str] = set()
-        event_sequences: dict[str, int] = {}
-        expected_alert_rows: dict[str, tuple[int, str, str]] = {}
+        event_count = 0
         for row in event_rows:
+            event_count += 1
+            self._observe_integrity_buffer("event_row", 1)
             sequence = int(row["sequence"])
             expected_sequence += 1
             if sequence != expected_sequence:
@@ -2545,19 +2596,31 @@ class PaperStore:
                     else:
                         alert_payload = cast(dict[str, JsonValue], dict(raw_alert))
                         alert_id = self._alert_id(run_id, alert_payload)
-                        if alert_id in expected_alert_rows:
+                        expected_alert_json = canonical_json(alert_payload)
+                        expected_alert_hash = canonical_sha256(alert_payload)
+                        alert_row = connection.execute(
+                            """
+                            SELECT commit_sequence, event_sequence, payload_json, payload_hash
+                            FROM paper_alerts WHERE run_id=? AND alert_id=?
+                            """,
+                            (run_id, alert_id),
+                        ).fetchone()
+                        if alert_row is None or alert_row["commit_sequence"] is None:
                             issue(
-                                "ALERT_EVENT_ID_REUSE",
-                                f"alert_id {alert_id!r} occurs in multiple events",
+                                "ALERT_ROWS_MISSING",
+                                f"ALERT_RAISED event {sequence} lacks a committed alert row",
                             )
-                        expected_alert_rows[alert_id] = (
-                            sequence,
-                            canonical_json(alert_payload),
-                            canonical_sha256(alert_payload),
-                        )
+                        elif (
+                            int(alert_row["event_sequence"]) != sequence
+                            or str(alert_row["payload_json"]) != expected_alert_json
+                            or str(alert_row["payload_hash"]) != expected_alert_hash
+                        ):
+                            issue(
+                                "ALERT_EVENT_MISMATCH",
+                                f"alert {alert_id!r} differs from ALERT_RAISED event {sequence}",
+                            )
             except (TypeError, ValueError) as error:
                 payload = {}
-                payload_hash = str(row["payload_hash"])
                 issue("EVENT_INVALID", f"event {sequence}: {error}")
             stored_previous = str(row["previous_hash"])
             if stored_previous != expected_event_previous:
@@ -2570,27 +2633,23 @@ class PaperStore:
             if calculated_event_hash != str(row["event_hash"]):
                 issue("EVENT_CHAIN_HASH", f"event {sequence} chain hash differs")
             expected_event_previous = str(row["event_hash"])
-            event_by_input[str(row["input_id"])].append(str(row["event_hash"]))
-            durable_event_id = str(row["event_id"])
-            known_event_ids.add(durable_event_id)
-            event_sequences[durable_event_id] = sequence
-        if len(event_rows) != int(run["event_count"]):
+        if event_count != int(run["event_count"]):
             issue(
                 "EVENT_COUNT_MISMATCH",
-                f"run anchors {run['event_count']} events but table contains {len(event_rows)}",
+                f"run anchors {run['event_count']} events but table contains {event_count}",
             )
         if expected_event_previous != str(run["event_head_hash"]):
             issue("EVENT_HEAD_MISMATCH", "run event head differs from verified chain head")
 
-        ledger_hashes_by_input: dict[str, list[str]] = defaultdict(list)
         transaction_rows = connection.execute(
             """
             SELECT * FROM paper_ledger_transactions
             WHERE run_id=? ORDER BY rowid
             """,
             (run_id,),
-        ).fetchall()
+        )
         for transaction in transaction_rows:
+            self._observe_integrity_buffer("ledger_transaction_row", 1)
             transaction_id = str(transaction["transaction_id"])
             rows = connection.execute(
                 """
@@ -2598,10 +2657,15 @@ class PaperStore:
                 WHERE run_id=? AND transaction_id=? ORDER BY entry_index
                 """,
                 (run_id, transaction_id),
-            ).fetchall()
+            )
             prepared: list[_PreparedLedgerEntry] = []
             balances: dict[str, Decimal] = defaultdict(Decimal)
+            entry_count = 0
+            transaction_event_id: str | None = None
+            transaction_event_mismatch = False
             for index, row in enumerate(rows):
+                entry_count += 1
+                self._observe_integrity_buffer("ledger_entry_row", 1)
                 if int(row["entry_index"]) != index:
                     issue(
                         "LEDGER_ENTRY_GAP",
@@ -2624,6 +2688,18 @@ class PaperStore:
                             "LEDGER_ENTRY_HASH",
                             f"ledger entry {row['entry_id']!r} hash differs",
                         )
+                    if (
+                        payload.get("entry_id") != str(row["entry_id"])
+                        or payload.get("run_id") != run_id
+                        or payload.get("event_id") != cast(str | None, row["event_id"])
+                        or payload.get("transaction_id") != transaction_id
+                        or payload.get("account") != str(row["account"])
+                        or payload.get("currency") != str(row["unit"])
+                    ):
+                        issue(
+                            "LEDGER_ENTRY_METADATA",
+                            f"ledger entry {row['entry_id']!r} columns differ from payload",
+                        )
                     amount_text = _decimal_text(payload.get("amount"), label="ledger amount")
                     if amount_text != str(row["amount_text"]):
                         issue(
@@ -2645,7 +2721,20 @@ class PaperStore:
                         f"ledger entry {row['entry_id']!r} has invalid decimal text",
                     )
                 event_id = cast(str | None, row["event_id"])
-                if event_id is not None and event_id not in known_event_ids:
+                if event_id is None:
+                    transaction_event_mismatch = True
+                elif transaction_event_id is None:
+                    transaction_event_id = event_id
+                elif event_id != transaction_event_id:
+                    transaction_event_mismatch = True
+                if (
+                    event_id is not None
+                    and connection.execute(
+                        "SELECT 1 FROM paper_events WHERE run_id=? AND event_id=?",
+                        (run_id, event_id),
+                    ).fetchone()
+                    is None
+                ):
                     issue(
                         "LEDGER_EVENT_MISSING",
                         f"ledger entry {row['entry_id']!r} references an unknown event",
@@ -2663,7 +2752,9 @@ class PaperStore:
                         entry_hash=entry_hash,
                     )
                 )
-            if len(rows) != int(transaction["entry_count"]):
+                self._observe_integrity_buffer("transaction_entries", len(prepared))
+                self._observe_integrity_buffer("transaction_units", len(balances))
+            if entry_count != int(transaction["entry_count"]):
                 issue(
                     "LEDGER_ENTRY_COUNT",
                     f"transaction {transaction_id!r} entry count differs",
@@ -2674,16 +2765,22 @@ class PaperStore:
                         "LEDGER_IMBALANCE",
                         f"transaction {transaction_id!r} unit {unit!r} balances to {balance}",
                     )
-            transaction_event_ids = {entry.event_id for entry in prepared}
-            if len(transaction_event_ids) != 1 or None in transaction_event_ids:
+            if transaction_event_mismatch or transaction_event_id is None:
                 issue(
                     "LEDGER_TRANSACTION_EVENT",
                     f"transaction {transaction_id!r} does not bind exactly one event",
                 )
             else:
-                transaction_event_id = cast(str, next(iter(transaction_event_ids)))
-                expected_ledger_sequence = event_sequences.get(transaction_event_id)
-                if expected_ledger_sequence != int(transaction["event_sequence"]):
+                event_row = connection.execute(
+                    "SELECT sequence FROM paper_events WHERE run_id=? AND event_id=?",
+                    (run_id, transaction_event_id),
+                ).fetchone()
+                if event_row is None:
+                    issue(
+                        "LEDGER_EVENT_MISSING",
+                        f"transaction {transaction_id!r} references an unknown event",
+                    )
+                elif int(event_row["sequence"]) != int(transaction["event_sequence"]):
                     issue(
                         "LEDGER_EVENT_SEQUENCE",
                         f"transaction {transaction_id!r} event sequence differs",
@@ -2698,61 +2795,80 @@ class PaperStore:
                     "LEDGER_TRANSACTION_HASH",
                     f"transaction {transaction_id!r} hash differs",
                 )
-            ledger_hashes_by_input[str(transaction["input_id"])].append(
-                str(transaction["transaction_hash"])
-            )
 
-        alert_hashes_by_commit: dict[int, list[str]] = defaultdict(list)
         alert_rows = connection.execute(
             "SELECT * FROM paper_alerts WHERE run_id=? ORDER BY rowid",
             (run_id,),
-        ).fetchall()
-        committed_alert_ids: set[str] = set()
+        )
+        has_safety_alert = False
         for row in alert_rows:
+            self._observe_integrity_buffer("alert_row", 1)
+            alert_id = str(row["alert_id"])
+            alert_code = str(row["code"])
+            if alert_code.endswith("INTEGRITY_FAILURE") or alert_code.endswith("CONFLICT"):
+                has_safety_alert = True
             try:
-                payload = _json_object(str(row["payload_json"]), label=f"alert {row['alert_id']}")
+                payload = _json_object(str(row["payload_json"]), label=f"alert {alert_id}")
                 payload_json = canonical_json(payload)
                 payload_hash = canonical_sha256(payload)
                 if payload_json != str(row["payload_json"]):
-                    issue("ALERT_NOT_CANONICAL", f"alert {row['alert_id']!r} is not canonical")
+                    issue("ALERT_NOT_CANONICAL", f"alert {alert_id!r} is not canonical")
                 if payload_hash != str(row["payload_hash"]):
-                    issue("ALERT_HASH", f"alert {row['alert_id']!r} hash differs")
+                    issue("ALERT_HASH", f"alert {alert_id!r} hash differs")
+                if payload.get("code") != alert_code or payload.get("severity") != str(row["severity"]):
+                    issue(
+                        "ALERT_METADATA_MISMATCH",
+                        f"alert {alert_id!r} columns differ from payload",
+                    )
             except (TypeError, ValueError) as error:
-                issue("ALERT_INVALID", f"alert {row['alert_id']!r}: {error}")
+                issue("ALERT_INVALID", f"alert {alert_id!r}: {error}")
             commit_raw = row["commit_sequence"]
             if commit_raw is not None:
-                committed_alert_ids.add(str(row["alert_id"]))
-                alert_hashes_by_commit[int(commit_raw)].append(str(row["payload_hash"]))
-                expected_alert = expected_alert_rows.get(str(row["alert_id"]))
-                if expected_alert is None:
+                event_row = connection.execute(
+                    """
+                    SELECT event_type, payload_json FROM paper_events
+                    WHERE run_id=? AND sequence=?
+                    """,
+                    (run_id, int(row["event_sequence"])),
+                ).fetchone()
+                if event_row is None or str(event_row["event_type"]) != (PaperEventType.ALERT_RAISED.value):
                     issue(
                         "ALERT_EVENT_MISSING",
-                        f"alert {row['alert_id']!r} has no ALERT_RAISED event",
+                        f"alert {alert_id!r} has no ALERT_RAISED event",
                     )
-                elif (
-                    int(row["event_sequence"]) != expected_alert[0]
-                    or str(row["payload_json"]) != expected_alert[1]
-                    or str(row["payload_hash"]) != expected_alert[2]
-                ):
-                    issue(
-                        "ALERT_EVENT_MISMATCH",
-                        f"alert {row['alert_id']!r} differs from its ALERT_RAISED event",
-                    )
-        missing_alert_rows = set(expected_alert_rows) - committed_alert_ids
-        if missing_alert_rows:
-            issue(
-                "ALERT_ROWS_MISSING",
-                f"ALERT_RAISED events lack rows for {sorted(missing_alert_rows)}",
-            )
+                else:
+                    try:
+                        event_payload = _json_object(
+                            str(event_row["payload_json"]),
+                            label=f"alert event {row['event_sequence']}",
+                        )
+                        raw_alert = event_payload.get("payload")
+                        if not isinstance(raw_alert, Mapping):
+                            raise TypeError("ALERT_RAISED payload is not an object")
+                        expected_alert = cast(dict[str, JsonValue], dict(raw_alert))
+                        if (
+                            self._alert_id(run_id, expected_alert) != alert_id
+                            or canonical_json(expected_alert) != str(row["payload_json"])
+                            or canonical_sha256(expected_alert) != str(row["payload_hash"])
+                        ):
+                            issue(
+                                "ALERT_EVENT_MISMATCH",
+                                f"alert {alert_id!r} differs from its ALERT_RAISED event",
+                            )
+                    except (TypeError, ValueError) as error:
+                        issue(
+                            "ALERT_EVENT_MISMATCH",
+                            f"alert {alert_id!r} event is invalid: {error}",
+                        )
 
         inbox_rows = connection.execute(
             "SELECT * FROM paper_inbox WHERE run_id=? ORDER BY commit_sequence",
             (run_id,),
-        ).fetchall()
-        inbox_by_commit: dict[int, sqlite3.Row] = {}
+        )
+        inbox_count = 0
         for row in inbox_rows:
-            sequence = int(row["commit_sequence"])
-            inbox_by_commit[sequence] = row
+            inbox_count += 1
+            self._observe_integrity_buffer("inbox_row", 1)
             try:
                 payload = _json_object(str(row["payload_json"]), label=f"input {row['input_id']}")
                 if canonical_json(payload) != str(row["payload_json"]):
@@ -2762,14 +2878,30 @@ class PaperStore:
             except (TypeError, ValueError) as error:
                 issue("INPUT_INVALID", f"input {row['input_id']!r}: {error}")
 
+        def component_hashes(raw: object, *, commit_sequence: int, label: str) -> list[str]:
+            try:
+                parsed = json.loads(str(raw))
+            except json.JSONDecodeError as error:
+                issue("COMMIT_COMPONENT_JSON", f"commit {commit_sequence}: {error}")
+                return []
+            if not isinstance(parsed, list) or any(not isinstance(value, str) for value in parsed):
+                issue(
+                    "COMMIT_COMPONENT_JSON",
+                    f"commit {commit_sequence} {label} must be a JSON string list",
+                )
+                return []
+            return cast(list[str], parsed)
+
         expected_commit_previous = _commit_genesis(run_id, config_hash)
         commit_rows = connection.execute(
             "SELECT * FROM paper_commits WHERE run_id=? ORDER BY commit_sequence",
             (run_id,),
-        ).fetchall()
-        commit_projection: dict[int, tuple[int, str]] = {}
+        )
+        commit_count = 0
         prior_last_sequence = 0
         for expected_commit_sequence, row in enumerate(commit_rows, start=1):
+            commit_count += 1
+            self._observe_integrity_buffer("commit_row", 1)
             commit_sequence = int(row["commit_sequence"])
             if commit_sequence != expected_commit_sequence:
                 issue(
@@ -2780,7 +2912,39 @@ class PaperStore:
             first_raw = row["first_event_sequence"]
             first_sequence = int(first_raw) if first_raw is not None else None
             last_sequence = int(row["last_event_sequence"])
-            expected_hashes = event_by_input.get(input_id, [])
+            expected_hashes = [
+                str(component["event_hash"])
+                for component in connection.execute(
+                    """
+                    SELECT event_hash FROM paper_events
+                    WHERE run_id=? AND input_id=? ORDER BY sequence
+                    """,
+                    (run_id, input_id),
+                )
+            ]
+            expected_ledger_hashes = [
+                str(component["transaction_hash"])
+                for component in connection.execute(
+                    """
+                    SELECT transaction_hash FROM paper_ledger_transactions
+                    WHERE run_id=? AND input_id=? ORDER BY rowid
+                    """,
+                    (run_id, input_id),
+                )
+            ]
+            expected_alert_hashes = [
+                str(component["payload_hash"])
+                for component in connection.execute(
+                    """
+                    SELECT payload_hash FROM paper_alerts
+                    WHERE run_id=? AND commit_sequence=? ORDER BY rowid
+                    """,
+                    (run_id, commit_sequence),
+                )
+            ]
+            self._observe_integrity_buffer("commit_event_hashes", len(expected_hashes))
+            self._observe_integrity_buffer("commit_ledger_hashes", len(expected_ledger_hashes))
+            self._observe_integrity_buffer("commit_alert_hashes", len(expected_alert_hashes))
             if first_sequence is None:
                 if expected_hashes or last_sequence != prior_last_sequence:
                     issue("COMMIT_EVENT_RANGE", f"commit {commit_sequence} has an invalid empty range")
@@ -2790,18 +2954,29 @@ class PaperStore:
                 if last_sequence != first_sequence + len(expected_hashes) - 1:
                     issue("COMMIT_EVENT_RANGE", f"commit {commit_sequence} event range differs")
             prior_last_sequence = last_sequence
-            try:
-                event_hashes = cast(list[str], json.loads(str(row["event_hashes_json"])))
-                ledger_hashes = cast(list[str], json.loads(str(row["ledger_hashes_json"])))
-                alert_hashes = cast(list[str], json.loads(str(row["alert_hashes_json"])))
-            except json.JSONDecodeError as error:
-                issue("COMMIT_COMPONENT_JSON", f"commit {commit_sequence}: {error}")
-                event_hashes, ledger_hashes, alert_hashes = [], [], []
+            event_hashes = component_hashes(
+                row["event_hashes_json"],
+                commit_sequence=commit_sequence,
+                label="event hashes",
+            )
+            ledger_hashes = component_hashes(
+                row["ledger_hashes_json"],
+                commit_sequence=commit_sequence,
+                label="ledger hashes",
+            )
+            alert_hashes = component_hashes(
+                row["alert_hashes_json"],
+                commit_sequence=commit_sequence,
+                label="alert hashes",
+            )
+            self._observe_integrity_buffer("stored_commit_event_hashes", len(event_hashes))
+            self._observe_integrity_buffer("stored_commit_ledger_hashes", len(ledger_hashes))
+            self._observe_integrity_buffer("stored_commit_alert_hashes", len(alert_hashes))
             if event_hashes != expected_hashes:
                 issue("COMMIT_EVENT_HASHES", f"commit {commit_sequence} event hashes differ")
-            if ledger_hashes != ledger_hashes_by_input.get(input_id, []):
+            if ledger_hashes != expected_ledger_hashes:
                 issue("COMMIT_LEDGER_HASHES", f"commit {commit_sequence} ledger hashes differ")
-            if alert_hashes != alert_hashes_by_commit.get(commit_sequence, []):
+            if alert_hashes != expected_alert_hashes:
                 issue("COMMIT_ALERT_HASHES", f"commit {commit_sequence} alert hashes differ")
             if str(row["previous_commit_hash"]) != expected_commit_previous:
                 issue("COMMIT_CHAIN_PREVIOUS", f"commit {commit_sequence} previous hash differs")
@@ -2821,36 +2996,77 @@ class PaperStore:
             if calculated_commit_hash != str(row["commit_hash"]):
                 issue("COMMIT_HASH", f"commit {commit_sequence} hash differs")
             expected_commit_previous = str(row["commit_hash"])
-            commit_projection[commit_sequence] = (
-                int(row["projection_revision"]),
-                str(row["projection_hash"]),
-            )
-            inbox = inbox_by_commit.get(commit_sequence)
+            history_anchor = connection.execute(
+                """
+                SELECT input_id, revision, projection_hash
+                FROM paper_projection_history WHERE run_id=? AND revision=?
+                """,
+                (run_id, commit_sequence),
+            ).fetchone()
+            if (
+                history_anchor is None
+                or cast(str | None, history_anchor["input_id"]) != input_id
+                or int(row["projection_revision"]) != commit_sequence
+                or int(history_anchor["revision"]) != commit_sequence
+                or str(history_anchor["projection_hash"]) != str(row["projection_hash"])
+            ):
+                issue(
+                    "PROJECTION_COMMIT_ANCHOR",
+                    f"projection revision {commit_sequence} differs",
+                )
+            inbox = connection.execute(
+                "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence=?",
+                (run_id, commit_sequence),
+            ).fetchone()
             if inbox is None:
                 issue("COMMIT_INPUT_MISSING", f"commit {commit_sequence} has no inbox record")
             elif (
                 str(inbox["input_id"]) != input_id
                 or str(inbox["commit_hash"]) != str(row["commit_hash"])
+                or (int(inbox["first_event_sequence"]) if inbox["first_event_sequence"] is not None else None)
+                != first_sequence
                 or int(inbox["last_event_sequence"]) != last_sequence
             ):
                 issue("COMMIT_INPUT_MISMATCH", f"commit {commit_sequence} differs from inbox")
-        if len(inbox_rows) != len(commit_rows):
+        if inbox_count != commit_count:
             issue("INBOX_COMMIT_COUNT", "inbox and commit counts differ")
-        if len(commit_rows) != int(run["commit_count"]):
+        if commit_count != int(run["commit_count"]):
             issue(
                 "COMMIT_COUNT_MISMATCH",
-                f"run anchors {run['commit_count']} commits but table contains {len(commit_rows)}",
+                f"run anchors {run['commit_count']} commits but table contains {commit_count}",
             )
         if expected_commit_previous != str(run["commit_head_hash"]):
             issue("COMMIT_HEAD_MISMATCH", "run commit head differs from verified commit chain")
-        if prior_last_sequence != len(event_rows):
+        if prior_last_sequence != event_count:
             issue("COMMIT_EVENT_COVERAGE", "commit ranges do not cover the complete event journal")
+        if (
+            connection.execute(
+                """
+            SELECT 1 FROM paper_alerts AS alert
+            WHERE alert.run_id=? AND alert.commit_sequence IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM paper_commits AS commit_row
+                  WHERE commit_row.run_id=alert.run_id
+                    AND commit_row.commit_sequence=alert.commit_sequence
+              )
+            LIMIT 1
+            """,
+                (run_id,),
+            ).fetchone()
+            is not None
+        ):
+            issue("COMMIT_ALERT_HASHES", "a committed alert has no owning commit")
 
         history_rows = connection.execute(
             "SELECT * FROM paper_projection_history WHERE run_id=? ORDER BY revision",
             (run_id,),
-        ).fetchall()
+        )
+        history_count = 0
+        latest_history_hash: str | None = None
+        latest_history_json: str | None = None
         for expected_revision, row in enumerate(history_rows):
+            history_count += 1
+            self._observe_integrity_buffer("projection_history_row", 1)
             revision = int(row["revision"])
             if revision != expected_revision:
                 issue("PROJECTION_HISTORY_GAP", f"expected projection revision {expected_revision}")
@@ -2875,10 +3091,23 @@ class PaperStore:
             except (TypeError, ValueError) as error:
                 issue("PROJECTION_INVALID", f"projection revision {revision}: {error}")
             if revision > 0:
-                anchor = commit_projection.get(revision)
-                if anchor != (revision, str(row["projection_hash"])):
+                anchor = connection.execute(
+                    """
+                    SELECT input_id, projection_revision, projection_hash
+                    FROM paper_commits WHERE run_id=? AND commit_sequence=?
+                    """,
+                    (run_id, revision),
+                ).fetchone()
+                if (
+                    anchor is None
+                    or str(anchor["input_id"]) != cast(str | None, row["input_id"])
+                    or int(anchor["projection_revision"]) != revision
+                    or str(anchor["projection_hash"]) != str(row["projection_hash"])
+                ):
                     issue("PROJECTION_COMMIT_ANCHOR", f"projection revision {revision} differs")
-        if len(history_rows) != len(commit_rows) + 1:
+            latest_history_hash = str(row["projection_hash"])
+            latest_history_json = str(row["payload_json"])
+        if history_count != commit_count + 1:
             issue("PROJECTION_HISTORY_COUNT", "projection history and commit counts differ")
 
         projection = connection.execute(
@@ -2916,23 +3145,17 @@ class PaperStore:
                     issue("CURRENT_PROJECTION_STATE", "current projection state differs")
             except (TypeError, ValueError) as error:
                 issue("CURRENT_PROJECTION_INVALID", str(error))
-            if history_rows:
-                latest = history_rows[-1]
-                if (
-                    str(latest["projection_hash"]) != str(projection["projection_hash"])
-                    or str(latest["payload_json"]) != str(projection["payload_json"])
-                ):
-                    issue("CURRENT_PROJECTION_HISTORY", "current projection differs from history")
-            safety_latched = str(run["status"]) == "MANUAL_REVIEW" and any(
-                str(row["code"]).endswith("INTEGRITY_FAILURE")
-                or str(row["code"]).endswith("CONFLICT")
-                for row in alert_rows
-            )
+            if latest_history_hash is not None and (
+                latest_history_hash != str(projection["projection_hash"])
+                or latest_history_json != str(projection["payload_json"])
+            ):
+                issue("CURRENT_PROJECTION_HISTORY", "current projection differs from history")
+            safety_latched = str(run["status"]) == "MANUAL_REVIEW" and has_safety_alert
             if not safety_latched and str(projection["status"]) != str(run["status"]):
                 issue("RUN_PROJECTION_STATE", "run and projection states differ")
             if safety_latched and str(projection["effective_status"]) != "MANUAL_REVIEW":
                 issue("SAFETY_LATCH_MISSING", "integrity alert did not latch effective projection state")
-        return tuple(issues)
+        return issues.freeze()
 
     def _report(
         self,
@@ -2977,10 +3200,7 @@ class PaperStore:
         payload: dict[str, JsonValue] = {
             "code": code,
             "detail": detail,
-            "issues": [
-                {"code": item.code, "detail": item.detail}
-                for item in issues
-            ],
+            "issues": [{"code": item.code, "detail": item.detail} for item in issues],
             "run_id": run_id,
             "severity": "CRITICAL",
         }
@@ -3047,9 +3267,21 @@ class PaperStore:
             raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
         return self._run_from_row(row)
 
-    def list_runs(self) -> tuple[RunRecord, ...]:
+    def list_runs(self, *, limit: int | None = None) -> tuple[RunRecord, ...]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+            raise ValueError("limit must be a positive integer or None")
+        sql = "SELECT * FROM paper_runs ORDER BY created_at, run_id"
+        parameters: tuple[object, ...] = ()
+        if limit is not None:
+            sql = (
+                "SELECT * FROM ("
+                "SELECT * FROM paper_runs "
+                "ORDER BY created_at DESC, run_id DESC LIMIT ?"
+                ") ORDER BY created_at, run_id"
+            )
+            parameters = (limit,)
         with self._read_connection() as connection:
-            rows = connection.execute("SELECT * FROM paper_runs ORDER BY created_at, run_id").fetchall()
+            rows = connection.execute(sql, parameters).fetchall()
         return tuple(self._run_from_row(row) for row in rows)
 
     def get_event_records(
@@ -3069,6 +3301,85 @@ class PaperStore:
         if limit is not None:
             sql += " LIMIT ?"
             parameters.append(limit)
+        with self._read_connection() as connection:
+            rows = connection.execute(sql, parameters).fetchall()
+        return tuple(
+            StoredEventRecord(
+                run_id=str(row["run_id"]),
+                sequence=int(row["sequence"]),
+                event_id=str(row["event_id"]),
+                event_type=str(row["event_type"]),
+                event=_json_object(str(row["payload_json"]), label="event payload"),
+                payload_hash=str(row["payload_hash"]),
+                previous_hash=str(row["previous_hash"]),
+                event_hash=str(row["event_hash"]),
+                input_id=str(row["input_id"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        )
+
+    def _iter_events_stream(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> Iterable[StoredPaperEvent]:
+        """Stream the immutable event journal in sequence order with bounded memory."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be non-negative")
+        with self._read_connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT payload_json, sequence, previous_hash, event_hash
+                FROM paper_events
+                WHERE run_id=? AND sequence>? ORDER BY sequence
+                """,
+                (normalized_run_id, after_sequence),
+            )
+            for row in cursor:
+                event_payload = _json_object(str(row["payload_json"]), label="event payload")
+                yield StoredPaperEvent(
+                    event=PaperEvent.from_dict(event_payload),
+                    sequence=int(row["sequence"]),
+                    previous_event_hash=str(row["previous_hash"]),
+                    event_hash=str(row["event_hash"]),
+                )
+
+    def get_event_records_by_type(
+        self,
+        run_id: str,
+        *,
+        event_types: Sequence[str],
+        after_sequence: int = 0,
+        limit: int,
+    ) -> tuple[StoredEventRecord, ...]:
+        """Return a bounded event page filtered in SQLite, never in memory."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be non-negative")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        normalized_types = tuple(
+            dict.fromkeys(_identifier(event_type, label="event_type") for event_type in event_types)
+        )
+        if not normalized_types:
+            return ()
+        placeholders = ",".join("?" for _ in normalized_types)
+        sql = (
+            "SELECT * FROM paper_events "
+            f"WHERE run_id=? AND sequence>? AND event_type IN ({placeholders}) "
+            "ORDER BY sequence LIMIT ?"
+        )
+        parameters: list[object] = [
+            normalized_run_id,
+            after_sequence,
+            *normalized_types,
+            limit,
+        ]
         with self._read_connection() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return tuple(
@@ -3124,7 +3435,7 @@ class PaperStore:
         *,
         after_sequence: int = 0,
     ) -> Iterable[StoredPaperEvent]:
-        return iter(self.get_events(run_id, after_sequence=after_sequence))
+        return self._iter_events_stream(run_id, after_sequence=after_sequence)
 
     def get_projection_payload(self, run_id: str) -> dict[str, JsonValue]:
         normalized_run_id = _identifier(run_id, label="run_id")
@@ -3144,8 +3455,229 @@ class PaperStore:
     def get_projection(self, run_id: str) -> PaperProjection:
         return PaperProjection.from_dict(self.get_projection_payload(run_id))
 
+    def get_projection_before_received_at(
+        self,
+        run_id: str,
+        *,
+        before: datetime,
+    ) -> PaperProjection | None:
+        """Return the last durable projection strictly before one UTC instant."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if not isinstance(before, datetime):
+            raise TypeError("before must be a datetime")
+        if before.tzinfo is None or before.utcoffset() is None:
+            raise ValueError("before must be timezone-aware")
+        cutoff = before.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json
+                FROM paper_projection_history
+                WHERE run_id=?
+                  AND json_type(payload_json, '$.last_received_at')='text'
+                  AND json_extract(payload_json, '$.last_received_at') < ?
+                ORDER BY revision DESC
+                LIMIT 1
+                """,
+                (normalized_run_id, cutoff),
+            ).fetchone()
+        if row is None:
+            return None
+        return PaperProjection.from_dict(
+            _json_object(str(row["payload_json"]), label="historical projection")
+        )
+
     def load_projection(self, run_id: str) -> PaperProjection:
         return self.get_projection(run_id)
+
+    def get_daily_projection_records(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+    ) -> tuple[ProjectionHistoryRecord, ...]:
+        """Return the last projection of each recent UTC day, chronologically."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                WITH dated AS (
+                    SELECT
+                        h.*,
+                        CASE
+                            WHEN json_type(h.payload_json, '$.last_received_at') = 'text'
+                            THEN substr(json_extract(h.payload_json, '$.last_received_at'), 1, 10)
+                            ELSE substr(json_extract(r.config_json, '$.validation_started_at'), 1, 10)
+                        END AS utc_date
+                    FROM paper_projection_history AS h
+                    JOIN paper_runs AS r ON r.run_id=h.run_id
+                    WHERE h.run_id=?
+                ), ranked AS (
+                    SELECT
+                        *,
+                        row_number() OVER (
+                            PARTITION BY utc_date ORDER BY revision DESC
+                        ) AS day_rank
+                    FROM dated
+                )
+                SELECT
+                    run_id,
+                    revision,
+                    input_id,
+                    event_sequence,
+                    event_head_hash,
+                    status,
+                    projection_hash,
+                    created_at,
+                    utc_date,
+                    json_object(
+                        'cash', json_extract(payload_json, '$.cash'),
+                        'cost_basis', json(
+                            coalesce(json_extract(payload_json, '$.cost_basis'), '{}')
+                        ),
+                        'fees', json_extract(payload_json, '$.fees'),
+                        'initial_cash', json_extract(payload_json, '$.initial_cash'),
+                        'inventory_value', json(
+                            coalesce(json_extract(payload_json, '$.inventory_value'), '{}')
+                        ),
+                        'marks', json(coalesce(json_extract(payload_json, '$.marks'), '{}')),
+                        'peak_equity', json_extract(payload_json, '$.peak_equity'),
+                        'positions', json(
+                            coalesce(json_extract(payload_json, '$.positions'), '{}')
+                        ),
+                        'realized_pnl', json_extract(payload_json, '$.realized_pnl'),
+                        'session_date', json_extract(payload_json, '$.session_date'),
+                        'session_start_equity', json_extract(
+                            payload_json, '$.session_start_equity'
+                        )
+                    ) AS report_projection_json
+                FROM ranked
+                WHERE day_rank=1
+                ORDER BY utc_date DESC
+                LIMIT ?
+                """,
+                (normalized_run_id, limit),
+            ).fetchall()
+        records = tuple(
+            ProjectionHistoryRecord(
+                run_id=str(row["run_id"]),
+                revision=int(row["revision"]),
+                input_id=(str(row["input_id"]) if row["input_id"] is not None else None),
+                event_sequence=int(row["event_sequence"]),
+                event_head_hash=str(row["event_head_hash"]),
+                status=str(row["status"]),
+                projection=_json_object(
+                    str(row["report_projection_json"]),
+                    label="projection history payload",
+                ),
+                projection_hash=str(row["projection_hash"]),
+                created_at=str(row["created_at"]),
+                utc_date=str(row["utc_date"]),
+            )
+            for row in rows
+        )
+        return tuple(reversed(records))
+
+    def get_ledger_account_total(
+        self,
+        run_id: str,
+        *,
+        account: str,
+        unit: str = "USD",
+    ) -> Decimal:
+        """Sum one ledger account exactly with bounded memory."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        normalized_account = _identifier(account, label="ledger account")
+        normalized_unit = _identifier(unit, label="ledger unit")
+        total = Decimal(0)
+        with self._read_connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT amount_text FROM paper_ledger_entries
+                WHERE run_id=? AND account=? AND unit=?
+                ORDER BY transaction_id, entry_index
+                """,
+                (normalized_run_id, normalized_account, normalized_unit),
+            )
+            for row in cursor:
+                total += Decimal(str(row["amount_text"]))
+        return total
+
+    def get_funding_by_utc_date(
+        self,
+        run_id: str,
+        *,
+        utc_dates: Sequence[str],
+    ) -> dict[str, Decimal]:
+        """Sum durable funding events for a bounded set of UTC dates."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        normalized_dates = tuple(dict.fromkeys(str(value) for value in utc_dates))
+        if len(normalized_dates) > 367:
+            raise ValueError("at most 367 UTC dates may be queried at once")
+        for value in normalized_dates:
+            try:
+                parsed = datetime.fromisoformat(f"{value}T00:00:00+00:00")
+            except ValueError as error:
+                raise ValueError("UTC dates must use YYYY-MM-DD") from error
+            if parsed.date().isoformat() != value:
+                raise ValueError("UTC dates must use YYYY-MM-DD")
+        totals = {value: Decimal(0) for value in normalized_dates}
+        if not normalized_dates:
+            return totals
+        placeholders = ",".join("?" for _ in normalized_dates)
+        sql = (
+            "SELECT "
+            "substr(json_extract(payload_json, '$.received_at'), 1, 10) AS utc_date, "
+            "json_extract(payload_json, '$.payload.amount') AS amount_text "
+            "FROM paper_events WHERE run_id=? AND event_type=? AND "
+            f"substr(json_extract(payload_json, '$.received_at'), 1, 10) IN ({placeholders}) "
+            "ORDER BY sequence"
+        )
+        with self._read_connection() as connection:
+            cursor = connection.execute(
+                sql,
+                [
+                    normalized_run_id,
+                    PaperEventType.FUNDING_POSTED.value,
+                    *normalized_dates,
+                ],
+            )
+            for row in cursor:
+                date = str(row["utc_date"])
+                totals[date] += Decimal(str(row["amount_text"]))
+        return totals
+
+    def iter_ledger_entries(self, run_id: str) -> Iterable[LedgerRecord]:
+        """Stream ledger entries in deterministic transaction order."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        with self._read_connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT * FROM paper_ledger_entries
+                WHERE run_id=? ORDER BY transaction_id, entry_index
+                """,
+                (normalized_run_id,),
+            )
+            for row in cursor:
+                yield LedgerRecord(
+                    run_id=str(row["run_id"]),
+                    transaction_id=str(row["transaction_id"]),
+                    entry_index=int(row["entry_index"]),
+                    entry_id=str(row["entry_id"]),
+                    event_id=cast(str | None, row["event_id"]),
+                    account=str(row["account"]),
+                    unit=str(row["unit"]),
+                    amount=Decimal(str(row["amount_text"])),
+                    entry=_json_object(str(row["payload_json"]), label="ledger entry"),
+                    entry_hash=str(row["entry_hash"]),
+                )
 
     def get_ledger_entries(self, run_id: str) -> tuple[LedgerRecord, ...]:
         normalized_run_id = _identifier(run_id, label="run_id")
@@ -3173,6 +3705,64 @@ class PaperStore:
             for row in rows
         )
 
+    def contains_alert(self, run_id: str, alert_id: str) -> bool:
+        """Return whether one exact durable alert exists via the primary key."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        normalized_alert_id = _identifier(alert_id, label="alert_id")
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM paper_alerts WHERE run_id=? AND alert_id=? LIMIT 1",
+                (normalized_run_id, normalized_alert_id),
+            ).fetchone()
+        return row is not None
+    def get_latest_alert(
+        self,
+        run_id: str,
+        *,
+        severity: str | None = None,
+    ) -> AlertRecord | None:
+        """Return the newest exact alert through a SQL LIMIT 1 query."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if severity is None:
+            sql = """
+                SELECT * FROM paper_alerts
+                WHERE run_id=?
+                ORDER BY event_sequence DESC, created_at DESC, alert_id DESC
+                LIMIT 1
+            """
+            parameters: tuple[object, ...] = (normalized_run_id,)
+        else:
+            normalized_severity = _identifier(severity, label="severity")
+            sql = """
+                SELECT * FROM paper_alerts
+                WHERE run_id=? AND severity=?
+                ORDER BY event_sequence DESC, created_at DESC, alert_id DESC
+                LIMIT 1
+            """
+            parameters = (normalized_run_id, normalized_severity)
+        with self._read_connection() as connection:
+            row = connection.execute(sql, parameters).fetchone()
+        if row is None:
+            return None
+        return AlertRecord(
+            run_id=str(row["run_id"]),
+            alert_id=str(row["alert_id"]),
+            commit_sequence=(
+                int(row["commit_sequence"])
+                if row["commit_sequence"] is not None
+                else None
+            ),
+            event_sequence=int(row["event_sequence"]),
+            severity=str(row["severity"]),
+            code=str(row["code"]),
+            alert=_json_object(str(row["payload_json"]), label="alert"),
+            payload_hash=str(row["payload_hash"]),
+            created_at=str(row["created_at"]),
+        )
+
+
     def get_alerts(self, run_id: str) -> tuple[AlertRecord, ...]:
         normalized_run_id = _identifier(run_id, label="run_id")
         with self._read_connection() as connection:
@@ -3187,11 +3777,7 @@ class PaperStore:
             AlertRecord(
                 run_id=str(row["run_id"]),
                 alert_id=str(row["alert_id"]),
-                commit_sequence=(
-                    int(row["commit_sequence"])
-                    if row["commit_sequence"] is not None
-                    else None
-                ),
+                commit_sequence=(int(row["commit_sequence"]) if row["commit_sequence"] is not None else None),
                 event_sequence=int(row["event_sequence"]),
                 severity=str(row["severity"]),
                 code=str(row["code"]),
@@ -3201,6 +3787,43 @@ class PaperStore:
             )
             for row in rows
         )
+
+    def get_recent_alerts(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+    ) -> tuple[AlertRecord, ...]:
+        """Return a bounded recent alert page in chronological order."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM paper_alerts
+                WHERE run_id=?
+                ORDER BY event_sequence DESC, created_at DESC, alert_id DESC
+                LIMIT ?
+                """,
+                (normalized_run_id, limit),
+            ).fetchall()
+        alerts = tuple(
+            AlertRecord(
+                run_id=str(row["run_id"]),
+                alert_id=str(row["alert_id"]),
+                commit_sequence=(int(row["commit_sequence"]) if row["commit_sequence"] is not None else None),
+                event_sequence=int(row["event_sequence"]),
+                severity=str(row["severity"]),
+                code=str(row["code"]),
+                alert=_json_object(str(row["payload_json"]), label="alert"),
+                payload_hash=str(row["payload_hash"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        )
+        return tuple(reversed(alerts))
 
     def contains_input(self, run_id: str, input_id: str) -> bool:
         return self.get_input(run_id, input_id) is not None
@@ -3213,9 +3836,7 @@ class PaperStore:
             payload=_json_object(str(row["payload_json"]), label="input payload"),
             payload_hash=str(row["payload_hash"]),
             first_event_sequence=(
-                int(row["first_event_sequence"])
-                if row["first_event_sequence"] is not None
-                else None
+                int(row["first_event_sequence"]) if row["first_event_sequence"] is not None else None
             ),
             last_event_sequence=int(row["last_event_sequence"]),
             commit_sequence=int(row["commit_sequence"]),
@@ -3234,6 +3855,167 @@ class PaperStore:
                 (normalized_run_id, normalized_input_id),
             ).fetchone()
         return self._input_from_row(row) if row is not None else None
+
+    def get_input_payloads(
+        self,
+        run_id: str,
+        *,
+        input_ids: Sequence[str],
+    ) -> dict[str, dict[str, JsonValue]]:
+        """Fetch a bounded set of canonical inbox payloads in one read query."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        normalized_ids = tuple(
+            dict.fromkeys(_identifier(input_id, label="input_id") for input_id in input_ids)
+        )
+        if not normalized_ids:
+            return {}
+        if len(normalized_ids) > 1_000:
+            raise ValueError("at most 1000 input_ids may be queried at once")
+        placeholders = ",".join("?" for _ in normalized_ids)
+        sql = (
+            f"SELECT input_id, payload_json FROM paper_inbox WHERE run_id=? AND input_id IN ({placeholders})"
+        )
+        with self._read_connection() as connection:
+            rows = connection.execute(sql, [normalized_run_id, *normalized_ids]).fetchall()
+        return {
+            str(row["input_id"]): _json_object(
+                str(row["payload_json"]),
+                label="input payload",
+            )
+            for row in rows
+        }
+
+    def get_public_market_source_summary(
+        self,
+        run_id: str,
+        *,
+        latest_instrument_limit: int,
+    ) -> dict[str, JsonValue]:
+        """Aggregate public-market health in SQLite with bounded output."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        if latest_instrument_limit <= 0:
+            raise ValueError("latest_instrument_limit must be positive")
+        with self._read_connection() as connection:
+            aggregate = connection.execute(
+                """
+                SELECT
+                    count(*) AS event_count,
+                    count(DISTINCT json_extract(payload_json, '$.market.instrument'))
+                        AS instrument_count,
+                    sum(CASE WHEN json_extract(payload_json, '$.market.gap') = 1
+                        THEN 1 ELSE 0 END) AS gap_count,
+                    sum(CASE WHEN json_extract(payload_json, '$.market.stale') = 1
+                        THEN 1 ELSE 0 END) AS stale_count,
+                    sum(CASE WHEN json_extract(payload_json, '$.market.tradable') = 0
+                        THEN 1 ELSE 0 END) AS nontradable_count,
+                    count(DISTINCT json_extract(
+                        payload_json, '$.market.source_connection_epoch'
+                    )) AS connection_epoch_count,
+                    count(DISTINCT json_extract(
+                        payload_json, '$.market.source_connection_id'
+                    )) AS connection_id_count,
+                    max(json_extract(payload_json, '$.market.received_at'))
+                        AS last_received_at
+                FROM paper_inbox
+                WHERE run_id=?
+                  AND json_extract(payload_json, '$.input_type')='PUBLIC_MARKET_EVENT'
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+            latest_rows = connection.execute(
+                """
+                WITH markets AS (
+                    SELECT
+                        json_extract(payload_json, '$.market.instrument') AS instrument,
+                        payload_json,
+                        commit_sequence,
+                        row_number() OVER (
+                            PARTITION BY json_extract(
+                                payload_json, '$.market.instrument'
+                            )
+                            ORDER BY commit_sequence DESC, input_id DESC
+                        ) AS instrument_rank
+                    FROM paper_inbox
+                    WHERE run_id=?
+                      AND json_extract(payload_json, '$.input_type')='PUBLIC_MARKET_EVENT'
+                )
+                SELECT instrument, payload_json FROM markets
+                WHERE instrument_rank=1 AND instrument IS NOT NULL
+                ORDER BY instrument
+                LIMIT ?
+                """,
+                (normalized_run_id, latest_instrument_limit),
+            ).fetchall()
+            kind_rows = connection.execute(
+                """
+                SELECT
+                    json_extract(payload_json, '$.market.source_event_kind') AS event_kind,
+                    count(*) AS event_count
+                FROM paper_inbox
+                WHERE run_id=?
+                  AND json_extract(payload_json, '$.input_type')='PUBLIC_MARKET_EVENT'
+                  AND json_type(
+                      payload_json, '$.market.source_event_kind'
+                  )='text'
+                GROUP BY event_kind
+                ORDER BY event_kind
+                LIMIT 32
+                """,
+                (normalized_run_id,),
+            ).fetchall()
+
+        event_count = int(aggregate["event_count"] or 0)
+        instrument_count = int(aggregate["instrument_count"] or 0)
+        epoch_count = int(aggregate["connection_epoch_count"] or 0)
+        connection_id_count = int(aggregate["connection_id_count"] or 0)
+        latest_by_instrument: dict[str, JsonValue] = {}
+        for row in latest_rows:
+            payload = _json_object(str(row["payload_json"]), label="input payload")
+            market = payload.get("market")
+            if isinstance(market, dict):
+                latest_by_instrument[str(row["instrument"])] = market
+        kind_counts: dict[str, JsonValue] = {
+            str(row["event_kind"]): int(row["event_count"]) for row in kind_rows
+        }
+        return {
+            "connection_epoch_count": epoch_count,
+            "connection_id_count": connection_id_count,
+            "event_count": event_count,
+            "gap_count": int(aggregate["gap_count"] or 0),
+            "instrument_count": instrument_count,
+            "last_received_at": (
+                str(aggregate["last_received_at"]) if aggregate["last_received_at"] is not None else None
+            ),
+            "latest_by_instrument": latest_by_instrument,
+            "latest_instruments_truncated": instrument_count > len(latest_by_instrument),
+            "nontradable_count": int(aggregate["nontradable_count"] or 0),
+            "reconnect_count": max(0, epoch_count - 1, connection_id_count - 1),
+            "source_event_kind_counts": kind_counts,
+            "stale_count": int(aggregate["stale_count"] or 0),
+        }
+
+    def iter_inputs(
+        self,
+        run_id: str,
+        *,
+        input_type: str | None = None,
+    ) -> Iterable[InputRecord]:
+        """Stream the canonical inbox in commit order with bounded memory."""
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        normalized_type = _identifier(input_type, label="input_type") if input_type is not None else None
+        sql = "SELECT * FROM paper_inbox WHERE run_id=?"
+        parameters: list[object] = [normalized_run_id]
+        if normalized_type is not None:
+            sql += " AND json_extract(payload_json, '$.input_type')=?"
+            parameters.append(normalized_type)
+        sql += " ORDER BY commit_sequence, input_id"
+        with self._read_connection() as connection:
+            cursor = connection.execute(sql, parameters)
+            for row in cursor:
+                yield self._input_from_row(row)
 
     def get_inputs(self, run_id: str) -> tuple[InputRecord, ...]:
         """Return the canonical inbox in durable commit order for exact replay."""
@@ -3287,6 +4069,7 @@ __all__ = [
     "LedgerRecord",
     "PaperStore",
     "PaperStoreError",
+    "ProjectionHistoryRecord",
     "RunConflictError",
     "RunNotFoundError",
     "RunRecord",

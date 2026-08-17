@@ -5,6 +5,7 @@ import json
 import math
 import queue
 import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -46,13 +47,78 @@ class _BookState:
     ask_depth: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class PublicFundingSettlement:
+    """Immutable normalized public funding settlement with stable economic identity."""
+
+    event_id: str
+    instrument: str
+    funding_time: datetime
+    received_at: datetime
+    funding_rate: Decimal
+    funding_interval_seconds: int
+    rate_kind: str
+    mark_price: Decimal | None
+    oracle_price: Decimal | None
+    source_observation_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.event_id, str)
+            or len(self.event_id) != 64
+            or any(character not in "0123456789abcdef" for character in self.event_id)
+        ):
+            raise ValueError("public funding event_id must be a lowercase SHA-256 digest")
+        _required_text(self.instrument, label="funding instrument")
+        funding_time = _utc(self.funding_time, label="funding_time")
+        received_at = _utc(self.received_at, label="funding received_at")
+        if funding_time > received_at:
+            raise ValueError("public funding settlement cannot be received before funding_time")
+        object.__setattr__(self, "funding_time", funding_time)
+        object.__setattr__(self, "received_at", received_at)
+        if not isinstance(self.funding_rate, Decimal) or not self.funding_rate.is_finite():
+            raise ValueError("public funding rate must be a finite Decimal")
+        if (
+            isinstance(self.funding_interval_seconds, bool)
+            or not isinstance(self.funding_interval_seconds, int)
+            or self.funding_interval_seconds <= 0
+        ):
+            raise ValueError("public funding interval must be a positive integer")
+        _required_text(self.rate_kind, label="funding rate_kind")
+        _required_text(self.source_observation_id, label="funding source_observation_id")
+        for label, value in (
+            ("funding mark_price", self.mark_price),
+            ("funding oracle_price", self.oracle_price),
+        ):
+            if value is not None and (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"{label} must be a finite positive Decimal when present"
+                )
+
+
+PublicSourceItem = Mapping[str, MarketEvent] | PublicFundingSettlement
+
+
 _SourceKey = tuple[str, str]
-_SUPPORTED_RECORD_TYPES = frozenset({RecordType.BBO, RecordType.CONNECTION_EVENT})
+_SUPPORTED_RECORD_TYPES = frozenset({RecordType.BBO, RecordType.CONNECTION_EVENT, RecordType.FUNDING})
 _GAP_EVENTS = frozenset({"disconnect", "gap", "resync_start"})
 _AWAITING_BOOK_EVENTS = frozenset({"connect", "resync_complete"})
-_ADAPTER_SCHEMA_VERSION = 2
-_FEED_CONTRACT = "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_BOUNDED_FIFO_V2"
-_GLOBAL_CONNECTION_POLICY = "MULTI_INSTRUMENT_GLOBAL_EVENT_TERMINAL_V1"
+_ADAPTER_SCHEMA_VERSION = 8
+_FEED_CONTRACT = "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8"
+_GLOBAL_CONNECTION_POLICY = (
+    "MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4"
+)
+_BBO_TRADABILITY_POLICY = (
+    "REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_"
+    "MALFORMED_TERMINAL_V2"
+)
+_MALFORMED_BBO_POLICY = (
+    "TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1"
+)
 _INSTRUMENT_ROUTE_POLICY = "EXPLICIT_MAPPING_REQUIRES_SEPARATE_METADATA_REVIEW_V1"
 _SOURCE_VENUE_TO_PAPER_EXCHANGE: Mapping[str, str] = MappingProxyType(
     {"hyperliquid": "HL"}
@@ -147,6 +213,8 @@ class PublicRecordMarketEventAdapter:
         *,
         instruments: Mapping[_SourceKey, str],
         queue_capacity: int,
+        funding_dedupe_capacity: int = 4_096,
+        identity_context: Mapping[str, object] | None = None,
     ) -> None:
         if not instruments:
             raise ValueError("at least one explicit public instrument mapping is required")
@@ -156,6 +224,29 @@ class PublicRecordMarketEventAdapter:
             or queue_capacity < 1
         ):
             raise ValueError("queue_capacity must be a positive integer")
+        if (
+            isinstance(funding_dedupe_capacity, bool)
+            or not isinstance(funding_dedupe_capacity, int)
+            or funding_dedupe_capacity < 1
+        ):
+            raise ValueError("funding_dedupe_capacity must be a positive integer")
+        if identity_context is not None and not isinstance(identity_context, Mapping):
+            raise TypeError("identity_context must be a mapping when present")
+        raw_identity_context = {} if identity_context is None else identity_context
+        if any(not isinstance(key, str) or not key for key in raw_identity_context):
+            raise ValueError("identity_context keys must be non-empty strings")
+        try:
+            transport_identity = json.loads(
+                json.dumps(
+                    dict(raw_identity_context),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("identity_context must be canonical JSON data") from exc
 
         normalized: dict[_SourceKey, str] = {}
         seen_instruments: set[str] = set()
@@ -187,12 +278,23 @@ class PublicRecordMarketEventAdapter:
         self._instruments = MappingProxyType(normalized)
         self._queue_capacity = queue_capacity
         self._books: dict[_SourceKey, _BookState] = {}
+        self._funding_dedupe_capacity = funding_dedupe_capacity
         self._status = {key: _StreamStatus.READY for key in normalized}
+        self._admitted_websocket_lineage: dict[
+            _SourceKey, tuple[str, int] | None
+        ] = {key: None for key in normalized}
         self._last_received_at: datetime | None = None
+        self._funding_signatures: OrderedDict[
+            str,
+            tuple[Decimal, int, Decimal | None, Decimal | None],
+        ] = OrderedDict()
         identity = {
             "adapter_schema_version": _ADAPTER_SCHEMA_VERSION,
+            "bbo_tradability_policy": _BBO_TRADABILITY_POLICY,
             "feed_contract": _FEED_CONTRACT,
+            "funding_dedupe_capacity_settlements": funding_dedupe_capacity,
             "global_connection_policy": _GLOBAL_CONNECTION_POLICY,
+            "malformed_bbo_policy": _MALFORMED_BBO_POLICY,
             "instrument_route_policy": _INSTRUMENT_ROUTE_POLICY,
             "instruments": [
                 {
@@ -222,6 +324,7 @@ class PublicRecordMarketEventAdapter:
                 )
             ],
             "trade_projection": "BLOCKED_RESTART_DURABLE_IDENTITY_UNAVAILABLE",
+            "transport": transport_identity,
         }
         self._identity_artifact_bytes = json.dumps(
             identity,
@@ -248,8 +351,8 @@ class PublicRecordMarketEventAdapter:
     def queue_capacity(self) -> int:
         return self._queue_capacity
 
-    def adapt(self, record: ParsedRecord) -> Mapping[str, MarketEvent] | None:
-        """Adapt one already-normalized record, preserving input arrival order."""
+    def adapt(self, record: ParsedRecord) -> PublicSourceItem | None:
+        """Adapt one already-normalized record into an immutable Paper source item."""
 
         if not isinstance(record, ParsedRecord):
             raise TypeError("record must be a ParsedRecord")
@@ -268,7 +371,8 @@ class PublicRecordMarketEventAdapter:
 
         venue, asset = self._record_identity(record)
         received_at = _utc(record.row.get("received_time"), label="received_time")
-        self._observe_order(received_at)
+        if record.record_type is not RecordType.FUNDING:
+            self._observe_order(received_at)
 
         if record.record_type is RecordType.CONNECTION_EVENT:
             return self._adapt_connection(record, venue=venue, asset=asset, received_at=received_at)
@@ -276,6 +380,8 @@ class PublicRecordMarketEventAdapter:
         key = (venue, asset)
         if key not in self._instruments:
             return None
+        if record.record_type is RecordType.FUNDING:
+            return self._adapt_funding(record, key=key, received_at=received_at)
         return self._adapt_bbo(record, key=key, received_at=received_at)
 
     @staticmethod
@@ -319,6 +425,26 @@ class PublicRecordMarketEventAdapter:
                 "ask_quantity",
             ):
                 _optional_schema_decimal(row.get(name), label=name)
+            return
+        if record.record_type is RecordType.FUNDING:
+            funding_time = _utc(row.get("funding_time"), label="funding_time")
+            if row.get("event_time") != funding_time or exchange_time != funding_time:
+                raise PublicRecordAdapterError(
+                    "funding event_time and exchange_time must equal funding_time"
+                )
+            funding_rate = row.get("funding_rate")
+            if not isinstance(funding_rate, Decimal) or not funding_rate.is_finite():
+                raise PublicRecordAdapterError("funding_rate must be a finite Decimal")
+            interval = row.get("funding_interval_seconds")
+            if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+                raise PublicRecordAdapterError("funding_interval_seconds must be a positive integer")
+            _required_text(row.get("rate_kind"), label="rate_kind")
+            _required_text(row.get("observation_id"), label="observation_id")
+            for name in ("mark_price", "oracle_price"):
+                _optional_schema_decimal(row.get(name), label=name)
+                price = row.get(name)
+                if isinstance(price, Decimal) and price <= 0:
+                    raise PublicRecordAdapterError(f"{name} must be positive when present")
             return
 
         for name in (
@@ -396,6 +522,80 @@ class PublicRecordMarketEventAdapter:
         payload = "\n".join(f"{name}:{len(value)}:{value}" for name, value in parts)
         return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:16], "big")
 
+    def _adapt_funding(
+        self,
+        record: ParsedRecord,
+        *,
+        key: _SourceKey,
+        received_at: datetime,
+    ) -> PublicFundingSettlement | None:
+        row = record.row
+        funding_time = _utc(row.get("funding_time"), label="funding_time")
+        if funding_time > received_at:
+            raise PublicRecordAdapterError(
+                "funding settlement cannot be received before funding_time"
+            )
+        funding_rate_value = row.get("funding_rate")
+        if not isinstance(funding_rate_value, Decimal) or not funding_rate_value.is_finite():
+            raise PublicRecordAdapterError("funding_rate must be a finite Decimal")
+        interval_value = row.get("funding_interval_seconds")
+        if isinstance(interval_value, bool) or not isinstance(interval_value, int) or interval_value <= 0:
+            raise PublicRecordAdapterError("funding_interval_seconds must be a positive integer")
+        rate_kind = _required_text(row.get("rate_kind"), label="rate_kind")
+        if rate_kind != "hyperliquid-hourly-settlement":
+            raise PublicRecordAdapterError(
+                "only finalized Hyperliquid hourly funding settlements are supported"
+            )
+        observation_id = _required_text(
+            row.get("observation_id"),
+            label="observation_id",
+        )
+        mark_value = row.get("mark_price")
+        oracle_value = row.get("oracle_price")
+        mark_price = mark_value if isinstance(mark_value, Decimal) else None
+        oracle_price = oracle_value if isinstance(oracle_value, Decimal) else None
+        identity_payload = json.dumps(
+            {
+                "funding_time": funding_time.isoformat(timespec="microseconds"),
+                "instrument": self._instruments[key],
+                "rate_kind": rate_kind,
+                "schema": "paper-public-funding-settlement-v1",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        event_id = hashlib.sha256(identity_payload).hexdigest()
+        signature = (
+            funding_rate_value,
+            interval_value,
+            mark_price,
+            oracle_price,
+        )
+        previous = self._funding_signatures.get(event_id)
+        if previous is not None:
+            if previous != signature:
+                raise PublicRecordAdapterError(
+                    "public funding settlement correction conflicts with an admitted identity"
+                )
+            self._funding_signatures.move_to_end(event_id)
+            return None
+        self._funding_signatures[event_id] = signature
+        if len(self._funding_signatures) > self._funding_dedupe_capacity:
+            self._funding_signatures.popitem(last=False)
+        return PublicFundingSettlement(
+            event_id=event_id,
+            instrument=self._instruments[key],
+            funding_time=funding_time,
+            received_at=received_at,
+            funding_rate=funding_rate_value,
+            funding_interval_seconds=interval_value,
+            rate_kind=rate_kind,
+            mark_price=mark_price,
+            oracle_price=oracle_price,
+            source_observation_id=observation_id,
+        )
+
     def _adapt_bbo(
         self,
         record: ParsedRecord,
@@ -413,15 +613,19 @@ class PublicRecordMarketEventAdapter:
             or ask_price is None
             or bid_depth is None
             or ask_depth is None
-            or bid_price > ask_price
         ):
-            if self._status[key] is not _StreamStatus.GAPPED:
-                self._status[key] = _StreamStatus.STALE
-            return None
+            raise PublicRecordAdapterError(
+                "supported BBO must be bilateral with finite positive Decimal "
+                "prices and quantities"
+            )
+        if bid_price > ask_price:
+            raise PublicRecordAdapterError("supported BBO must not be crossed")
 
         if self._status[key] in {_StreamStatus.AWAITING_BOOK, _StreamStatus.STALE}:
             self._status[key] = _StreamStatus.READY
 
+        source_lineage = self._market_source_lineage(record)
+        lineage_admitted = source_lineage == self._admitted_websocket_lineage[key]
         book = _BookState(
             instrument=self._instruments[key],
             bid_price=bid_price,
@@ -430,7 +634,11 @@ class PublicRecordMarketEventAdapter:
             ask_depth=ask_depth,
         )
         self._books[key] = book
-        blocked = self._status[key] is not _StreamStatus.READY
+        blocked = (
+            self._status[key] is not _StreamStatus.READY
+            or source_lineage[0] is None
+            or not lineage_admitted
+        )
         event = self._market_event(
             record,
             key=key,
@@ -465,20 +673,39 @@ class PublicRecordMarketEventAdapter:
         if not affected:
             return None
 
-        target_status = (
-            _StreamStatus.GAPPED
-            if event_kind in _GAP_EVENTS
-            else _StreamStatus.AWAITING_BOOK
-        )
-        for key in affected:
-            self._status[key] = target_status
-        if asset == "GLOBAL" and len(affected) > 1:
-            raise PublicRecordAdapterError(
-                "global connection event spans multiple instruments and cannot be "
-                "crash-atomically represented by the current paper runtime"
+        connection_epoch = record.row.get("connection_epoch")
+        initial_bootstrap_connect = (
+            event_kind == "connect"
+            and isinstance(connection_epoch, int)
+            and not isinstance(connection_epoch, bool)
+            and connection_epoch > 0
+            and all(
+                self._status[key] is _StreamStatus.READY and key in self._books
+                for key in affected
             )
-
+        )
+        if not initial_bootstrap_connect:
+            target_status = (
+                _StreamStatus.GAPPED
+                if event_kind in _GAP_EVENTS
+                else _StreamStatus.AWAITING_BOOK
+            )
+            for key in affected:
+                self._status[key] = target_status
+        connection_lineage = self._market_source_lineage(record)
+        if (
+            event_kind == "connect"
+            and connection_lineage[0] is not None
+            and connection_lineage[1] is not None
+        ):
+            admitted_lineage = (connection_lineage[0], connection_lineage[1])
+        else:
+            admitted_lineage = None
         for key in affected:
+            self._admitted_websocket_lineage[key] = admitted_lineage
+        events: dict[str, MarketEvent] = {}
+        for index, key in enumerate(affected):
+            capture_ordinal = index + 1 if len(affected) > 1 else 0
             book = self._books.get(key)
             if book is None:
                 continue
@@ -488,11 +715,44 @@ class PublicRecordMarketEventAdapter:
                 received_at=received_at,
                 book=book,
                 stale=False,
-                gap=True,
+                gap=not initial_bootstrap_connect,
                 tradable=False,
+                capture_ordinal=capture_ordinal,
             )
-            return MappingProxyType({event.instrument: event})
-        return None
+            events[event.instrument] = event
+        return MappingProxyType(events) if events else None
+
+    @staticmethod
+    def _market_source_lineage(record: ParsedRecord) -> tuple[str | None, int | None]:
+        row = record.row
+        connection_id = row.get("connection_id")
+        if record.record_type is not RecordType.BBO:
+            connection_epoch = row.get("connection_epoch")
+            if (
+                isinstance(connection_id, str)
+                and isinstance(connection_epoch, int)
+                and not isinstance(connection_epoch, bool)
+                and connection_id
+                and 1 <= connection_epoch <= _UINT64_MAX
+            ):
+                return connection_id, connection_epoch
+            return None, None
+        if not isinstance(connection_id, str):
+            return None, None
+        update_id = row.get("update_id")
+        if not isinstance(update_id, str) or update_id.startswith("rest:"):
+            return None, None
+        parts = update_id.rsplit(":", 2)
+        if len(parts) != 3 or not parts[0].endswith(f":{connection_id}"):
+            return None, None
+        epoch_text, arrival_text = parts[1:]
+        if not epoch_text.isdecimal() or not arrival_text.isdecimal():
+            return None, None
+        epoch = int(epoch_text)
+        arrival_sequence = int(arrival_text)
+        if not 1 <= epoch <= _UINT64_MAX or not 1 <= arrival_sequence <= _UINT64_MAX:
+            return None, None
+        return connection_id, epoch
 
     def _market_event(
         self,
@@ -504,8 +764,15 @@ class PublicRecordMarketEventAdapter:
         stale: bool,
         gap: bool,
         tradable: bool,
+        capture_ordinal: int = 0,
     ) -> MarketEvent:
         source_venue, source_asset = self._record_identity(record)
+        source_event_kind = (
+            _required_text(record.row.get("event_kind"), label="event_kind")
+            if record.record_type is RecordType.CONNECTION_EVENT
+            else record.record_type.value
+        )
+        source_connection_id, source_connection_epoch = self._market_source_lineage(record)
         return MarketEvent.create(
             received_at=received_at,
             instrument=book.instrument,
@@ -518,6 +785,10 @@ class PublicRecordMarketEventAdapter:
                 venue=source_venue,
                 asset=source_asset,
             ),
+            source_event_kind=source_event_kind,
+            source_connection_id=source_connection_id,
+            source_connection_epoch=source_connection_epoch,
+            capture_ordinal=capture_ordinal,
             stale=stale,
             gap=gap,
             tradable=tradable,
@@ -554,7 +825,8 @@ class BoundedPublicRecordSource:
             )
         self._descriptor = descriptor
         self._adapter = adapter
-        self._queue: queue.Queue[Mapping[str, MarketEvent]] = queue.Queue(maxsize=capacity)
+        self._queue: queue.Queue[PublicSourceItem] = queue.Queue(maxsize=capacity)
+        self._high_water = 0
         self._feed_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stopped = threading.Event()
@@ -564,6 +836,18 @@ class BoundedPublicRecordSource:
     @property
     def descriptor(self) -> PublicSourceDescriptor:
         return self._descriptor
+
+    @property
+    def identity_artifact_bytes(self) -> bytes:
+        return self._adapter.identity_artifact_bytes
+
+    @property
+    def pending_count(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def high_water(self) -> int:
+        return self._high_water
 
     def feed(self, record: ParsedRecord) -> bool:
         """Feed one record; return whether it produced an enqueued paper frame."""
@@ -579,6 +863,7 @@ class BoundedPublicRecordSource:
                 return False
             try:
                 self._queue.put_nowait(frame)
+                self._high_water = max(self._high_water, self._queue.qsize())
             except queue.Full as exc:
                 error = PublicRecordQueueFull(
                     "public paper source queue saturated; normalized coverage is incomplete"
@@ -593,7 +878,7 @@ class BoundedPublicRecordSource:
             enqueued += int(self.feed(record))
         return enqueued
 
-    def poll(self, *, timeout_seconds: float) -> Mapping[str, MarketEvent] | None:
+    def poll(self, *, timeout_seconds: float) -> PublicSourceItem | None:
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -611,6 +896,9 @@ class BoundedPublicRecordSource:
             return None
         self._raise_if_fatal()
         return frame
+
+    def fail(self, error: Exception) -> None:
+        self._latch(error)
 
     def stop(self) -> None:
         self._stopped.set()

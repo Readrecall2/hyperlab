@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
+import platform
 import re
+import struct
+import sys
+import sysconfig
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -392,6 +397,7 @@ class EvidenceVerificationContext:
     subject: ReadinessSubject
     profile_sha256: str
     artifact_bytes: bytes
+    evidence_root: Path | None = None
 
 
 EvidenceVerifier = Callable[[EvidenceVerificationContext], bool]
@@ -449,6 +455,234 @@ _TESTNET_RISK_INTEGER_CEILINGS = {
     'replace_requests_per_minute': 6,
     'submit_requests_per_minute': 12,
 }
+_PAPER_CANDIDATE_ID = 'phase08-robust-pairs-btc-eth-paper-v1'
+_PAPER_STRATEGY_NAME = 'pairs_mean_reversion_phase08'
+_PAPER_SOURCE_IDENTITY = 'hyperliquid-mainnet-public-bbo-funding-v1'
+_PAPER_HTTP_ENDPOINT = 'https://api.hyperliquid.xyz'
+_PAPER_WEBSOCKET_ENDPOINT = 'wss://api.hyperliquid.xyz/ws'
+_PAPER_RELEASE_CODE_MANIFEST_ARTIFACT = 'release-code-manifest.json'
+_PAPER_RELEASE_CODE_MANIFEST_SCHEMA_VERSION = 1
+_PAPER_RELEASE_CODE_CANONICALIZATION = (
+    'UTF8_LF_CLI_DERIVED_BINDINGS_REDACTED_OR_BINARY_V1'
+)
+_PAPER_RELEASE_CODE_FIXED_PATHS = (
+    'pyproject.toml',
+    'requirements-runtime.lock',
+    'scripts/generate_phase12_live_paper_artifacts.py',
+)
+_PAPER_RELEASE_CODE_MANIFEST_KEYS = frozenset(
+    {
+        'artifact_schema_version',
+        'candidate_id',
+        'canonicalization',
+        'files',
+        'release_code_sha256',
+    }
+)
+_PAPER_RELEASE_CODE_ATTESTATION_KEYS = frozenset(
+    {'canonicalization', 'file_count', 'path', 'release_code_sha256', 'sha256'}
+)
+_PAPER_RUNTIME_ENVIRONMENT_ARTIFACT = 'runtime-environment-attestation.json'
+_PAPER_RUNTIME_ENVIRONMENT_SCHEMA_VERSION = 1
+_PAPER_RUNTIME_ENVIRONMENT_CANONICALIZATION = (
+    'CANONICAL_JSON_HASHED_LOCK_PINS_EXACT_DISTRIBUTIONS_CPYTHON_PLATFORM_V1'
+)
+_PAPER_RUNTIME_ENVIRONMENT_KEYS = frozenset(
+    {
+        'artifact_schema_version',
+        'candidate_id',
+        'canonicalization',
+        'distribution_count',
+        'extras_allowed',
+        'installed_distributions',
+        'interpreter',
+        'lock',
+        'runtime_environment_sha256',
+    }
+)
+_PAPER_RUNTIME_ENVIRONMENT_LOCK_KEYS = frozenset(
+    {'path', 'pins', 'sha256'}
+)
+_PAPER_RUNTIME_ENVIRONMENT_ATTESTATION_KEYS = frozenset(
+    {
+        'canonicalization',
+        'distribution_count',
+        'path',
+        'runtime_environment_sha256',
+        'sha256',
+    }
+)
+_PAPER_RUNTIME_INTERPRETER_KEYS = frozenset(
+    {
+        'abi_flags',
+        'byteorder',
+        'cache_tag',
+        'hexversion',
+        'implementation',
+        'implementation_version',
+        'platform_machine',
+        'platform_system',
+        'platform_tag',
+        'pointer_bits',
+        'python_compiler',
+        'python_version',
+        'version_info',
+    }
+)
+_PAPER_RUNTIME_VERSION_KEYS = frozenset(
+    {'major', 'micro', 'minor', 'releaselevel', 'serial'}
+)
+_PAPER_RUNTIME_LOCK_PIN_RE = re.compile(
+    r'(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,127})=='
+    r'(?P<version>[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127})'
+    r'(?P<continuation>\s+\\)?\Z'
+)
+_PAPER_RUNTIME_LOCK_HASH_RE = re.compile(
+    r'--hash=sha256:(?P<digest>[0-9a-f]{64})'
+    r'(?P<continuation>\s+\\)?\Z'
+)
+_PAPER_DISTRIBUTION_NORMALIZE_RE = re.compile(r'[-_.]+')
+_PAPER_CLI_DERIVED_BINDING_NAMES = (
+    '_PHASE12_PAPER_CONFIG_HASH',
+    '_PHASE12_PAPER_READINESS_MANIFEST_SHA256',
+    '_PHASE12_PAPER_READINESS_PROFILE_SHA256',
+)
+_PAPER_EVIDENCE_KEYS = frozenset(
+    {
+        'check',
+        'environment',
+        'facts',
+        'purpose',
+        'runtime_scope',
+        'schema_version',
+        'subject',
+    }
+)
+_PAPER_RUNTIME_SCOPE_FACTS: Mapping[str, object] = MappingProxyType(
+    {
+        'authorizes_real_money': False,
+        'credential_scope': CredentialScope.NONE.value,
+        'execution_network': ExecutionNetwork.NONE.value,
+        'order_capability': OrderCapability.SIMULATED_ONLY.value,
+        'orders_enabled': False,
+        'real_money_execution_enabled_in_build': False,
+    }
+)
+_PAPER_RUNTIME_LEASE_FACTS: Mapping[str, object] = MappingProxyType(
+    {
+        'canonical_database_path': 'RESOLVE_STRICT_THEN_OS_PATH_NORMCASE',
+        'contention_action': 'BLOCK_SECOND_RUNTIME_OR_STANDALONE_REPLAY_OR_RECONCILE',
+        'identity_fields': [
+            'CANONICAL_DATABASE_PATH',
+            'RUN_ID',
+            'LEASE_SCHEMA',
+        ],
+        'identity_hash': 'CANONICAL_JSON_SHA256',
+        'lock_file_pattern': '.{DATABASE_NAME}.paper-runtime-{IDENTITY_SHA256}.lock',
+        'lock_file_deletion_required_on_close': False,
+        'lock_file_directory': 'DATABASE_PARENT',
+        'lock_mode': 'NONBLOCKING_EXCLUSIVE_OS_LOCK',
+        'lock_payload': 'ONE_NUL_BYTE_FSYNCED_WHEN_EMPTY',
+        'platform_backends': [
+            'WINDOWS_MSVCRT_LK_NBLCK_FIRST_BYTE',
+            'POSIX_FCNTL_FLOCK_EX_NB',
+        ],
+        'schema': 'paper-runtime-exclusive-os-lock-v1',
+        'os_crash_releases_lock': True,
+        'read_only_status_report_require_lease': False,
+        'operator_pause_resume_kill_require_lease': False,
+        'runtime_acquired_after_release_and_frozen_binding_checks': True,
+        'runtime_acquired_before_engine_start_startup_reconciliation_and_public_source_start': True,
+        'runtime_admission_failure_releases_lock': True,
+        'runtime_held_until_close': True,
+        'scope': 'EXACT_CANONICAL_DATABASE_AND_RUN',
+        'second_runtime_for_exact_database_and_run_rejected': True,
+        'standalone_reconcile_acquired_after_release_check': True,
+        'standalone_reconcile_failure_releases_lock': True,
+        'standalone_reconcile_held_until_completion': True,
+        'standalone_reconcile_requires_stopped_runtime': True,
+        'standalone_replay_acquired_after_release_check': True,
+        'standalone_replay_failure_releases_lock': True,
+        'standalone_replay_held_until_completion': True,
+        'standalone_replay_requires_stopped_runtime': True,
+    }
+)
+
+
+def _paper_runtime_lease_facts() -> dict[str, object]:
+    return {
+        **_PAPER_RUNTIME_LEASE_FACTS,
+        'identity_fields': [
+            'CANONICAL_DATABASE_PATH',
+            'RUN_ID',
+            'LEASE_SCHEMA',
+        ],
+        'platform_backends': [
+            'WINDOWS_MSVCRT_LK_NBLCK_FIRST_BYTE',
+            'POSIX_FCNTL_FLOCK_EX_NB',
+        ],
+    }
+
+
+_PAPER_RISK_FACT_KEYS = frozenset(
+    {'enforcement', 'limits', 'limits_sha256', 'order_capability', 'protective_risk'}
+)
+
+
+def _paper_protective_risk_facts() -> dict[str, object]:
+    return {
+        'breach_transition': 'REDUCE_ONLY_BEFORE_ENTRY_ECONOMICS',
+        'entry_orders_protected': True,
+        'flatten_execution': (
+            'STRATEGY_INDEPENDENT_IOC_REDUCE_ONLY_WITH_FRESH_BILATERAL_DURABLE_MARKETS'
+        ),
+        'manual_review_policy': 'NO_APPEND',
+        'marked_limits': [
+            'GROSS_NOTIONAL',
+            'NET_NOTIONAL',
+            'INSTRUMENT_NOTIONAL',
+            'DAILY_LOSS',
+            'DRAWDOWN',
+        ],
+        'missing_mark_action': 'CRITICAL_DEDUPED_FAIL_CLOSED',
+        'partial_or_no_fill_action': 'RETRY_WHILE_BREACH_PERSISTS',
+        'paused_policy': 'MONITOR_ALERT_PROTECT_NO_EXECUTION',
+        'valuation_source': 'DURABLE_PUBLIC_BBO',
+    }
+_PAPER_RISK_LIMIT_KEYS = frozenset(
+    {
+        'max_concurrent_orders',
+        'max_daily_loss',
+        'max_drawdown',
+        'max_gross_notional',
+        'max_instrument_notional',
+        'max_net_notional',
+        'max_order_notional',
+        'max_order_quantity',
+        'max_position_quantity',
+        'stale_after_seconds',
+        'unhedged_timeout_seconds',
+    }
+)
+_PAPER_RISK_DECIMAL_CEILINGS: Mapping[str, Decimal] = MappingProxyType(
+    {
+        'max_daily_loss': Decimal('500'),
+        'max_drawdown': Decimal('1000'),
+        'max_gross_notional': Decimal('10000'),
+        'max_instrument_notional': Decimal('5000'),
+        'max_net_notional': Decimal('2500'),
+        'max_order_notional': Decimal('1000'),
+        'max_order_quantity': Decimal('2'),
+        'max_position_quantity': Decimal('10'),
+    }
+)
+_PAPER_RISK_INTEGER_CEILINGS: Mapping[str, int] = MappingProxyType(
+    {
+        'max_concurrent_orders': 4,
+        'stale_after_seconds': 10,
+        'unhedged_timeout_seconds': 60,
+    }
+)
 
 
 def _fixed_testnet_facts(check: EvidenceCheck) -> dict[str, object] | None:
@@ -747,6 +981,1312 @@ def _make_testnet_evidence_verifier(check: EvidenceCheck) -> EvidenceVerifier:
     return verify
 
 
+def _paper_subject_is_exact(subject: ReadinessSubject) -> bool:
+    return (
+        subject.candidate_id == _PAPER_CANDIDATE_ID
+        and subject.source_identity == _PAPER_SOURCE_IDENTITY
+    )
+
+
+def _paper_release_repository_root() -> Path:
+    module_path = Path(__file__).resolve(strict=True)
+    repository_root = module_path.parents[2]
+    expected_module = (
+        repository_root / 'src' / 'hyperlab' / 'environment_authorization.py'
+    ).resolve(strict=True)
+    if expected_module != module_path:
+        raise ValueError('PAPER release verification requires the reviewed source checkout')
+    return repository_root
+
+
+def _paper_release_stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+def _paper_release_path_is_link(path: Path) -> bool:
+    is_junction = getattr(path, 'is_junction', None)
+    return path.is_symlink() or (
+        callable(is_junction) and cast(Callable[[], bool], is_junction)()
+    )
+
+
+def _resolve_paper_release_path(root: Path, relative_path: str) -> Path:
+    pure = PurePosixPath(relative_path)
+    if (
+        not relative_path
+        or '\\' in relative_path
+        or pure.is_absolute()
+        or pure.as_posix() != relative_path
+        or any(part in {'', '.', '..'} for part in pure.parts)
+    ):
+        raise ValueError('PAPER release path is not an exact safe POSIX-relative path')
+    resolved_root = root.resolve(strict=True)
+    if not resolved_root.is_dir():
+        raise ValueError('PAPER release root is not a directory')
+    cursor = resolved_root
+    for part in pure.parts:
+        cursor = cursor / part
+        if _paper_release_path_is_link(cursor):
+            raise ValueError('PAPER release paths may not traverse links or junctions')
+    resolved = cursor.resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError('PAPER release path escapes its root') from error
+    if not resolved.is_file():
+        raise ValueError('PAPER release path must identify a regular file')
+    return resolved
+
+
+def _read_stable_paper_release_file(path: Path) -> bytes:
+    before = path.stat()
+    if before.st_size > _MAX_SEMANTIC_ARTIFACT_BYTES:
+        raise ValueError('PAPER release file exceeds the compiled bounded size')
+    with path.open('rb') as stream:
+        handle_before = os.fstat(stream.fileno())
+        payload = stream.read(_MAX_SEMANTIC_ARTIFACT_BYTES + 1)
+        handle_after = os.fstat(stream.fileno())
+    after = path.stat()
+    identities = (
+        _paper_release_stat_identity(before),
+        _paper_release_stat_identity(handle_before),
+        _paper_release_stat_identity(handle_after),
+        _paper_release_stat_identity(after),
+    )
+    if len(payload) > _MAX_SEMANTIC_ARTIFACT_BYTES or len(set(identities)) != 1:
+        raise ValueError('PAPER release file changed while it was being hashed')
+    return payload
+
+
+def _canonical_paper_release_file_bytes(root: Path, relative_path: str) -> bytes:
+    payload = _read_stable_paper_release_file(
+        _resolve_paper_release_path(root, relative_path)
+    )
+    if b'\0' in payload:
+        return payload
+    try:
+        text = payload.decode('utf-8')
+    except UnicodeDecodeError:
+        return payload
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    if relative_path == 'src/hyperlab/cli.py':
+        for name in _PAPER_CLI_DERIVED_BINDING_NAMES:
+            pattern = re.compile(
+                rf'(?m)^{re.escape(name)} = "[0-9a-f]{{64}}"$'
+            )
+            text, count = pattern.subn(
+                f'{name} = "<PHASE12_DERIVED_BINDING_SHA256>"',
+                text,
+            )
+            if count != 1:
+                raise ValueError(
+                    f'PAPER release CLI binding {name!r} is missing or ambiguous'
+                )
+    return text.encode('utf-8')
+
+
+def _paper_release_code_paths(repository_root: Path) -> tuple[str, ...]:
+    resolved_root = repository_root.resolve(strict=True)
+    source_root = (resolved_root / 'src' / 'hyperlab').resolve(strict=True)
+    try:
+        source_root.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError('PAPER release source root escapes the repository') from error
+    selected = set(_PAPER_RELEASE_CODE_FIXED_PATHS)
+    for path in source_root.rglob('*.py'):
+        if path.is_file():
+            selected.add(path.relative_to(resolved_root).as_posix())
+    return tuple(sorted(selected))
+
+
+def _paper_release_path_identities(
+    repository_root: Path,
+    relative_paths: tuple[str, ...],
+) -> dict[str, tuple[int, int, int, int]]:
+    return {
+        relative_path: _paper_release_stat_identity(
+            _resolve_paper_release_path(repository_root, relative_path).stat()
+        )
+        for relative_path in relative_paths
+    }
+
+
+def _paper_release_code_core(files: Mapping[str, str]) -> dict[str, object]:
+    return {
+        'artifact_schema_version': _PAPER_RELEASE_CODE_MANIFEST_SCHEMA_VERSION,
+        'candidate_id': _PAPER_CANDIDATE_ID,
+        'canonicalization': _PAPER_RELEASE_CODE_CANONICALIZATION,
+        'files': dict(files),
+    }
+
+
+def _paper_release_code_sha256(files: Mapping[str, str]) -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes(_paper_release_code_core(files))
+    ).hexdigest()
+
+
+def _build_paper_release_code_manifest_bytes(
+    repository_root: Path | None = None,
+) -> bytes:
+    root = (
+        _paper_release_repository_root()
+        if repository_root is None
+        else repository_root.resolve(strict=True)
+    )
+    selected_paths = _paper_release_code_paths(root)
+    identities_before = _paper_release_path_identities(root, selected_paths)
+    files = {
+        relative_path: hashlib.sha256(
+            _canonical_paper_release_file_bytes(root, relative_path)
+        ).hexdigest()
+        for relative_path in selected_paths
+    }
+    paths_after = _paper_release_code_paths(root)
+    if (
+        paths_after != selected_paths
+        or _paper_release_path_identities(root, paths_after) != identities_before
+    ):
+        raise ValueError(
+            'PAPER release code changed while the manifest was built'
+        )
+    return _canonical_json_bytes(
+        {
+            **_paper_release_code_core(files),
+            'release_code_sha256': _paper_release_code_sha256(files),
+        }
+    )
+
+
+def _decode_paper_release_code_manifest(
+    manifest_bytes: bytes,
+) -> tuple[dict[str, str], str]:
+    if (
+        not isinstance(manifest_bytes, bytes)
+        or not manifest_bytes
+        or len(manifest_bytes) > _MAX_SEMANTIC_ARTIFACT_BYTES
+    ):
+        raise ValueError('PAPER release-code manifest bytes are missing or too large')
+    try:
+        decoded = json.loads(
+            manifest_bytes.decode('utf-8'),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (
+        AuthorizationManifestError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError('PAPER release-code manifest is not strict UTF-8 JSON') from error
+    if (
+        not isinstance(decoded, Mapping)
+        or frozenset(decoded) != _PAPER_RELEASE_CODE_MANIFEST_KEYS
+        or manifest_bytes != _canonical_json_bytes(dict(decoded))
+        or type(decoded.get('artifact_schema_version')) is not int
+        or decoded.get('artifact_schema_version')
+        != _PAPER_RELEASE_CODE_MANIFEST_SCHEMA_VERSION
+        or decoded.get('candidate_id') != _PAPER_CANDIDATE_ID
+        or decoded.get('canonicalization') != _PAPER_RELEASE_CODE_CANONICALIZATION
+    ):
+        raise ValueError('PAPER release-code manifest lost its exact compiled schema')
+    raw_files = decoded.get('files')
+    if not isinstance(raw_files, Mapping) or not raw_files:
+        raise ValueError('PAPER release-code manifest files must be a non-empty object')
+    files: dict[str, str] = {}
+    for raw_path, raw_digest in raw_files.items():
+        if not isinstance(raw_path, str) or not isinstance(raw_digest, str):
+            raise ValueError('PAPER release-code manifest file bindings must be strings')
+        pure = PurePosixPath(raw_path)
+        if (
+            not raw_path
+            or '\\' in raw_path
+            or pure.is_absolute()
+            or pure.as_posix() != raw_path
+            or any(part in {'', '.', '..'} for part in pure.parts)
+            or _SHA256_RE.fullmatch(raw_digest) is None
+        ):
+            raise ValueError('PAPER release-code manifest contains an invalid file binding')
+        files[raw_path] = raw_digest
+    release_code_sha256 = decoded.get('release_code_sha256')
+    if (
+        not isinstance(release_code_sha256, str)
+        or _SHA256_RE.fullmatch(release_code_sha256) is None
+        or release_code_sha256 != _paper_release_code_sha256(files)
+    ):
+        raise ValueError('PAPER release-code aggregate digest is inconsistent')
+    return files, release_code_sha256
+
+
+def current_paper_release_code_sha256() -> str:
+    """Hash the exact current reviewed Paper release-code path set."""
+
+    _, release_code_sha256 = _decode_paper_release_code_manifest(
+        _build_paper_release_code_manifest_bytes()
+    )
+    return release_code_sha256
+
+
+def _normalize_paper_distribution_name(value: str) -> str:
+    return _PAPER_DISTRIBUTION_NORMALIZE_RE.sub('-', value).lower()
+
+
+def _parse_paper_runtime_lock(
+    lock_bytes: bytes,
+) -> dict[str, dict[str, object]]:
+    if (
+        not isinstance(lock_bytes, bytes)
+        or not lock_bytes
+        or len(lock_bytes) > _MAX_SEMANTIC_ARTIFACT_BYTES
+        or b'\0' in lock_bytes
+    ):
+        raise ValueError('PAPER runtime lock bytes are missing, binary, or too large')
+    try:
+        text = lock_bytes.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('PAPER runtime lock must be strict UTF-8') from error
+
+    pins: dict[str, dict[str, object]] = {}
+    current_name: str | None = None
+    current_closed = True
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        hash_match = _PAPER_RUNTIME_LOCK_HASH_RE.fullmatch(line)
+        if hash_match is not None:
+            if current_name is None or current_closed:
+                raise ValueError(
+                    f'PAPER runtime lock has an orphan hash at line {line_number}'
+                )
+            hashes = cast(list[str], pins[current_name]['hashes'])
+            digest = hash_match.group('digest')
+            if digest in hashes:
+                raise ValueError(
+                    f'PAPER runtime lock repeats a hash at line {line_number}'
+                )
+            hashes.append(digest)
+            current_closed = hash_match.group('continuation') is None
+            continue
+
+        pin_match = _PAPER_RUNTIME_LOCK_PIN_RE.fullmatch(line)
+        if pin_match is None:
+            raise ValueError(
+                f'PAPER runtime lock has unsupported syntax at line {line_number}'
+            )
+        if current_name is not None:
+            previous_hashes = cast(list[str], pins[current_name]['hashes'])
+            if not previous_hashes or not current_closed:
+                raise ValueError(
+                    f'PAPER runtime lock has an incomplete pin before line {line_number}'
+                )
+        if pin_match.group('continuation') is None:
+            raise ValueError(
+                f'PAPER runtime lock pin lacks required hashes at line {line_number}'
+            )
+        raw_name = pin_match.group('name')
+        normalized_name = _normalize_paper_distribution_name(raw_name)
+        if raw_name != normalized_name:
+            raise ValueError(
+                f'PAPER runtime lock distribution name is not canonical at line {line_number}'
+            )
+        if normalized_name in pins:
+            raise ValueError(
+                f'PAPER runtime lock repeats distribution {normalized_name!r}'
+            )
+        pins[normalized_name] = {
+            'hashes': [],
+            'version': pin_match.group('version'),
+        }
+        current_name = normalized_name
+        current_closed = False
+        if len(pins) > 512:
+            raise ValueError('PAPER runtime lock exceeds 512 distributions')
+
+    if current_name is None:
+        raise ValueError('PAPER runtime lock contains no exact pins')
+    if not cast(list[str], pins[current_name]['hashes']) or not current_closed:
+        raise ValueError('PAPER runtime lock ends with an incomplete pin')
+    return {
+        name: {
+            'hashes': sorted(cast(list[str], pin['hashes'])),
+            'version': pin['version'],
+        }
+        for name, pin in sorted(pins.items())
+    }
+
+
+def _paper_runtime_version_facts(value: Sequence[object]) -> dict[str, object]:
+    if len(value) != 5:
+        raise ValueError('PAPER runtime version tuple is malformed')
+    major, minor, micro, releaselevel, serial = value
+    return {
+        'major': int(cast(int, major)),
+        'micro': int(cast(int, micro)),
+        'minor': int(cast(int, minor)),
+        'releaselevel': str(cast(str, releaselevel)),
+        'serial': int(cast(int, serial)),
+    }
+
+
+def _current_paper_cpython_facts() -> dict[str, object]:
+    implementation = sys.implementation
+    if implementation.name != 'cpython':
+        raise ValueError('PAPER runtime requires CPython exactly')
+    version_info = _paper_runtime_version_facts(sys.version_info)
+    implementation_version = _paper_runtime_version_facts(
+        implementation.version
+    )
+    cache_tag = implementation.cache_tag
+    if not isinstance(cache_tag, str) or not cache_tag:
+        raise ValueError('PAPER runtime CPython cache tag is unavailable')
+    return {
+        'abi_flags': str(getattr(sys, 'abiflags', '')),
+        'byteorder': sys.byteorder,
+        'cache_tag': cache_tag,
+        'hexversion': sys.hexversion,
+        'implementation': implementation.name,
+        'implementation_version': implementation_version,
+        'platform_machine': platform.machine(),
+        'platform_system': platform.system(),
+        'platform_tag': sysconfig.get_platform(),
+        'pointer_bits': struct.calcsize('P') * 8,
+        'python_compiler': platform.python_compiler(),
+        'python_version': (
+            f"{version_info['major']}.{version_info['minor']}."
+            f"{version_info['micro']}"
+        ),
+        'version_info': version_info,
+    }
+
+
+def _paper_runtime_hexversion(version: Mapping[str, object]) -> int:
+    release_nibble = {
+        'alpha': 0xA,
+        'beta': 0xB,
+        'candidate': 0xC,
+        'final': 0xF,
+    }.get(cast(str, version.get('releaselevel')))
+    if release_nibble is None:
+        return -1
+    return (
+        (cast(int, version['major']) << 24)
+        | (cast(int, version['minor']) << 16)
+        | (cast(int, version['micro']) << 8)
+        | (release_nibble << 4)
+        | cast(int, version['serial'])
+    )
+
+
+def _validate_paper_runtime_version_facts(value: object) -> bool:
+    if not isinstance(value, Mapping) or frozenset(value) != _PAPER_RUNTIME_VERSION_KEYS:
+        return False
+    for name in ('major', 'minor', 'micro', 'serial'):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return False
+    return (
+        cast(int, value.get('major')) > 0
+        and cast(int, value.get('minor')) < 256
+        and cast(int, value.get('micro')) < 256
+        and cast(int, value.get('serial')) < 16
+        and value.get('releaselevel')
+        in {'alpha', 'beta', 'candidate', 'final'}
+    )
+
+
+def _validate_paper_runtime_interpreter_facts(value: object) -> bool:
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value) != _PAPER_RUNTIME_INTERPRETER_KEYS
+        or value.get('implementation') != 'cpython'
+        or not _validate_paper_runtime_version_facts(value.get('version_info'))
+        or not _validate_paper_runtime_version_facts(
+            value.get('implementation_version')
+        )
+        or value.get('implementation_version') != value.get('version_info')
+        or not isinstance(value.get('python_version'), str)
+        or not isinstance(value.get('cache_tag'), str)
+        or not isinstance(value.get('abi_flags'), str)
+        or any(
+            not isinstance(value.get(name), str)
+            or not cast(str, value.get(name))
+            or len(cast(str, value.get(name))) > 256
+            or any(
+                character in {'\0', '\r', '\n'}
+                for character in cast(str, value.get(name))
+            )
+            for name in (
+                'platform_machine',
+                'platform_system',
+                'platform_tag',
+                'python_compiler',
+            )
+        )
+        or value.get('byteorder') not in {'big', 'little'}
+        or isinstance(value.get('pointer_bits'), bool)
+        or not isinstance(value.get('pointer_bits'), int)
+        or cast(int, value.get('pointer_bits')) not in {32, 64, 128}
+        or isinstance(value.get('hexversion'), bool)
+        or not isinstance(value.get('hexversion'), int)
+    ):
+        return False
+    version = cast(Mapping[str, object], value['version_info'])
+    expected_version = (
+        f"{version['major']}.{version['minor']}.{version['micro']}"
+    )
+    expected_cache_tag = f"cpython-{version['major']}{version['minor']}"
+    return (
+        value.get('python_version') == expected_version
+        and value.get('cache_tag') == expected_cache_tag
+        and cast(str, value.get('abi_flags')).isascii()
+        and len(cast(str, value.get('abi_flags'))) <= 32
+        and value.get('hexversion') == _paper_runtime_hexversion(version)
+    )
+
+
+def _paper_installed_distribution_versions(
+    pins: Mapping[str, Mapping[str, object]],
+    distribution_version: Callable[[str], str],
+) -> dict[str, str]:
+    installed: dict[str, str] = {}
+    for name in pins:
+        try:
+            version = distribution_version(name)
+        except importlib_metadata.PackageNotFoundError as error:
+            raise ValueError(
+                f'PAPER runtime required distribution {name!r} is not installed'
+            ) from error
+        if (
+            not isinstance(version, str)
+            or not version
+            or version != version.strip()
+            or any(character.isspace() for character in version)
+        ):
+            raise ValueError(
+                f'PAPER runtime distribution {name!r} has an invalid version'
+            )
+        installed[name] = version
+    return installed
+
+
+def _paper_runtime_environment_core(
+    *,
+    installed: Mapping[str, str],
+    interpreter: Mapping[str, object],
+    lock_bytes: bytes,
+    pins: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        'artifact_schema_version': _PAPER_RUNTIME_ENVIRONMENT_SCHEMA_VERSION,
+        'candidate_id': _PAPER_CANDIDATE_ID,
+        'canonicalization': _PAPER_RUNTIME_ENVIRONMENT_CANONICALIZATION,
+        'distribution_count': len(pins),
+        'extras_allowed': True,
+        'installed_distributions': dict(installed),
+        'interpreter': dict(interpreter),
+        'lock': {
+            'path': 'requirements-runtime.lock',
+            'pins': {name: dict(pin) for name, pin in pins.items()},
+            'sha256': hashlib.sha256(lock_bytes).hexdigest(),
+        },
+    }
+
+
+def _build_paper_runtime_environment_attestation_bytes(
+    repository_root: Path | None = None,
+    *,
+    distribution_version: Callable[[str], str] | None = None,
+    interpreter_facts: Callable[[], Mapping[str, object]] | None = None,
+) -> bytes:
+    root = (
+        _paper_release_repository_root()
+        if repository_root is None
+        else repository_root.resolve(strict=True)
+    )
+    lock_path = _resolve_paper_release_path(root, 'requirements-runtime.lock')
+    lock_identity = _paper_release_stat_identity(lock_path.stat())
+    lock_bytes = _canonical_paper_release_file_bytes(
+        root,
+        'requirements-runtime.lock',
+    )
+    pins = _parse_paper_runtime_lock(lock_bytes)
+    lookup = distribution_version or importlib_metadata.version
+    facts_reader = interpreter_facts or _current_paper_cpython_facts
+    installed_before = _paper_installed_distribution_versions(pins, lookup)
+    interpreter_before = dict(facts_reader())
+    installed_after = _paper_installed_distribution_versions(pins, lookup)
+    interpreter_after = dict(facts_reader())
+    if (
+        _paper_release_stat_identity(lock_path.stat()) != lock_identity
+        or installed_after != installed_before
+        or interpreter_after != interpreter_before
+    ):
+        raise ValueError(
+            'PAPER runtime environment changed while the attestation was built'
+        )
+    if not _validate_paper_runtime_interpreter_facts(interpreter_before):
+        raise ValueError('PAPER runtime interpreter facts are invalid or not CPython')
+    mismatches = [
+        f"{name}:locked={pin['version']},installed={installed_before[name]}"
+        for name, pin in pins.items()
+        if installed_before[name] != pin['version']
+    ]
+    if mismatches:
+        raise ValueError(
+            'PAPER runtime locked distribution mismatch: ' + ', '.join(mismatches)
+        )
+    core = _paper_runtime_environment_core(
+        installed=installed_before,
+        interpreter=interpreter_before,
+        lock_bytes=lock_bytes,
+        pins=pins,
+    )
+    return _canonical_json_bytes(
+        {
+            **core,
+            'runtime_environment_sha256': hashlib.sha256(
+                _canonical_json_bytes(core)
+            ).hexdigest(),
+        }
+    )
+
+
+def _decode_paper_runtime_environment_attestation(
+    payload: bytes,
+) -> tuple[dict[str, object], str]:
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or len(payload) > _MAX_SEMANTIC_ARTIFACT_BYTES
+    ):
+        raise ValueError('PAPER runtime-environment attestation is missing or too large')
+    try:
+        decoded = json.loads(
+            payload.decode('utf-8'),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (
+        AuthorizationManifestError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError(
+            'PAPER runtime-environment attestation is not strict UTF-8 JSON'
+        ) from error
+    if (
+        not isinstance(decoded, Mapping)
+        or frozenset(decoded) != _PAPER_RUNTIME_ENVIRONMENT_KEYS
+        or payload != _canonical_json_bytes(dict(decoded))
+        or decoded.get('artifact_schema_version')
+        != _PAPER_RUNTIME_ENVIRONMENT_SCHEMA_VERSION
+        or decoded.get('candidate_id') != _PAPER_CANDIDATE_ID
+        or decoded.get('canonicalization')
+        != _PAPER_RUNTIME_ENVIRONMENT_CANONICALIZATION
+        or decoded.get('extras_allowed') is not True
+        or not _validate_paper_runtime_interpreter_facts(
+            decoded.get('interpreter')
+        )
+    ):
+        raise ValueError(
+            'PAPER runtime-environment attestation lost its exact schema'
+        )
+    lock = decoded.get('lock')
+    installed = decoded.get('installed_distributions')
+    if (
+        not isinstance(lock, Mapping)
+        or frozenset(lock) != _PAPER_RUNTIME_ENVIRONMENT_LOCK_KEYS
+        or lock.get('path') != 'requirements-runtime.lock'
+        or not isinstance(lock.get('sha256'), str)
+        or _SHA256_RE.fullmatch(cast(str, lock.get('sha256'))) is None
+        or not isinstance(lock.get('pins'), Mapping)
+        or not isinstance(installed, Mapping)
+    ):
+        raise ValueError('PAPER runtime-environment lock binding is invalid')
+    pins = cast(Mapping[object, object], lock['pins'])
+    if any(not isinstance(name, str) for name in pins):
+        raise ValueError('PAPER runtime-environment distribution set is invalid')
+    pin_names = tuple(cast(str, name) for name in pins)
+    if (
+        not pins
+        or pin_names != tuple(sorted(pin_names))
+        or frozenset(installed) != frozenset(pins)
+        or type(decoded.get('distribution_count')) is not int
+        or decoded.get('distribution_count') != len(pins)
+    ):
+        raise ValueError('PAPER runtime-environment distribution set is invalid')
+    for name, raw_pin in pins.items():
+        if (
+            not isinstance(name, str)
+            or name != _normalize_paper_distribution_name(name)
+            or not isinstance(raw_pin, Mapping)
+            or frozenset(raw_pin) != {'hashes', 'version'}
+            or not isinstance(raw_pin.get('version'), str)
+            or installed.get(name) != raw_pin.get('version')
+            or not isinstance(raw_pin.get('hashes'), list)
+            or not raw_pin.get('hashes')
+            or any(
+                not isinstance(item, str) or _SHA256_RE.fullmatch(item) is None
+                for item in cast(list[object], raw_pin.get('hashes'))
+            )
+            or raw_pin.get('hashes')
+            != sorted(set(cast(list[str], raw_pin.get('hashes'))))
+        ):
+            raise ValueError(
+                'PAPER runtime-environment distribution binding is invalid'
+            )
+    core = dict(decoded)
+    runtime_environment_sha256 = core.pop('runtime_environment_sha256', None)
+    if (
+        not isinstance(runtime_environment_sha256, str)
+        or _SHA256_RE.fullmatch(runtime_environment_sha256) is None
+        or runtime_environment_sha256
+        != hashlib.sha256(_canonical_json_bytes(core)).hexdigest()
+    ):
+        raise ValueError('PAPER runtime-environment digest is inconsistent')
+    return dict(decoded), runtime_environment_sha256
+
+
+def paper_runtime_environment_attestation_bytes(
+    repository_root: Path | None = None,
+) -> bytes:
+    """Return canonical proof of exact locked distributions and CPython facts."""
+
+    return _build_paper_runtime_environment_attestation_bytes(repository_root)
+
+
+def current_paper_runtime_environment_sha256() -> str:
+    """Hash the exact current locked Paper Python runtime environment."""
+
+    _, runtime_environment_sha256 = (
+        _decode_paper_runtime_environment_attestation(
+            paper_runtime_environment_attestation_bytes()
+        )
+    )
+    return runtime_environment_sha256
+
+
+def _paper_runtime_environment_attestation(
+    attestation_bytes: bytes,
+) -> dict[str, object]:
+    decoded, runtime_environment_sha256 = (
+        _decode_paper_runtime_environment_attestation(attestation_bytes)
+    )
+    return {
+        'canonicalization': _PAPER_RUNTIME_ENVIRONMENT_CANONICALIZATION,
+        'distribution_count': decoded['distribution_count'],
+        'path': _PAPER_RUNTIME_ENVIRONMENT_ARTIFACT,
+        'runtime_environment_sha256': runtime_environment_sha256,
+        'sha256': hashlib.sha256(attestation_bytes).hexdigest(),
+    }
+
+
+def _verify_paper_runtime_environment_attestation(
+    attestation: Mapping[str, object],
+    context: EvidenceVerificationContext,
+) -> bool:
+    if (
+        frozenset(attestation) != _PAPER_RUNTIME_ENVIRONMENT_ATTESTATION_KEYS
+        or attestation.get('canonicalization')
+        != _PAPER_RUNTIME_ENVIRONMENT_CANONICALIZATION
+        or type(attestation.get('distribution_count')) is not int
+        or cast(int, attestation.get('distribution_count')) <= 0
+        or attestation.get('path') != _PAPER_RUNTIME_ENVIRONMENT_ARTIFACT
+        or not isinstance(attestation.get('runtime_environment_sha256'), str)
+        or _SHA256_RE.fullmatch(
+            cast(str, attestation.get('runtime_environment_sha256'))
+        )
+        is None
+        or not isinstance(attestation.get('sha256'), str)
+        or _SHA256_RE.fullmatch(cast(str, attestation.get('sha256'))) is None
+        or context.evidence_root is None
+    ):
+        return False
+    try:
+        evidence_root = context.evidence_root.resolve(strict=True)
+        artifact_path = _resolve_paper_release_path(
+            evidence_root,
+            _PAPER_RUNTIME_ENVIRONMENT_ARTIFACT,
+        )
+        artifact_identity = _paper_release_stat_identity(artifact_path.stat())
+        artifact_bytes = _read_stable_paper_release_file(artifact_path)
+        if (
+            hashlib.sha256(artifact_bytes).hexdigest()
+            != attestation.get('sha256')
+        ):
+            return False
+        decoded, runtime_environment_sha256 = (
+            _decode_paper_runtime_environment_attestation(artifact_bytes)
+        )
+        current_bytes = paper_runtime_environment_attestation_bytes()
+        current_decoded, current_runtime_environment_sha256 = (
+            _decode_paper_runtime_environment_attestation(current_bytes)
+        )
+        if (
+            artifact_bytes != current_bytes
+            or decoded != current_decoded
+            or runtime_environment_sha256
+            != current_runtime_environment_sha256
+            or _paper_release_stat_identity(artifact_path.stat())
+            != artifact_identity
+        ):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        attestation.get('distribution_count')
+        == decoded['distribution_count']
+        and attestation.get('runtime_environment_sha256')
+        == runtime_environment_sha256
+    )
+
+
+def _paper_release_code_attestation(manifest_bytes: bytes) -> dict[str, object]:
+    files, release_code_sha256 = _decode_paper_release_code_manifest(manifest_bytes)
+    return {
+        'canonicalization': _PAPER_RELEASE_CODE_CANONICALIZATION,
+        'file_count': len(files),
+        'path': _PAPER_RELEASE_CODE_MANIFEST_ARTIFACT,
+        'release_code_sha256': release_code_sha256,
+        'sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+
+
+def _verify_paper_release_code_attestation(
+    attestation: Mapping[str, object],
+    context: EvidenceVerificationContext,
+) -> bool:
+    if (
+        frozenset(attestation) != _PAPER_RELEASE_CODE_ATTESTATION_KEYS
+        or attestation.get('canonicalization')
+        != _PAPER_RELEASE_CODE_CANONICALIZATION
+        or type(attestation.get('file_count')) is not int
+        or cast(int, attestation.get('file_count')) <= 0
+        or attestation.get('path') != _PAPER_RELEASE_CODE_MANIFEST_ARTIFACT
+        or not isinstance(attestation.get('release_code_sha256'), str)
+        or _SHA256_RE.fullmatch(
+            cast(str, attestation.get('release_code_sha256'))
+        )
+        is None
+        or not isinstance(attestation.get('sha256'), str)
+        or _SHA256_RE.fullmatch(cast(str, attestation.get('sha256'))) is None
+        or context.evidence_root is None
+    ):
+        return False
+    try:
+        evidence_root = context.evidence_root.resolve(strict=True)
+        manifest_path = _resolve_paper_release_path(
+            evidence_root,
+            _PAPER_RELEASE_CODE_MANIFEST_ARTIFACT,
+        )
+        manifest_identity = _paper_release_stat_identity(manifest_path.stat())
+        manifest_bytes = _read_stable_paper_release_file(manifest_path)
+        if hashlib.sha256(manifest_bytes).hexdigest() != attestation.get('sha256'):
+            return False
+        files, release_code_sha256 = _decode_paper_release_code_manifest(
+            manifest_bytes
+        )
+        repository_root = _paper_release_repository_root()
+        expected_paths = _paper_release_code_paths(repository_root)
+        identities_before = _paper_release_path_identities(repository_root, expected_paths)
+        if tuple(files) != expected_paths:
+            return False
+        for relative_path, expected_sha256 in files.items():
+            actual_sha256 = hashlib.sha256(
+                _canonical_paper_release_file_bytes(
+                    repository_root,
+                    relative_path,
+                )
+            ).hexdigest()
+            if actual_sha256 != expected_sha256:
+                return False
+        paths_after = _paper_release_code_paths(repository_root)
+        if (
+            paths_after != expected_paths
+            or _paper_release_path_identities(repository_root, paths_after)
+            != identities_before
+            or _paper_release_stat_identity(manifest_path.stat()) != manifest_identity
+        ):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        attestation.get('file_count') == len(files)
+        and attestation.get('release_code_sha256') == release_code_sha256
+    )
+
+
+def _validate_paper_risk_limits(
+    limits: Mapping[str, object],
+    *,
+    expected_sha256: str,
+) -> bool:
+    if frozenset(limits) != _PAPER_RISK_LIMIT_KEYS:
+        return False
+    decimals: dict[str, Decimal] = {}
+    for name, ceiling in _PAPER_RISK_DECIMAL_CEILINGS.items():
+        parsed = _positive_decimal(limits.get(name))
+        if parsed is None or parsed > ceiling:
+            return False
+        decimals[name] = parsed
+    if (
+        decimals['max_order_notional'] > decimals['max_instrument_notional']
+        or decimals['max_instrument_notional'] > decimals['max_gross_notional']
+        or decimals['max_net_notional'] > decimals['max_gross_notional']
+        or decimals['max_order_quantity'] > decimals['max_position_quantity']
+        or decimals['max_daily_loss'] > decimals['max_drawdown']
+    ):
+        return False
+    for name, integer_ceiling in _PAPER_RISK_INTEGER_CEILINGS.items():
+        value = limits.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value > integer_ceiling
+        ):
+            return False
+    limits_sha256 = hashlib.sha256(_canonical_json_bytes(dict(limits))).hexdigest()
+    return limits_sha256 == expected_sha256
+
+
+def _validate_paper_risk_facts(
+    facts: Mapping[str, object],
+    context: EvidenceVerificationContext,
+) -> bool:
+    if frozenset(facts) != _PAPER_RISK_FACT_KEYS:
+        return False
+    if (
+        facts.get('enforcement') != 'FAIL_CLOSED'
+        or facts.get('limits_sha256') != context.subject.risk_limits_hash
+        or facts.get('order_capability') != OrderCapability.SIMULATED_ONLY.value
+        or facts.get('protective_risk') != _paper_protective_risk_facts()
+    ):
+        return False
+    limits = facts.get('limits')
+    return isinstance(limits, Mapping) and _validate_paper_risk_limits(
+        limits,
+        expected_sha256=context.subject.risk_limits_hash,
+    )
+
+
+def _fixed_paper_facts(
+    check: EvidenceCheck,
+    subject: ReadinessSubject,
+) -> dict[str, object] | None:
+    if check is EvidenceCheck.PUBLIC_MARKET_SOURCE:
+        return {
+            'admitted_record_types': ['bbo', 'connection_event', 'funding'],
+            'authentication_required': False,
+            'bootstrap_timeout_seconds': 120.0,
+            'critical_funding_history': True,
+            'descriptor_schema_version': 1,
+            'http_final_url_must_equal_request': True,
+            'http_endpoint': _PAPER_HTTP_ENDPOINT,
+            'http_required_status': 200,
+            'instruments': ['HL:BTC:perp', 'HL:ETH:perp'],
+            'network': 'mainnet',
+            'private_api_used': False,
+            'public_only': True,
+            'redirects_allowed': False,
+            'reconnect_on_rest_refresh_failure': True,
+            'rest_methods': ['metaAndAssetCtxs', 'spotMetaAndAssetCtxs', 'fundingHistory', 'l2Book'],
+            'rest_l2_book_projection': 'BBO_BOOTSTRAP_AND_RESYNC_ONLY',
+            'source_identity': subject.source_identity,
+            'source_kind': 'PUBLIC_NORMALIZED',
+            'transport_schema': 'hyperliquid-paper-public-transport-v2',
+            'websocket_channels': ['bbo'],
+            'websocket_endpoint': _PAPER_WEBSOCKET_ENDPOINT,
+            'websocket_redirect_limit': 0,
+            'websocket_required_http_status': 101,
+        }
+    if check is EvidenceCheck.NORMALIZED_MARKET_EVENT_SCHEMA:
+        return {
+            'adapter_schema_version': 8,
+            'bbo_tradability_policy': (
+                'REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2'
+            ),
+            'causal_clock': 'RECEIVED_AT_UTC',
+            'feed_contract': 'SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8',
+            'gap_or_stale_action': 'PAUSE_AND_NO_EXECUTION',
+            'malformed_bbo_policy': (
+                'TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1'
+            ),
+            'global_connection_policy': (
+                'MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4'
+            ),
+            'normalized_record_schema_versions': {
+                'bbo': 2,
+                'connection_event': 2,
+                'funding': 2,
+            },
+            'paper_market_event_schema_version': 1,
+            'rest_bootstrap_execution_eligible': False,
+            'rest_bootstrap_lineage': 'NON_EXECUTABLE_INITIALIZATION_ONLY',
+            'synthetic_data_allowed': False,
+            'websocket_lineage_required_after_connect': True,
+        }
+    if check is EvidenceCheck.FROZEN_STRATEGY_CONFIG:
+        return {
+            'build_hash': subject.build_hash,
+            'candidate_id': subject.candidate_id,
+            'config_hash': subject.config_hash,
+            'config_immutable': True,
+            'gate_d_satisfied': False,
+            'run_kind': 'TECHNICAL',
+            'source_artifact_hash_binding': 'PAPER_CONFIG_DATA_HASH',
+            'source_identity': subject.source_identity,
+            'strategy_hash': subject.strategy_hash,
+            'strategy_name': _PAPER_STRATEGY_NAME,
+            'validation_paper': False,
+        }
+    if check is EvidenceCheck.DETERMINISTIC_ACCOUNTING:
+        return {
+            'accounting_numeric_type': 'DECIMAL',
+            'balanced_ledger_required': True,
+            'fees_recorded_separately': True,
+            'floating_point_accounting_allowed': False,
+            'funding_recorded_separately': True,
+            'partial_fills_recorded': True,
+            'projection_derived_from_journal': True,
+        }
+    if check is EvidenceCheck.DETERMINISTIC_REPLAY:
+        return {
+            'event_hash_chain_verified': True,
+            'event_order': 'COMMIT_SEQUENCE',
+            'exact_projection_equivalence_required': True,
+            'input_deduplication': True,
+            'same_inputs_same_events': True,
+            'strategy_hash_bound': subject.strategy_hash,
+        }
+    if check is EvidenceCheck.CONSERVATIVE_COST_MODEL:
+        return {
+            'account_fee_discount_assumed': False,
+            'adverse_exit_modelled': True,
+            'calibration_status': 'UNCALIBRATED',
+            'economic_eligibility': False,
+            'execution_policy': 'IOC_TAKER_ONLY',
+            'fee_policy': 'PUBLIC_TIER_0_OR_GREATER',
+            'maker_fill_assumed': False,
+            'missed_and_partial_fills_modelled': True,
+            'nonflat_funding_without_causal_fresh_bbo_action': 'PAUSE_FAIL_CLOSED',
+            'pre_activation_funding_history_ignored': True,
+            'flat_without_mark_funding_effect': 'ZERO',
+            'slippage_policy': 'BBO_DEPTH_PLUS_FIXED_ADVERSE',
+            'synthetic_funding_reserve_allowed': False,
+            'validation_scope': 'FIRST_SUPERVISED_10_TO_15_MINUTE_SMOKE',
+        }
+    if check is EvidenceCheck.RUNTIME_SOURCE_ATTESTATION:
+        return {
+            'config_hash': subject.config_hash,
+            'descriptor_bound_before_start': True,
+            'engine_semantic_build_hash': subject.build_hash,
+            'frozen_runtime_cadence': {
+                'runtime_source_poll_timeout_seconds': 0.25,
+                'runtime_timer_interval_seconds': 1.0,
+            },
+            'release_code_binding': {
+                'canonical_config_field': 'release_code_sha256',
+                'current_checkout_digest_required_during_construction_and_before_start': True,
+                'durable_config_snapshot': 'paper_runs.config_json',
+                'run_config_hash_binds_canonical_snapshot': True,
+                'run_start_config_hash_binds_canonical_snapshot': True,
+            },
+            'runtime_environment_binding': {
+                'artifact_path': _PAPER_RUNTIME_ENVIRONMENT_ARTIFACT,
+                'canonical_config_field': 'runtime_environment_sha256',
+                'cpython_runtime_facts_bound': [
+                    'abi_flags',
+                    'byteorder',
+                    'cache_tag',
+                    'hexversion',
+                    'implementation',
+                    'implementation_version',
+                    'platform_machine',
+                    'platform_system',
+                    'platform_tag',
+                    'pointer_bits',
+                    'python_compiler',
+                    'python_version',
+                    'version_info',
+                ],
+                'exact_locked_required_distributions': True,
+                'extra_installed_distributions_allowed': True,
+                'preflight_current_environment_required': True,
+                'runtime_rechecked_before_lease_and_immediately_before_source_start': True,
+            },
+            'runtime_session_contract': {
+                'active_definition': 'GENERATION_POSITIVE_ID_PRESENT_STOPPED_AT_NONE',
+                'failure_leaves_active': [
+                    'FAULT',
+                    'IN_FLIGHT_EXCEPTION',
+                    'BASE_EXCEPTION',
+                    'SOURCE_OR_CLEANUP_FAILURE',
+                ],
+                'generation': 'STARTS_ZERO_EXACT_PLUS_ONE',
+                'offline_recovery_required_before_replacement_start': True,
+                'projection_fields': [
+                    'runtime_session_generation',
+                    'runtime_session_id',
+                    'runtime_session_started_at',
+                    'runtime_session_stopped_at',
+                ],
+                'projection_schema_version': 3,
+                'session_id': 'LOWERCASE_SHA256',
+                'start_before_public_source': True,
+                'start_input_and_event': 'RUNTIME_SESSION_STARTED',
+                'stop_after_successful_source_shutdown_while_lease_held': True,
+                'stop_input_and_event': 'RUNTIME_SESSION_STOPPED',
+                'stop_reasons': [
+                    'COOPERATIVE_STOP',
+                    'NORMAL_COMPLETION',
+                ],
+                'unclosed_failure_input': 'PAPER_RUNTIME_FAILURE',
+                'unclosed_failure_origin': 'PAPER_RUNTIME_FAILURE',
+                'unclosed_failure_phase': 'UNCLOSED_RUNTIME_SESSION',
+                'unclosed_failure_type': 'UnclosedRuntimeSessionError',
+            },
+            'runtime_cadence_must_equal_frozen_config_before_lease': True,
+            'runtime_lease': _paper_runtime_lease_facts(),
+            'source_identity': subject.source_identity,
+            'source_started_after_reconciliation': True,
+            'startup_toctou_recheck': True,
+            'strategy_hash': subject.strategy_hash,
+        }
+    if check is EvidenceCheck.CRASH_RECOVERY:
+        return {
+            'append_transaction': 'BEGIN_IMMEDIATE_ATOMIC',
+            'atomic_commit_contents': [
+                'INBOX_INPUT',
+                'EVENTS',
+                'LEDGER_TRANSACTIONS_AND_ENTRIES',
+                'PROJECTION_CURRENT_HEAD',
+                'PROJECTION_HISTORY',
+                'ALERTS',
+                'COMMIT_RECORD',
+                'RUN_CURRENT_HEAD',
+            ],
+            'runtime_lease': _paper_runtime_lease_facts(),
+            'commit_hash_chain_persisted': True,
+            'critical_incident_on_failure': True,
+            'durable_inbox_payload_hash_persisted': True,
+            'event_hash_chain_persisted': True,
+            'hash_chain_verified_on_restore': True,
+            'journal_mode': 'DELETE',
+            'projection_restored_from_journal': True,
+            'concurrent_sqlite_writer_transactions_allowed': False,
+            'sqlite_writer_transaction_serialization': (
+                'BEGIN_IMMEDIATE_WITH_EXPECTED_SEQUENCE_AND_DURABLE_HEAD_HASH_GUARDS'
+            ),
+            'synchronous': 'FULL',
+        }
+    if check is EvidenceCheck.RESTART_RECOVERY:
+        return {
+            'before_public_source_start': 'RECONCILE',
+            'duplicate_economic_effects_allowed': False,
+            'duplicate_inputs_idempotent': True,
+            'funding_settlement_deduplicated': True,
+            'new_simulated_orders_before_recovery_allowed': False,
+            'projection_rebuilt_from_durable_events': True,
+            'strategy_state_rebuilt_from_durable_inputs': True,
+            'unclosed_runtime_session_recovery': {
+                'incident_summary_reverified_atomically': True,
+                'offline_runtime_lease_required': True,
+                'replacement_start_before_recovery_allowed': False,
+                'required_failure_phase': 'UNCLOSED_RUNTIME_SESSION',
+                'resume_targets': ['FLAT', 'REDUCE_ONLY'],
+                'stale_market_bypass_scope': 'OFFLINE_UNCLOSED_SESSION_ONLY',
+            },
+        }
+    if check is EvidenceCheck.RECONCILIATION:
+        return {
+            'authority': 'APPEND_ONLY_PAPER_JOURNAL',
+            'exact_replay_required': True,
+            'idempotent': True,
+            'mismatch_action': 'MANUAL_REVIEW',
+            'performed_before_source_start': True,
+            'position_invention_allowed': False,
+        }
+    if check is EvidenceCheck.NO_PRIVATE_EXECUTION_PATH:
+        return {
+            'exchange_order_routes_present': False,
+            'forbidden_client': 'hyperliquid.exchange.Exchange',
+            'private_api_present': False,
+            'public_market_client_only': True,
+            'simulated_orders_only': True,
+        }
+    if check is EvidenceCheck.NO_WALLET_OR_SIGNER:
+        return {
+            'api_wallet_present': False,
+            'credential_scope': CredentialScope.NONE.value,
+            'private_signing_material_present': False,
+            'seed_or_mnemonic_present': False,
+            'signer_present': False,
+        }
+    if check is EvidenceCheck.FAIL_CLOSED_ENVIRONMENT_IDENTITY:
+        return {
+            'accepted_environment': EnvironmentClass.PAPER.value,
+            'accepted_purpose': AuthorizationPurpose.PAPER_RUNTIME.value,
+            'accepted_source_identity': subject.source_identity,
+            'ambiguous_identity_action': 'BLOCK',
+            'mainnet_execution_identity_accepted': False,
+            'testnet_execution_identity_accepted': False,
+        }
+    if check is EvidenceCheck.FULL_AUDIT_LOG:
+        return {
+            'append_only_tables': [
+                'paper_alerts',
+                'paper_commits',
+                'paper_events',
+                'paper_inbox',
+                'paper_ledger_entries',
+                'paper_ledger_transactions',
+                'paper_projection_history',
+            ],
+            'mutable_current_head_tables': [
+                'paper_projections',
+                'paper_runs',
+            ],
+            'persisted_hash_fields': {
+                'paper_alerts': ['payload_hash'],
+                'paper_commits': [
+                    'alert_hashes_json',
+                    'commit_hash',
+                    'event_hashes_json',
+                    'ledger_hashes_json',
+                    'previous_commit_hash',
+                    'projection_hash',
+                ],
+                'paper_events': ['event_hash', 'payload_hash', 'previous_hash'],
+                'paper_inbox': ['commit_hash', 'payload_hash'],
+                'paper_ledger_entries': ['entry_hash'],
+                'paper_ledger_transactions': ['transaction_hash'],
+                'paper_projection_history': ['event_head_hash', 'projection_hash'],
+                'paper_projections': ['event_head_hash', 'projection_hash'],
+                'paper_runs': [
+                    'commit_head_hash',
+                    'config_hash',
+                    'event_head_hash',
+                    'projection_hash',
+                ],
+            },
+            'persistent': True,
+            'runtime_session_events': [
+                'RUNTIME_SESSION_STARTED',
+                'RUNTIME_SESSION_STOPPED',
+            ],
+            'runtime_session_failure_input': 'PAPER_RUNTIME_FAILURE',
+            'secret_material_persisted': False,
+        }
+    if check is EvidenceCheck.KILL_SWITCH:
+        return {
+            'kill_latch_state': 'MANUAL_REVIEW',
+            'kill_persistent': True,
+            'manual_reset_allowed': False,
+            'new_simulated_orders_blocked_after_kill': True,
+            'new_simulated_orders_blocked_when_paused': True,
+            'pause_persistent': True,
+            'paused_public_marks_continue_risk_monitoring': True,
+            'paused_risk_breach_action': 'CRITICAL_ALERT_PROTECT_NO_EXECUTION',
+            'reviewed_resume_fresh_frame_action': 'REDUCE_ONLY_PROTECTIVE_FLATTEN',
+            'pause_state': 'PAUSED',
+            'simulated_open_orders_cancelled_locally': True,
+        }
+    return None
+
+
+def _validate_paper_runtime_source_attestation(
+    facts: Mapping[str, object],
+    context: EvidenceVerificationContext,
+) -> bool:
+    expected_facts = _fixed_paper_facts(
+        EvidenceCheck.RUNTIME_SOURCE_ATTESTATION,
+        context.subject,
+    )
+    release_code_manifest = facts.get('release_code_manifest')
+    runtime_environment_attestation = facts.get(
+        'runtime_environment_attestation'
+    )
+    semantic_facts = dict(facts)
+    semantic_facts.pop('release_code_manifest', None)
+    semantic_facts.pop('runtime_environment_attestation', None)
+    return (
+        expected_facts is not None
+        and semantic_facts == expected_facts
+        and isinstance(release_code_manifest, Mapping)
+        and isinstance(runtime_environment_attestation, Mapping)
+        and _verify_paper_release_code_attestation(
+            release_code_manifest,
+            context,
+        )
+        and _verify_paper_runtime_environment_attestation(
+            runtime_environment_attestation,
+            context,
+        )
+    )
+
+
+def _verify_paper_evidence(
+    context: EvidenceVerificationContext,
+    *,
+    expected_check: EvidenceCheck,
+) -> bool:
+    if (
+        context.check is not expected_check
+        or context.environment is not EnvironmentClass.PAPER
+        or context.purpose is not AuthorizationPurpose.PAPER_RUNTIME
+        or context.environment_identity != EnvironmentClass.PAPER.value
+        or context.execution_network is not ExecutionNetwork.NONE
+        or context.credential_scope is not CredentialScope.NONE
+        or context.order_capability is not OrderCapability.SIMULATED_ONLY
+        or not _paper_subject_is_exact(context.subject)
+    ):
+        return False
+    try:
+        decoded = json.loads(
+            context.artifact_bytes.decode('utf-8'),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (AuthorizationManifestError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, Mapping) or frozenset(decoded) != _PAPER_EVIDENCE_KEYS:
+        return False
+    if context.artifact_bytes != _canonical_json_bytes(dict(decoded)):
+        return False
+    subject = decoded.get('subject')
+    facts = decoded.get('facts')
+    runtime_scope = decoded.get('runtime_scope')
+    if (
+        type(decoded.get('schema_version')) is not int
+        or decoded.get('schema_version') != 1
+        or decoded.get('environment') != EnvironmentClass.PAPER.value
+        or decoded.get('purpose') != AuthorizationPurpose.PAPER_RUNTIME.value
+        or decoded.get('check') != expected_check.value
+        or not isinstance(subject, Mapping)
+        or dict(subject) != context.subject.to_dict()
+        or not isinstance(facts, Mapping)
+        or not isinstance(runtime_scope, Mapping)
+        or dict(runtime_scope) != _PAPER_RUNTIME_SCOPE_FACTS
+    ):
+        return False
+    if expected_check is EvidenceCheck.BOUNDED_POSITION_NOTIONAL:
+        return _validate_paper_risk_facts(facts, context)
+    if expected_check is EvidenceCheck.RUNTIME_SOURCE_ATTESTATION:
+        return _validate_paper_runtime_source_attestation(facts, context)
+    expected_facts = _fixed_paper_facts(expected_check, context.subject)
+    return expected_facts is not None and dict(facts) == expected_facts
+
+
+def _make_paper_evidence_verifier(check: EvidenceCheck) -> EvidenceVerifier:
+    def verify(context: EvidenceVerificationContext) -> bool:
+        return _verify_paper_evidence(context, expected_check=check)
+
+    return verify
+
+
+
 @dataclass(frozen=True, slots=True)
 class _CompiledEvidenceVerifier:
     verifier_id: str
@@ -763,8 +2303,8 @@ class _CompiledEvidenceVerifier:
 
 
 # Deliberately private and immutable. Production callers cannot inject callbacks
-# through the readiness API. The exact TESTNET registry is compiled below after the
-# required-check set is declared; Paper and real-money scopes remain absent.
+# through the readiness API. Exact PAPER and TESTNET registries are compiled below
+# after their required-check sets are declared; real-money scopes remain absent.
 _COMPILED_EVIDENCE_VERIFIERS: Mapping[
     _VerifierScope, _CompiledEvidenceVerifier
 ]
@@ -889,6 +2429,8 @@ _PAPER_CHECKS = frozenset(
         EvidenceCheck.CONSERVATIVE_COST_MODEL,
         EvidenceCheck.RUNTIME_SOURCE_ATTESTATION,
         EvidenceCheck.CRASH_RECOVERY,
+        EvidenceCheck.RESTART_RECOVERY,
+        EvidenceCheck.KILL_SWITCH,
         EvidenceCheck.RECONCILIATION,
         EvidenceCheck.NO_PRIVATE_EXECUTION_PATH,
         EvidenceCheck.NO_WALLET_OR_SIGNER,
@@ -974,6 +2516,90 @@ def testnet_evidence_payload(
     }
 
 
+def paper_evidence_payload(
+    check: EvidenceCheck,
+    subject: ReadinessSubject,
+    risk_limits: Mapping[str, object] | None = None,
+    *,
+    release_code_manifest_bytes: bytes | None = None,
+    runtime_environment_attestation_bytes: bytes | None = None,
+) -> dict[str, object]:
+    """Build exact, technical-only PAPER/PAPER_RUNTIME semantic evidence."""
+
+    if not isinstance(check, EvidenceCheck) or check not in _PAPER_CHECKS:
+        raise ValueError('check is not a PAPER runtime evidence check')
+    if not isinstance(subject, ReadinessSubject):
+        raise TypeError('subject must be an exact ReadinessSubject')
+    if not _paper_subject_is_exact(subject):
+        raise ValueError(
+            'subject must identify the compiled Phase 08 robust-pairs Paper runtime'
+        )
+    if (
+        release_code_manifest_bytes is not None
+        and check is not EvidenceCheck.RUNTIME_SOURCE_ATTESTATION
+    ):
+        raise ValueError('release_code_manifest_bytes are only valid for runtime attestation')
+    if (
+        runtime_environment_attestation_bytes is not None
+        and check is not EvidenceCheck.RUNTIME_SOURCE_ATTESTATION
+    ):
+        raise ValueError(
+            'runtime_environment_attestation_bytes are only valid for runtime attestation'
+        )
+    if risk_limits is not None and (
+        not isinstance(risk_limits, Mapping)
+        or not _validate_paper_risk_limits(
+            risk_limits,
+            expected_sha256=subject.risk_limits_hash,
+        )
+    ):
+        raise ValueError('risk_limits do not match the bounded PAPER schema and ceilings')
+    if check is EvidenceCheck.BOUNDED_POSITION_NOTIONAL:
+        if risk_limits is None:
+            raise ValueError('risk_limits are required for bounded PAPER evidence')
+        facts: dict[str, object] = {
+            'enforcement': 'FAIL_CLOSED',
+            'limits': dict(risk_limits),
+            'limits_sha256': subject.risk_limits_hash,
+            'order_capability': OrderCapability.SIMULATED_ONLY.value,
+            'protective_risk': _paper_protective_risk_facts(),
+        }
+    else:
+        fixed_facts = _fixed_paper_facts(check, subject)
+        if fixed_facts is None:
+            raise ValueError('check has no compiled PAPER evidence facts')
+        if check is EvidenceCheck.RUNTIME_SOURCE_ATTESTATION:
+            manifest_bytes = (
+                _build_paper_release_code_manifest_bytes()
+                if release_code_manifest_bytes is None
+                else release_code_manifest_bytes
+            )
+            environment_bytes = (
+                paper_runtime_environment_attestation_bytes()
+                if runtime_environment_attestation_bytes is None
+                else runtime_environment_attestation_bytes
+            )
+            facts = {
+                **fixed_facts,
+                'release_code_manifest': _paper_release_code_attestation(manifest_bytes),
+                'runtime_environment_attestation': (
+                    _paper_runtime_environment_attestation(environment_bytes)
+                ),
+            }
+        else:
+            facts = fixed_facts
+    return {
+        'check': check.value,
+        'environment': EnvironmentClass.PAPER.value,
+        'facts': facts,
+        'purpose': AuthorizationPurpose.PAPER_RUNTIME.value,
+        'runtime_scope': dict(_PAPER_RUNTIME_SCOPE_FACTS),
+        'schema_version': 1,
+        'subject': subject.to_dict(),
+    }
+
+
+
 _COMPILED_EVIDENCE_VERIFIERS = MappingProxyType(
     {
         _verifier_scope(
@@ -986,6 +2612,18 @@ _COMPILED_EVIDENCE_VERIFIERS = MappingProxyType(
             verify=_make_testnet_evidence_verifier(check),
         )
         for check in _TESTNET_CHECKS
+    }
+    | {
+        _verifier_scope(
+            EnvironmentClass.PAPER,
+            AuthorizationPurpose.PAPER_RUNTIME,
+            check,
+        ): _CompiledEvidenceVerifier(
+            verifier_id=f'hyperlab:paper-runtime:{check.value.casefold()}',
+            version=5,
+            verify=_make_paper_evidence_verifier(check),
+        )
+        for check in _PAPER_CHECKS
     }
 )
 _REAL_MONEY_COMMON_CHECKS = frozenset(
@@ -1435,6 +3073,7 @@ def _run_semantic_verifier(
     binding: ReadinessArtifactBinding,
     resolved_path: Path | None,
     *,
+    evidence_root: Path | None,
     profile_sha256: str,
     blockers: list[AuthorizationBlocker],
 ) -> None:
@@ -1472,6 +3111,7 @@ def _run_semantic_verifier(
         subject=manifest.subject,
         profile_sha256=profile_sha256,
         artifact_bytes=payload,
+        evidence_root=evidence_root,
     )
     try:
         passed = verifier.verify(context)
@@ -1660,6 +3300,7 @@ def verify_environment_readiness(
             check,
             required_binding,
             verified_paths.get(check),
+            evidence_root=root,
             profile_sha256=profile_sha256,
             blockers=blockers,
         )
@@ -2197,7 +3838,11 @@ __all__ = [
     "ReadinessArtifactBinding",
     "ReadinessSubject",
     "compiled_evidence_verifier_status",
+    "current_paper_release_code_sha256",
+    "current_paper_runtime_environment_sha256",
     "issue_environment_receipt",
+    "paper_evidence_payload",
+    "paper_runtime_environment_attestation_bytes",
     "profile_for",
     "receipt_scope_blockers",
     "testnet_evidence_payload",

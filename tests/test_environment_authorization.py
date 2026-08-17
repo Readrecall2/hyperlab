@@ -358,13 +358,10 @@ def test_receipt_is_bound_to_exact_config_and_current_requirement_profile(
     assert {blocker.code for blocker in blockers} == {"CONFIG_SCOPE_MISMATCH"}
 
 
-def test_byte_bound_files_are_blocked_without_compiled_semantic_verifiers(
+def test_byte_bound_self_assertions_are_rejected_by_compiled_paper_verifiers(
     tmp_path: Path,
 ) -> None:
-    assert not any(
-        environment is EnvironmentClass.PAPER
-        for environment, _purpose, _check in authorization_module._COMPILED_EVIDENCE_VERIFIERS
-    )
+    assert authorization_module.compiled_evidence_verifier_status(EnvironmentClass.PAPER)["complete"] is True
     manifest = _manifest(tmp_path, EnvironmentClass.PAPER)
     arbitrary_evidence: dict[EvidenceCheck, ReadinessArtifactBinding] = {}
     for check, binding in manifest.evidence.items():
@@ -382,14 +379,14 @@ def test_byte_bound_files_are_blocked_without_compiled_semantic_verifiers(
 
     assert not decision.ready
     assert {blocker.code for blocker in decision.blockers} == {
-        "NO_COMPILED_EVIDENCE_VERIFIER"
+        "EVIDENCE_SEMANTIC_VERIFICATION_FAILED"
     }
-    no_verifier_locations = {
+    failed_locations = {
         blocker.location
         for blocker in decision.blockers
-        if blocker.code == "NO_COMPILED_EVIDENCE_VERIFIER"
+        if blocker.code == "EVIDENCE_SEMANTIC_VERIFICATION_FAILED"
     }
-    assert no_verifier_locations == {
+    assert failed_locations == {
         f"evidence.{check.value}"
         for check in profile_for(EnvironmentClass.PAPER).required_checks
     }

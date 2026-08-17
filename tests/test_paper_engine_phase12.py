@@ -35,6 +35,7 @@ from hyperlab.paper import (
     RunConflictError,
     TimeInForce,
     deterministic_id,
+    evaluate_order_risk,
     evaluate_paper_gate,
     keyed_uniform,
 )
@@ -131,9 +132,7 @@ def _config(
         data_calibration_evidence_hash=_DATA_EVIDENCE_HASH if calibrated else None,
         data_source="public-versioned-feed-2026q2" if calibrated else "deterministic-test-fixture",
         economic_prerequisites_satisfied=calibrated,
-        economic_prerequisites_evidence_hash=(
-            _PREREQUISITES_EVIDENCE_HASH if calibrated else None
-        ),
+        economic_prerequisites_evidence_hash=(_PREREQUISITES_EVIDENCE_HASH if calibrated else None),
         required_instruments=(_INSTRUMENT,) if calibrated else (),
     )
 
@@ -152,6 +151,7 @@ def _market(
     aggressor_side: OrderSide | None = None,
     stale: bool = False,
     gap: bool = False,
+    tradable: bool = True,
 ) -> MarketEvent:
     return MarketEvent.create(
         received_at=at,
@@ -166,6 +166,7 @@ def _market(
         aggressor_side=aggressor_side,
         stale=stale,
         gap=gap,
+        tradable=tradable,
     )
 
 
@@ -397,9 +398,7 @@ def test_state_machine_declares_all_eleven_states_and_only_documented_transition
     assert len(PaperState) == 11
     for source in PaperState:
         for target in PaperState:
-            assert legal_transition(source, target) is (
-                source is target or target in expected[source]
-            )
+            assert legal_transition(source, target) is (source is target or target in expected[source])
     with pytest.raises(ValueError, match="illegal paper state transition"):
         require_transition(PaperState.FLAT, PaperState.HEDGED)
 
@@ -657,9 +656,7 @@ def test_cost_rule_expiry_after_ack_is_terminal_audited_and_pauses(
     accepted = engine.submit_decision(decision, market).projection
     assert accepted.orders[decision.orders[0].order_id].status is OrderStatus.ACKED
 
-    result = engine.process_market(
-        _market("expired-cost-match", _START + timedelta(seconds=3))
-    ).projection
+    result = engine.process_market(_market("expired-cost-match", _START + timedelta(seconds=3))).projection
 
     assert result.orders[decision.orders[0].order_id].status is OrderStatus.EXPIRED
     assert result.state is PaperState.PAUSED
@@ -689,9 +686,7 @@ def test_exact_zero_cash_survives_serialization_clone_restart_and_replay(
         side=OrderSide.BUY,
     )
     engine.submit_decision(decision, decision_market)
-    filled = engine.process_market(
-        _market("zero-cash-fill", _START + timedelta(seconds=2))
-    ).projection
+    filled = engine.process_market(_market("zero-cash-fill", _START + timedelta(seconds=2))).projection
 
     assert filled.cash == Decimal(0)
     assert filled.to_dict()["cash"] == "0"
@@ -746,17 +741,13 @@ def test_happy_lifecycle_is_traceable_balanced_and_exactly_replayable(tmp_path: 
     assert restart_result.append.idempotent is True
     assert restarted.replay().to_dict() == projection.to_dict()
 
-    second_config, second_store, second_projection = _run_complete_cycle(
-        tmp_path / "second.sqlite3"
-    )
+    second_config, second_store, second_projection = _run_complete_cycle(tmp_path / "second.sqlite3")
     first_events = store.get_events(config.run_id)
     second_events = second_store.get_events(second_config.run_id)
     assert [event.event.unsigned_dict() for event in first_events] == [
         event.event.unsigned_dict() for event in second_events
     ]
-    assert [event.event_hash for event in first_events] == [
-        event.event_hash for event in second_events
-    ]
+    assert [event.event_hash for event in first_events] == [event.event_hash for event in second_events]
     assert projection.to_dict() == second_projection.to_dict()
 
 
@@ -787,11 +778,7 @@ def test_timer_without_market_persists_critical_stale_pause_idempotently(
     assert first.append.idempotent is False
     assert first.projection.state is PaperState.PAUSED
     assert _event_types(store, config.run_id).count(PaperEventType.TIMER_TICKED) == 1
-    stale_alerts = [
-        alert
-        for alert in store.get_alerts(config.run_id)
-        if alert.code == "STALE_MARKET_DATA"
-    ]
+    stale_alerts = [alert for alert in store.get_alerts(config.run_id) if alert.code == "STALE_MARKET_DATA"]
     assert len(stale_alerts) == 1
     assert stale_alerts[0].severity == "CRITICAL"
 
@@ -802,6 +789,29 @@ def test_timer_without_market_persists_critical_stale_pause_idempotently(
     assert duplicate.projection.to_dict() == durable
     assert len(store.get_events(config.run_id)) == event_count
     assert _event_types(store, config.run_id).count(PaperEventType.TIMER_TICKED) == 1
+
+
+def test_stale_timer_duplicate_alert_uses_indexed_lookup_not_lifetime_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(risk=replace(PaperRiskLimits(), stale_after_seconds=5))
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+
+    first = engine.process_timer(as_of=_START + timedelta(seconds=6))
+    assert first.projection.state is PaperState.PAUSED
+    assert _event_types(store, config.run_id).count(PaperEventType.ALERT_RAISED) == 1
+
+    def forbid_lifetime_alert_scan(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("duplicate alert detection must use the indexed point lookup")
+
+    monkeypatch.setattr(store, "get_alerts", forbid_lifetime_alert_scan)
+    second = engine.process_timer(as_of=_START + timedelta(seconds=7))
+
+    assert second.append.idempotent is False
+    assert second.projection.state is PaperState.PAUSED
+    assert _event_types(store, config.run_id).count(PaperEventType.ALERT_RAISED) == 1
+    assert _event_types(store, config.run_id).count(PaperEventType.TIMER_TICKED) == 2
 
 
 def test_fresh_channel_cannot_mask_a_stale_instrument_with_exposure(
@@ -830,23 +840,14 @@ def test_fresh_channel_cannot_mask_a_stale_instrument_with_exposure(
     ).projection
     assert exposed.positions == {_HEDGE_INSTRUMENT: Decimal(1)}
 
-    engine.process_market(
-        _market("per-channel-btc-fresh", _START + timedelta(seconds=10))
-    )
-    paused = engine.process_timer(
-        as_of=_START + timedelta(seconds=10)
-    ).projection
+    engine.process_market(_market("per-channel-btc-fresh", _START + timedelta(seconds=10)))
+    paused = engine.process_timer(as_of=_START + timedelta(seconds=10)).projection
 
     assert paused.state is PaperState.PAUSED
-    assert paused.last_market_received_at_by_instrument[_INSTRUMENT] == (
-        _START + timedelta(seconds=10)
-    )
-    assert paused.last_market_received_at_by_instrument[_HEDGE_INSTRUMENT] == (
-        _START + timedelta(seconds=2)
-    )
+    assert paused.last_market_received_at_by_instrument[_INSTRUMENT] == (_START + timedelta(seconds=10))
+    assert paused.last_market_received_at_by_instrument[_HEDGE_INSTRUMENT] == (_START + timedelta(seconds=2))
     assert any(
-        alert.code == "STALE_MARKET_DATA"
-        and _HEDGE_INSTRUMENT in str(alert.alert.get("message"))
+        alert.code == "STALE_MARKET_DATA" and _HEDGE_INSTRUMENT in str(alert.alert.get("message"))
         for alert in store.get_alerts(config.run_id)
     )
 
@@ -894,6 +895,91 @@ def test_funding_source_is_idempotent_and_divergent_amount_conflicts(
     assert _event_types(store, config.run_id).count(PaperEventType.FUNDING_POSTED) == 1
 
 
+def test_detailed_funding_uses_position_before_settlement_and_ignores_bootstrap_history(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    engine.reconcile(as_of=_START)
+    entry_market = _market("detailed-funding-entry", _START + timedelta(seconds=1))
+    entry = _decision(
+        config,
+        entry_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+    )
+    engine.submit_decision(entry, entry_market)
+    engine.process_market(_market("detailed-funding-entry-fill", _START + timedelta(seconds=2)))
+
+    exit_at = _START + timedelta(seconds=3, milliseconds=500)
+    exit_market = _market("detailed-funding-exit", exit_at)
+    exit_decision = _decision(
+        config,
+        exit_market,
+        action=DecisionAction.EXIT,
+        side=OrderSide.SELL,
+    )
+    engine.submit_decision(exit_decision, exit_market)
+    flat = engine.process_market(
+        _market(
+            "detailed-funding-exit-fill",
+            _START + timedelta(seconds=3, milliseconds=600),
+        )
+    ).projection
+    assert flat.positions == {}
+
+    before_funding = flat.realized_pnl
+    applied = engine.post_funding(
+        instrument=_INSTRUMENT,
+        amount=Decimal("-0.1"),
+        occurred_at=_START + timedelta(seconds=3),
+        source_event_id=deterministic_id("detailed_funding", "applied"),
+        funding_rate=Decimal("0.001"),
+        funding_interval_seconds=3600,
+        rate_kind="hyperliquid-hourly-settlement",
+        mark_price=Decimal("100"),
+        source_mark_price=Decimal("100"),
+        position_quantity=Decimal("1"),
+        mark_source="PUBLIC_SETTLEMENT_MARK",
+        source_observation_id="detailed-funding-applied",
+        received_at=_START + timedelta(seconds=4),
+        applicability="APPLIED",
+        source_activation_cutoff=_START,
+    ).projection
+
+    assert applied.positions == {}
+    assert applied.realized_pnl == before_funding - Decimal("0.1")
+
+    ignored = engine.post_funding(
+        instrument=_INSTRUMENT,
+        amount=Decimal("0"),
+        occurred_at=_START - timedelta(hours=1),
+        source_event_id=deterministic_id("detailed_funding", "pre-activation"),
+        funding_rate=Decimal("0.001"),
+        funding_interval_seconds=3600,
+        rate_kind="hyperliquid-hourly-settlement",
+        position_quantity=Decimal("0"),
+        mark_source="FLAT_NO_MARK",
+        source_observation_id="detailed-funding-pre-activation",
+        received_at=_START + timedelta(seconds=5),
+        applicability="PRE_ACTIVATION_IGNORED",
+        source_activation_cutoff=_START,
+    ).projection
+
+    assert ignored.realized_pnl == applied.realized_pnl
+    ignored_input = store.get_input(
+        config.run_id,
+        deterministic_id(
+            "paper_funding_input",
+            config.run_id,
+            deterministic_id("detailed_funding", "pre-activation"),
+        ),
+    )
+    assert ignored_input is not None
+    assert ignored_input.payload["applicability"] == "PRE_ACTIVATION_IGNORED"
+    assert engine.verify_input_replay().to_dict() == ignored.to_dict()
+
+
 def test_explicitly_stale_frame_does_not_change_mark_equity_or_peak(tmp_path: Path) -> None:
     config = _config()
     _store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
@@ -905,9 +991,7 @@ def test_explicitly_stale_frame_does_not_change_mark_equity_or_peak(tmp_path: Pa
         side=OrderSide.BUY,
     )
     engine.submit_decision(entry, entry_market)
-    reliable = engine.process_market(
-        _market("stale-mark-reliable", _START + timedelta(seconds=2))
-    ).projection
+    reliable = engine.process_market(_market("stale-mark-reliable", _START + timedelta(seconds=2))).projection
     before_mark = reliable.marks[_INSTRUMENT]
     before_equity = reliable.equity
     before_peak = reliable.peak_equity
@@ -925,6 +1009,86 @@ def test_explicitly_stale_frame_does_not_change_mark_equity_or_peak(tmp_path: Pa
     assert stale.marks[_INSTRUMENT] == before_mark
     assert stale.equity == before_equity
     assert stale.peak_equity == before_peak
+
+
+def test_nontradable_health_frame_is_persisted_without_mark_ack_or_fill(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        execution=replace(_execution_config(), ack_latency_ms=500),
+    )
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    entry_market = _market("health-entry", _START + timedelta(seconds=1))
+    decision = _decision(
+        config,
+        entry_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+    )
+    accepted = engine.submit_decision(decision, entry_market).projection
+    order_id = decision.orders[0].order_id
+    assert accepted.orders[order_id].status is OrderStatus.RISK_ACCEPTED
+
+    health = _market(
+        "connect-health-only",
+        _START + timedelta(seconds=2),
+        bid="1",
+        ask="2",
+        tradable=False,
+    )
+    observed = engine.process_market(health).projection
+
+    assert store.get_input(config.run_id, health.event_id) is not None
+    assert observed.orders[order_id].status is OrderStatus.RISK_ACCEPTED
+    assert observed.positions == {}
+    assert _INSTRUMENT not in observed.marks
+    types = _event_types(store, config.run_id)
+    assert PaperEventType.ORDER_ACKED not in types
+    assert PaperEventType.ORDER_FILLED not in types
+    assert PaperEventType.MARK_RECORDED not in types
+    assert PaperEventType.PUBLIC_SOURCE_HEALTH_RECORDED in types
+
+    recovered = engine.process_market(
+        _market("health-next-tradable", _START + timedelta(seconds=3))
+    ).projection
+    assert recovered.orders[order_id].status is OrderStatus.FILLED
+    assert recovered.positions[_INSTRUMENT] == Decimal("1")
+
+
+def test_public_source_failure_is_critical_and_durable_while_already_paused(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    paused = engine.pause(
+        as_of=_START + timedelta(seconds=1),
+        reason="operator inspection fixture",
+        operator_artifact_hash="1" * 64,
+    )
+    assert paused.projection.state is PaperState.PAUSED
+
+    failed = engine.pause(
+        as_of=_START + timedelta(seconds=2),
+        reason="terminal public source failure: TimeoutError",
+        operator_artifact_hash="2" * 64,
+        origin="PUBLIC_SOURCE_FAILURE",
+    )
+
+    assert failed.projection.state is PaperState.PAUSED
+    failures = tuple(store.iter_inputs(config.run_id, input_type="PUBLIC_SOURCE_FAILURE"))
+    assert len(failures) == 1
+    source_alerts = [
+        alert for alert in store.get_alerts(config.run_id) if alert.code == "PUBLIC_SOURCE_FAILURE"
+    ]
+    assert len(source_alerts) == 1
+    assert source_alerts[0].severity == "CRITICAL"
+    paused_transitions = [
+        event
+        for event in store.get_events(config.run_id)
+        if event.event.event_type is PaperEventType.STATE_TRANSITIONED
+        and event.event.payload.get("target") == PaperState.PAUSED.value
+    ]
+    assert len(paused_transitions) == 1
 
 
 def test_risk_rejection_is_terminal_and_precedes_any_ack(tmp_path: Path) -> None:
@@ -948,6 +1112,80 @@ def test_risk_rejection_is_terminal_and_precedes_any_ack(tmp_path: Path) -> None
     assert PaperEventType.ORDER_ACKED not in types
     assert PaperEventType.ORDER_REJECTED not in types
     assert any(alert.code == "RISK_REJECTED" for alert in store.get_alerts(config.run_id))
+
+
+def test_quantity_and_concurrent_order_limits_are_enforced_before_ack(
+    tmp_path: Path,
+) -> None:
+    quantity_limits = replace(
+        PaperRiskLimits(),
+        max_order_quantity=Decimal("0.5"),
+        max_position_quantity=Decimal("0.75"),
+    )
+    quantity_config = _config(risk=quantity_limits)
+    _quantity_store, quantity_engine = _started_engine(tmp_path / "quantity.sqlite3", quantity_config)
+    market = _market("quantity-cap", _START + timedelta(seconds=1))
+    oversized = _decision(
+        quantity_config,
+        market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+        quantity="1",
+    )
+
+    quantity_result = quantity_engine.submit_decision(oversized, market).projection
+
+    assert quantity_result.orders[oversized.orders[0].order_id].status is OrderStatus.REJECTED
+
+    concurrency_limits = replace(PaperRiskLimits(), max_concurrent_orders=1)
+    concurrency_config = _config(risk=concurrency_limits)
+    _concurrency_store, concurrency_engine = _started_engine(
+        tmp_path / "concurrency.sqlite3", concurrency_config
+    )
+    mixed_market = _market("concurrent-cap", _START + timedelta(seconds=1))
+    mixed = _mixed_entry_decision(concurrency_config, mixed_market)
+
+    concurrent_result = concurrency_engine.submit_decision(mixed, mixed_market).projection
+
+    statuses = [concurrent_result.orders[order.order_id].status for order in mixed.orders]
+    assert sum(status is OrderStatus.REJECTED for status in statuses) == 1
+    assert len(concurrent_result.active_orders) == 1
+
+
+def test_true_reduce_only_order_can_escape_quantity_caps(tmp_path: Path) -> None:
+    config = _config()
+    _store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    entry_market = _market("quantity-reduce-entry", _START + timedelta(seconds=1))
+    entry = _decision(
+        config,
+        entry_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+        quantity="1",
+    )
+    engine.submit_decision(entry, entry_market)
+    opened = engine.process_market(_market("quantity-reduce-fill", _START + timedelta(seconds=2))).projection
+    assert opened.positions[_INSTRUMENT] == Decimal(1)
+
+    exit_market = _market("quantity-reduce-exit", _START + timedelta(seconds=3))
+    exit_intent = _decision(
+        config,
+        exit_market,
+        action=DecisionAction.EXIT,
+        side=OrderSide.SELL,
+        quantity="1",
+    ).orders[0]
+    strict_limits = replace(
+        PaperRiskLimits(),
+        max_order_quantity=Decimal("0.1"),
+        max_position_quantity=Decimal("0.5"),
+    )
+
+    risk = evaluate_order_risk(opened, exit_intent, exit_market, strict_limits)
+
+    assert risk.accepted is True
+    assert risk.risk_reducing is True
+    assert risk.projected_instrument_quantity > strict_limits.max_position_quantity
 
 
 def test_decision_older_than_frozen_staleness_limit_is_rejected_before_ack(
@@ -1063,9 +1301,7 @@ def test_concurrent_reduce_only_orders_cannot_overreserve_or_invert_a_position(
         Decimal(0),
     )
     assert active_reduce_quantity <= Decimal(1)
-    assert sum(
-        order.status is OrderStatus.REJECTED for order in planned.orders.values()
-    ) >= 1
+    assert sum(order.status is OrderStatus.REJECTED for order in planned.orders.values()) >= 1
 
     matched = engine.process_market(
         _market("reduce-reservation-fill", _START + timedelta(seconds=4))
@@ -1168,10 +1404,7 @@ def test_maker_non_fill_expires_without_an_implicit_ioc_chase(tmp_path: Path) ->
     assert result.projection.state is PaperState.FLAT
     assert order.status is OrderStatus.NO_FILL
     assert order.filled_quantity == 0
-    assert all(
-        item.intent.order_type is PaperOrderType.MAKER
-        for item in result.projection.orders.values()
-    )
+    assert all(item.intent.order_type is PaperOrderType.MAKER for item in result.projection.orders.values())
     types = _event_types(store, config.run_id)
     assert PaperEventType.ORDER_NO_FILL in types
     assert PaperEventType.ORDER_PARTIALLY_FILLED not in types
@@ -1251,9 +1484,7 @@ def test_terminal_order_from_an_old_cycle_cannot_block_the_next_cycle(
         limit_price="100",
     )
     engine.submit_decision(old_entry, first_market)
-    expired = engine.process_market(
-        _market("old-cycle-terminal", _START + timedelta(seconds=3))
-    ).projection
+    expired = engine.process_market(_market("old-cycle-terminal", _START + timedelta(seconds=3))).projection
     assert expired.orders[old_entry.orders[0].order_id].status is OrderStatus.NO_FILL
     assert expired.state is PaperState.FLAT
 
@@ -1265,9 +1496,7 @@ def test_terminal_order_from_an_old_cycle_cannot_block_the_next_cycle(
         side=OrderSide.BUY,
     )
     engine.submit_decision(next_entry, next_market)
-    filled = engine.process_market(
-        _market("new-cycle-fill", _START + timedelta(seconds=5))
-    ).projection
+    filled = engine.process_market(_market("new-cycle-fill", _START + timedelta(seconds=5))).projection
     assert filled.orders[next_entry.orders[0].order_id].status is OrderStatus.FILLED
     assert filled.positions == {_INSTRUMENT: Decimal(1)}
     assert filled.state is PaperState.HEDGED
@@ -1471,9 +1700,7 @@ def test_paused_rejects_unacked_entries_but_accepts_a_true_reduce_only_exit(
     assert exit_planned.state is PaperState.EXIT_PENDING
     assert exit_planned.orders[exit_decision.orders[0].order_id].status is OrderStatus.ACKED
 
-    flattened = engine.process_market(
-        _market("paused-exit-fill", _START + timedelta(seconds=5))
-    ).projection
+    flattened = engine.process_market(_market("paused-exit-fill", _START + timedelta(seconds=5))).projection
     assert flattened.state is PaperState.FLAT
     assert flattened.positions == {}
 
@@ -1544,7 +1771,7 @@ def test_reduce_only_protection_cancels_active_entries_then_allows_exit(
         side=OrderSide.SELL,
     )
     exit_planned = engine.submit_decision(exit_decision, exit_market).projection
-    assert exit_planned.state is PaperState.EXIT_PENDING
+    assert exit_planned.state is PaperState.REDUCE_ONLY
     assert exit_planned.orders[exit_decision.orders[0].order_id].status is OrderStatus.ACKED
 
     flattened = engine.process_market(
@@ -1572,7 +1799,53 @@ def test_reduce_only_protection_cancels_active_entries_then_allows_exit(
     assert PaperEventType.ORDER_PARTIALLY_FILLED not in pending_fill_events
 
 
-def test_entry_may_fill_during_cancel_latency_but_not_after_cancel_effective(
+def test_public_mark_jump_breaches_cap_before_pending_entry_can_increase_risk(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _execution_config(),
+        cancel_latency_ms=2_000,
+        maker_timeout_ms=10_000,
+    )
+    risk = replace(
+        PaperRiskLimits(),
+        max_gross_notional=Decimal("175"),
+        max_net_notional=Decimal("175"),
+        max_instrument_notional=Decimal("175"),
+    )
+    config = _config(execution=execution, risk=risk)
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    entry_market = _market("marked-cap-entry", _START + timedelta(seconds=1))
+    entry = _mixed_entry_decision(config, entry_market)
+    pending_entry_id = entry.orders[1].order_id
+    engine.submit_decision(entry, entry_market)
+    exposed = engine.process_market(
+        _market("marked-cap-first-leg-fill", _START + timedelta(seconds=2))
+    ).projection
+    assert exposed.positions == {_INSTRUMENT: Decimal(1)}
+    assert exposed.orders[pending_entry_id].status is OrderStatus.ACKED
+
+    protected = engine.process_market(
+        _market(
+            "marked-cap-jump",
+            _START + timedelta(seconds=3),
+            bid="200",
+            ask="201",
+            trade_price="100",
+            trade_quantity="1",
+            aggressor_side=OrderSide.SELL,
+        )
+    ).projection
+
+    assert protected.state is PaperState.REDUCE_ONLY
+    assert protected.positions == {_INSTRUMENT: Decimal(1)}
+    assert protected.orders[pending_entry_id].status is OrderStatus.CANCEL_PENDING
+    assert protected.orders[pending_entry_id].filled_quantity == 0
+    assert any(alert.code == "MARKED_GROSS_NOTIONAL_LIMIT" for alert in store.get_alerts(config.run_id))
+    assert engine.replay().to_dict() == protected.to_dict()
+
+
+def test_entry_cannot_fill_in_protective_state_during_cancel_latency(
     tmp_path: Path,
 ) -> None:
     execution = replace(
@@ -1587,9 +1860,7 @@ def test_entry_may_fill_during_cancel_latency_but_not_after_cancel_effective(
     entry = _mixed_entry_decision(config, entry_market)
     pending_entry_id = entry.orders[1].order_id
     engine.submit_decision(entry, entry_market)
-    engine.process_market(
-        _market("cancel-latency-first-leg-fill", _START + timedelta(seconds=2))
-    )
+    engine.process_market(_market("cancel-latency-first-leg-fill", _START + timedelta(seconds=2)))
     protected = engine.process_market(
         _market(
             "cancel-latency-drawdown",
@@ -1611,8 +1882,22 @@ def test_entry_may_fill_during_cancel_latency_but_not_after_cancel_effective(
             aggressor_side=OrderSide.SELL,
         )
     ).projection
-    assert during_latency.orders[pending_entry_id].status is OrderStatus.FILLED
-    assert during_latency.orders[pending_entry_id].filled_quantity == Decimal("0.5")
+    assert during_latency.orders[pending_entry_id].status is OrderStatus.CANCEL_PENDING
+    assert during_latency.orders[pending_entry_id].filled_quantity == 0
+
+    after_effective = engine.process_market(
+        _market(
+            "cancel-latency-after-effective",
+            _START + timedelta(seconds=6),
+            bid="49",
+            ask="50",
+            trade_price="100",
+            trade_quantity="0.5",
+            aggressor_side=OrderSide.SELL,
+        )
+    ).projection
+    assert after_effective.orders[pending_entry_id].status is OrderStatus.CANCELLED
+    assert after_effective.orders[pending_entry_id].filled_quantity == 0
 
 
 def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) -> None:
@@ -1650,13 +1935,32 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
     assert entry_order.filled_quantity == Decimal("0.5")
     assert partial.projection.positions == {_INSTRUMENT: Decimal("0.5")}
 
-    timed_out = engine.process_timer(as_of=_START + timedelta(seconds=5))
+    paused = engine.process_market(
+        _market(
+            "partial-entry-source-gap",
+            _START + timedelta(seconds=3),
+            gap=True,
+        )
+    )
+    assert paused.projection.state is PaperState.PAUSED
+    assert paused.projection.suspended_from is PaperState.HEDGE_PENDING
+
+    timed_out = engine.process_timer(as_of=_START + timedelta(seconds=6))
     assert timed_out.projection.state is PaperState.EMERGENCY_FLATTEN
     assert any(alert.code == "UNHEDGED_TIMEOUT" for alert in store.get_alerts(config.run_id))
 
+    gap_while_emergency = engine.process_market(
+        _market(
+            "emergency-source-gap",
+            _START + timedelta(seconds=6, milliseconds=100),
+            gap=True,
+        )
+    )
+    assert gap_while_emergency.projection.state is PaperState.EMERGENCY_FLATTEN
+
     emergency_market = _market(
         "emergency-decision",
-        _START + timedelta(seconds=5),
+        _START + timedelta(seconds=6, milliseconds=200),
         bid_depth="10",
         ask_depth="10",
     )
@@ -1666,9 +1970,7 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
         reason="unhedged timeout fixture",
     )
     emergency_orders = [
-        order
-        for order in planned.projection.orders.values()
-        if order.action is DecisionAction.EXIT
+        order for order in planned.projection.orders.values() if order.action is DecisionAction.EXIT
     ]
     assert len(emergency_orders) == 1
     assert emergency_orders[0].intent.reduce_only is True
@@ -1677,7 +1979,7 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
     flattened = engine.process_market(
         _market(
             "emergency-fill",
-            _START + timedelta(seconds=6),
+            _START + timedelta(seconds=7),
             bid_depth="10",
             ask_depth="10",
         )
@@ -1715,10 +2017,7 @@ def test_duplicate_inputs_are_noops_but_divergent_reuse_fails_closed(tmp_path: P
     with pytest.raises(IdempotencyConflictError, match="different payload"):
         engine.submit_decision(decision, divergent_market)
     assert store.get_run(config.run_id).status == PaperState.MANUAL_REVIEW.value
-    assert any(
-        alert.code == "INBOX_IDEMPOTENCY_CONFLICT"
-        for alert in store.get_alerts(config.run_id)
-    )
+    assert any(alert.code == "INBOX_IDEMPOTENCY_CONFLICT" for alert in store.get_alerts(config.run_id))
 
 
 def test_runtime_duplicate_lookup_uses_one_targeted_input_not_the_full_inbox(
@@ -1797,11 +2096,7 @@ def test_targeted_input_lookup_sql_shape_is_constant_after_inbox_growth(
     assert grown_record is not None
 
     for trace in (initial_trace, grown_trace):
-        inbox_queries = [
-            statement.upper()
-            for statement in trace
-            if "PAPER_INBOX" in statement.upper()
-        ]
+        inbox_queries = [statement.upper() for statement in trace if "PAPER_INBOX" in statement.upper()]
         assert len(inbox_queries) == 1
         assert "WHERE RUN_ID=" in inbox_queries[0]
         assert "AND INPUT_ID=" in inbox_queries[0]
@@ -1828,9 +2123,7 @@ def test_append_hot_path_uses_incremental_guard_without_a_full_history_scan(
     monkeypatch.setattr(store, "_collect_integrity_issues", forbidden_full_scan)
     monkeypatch.setattr(store, "_collect_append_head_issues", counted_incremental_guard)
 
-    result = engine.process_market(
-        _market("bounded-append-guard", _START + timedelta(seconds=1))
-    )
+    result = engine.process_market(_market("bounded-append-guard", _START + timedelta(seconds=1)))
 
     assert result.append.appended_event_count > 0
     assert result.append.idempotent is False
@@ -1892,10 +2185,7 @@ def test_incremental_append_guard_detects_corrupt_durable_heads_without_full_sca
     issue_codes = {issue.code for issue in captured.value.report.issues}
     assert expected_issue in issue_codes
     assert store.get_run(config.run_id).status == PaperState.MANUAL_REVIEW.value
-    assert any(
-        alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
-        for alert in store.get_alerts(config.run_id)
-    )
+    assert any(alert.code == "PAPER_STORE_INTEGRITY_FAILURE" for alert in store.get_alerts(config.run_id))
 
 
 def test_config_drift_creates_a_new_identity_and_cannot_rewrite_a_run(tmp_path: Path) -> None:
@@ -1956,10 +2246,7 @@ def test_crash_boundaries_restart_without_loss_or_duplicate_effects(
 
     recovered = restarted.submit_decision(decision, market)
     assert recovered.append.idempotent is durable_after_crash
-    assert (
-        _event_types(restarted_store, config.run_id).count(PaperEventType.DECISION_RECORDED)
-        == 1
-    )
+    assert _event_types(restarted_store, config.run_id).count(PaperEventType.DECISION_RECORDED) == 1
     assert restarted.replay().to_dict() == restarted.projection().to_dict()
     assert restarted_store.verify_integrity(config.run_id).ok is True
 
@@ -1986,10 +2273,7 @@ def test_event_tampering_latches_manual_review_and_blocks_restart(tmp_path: Path
         store.verify_integrity(config.run_id)
     assert captured.value.report.ok is False
     assert store.get_run(config.run_id).status == PaperState.MANUAL_REVIEW.value
-    assert any(
-        alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
-        for alert in store.get_alerts(config.run_id)
-    )
+    assert any(alert.code == "PAPER_STORE_INTEGRITY_FAILURE" for alert in store.get_alerts(config.run_id))
     with pytest.raises(IntegrityError):
         PaperEngine(PaperStore(database), config).start()
 
@@ -2046,9 +2330,7 @@ def _persist_gate_evidence(
     stressed_net_pnl: Decimal = Decimal(1),
 ) -> None:
     engine.process_market(_market(f"gate-terminal-{as_of.isoformat()}", as_of))
-    for ordinal, exercise in enumerate(
-        ("RESTART", "DISCONNECT", "PARTIAL_FILL", "CRASH_RECOVERY")
-    ):
+    for ordinal, exercise in enumerate(("RESTART", "DISCONNECT", "PARTIAL_FILL", "CRASH_RECOVERY")):
         engine.record_resilience_exercise(
             exercise=exercise,
             artifact_hash=deterministic_id("phase12_gate_exercise", exercise, ordinal),
@@ -2087,9 +2369,7 @@ def _gate_run(
     as_of = config.validation_started_at + timedelta(days=days)
     if recent_incident:
         incident_at = as_of - timedelta(days=13, hours=23)
-        engine.process_market(
-            _market("gate-recent-incident", incident_at, stale=True)
-        )
+        engine.process_market(_market("gate-recent-incident", incident_at, stale=True))
     _persist_gate_evidence(
         engine,
         config,
@@ -2131,11 +2411,7 @@ def test_gate_d_is_store_bound_enforces_thresholds_and_blocks_demo(
         "gate_d_artifact_bytes_verified",
     }
     assert all(not non_authorizing.checks[name] for name in production_checks)
-    assert all(
-        value
-        for name, value in non_authorizing.checks.items()
-        if name not in production_checks
-    )
+    assert all(value for name, value in non_authorizing.checks.items() if name not in production_checks)
 
     long_config, long_store, long_evidence = _gate_run(
         tmp_path / "long-window.sqlite3",
@@ -2230,9 +2506,7 @@ def test_gate_rejects_a_stress_result_that_predates_later_economic_events(
         evaluated_at=as_of - timedelta(seconds=1),
     )
     engine.process_market(_market("after-stress-economic-market", as_of))
-    for ordinal, exercise in enumerate(
-        ("RESTART", "DISCONNECT", "PARTIAL_FILL", "CRASH_RECOVERY")
-    ):
+    for ordinal, exercise in enumerate(("RESTART", "DISCONNECT", "PARTIAL_FILL", "CRASH_RECOVERY")):
         engine.record_resilience_exercise(
             exercise=exercise,
             artifact_hash=deterministic_id("phase12_stale_stress_exercise", ordinal),
@@ -2255,3 +2529,244 @@ def test_gate_rejects_a_stress_result_that_predates_later_economic_events(
     assert result.status is PaperGateStatus.BLOCKED_STRESSED_RESULT
     assert result.checks["positive_stressed_net_pnl"] is False
     assert any("final economic event" in reason for reason in result.reasons)
+
+
+def test_fill_keeps_public_bbo_valuation_and_funding_mark_separate(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _execution_config(max_participation=1.0),
+        maker_fee_bps=Decimal(0),
+        taker_fee_bps=Decimal(0),
+        slippage=SlippageModel(base_bps=100.0, max_participation=1.0),
+    )
+    config = _config(execution=execution)
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    decision_market = _market("valuation-entry", _START + timedelta(seconds=1))
+    engine.reconcile(as_of=_START)
+    decision = _decision(
+        config,
+        decision_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+        quantity="1",
+    )
+    engine.submit_decision(decision, decision_market)
+    fill_market = _market("valuation-fill", _START + timedelta(seconds=2))
+    filled = engine.process_market(fill_market).projection
+
+    public_mid = Decimal("100.5")
+    assert filled.public_bbo_mids[_INSTRUMENT] == public_mid
+    assert filled.marks[_INSTRUMENT] == public_mid
+    assert filled.cost_basis[_INSTRUMENT] > public_mid
+    assert filled.equity < config.initial_cash
+    assert filled.net_pnl == filled.equity - config.initial_cash
+
+    funding_rate = Decimal("0.0001")
+    funding_amount = -(Decimal(1) * public_mid * funding_rate)
+    funded = engine.post_funding(
+        instrument=_INSTRUMENT,
+        amount=funding_amount,
+        occurred_at=_START + timedelta(seconds=3),
+        source_event_id=deterministic_id("phase12_funding", "public-bbo-not-fill"),
+        funding_rate=funding_rate,
+        funding_interval_seconds=3600,
+        rate_kind="hyperliquid-hourly-settlement",
+        mark_price=public_mid,
+        source_mark_price=None,
+        oracle_price=None,
+        position_quantity=Decimal(1),
+        mark_source="DURABLE_PUBLIC_BBO_MID",
+        source_observation_id="public-bbo-not-fill-observation",
+        received_at=_START + timedelta(seconds=3),
+        processed_at=_START + timedelta(seconds=3),
+        source_activation_cutoff=_START,
+    ).projection
+
+    assert funded.public_bbo_mids[_INSTRUMENT] == public_mid
+    funding_inputs = tuple(store.iter_inputs(config.run_id, input_type="PUBLIC_FUNDING_SETTLEMENT"))
+    assert len(funding_inputs) == 1
+    assert funding_inputs[0].payload["mark_price"] == "100.5"
+    assert funding_inputs[0].payload["mark_source"] == "DURABLE_PUBLIC_BBO_MID"
+    assert engine.replay().to_dict() == funded.to_dict()
+
+
+def test_hour_old_public_bbo_cannot_value_funding(tmp_path: Path) -> None:
+    config = _config(
+        risk=replace(PaperRiskLimits(), stale_after_seconds=5),
+    )
+    _store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    engine.reconcile(as_of=_START)
+    entry_market = _market("old-funding-mark-entry", _START + timedelta(seconds=1))
+    entry = _decision(
+        config,
+        entry_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+    )
+    engine.submit_decision(entry, entry_market)
+    engine.process_market(_market("old-funding-mark-fill", _START + timedelta(seconds=2)))
+
+    with pytest.raises(ValueError, match="stale at funding_time"):
+        engine.post_funding(
+            instrument=_INSTRUMENT,
+            amount=Decimal("-0.01005"),
+            occurred_at=_START + timedelta(seconds=10),
+            source_event_id=deterministic_id("phase12_funding", "stale-public-bbo"),
+            funding_rate=Decimal("0.0001"),
+            funding_interval_seconds=3600,
+            rate_kind="hyperliquid-hourly-settlement",
+            mark_price=Decimal("100.5"),
+            source_mark_price=None,
+            oracle_price=None,
+            position_quantity=Decimal(1),
+            mark_source="DURABLE_PUBLIC_BBO_MID",
+            source_observation_id="stale-public-bbo-observation",
+            received_at=_START + timedelta(seconds=11),
+            processed_at=_START + timedelta(seconds=11),
+            source_activation_cutoff=_START,
+        )
+
+
+def test_adverse_slippage_crossing_hard_cap_has_no_economic_effect(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _execution_config(max_participation=1.0),
+        maker_fee_bps=Decimal(0),
+        taker_fee_bps=Decimal(0),
+        slippage=SlippageModel(base_bps=100.0, max_participation=1.0),
+    )
+    risk = replace(
+        PaperRiskLimits(),
+        max_order_notional=Decimal("101"),
+        max_gross_notional=Decimal("101"),
+        max_net_notional=Decimal("101"),
+        max_instrument_notional=Decimal("101"),
+    )
+    config = _config(execution=execution, risk=risk)
+    store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    decision_market = _market("hard-cap-decision", _START + timedelta(seconds=1))
+    decision = _decision(
+        config,
+        decision_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+    )
+    accepted = engine.submit_decision(decision, decision_market).projection
+    assert accepted.orders[decision.orders[0].order_id].status is OrderStatus.ACKED
+
+    rejected = engine.process_market(_market("hard-cap-fill", _START + timedelta(seconds=2))).projection
+
+    assert rejected.positions == {}
+    assert rejected.cash == config.initial_cash
+    assert rejected.fees == 0
+    assert rejected.state is PaperState.PAUSED
+    assert any(alert.code == "FILL_HARD_CAP_REJECTED" for alert in store.get_alerts(config.run_id))
+
+
+def test_reduce_only_exit_remains_allowed_above_entry_hard_caps(tmp_path: Path) -> None:
+    execution = replace(
+        _execution_config(max_participation=1.0),
+        maker_fee_bps=Decimal(0),
+        taker_fee_bps=Decimal(0),
+        slippage=SlippageModel(base_bps=100.0, max_participation=1.0),
+    )
+    risk = replace(
+        PaperRiskLimits(),
+        max_order_notional=Decimal("50"),
+        max_gross_notional=Decimal("50"),
+        max_net_notional=Decimal("50"),
+        max_instrument_notional=Decimal("50"),
+    )
+    config = _config(execution=execution, risk=risk)
+    _store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    entry_market = _market("reduce-cap-entry", _START + timedelta(seconds=1))
+    entry = _decision(
+        config,
+        entry_market,
+        action=DecisionAction.ENTRY,
+        side=OrderSide.BUY,
+        quantity="0.4",
+    )
+    engine.submit_decision(entry, entry_market)
+    opened = engine.process_market(_market("reduce-cap-entry-fill", _START + timedelta(seconds=2))).projection
+    assert opened.positions[_INSTRUMENT] == Decimal("0.4")
+
+    exit_market = _market(
+        "reduce-cap-exit",
+        _START + timedelta(seconds=3),
+        bid="200",
+        ask="201",
+    )
+    exit_decision = _decision(
+        config,
+        exit_market,
+        action=DecisionAction.EXIT,
+        side=OrderSide.SELL,
+        quantity="0.4",
+    )
+    accepted = engine.submit_decision(exit_decision, exit_market).projection
+    assert accepted.orders[exit_decision.orders[0].order_id].status is OrderStatus.ACKED
+    flattened = engine.process_market(
+        _market(
+            "reduce-cap-exit-fill",
+            _START + timedelta(seconds=4),
+            bid="200",
+            ask="201",
+        )
+    ).projection
+
+    assert flattened.positions == {}
+    assert flattened.state is PaperState.FLAT
+
+
+def test_resume_requires_bilateral_fresh_public_bbos(tmp_path: Path) -> None:
+    config = replace(
+        _config(risk=replace(PaperRiskLimits(), stale_after_seconds=5)),
+        required_instruments=(_INSTRUMENT, _HEDGE_INSTRUMENT),
+    )
+    _store, engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    engine.process_market(_market("resume-btc-initial", _START + timedelta(seconds=1)))
+    engine.process_market(
+        _market(
+            "resume-eth-initial",
+            _START + timedelta(seconds=1),
+            instrument=_HEDGE_INSTRUMENT,
+        )
+    )
+    engine.pause(
+        as_of=_START + timedelta(seconds=2),
+        reason="bilateral freshness fixture",
+        operator_artifact_hash="1" * 64,
+    )
+    engine.process_market(_market("resume-btc-fresh", _START + timedelta(seconds=3)))
+
+    review_hash = "2" * 64
+    reviewed = engine.projection()
+    with pytest.raises(ValueError, match="every required instrument"):
+        engine.resume_from_pause(
+            as_of=_START + timedelta(seconds=7),
+            review_artifact_hash=review_hash,
+            reviewed_critical_incident_count=reviewed.critical_incident_count,
+            reviewed_last_critical_incident_at=reviewed.last_critical_incident_at,
+            recovery_mode="STANDARD",
+        )
+
+    engine.process_market(
+        _market(
+            "resume-eth-fresh",
+            _START + timedelta(seconds=7),
+            instrument=_HEDGE_INSTRUMENT,
+        )
+    )
+    resumed = engine.resume_from_pause(
+        as_of=_START + timedelta(seconds=8),
+        review_artifact_hash=review_hash,
+        reviewed_critical_incident_count=reviewed.critical_incident_count,
+        reviewed_last_critical_incident_at=reviewed.last_critical_incident_at,
+        recovery_mode="STANDARD",
+    ).projection
+
+    assert resumed.state is PaperState.FLAT
+    assert engine.replay().to_dict() == resumed.to_dict()

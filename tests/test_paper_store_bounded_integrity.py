@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import sqlite3
+from collections import defaultdict
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from types import TracebackType
+
+import pytest
+
+from hyperlab.paper import (
+    MarketEvent,
+    PaperEngine,
+    PaperExecutionConfig,
+    PaperRiskLimits,
+    PaperRunConfig,
+    PaperStore,
+)
+
+_START = datetime(2026, 8, 17, 8, tzinfo=UTC)
+_INSTRUMENT = "HYPERLIQUID:BTC:perp"
+
+
+def _config() -> PaperRunConfig:
+    return PaperRunConfig(
+        strategy_name="bounded_integrity_fixture",
+        strategy_hash="a" * 64,
+        parameters={"fixture": "bounded-integrity"},
+        data_hash="b" * 64,
+        execution=PaperExecutionConfig(
+            calibration_status="SYNTHETIC",
+            source="deterministic-test-fixture",
+        ),
+        risk=PaperRiskLimits(),
+        seed=7,
+        initial_cash=Decimal("100000"),
+        validation_started_at=_START,
+        data_calibration_status="SYNTHETIC",
+        data_source="deterministic-test-fixture",
+    )
+
+
+def _build_journal(
+    database: Path,
+    *,
+    market_count: int,
+) -> tuple[PaperStore, PaperRunConfig]:
+    config = _config()
+    store = PaperStore(database)
+    engine = PaperEngine(store, config)
+    engine.start()
+    for ordinal in range(market_count):
+        engine.process_market(
+            MarketEvent.create(
+                received_at=_START + timedelta(seconds=ordinal + 1),
+                instrument=_INSTRUMENT,
+                bid_price=Decimal("100"),
+                ask_price=Decimal("101"),
+                bid_depth=Decimal("100"),
+                ask_depth=Decimal("100"),
+                source_sequence=ordinal + 1,
+            )
+        )
+    funding_at = _START + timedelta(seconds=market_count + 1)
+    engine.post_funding(
+        instrument=_INSTRUMENT,
+        amount=Decimal("0"),
+        occurred_at=funding_at,
+        source_event_id="d" * 64,
+    )
+    engine.pause(
+        as_of=funding_at + timedelta(seconds=1),
+        reason="bounded integrity alert fixture",
+        operator_artifact_hash="c" * 64,
+    )
+    return store, config
+
+
+class _NoFetchAllCursor:
+    def __init__(self, inner: sqlite3.Cursor) -> None:
+        self._inner = inner
+
+    def __iter__(self) -> Iterator[sqlite3.Row]:
+        return iter(self._inner)
+
+    def fetchone(self) -> sqlite3.Row | None:
+        return self._inner.fetchone()
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        raise AssertionError("full integrity inspection must not call fetchall")
+
+
+class _NoFetchAllConnection:
+    def __init__(self, inner: sqlite3.Connection) -> None:
+        self._inner = inner
+
+    def __enter__(self) -> _NoFetchAllConnection:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self._inner.close()
+
+    def execute(
+        self,
+        sql: str,
+        parameters: tuple[object, ...] = (),
+    ) -> _NoFetchAllCursor:
+        return _NoFetchAllCursor(self._inner.execute(sql, parameters))
+
+
+def test_full_integrity_inspection_forbids_fetchall_for_all_history_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, config = _build_journal(tmp_path / "no-fetchall.sqlite3", market_count=12)
+    read_connection = store._read_connection
+
+    def no_fetchall_connection() -> _NoFetchAllConnection:
+        return _NoFetchAllConnection(read_connection())
+
+    monkeypatch.setattr(store, "_read_connection", no_fetchall_connection)
+
+    assert store.inspect_integrity_readonly(config.run_id).ok is True
+
+
+def test_large_journal_integrity_scan_has_bounded_python_side_cardinality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "large-journal.sqlite3"
+    store, config = _build_journal(database, market_count=512)
+    maxima: defaultdict[str, int] = defaultdict(int)
+
+    def observe(name: str, size: int) -> None:
+        maxima[name] = max(maxima[name], size)
+
+    monkeypatch.setattr(store, "_observe_integrity_buffer", observe)
+
+    report = store.inspect_integrity_readonly(config.run_id)
+
+    assert report.ok is True
+    for name in (
+        "event_row",
+        "ledger_transaction_row",
+        "ledger_entry_row",
+        "alert_row",
+        "inbox_row",
+        "commit_row",
+        "projection_history_row",
+    ):
+        assert maxima[name] == 1
+    assert maxima["transaction_entries"] <= 4
+    assert maxima["transaction_units"] <= 2
+    for name in (
+        "commit_event_hashes",
+        "commit_ledger_hashes",
+        "commit_alert_hashes",
+        "stored_commit_event_hashes",
+        "stored_commit_ledger_hashes",
+        "stored_commit_alert_hashes",
+    ):
+        assert maxima[name] <= 4
+
+    with sqlite3.connect(database) as connection:
+        counts = [
+            int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                    (config.run_id,),
+                ).fetchone()[0]
+            )
+            for table in (
+                "paper_events",
+                "paper_inbox",
+                "paper_commits",
+                "paper_projection_history",
+            )
+        ]
+    assert min(counts) > 500
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER paper_events_no_update")
+        connection.execute(
+            "UPDATE paper_events SET payload_json='{}' WHERE run_id=?",
+            (config.run_id,),
+        )
+    maxima.clear()
+
+    corrupt_report = store.inspect_integrity_readonly(config.run_id)
+
+    assert corrupt_report.ok is False
+    assert maxima["event_row"] == 1
+    assert maxima["issue_codes"] < 16
+    assert len(corrupt_report.issues) < 16
+
+
+@pytest.mark.parametrize(
+    ("setup_sql", "tamper_sql", "expected_issue"),
+    [
+        (
+            "DROP TRIGGER paper_events_no_update",
+            "UPDATE paper_events SET payload_json='{}' WHERE sequence=1",
+            "EVENT_PAYLOAD_HASH",
+        ),
+        (
+            "DROP TRIGGER paper_ledger_entries_no_update",
+            "UPDATE paper_ledger_entries SET amount_text='99' WHERE entry_index=0",
+            "LEDGER_AMOUNT_MISMATCH",
+        ),
+        (
+            "DROP TRIGGER paper_ledger_entries_no_update",
+            "UPDATE paper_ledger_entries SET account='tampered' WHERE entry_index=0",
+            "LEDGER_ENTRY_METADATA",
+        ),
+        (
+            "DROP TRIGGER paper_alerts_no_update",
+            "UPDATE paper_alerts SET payload_hash=printf('%064d', 0) WHERE commit_sequence IS NOT NULL",
+            "ALERT_HASH",
+        ),
+        (
+            "DROP TRIGGER paper_alerts_no_update",
+            "UPDATE paper_alerts SET severity='INFO' WHERE commit_sequence IS NOT NULL",
+            "ALERT_METADATA_MISMATCH",
+        ),
+        (
+            "DROP TRIGGER paper_inbox_no_update",
+            "UPDATE paper_inbox SET payload_hash=printf('%064d', 0) WHERE commit_sequence=1",
+            "INPUT_HASH",
+        ),
+        (
+            "DROP TRIGGER paper_commits_no_update",
+            "UPDATE paper_commits SET event_hashes_json='[]' WHERE commit_sequence=1",
+            "COMMIT_EVENT_HASHES",
+        ),
+        (
+            "DROP TRIGGER paper_projection_history_no_update",
+            "UPDATE paper_projection_history SET projection_hash=printf('%064d', 0) WHERE revision=1",
+            "PROJECTION_HASH",
+        ),
+    ],
+)
+def test_streaming_integrity_scan_still_detects_authoritative_history_tampering(
+    tmp_path: Path,
+    setup_sql: str,
+    tamper_sql: str,
+    expected_issue: str,
+) -> None:
+    database = tmp_path / f"{expected_issue}.sqlite3"
+    store, config = _build_journal(database, market_count=4)
+    with sqlite3.connect(database) as connection:
+        connection.execute(setup_sql)
+        connection.execute(tamper_sql + " AND run_id=?", (config.run_id,))
+
+    report = store.inspect_integrity_readonly(config.run_id)
+
+    assert report.ok is False
+    assert expected_issue in {issue.code for issue in report.issues}
+
+
+def test_list_runs_applies_optional_limit_in_sql_and_preserves_unlimited_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PaperStore(tmp_path / "bounded-runs.sqlite3")
+    for ordinal in range(4):
+        store.create_run(
+            f"bounded-run-{ordinal}",
+            {"ordinal": ordinal},
+            created_at=f"2026-08-17T08:00:0{ordinal}Z",
+        )
+
+    queries: list[tuple[str, tuple[object, ...]]] = []
+    read_connection = store._read_connection
+
+    class RecordingConnection:
+        def __init__(self, inner: sqlite3.Connection) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> RecordingConnection:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            del exc_type, exc_value, traceback
+            self._inner.close()
+
+        def execute(
+            self,
+            sql: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor:
+            queries.append((sql, parameters))
+            return self._inner.execute(sql, parameters)
+
+    def recording_connection() -> RecordingConnection:
+        return RecordingConnection(read_connection())
+
+    monkeypatch.setattr(store, "_read_connection", recording_connection)
+
+    bounded = store.list_runs(limit=2)
+    unlimited = store.list_runs()
+
+    assert [run.run_id for run in bounded] == [
+        "bounded-run-2",
+        "bounded-run-3",
+    ]
+    assert [run.run_id for run in unlimited] == [
+        "bounded-run-0",
+        "bounded-run-1",
+        "bounded-run-2",
+        "bounded-run-3",
+    ]
+    assert " LIMIT ?" in queries[0][0]
+    assert queries[0][1] == (2,)
+    assert " LIMIT ?" not in queries[1][0]
+    assert "ORDER BY created_at DESC, run_id DESC" in queries[0][0]
+    assert [run.created_at for run in bounded] == [
+        "2026-08-17T08:00:02Z",
+        "2026-08-17T08:00:03Z",
+    ]
+    with pytest.raises(ValueError, match="positive integer"):
+        store.list_runs(limit=0)
+    with pytest.raises(ValueError, match="positive integer"):
+        store.list_runs(limit=True)
+
+
+def test_contains_alert_is_exact_indexed_point_lookup_without_history_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, config = _build_journal(tmp_path / "contains-alert.sqlite3", market_count=2)
+    alert = store.get_recent_alerts(config.run_id, limit=1)[0]
+
+    def forbid_get_alerts(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("contains_alert may not collect alert history")
+
+    monkeypatch.setattr(store, "get_alerts", forbid_get_alerts)
+
+    assert store.contains_alert(config.run_id, alert.alert_id) is True
+    assert store.contains_alert(config.run_id, "0" * 64) is False
+
+
+def test_get_latest_alert_uses_bounded_indexed_severity_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "latest-alert.sqlite3"
+    store, config = _build_journal(database, market_count=2)
+    engine = PaperEngine(store, config)
+    engine.start()
+    first = engine.pause(
+        as_of=_START + timedelta(seconds=5),
+        reason="first critical runtime failure",
+        operator_artifact_hash="d" * 64,
+        origin="PAPER_RUNTIME_FAILURE",
+    )
+    second = engine.pause(
+        as_of=_START + timedelta(seconds=6),
+        reason="latest critical runtime failure",
+        operator_artifact_hash="e" * 64,
+        origin="PAPER_RUNTIME_FAILURE",
+    )
+
+    def forbid_history(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("latest alert lookup may not collect alert history")
+
+    monkeypatch.setattr(store, "get_alerts", forbid_history)
+    monkeypatch.setattr(store, "get_recent_alerts", forbid_history)
+
+    latest = store.get_latest_alert(config.run_id)
+    latest_critical = store.get_latest_alert(config.run_id, severity="CRITICAL")
+    latest_warning = store.get_latest_alert(config.run_id, severity="WARNING")
+
+    assert latest is not None
+    assert latest_critical is not None
+    assert latest_warning is not None
+    assert latest.alert_id == latest_critical.alert_id
+    assert latest_critical.event_sequence == second.append.last_sequence
+    assert latest_critical.event_sequence > first.append.last_sequence
+    assert latest_critical.code == "PAPER_RUNTIME_FAILURE"
+    assert latest_warning.code == "OPERATOR_PAUSE"
+    assert store.get_latest_alert(config.run_id, severity="INFO") is None
+
+    with sqlite3.connect(database) as connection:
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list('paper_alerts')")
+        }
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT * FROM paper_alerts
+            WHERE run_id=? AND severity=?
+            ORDER BY event_sequence DESC, created_at DESC, alert_id DESC
+            LIMIT 1
+            """,
+            (config.run_id, "CRITICAL"),
+        ).fetchall()
+    assert "paper_alerts_run_severity_sequence_idx" in indexes
+    assert any(
+        "paper_alerts_run_severity_sequence_idx" in str(row[3])
+        for row in plan
+    )

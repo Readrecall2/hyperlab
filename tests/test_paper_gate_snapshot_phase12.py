@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -34,11 +35,17 @@ def _demo_config() -> PaperRunConfig:
 
 def test_gate_result_metrics_are_bound_to_one_read_only_durable_head(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "paper.sqlite3"
     config = _demo_config()
     store = PaperStore(database)
     PaperEngine(store, config).start()
+
+    def forbid_full_materialization(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Gate-D must stream the durable event journal")
+
+    monkeypatch.setattr(store, "get_events", forbid_full_materialization)
     before = database.read_bytes()
 
     result = evaluate_paper_gate(
@@ -102,20 +109,18 @@ def test_gate_fails_closed_when_the_durable_head_changes_mid_evaluation(
     engine = PaperEngine(store, config)
     engine.start()
     as_of = config.validation_started_at + timedelta(days=1)
-    original_get_events = store.get_events
+    original_iter_events = store.iter_events
     mutated = False
 
-    def get_events_then_append(
+    def iter_events_then_append(
         run_id: str,
         *,
         after_sequence: int = 0,
-        limit: int | None = None,
-    ) -> tuple[StoredPaperEvent, ...]:
+    ) -> Iterator[StoredPaperEvent]:
         nonlocal mutated
-        events = original_get_events(
+        yield from original_iter_events(
             run_id,
             after_sequence=after_sequence,
-            limit=limit,
         )
         if not mutated:
             mutated = True
@@ -130,10 +135,9 @@ def test_gate_fails_closed_when_the_durable_head_changes_mid_evaluation(
                     source_sequence=1,
                 )
             )
-        return events
 
     initial_sequence = store.get_run(config.run_id).event_sequence
-    monkeypatch.setattr(store, "get_events", get_events_then_append)
+    monkeypatch.setattr(store, "iter_events", iter_events_then_append)
 
     with pytest.raises(ConcurrentWriteError, match="durable head changed"):
         evaluate_paper_gate(

@@ -12,7 +12,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hyperlab.dashboard.app import _resolve_report_download, _runtime_summary, create_app
+from hyperlab.dashboard.app import (
+    _paper_readiness,
+    _resolve_report_download,
+    _runtime_summary,
+    create_app,
+)
 from hyperlab.paper import (
     PaperEngine,
     PaperExecutionConfig,
@@ -194,14 +199,276 @@ def test_dashboard_masks_a_corrupt_projection_without_mutating_the_database(
     assert len(payload["runs"]) == 1
     run = payload["runs"][0]
     assert run["run_id"] == config.run_id
-    assert run["integrity"] == "FAILED_READONLY"
+    assert run["integrity"] == "HEAD_ANCHORS_FAILED_READONLY"
     assert run["status"] == "MANUAL_REVIEW"
     assert run["projection"] is None
     assert run["orders_enabled"] is False
 
 
+def _dashboard_paper_config(seed: int) -> PaperRunConfig:
+    return PaperRunConfig(
+        strategy_name=f"dashboard_same_head_fixture_{seed}",
+        strategy_hash="a" * 64,
+        parameters={"version": 1},
+        data_hash="b" * 64,
+        execution=PaperExecutionConfig(),
+        risk=PaperRiskLimits(),
+        seed=seed,
+        initial_cash=Decimal("100000"),
+        validation_started_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+
+
+def test_paper_api_bounds_run_and_alert_queries_without_lifetime_collectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paper_dir = tmp_path / "paper"
+    paper_dir.mkdir()
+    database = paper_dir / "paper.sqlite3"
+    config = PaperRunConfig(
+        strategy_name="dashboard_bounded_status_fixture",
+        strategy_hash="a" * 64,
+        parameters={"version": 1},
+        data_hash="b" * 64,
+        execution=PaperExecutionConfig(),
+        risk=PaperRiskLimits(),
+        seed=31,
+        initial_cash=Decimal("100000"),
+        validation_started_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+    store = PaperStore(database)
+    PaperEngine(store, config).start()
+    run = store.get_run(config.run_id)
+    list_limits: list[int | None] = []
+    alert_limits: list[int] = []
+
+    def bounded_list_runs(
+        _store: PaperStore,
+        *,
+        limit: int | None = None,
+    ):  # type: ignore[no-untyped-def]
+        list_limits.append(limit)
+        return (run,) * 51
+
+    def bounded_recent_alerts(
+        _store: PaperStore,
+        _run_id: str,
+        *,
+        limit: int,
+    ):  # type: ignore[no-untyped-def]
+        alert_limits.append(limit)
+        return ()
+
+    def forbid_unbounded_alerts(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("dashboard may not collect lifetime alert history")
+
+    monkeypatch.setattr(PaperStore, "list_runs", bounded_list_runs)
+    monkeypatch.setattr(PaperStore, "get_recent_alerts", bounded_recent_alerts)
+    monkeypatch.setattr(PaperStore, "get_alerts", forbid_unbounded_alerts)
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/api/paper")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_limit"] == 50
+    assert payload["runs_truncated"] is True
+    assert len(payload["runs"]) == 50
+    assert list_limits == [51, 51]
+    assert alert_limits == [51] * 50
+    assert all(run_payload["alert_limit"] == 50 for run_payload in payload["runs"])
+    assert all(run_payload["alerts_truncated"] is False for run_payload in payload["runs"])
+
+
+def test_paper_api_exposes_bounded_active_runtime_session_and_incident(tmp_path: Path) -> None:
+    paper_dir = tmp_path / "paper"
+    paper_dir.mkdir()
+    database = paper_dir / "paper.sqlite3"
+    config = _dashboard_paper_config(32)
+    store = PaperStore(database)
+    engine = PaperEngine(store, config)
+    engine.start()
+    engine.start_runtime_session(
+        as_of=datetime(2026, 8, 17, 0, 0, 1, tzinfo=UTC),
+        session_id="e" * 64,
+        generation=1,
+    )
+    engine.pause(
+        as_of=datetime(2026, 8, 17, 0, 0, 2, tzinfo=UTC),
+        reason="terminal paper runtime failure: TEST_PHASE: RuntimeError",
+        operator_artifact_hash="f" * 64,
+        origin="PAPER_RUNTIME_FAILURE",
+    )
+    store.close()
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/api/paper")
+
+    assert response.status_code == 200
+    session = response.json()["runs"][0]["runtime_session"]
+    assert session["active"] is True
+    assert session["unclosed"] is True
+    assert session["generation"] == 1
+    assert session["session_id"] == "e" * 64
+    assert session["started_at"] == "2026-08-17T00:00:01.000000Z"
+    assert session["stopped_at"] is None
+    assert [incident["code"] for incident in session["recent_incidents"]] == [
+        "PAPER_RUNTIME_FAILURE"
+    ]
+    assert {"pid", "process_id", "database_path", "lock_path"}.isdisjoint(session)
+
+
+def test_paper_readiness_fails_closed_before_inspecting_more_than_100_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "paper.sqlite3"
+    store = PaperStore(database)
+    store.create_run("bounded-readiness-run", {"fixture": True})
+    run = store.get_run("bounded-readiness-run")
+    limits: list[int | None] = []
+
+    def bounded_list_runs(
+        _store: PaperStore,
+        *,
+        limit: int | None = None,
+    ):  # type: ignore[no-untyped-def]
+        limits.append(limit)
+        return (run,) * 101
+
+    def forbid_integrity(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("too-many-runs must fail before per-run inspection")
+
+    monkeypatch.setattr(PaperStore, "list_runs", bounded_list_runs)
+    monkeypatch.setattr(PaperStore, "inspect_head_integrity_readonly", forbid_integrity)
+
+    assert _paper_readiness(database) == "too_many_runs"
+    assert limits == [101]
+
+
+@pytest.mark.parametrize(
+    ("injected_commits", "expected_status_code", "expected_status"),
+    [
+        (1, 200, "AVAILABLE"),
+        (2, 409, "HEAD_CHANGED_RETRY"),
+    ],
+)
+def test_paper_api_same_head_retry_is_bounded_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injected_commits: int,
+    expected_status_code: int,
+    expected_status: str,
+) -> None:
+    paper_dir = tmp_path / "paper"
+    paper_dir.mkdir()
+    database = paper_dir / "paper.sqlite3"
+    config = _dashboard_paper_config(40 + injected_commits)
+    writer_store = PaperStore(database)
+    writer = PaperEngine(writer_store, config)
+    writer.start()
+    original_recent_alerts = PaperStore.get_recent_alerts
+    calls = 0
+
+    def racing_recent_alerts(
+        store: PaperStore,
+        run_id: str,
+        *,
+        limit: int,
+    ):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        alerts = original_recent_alerts(store, run_id, limit=limit)
+        calls += 1
+        if calls <= injected_commits:
+            writer.reconcile(as_of=datetime(2026, 8, 17, tzinfo=UTC) + timedelta(seconds=calls))
+        return alerts
+
+    monkeypatch.setattr(PaperStore, "get_recent_alerts", racing_recent_alerts)
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/api/paper")
+    writer_store.close()
+
+    assert response.status_code == expected_status_code
+    payload = response.json()
+    assert payload["status"] == expected_status
+    assert calls == 2
+    if expected_status_code == 200:
+        assert payload["same_head_assembly"] is True
+        assert payload["head_read_attempt_limit"] == 2
+        assert payload["runs"][0]["same_head_assembly"] is True
+    else:
+        assert payload["retryable"] is True
+        assert payload["orders_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("injected_commits", "expected"),
+    [(1, "ready"), (2, "head_changed_retry")],
+)
+def test_paper_readiness_same_head_retry_is_bounded_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injected_commits: int,
+    expected: str,
+) -> None:
+    database = tmp_path / "paper.sqlite3"
+    config = _dashboard_paper_config(50 + injected_commits)
+    writer_store = PaperStore(database)
+    writer = PaperEngine(writer_store, config)
+    writer.start()
+    original_integrity = PaperStore.inspect_head_integrity_readonly
+    calls = 0
+
+    def racing_integrity(
+        store: PaperStore,
+        run_id: str,
+    ):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        integrity = original_integrity(store, run_id)
+        calls += 1
+        if calls <= injected_commits:
+            writer.reconcile(as_of=datetime(2026, 8, 17, tzinfo=UTC) + timedelta(seconds=calls))
+        return integrity
+
+    monkeypatch.setattr(
+        PaperStore,
+        "inspect_head_integrity_readonly",
+        racing_integrity,
+    )
+
+    assert _paper_readiness(database) == expected
+    assert calls == 2
+    writer_store.close()
+
+
+def test_paper_api_retains_newest_runs_after_dropping_the_oldest_sentinel(
+    tmp_path: Path,
+) -> None:
+    paper_dir = tmp_path / "paper"
+    paper_dir.mkdir()
+    database = paper_dir / "paper.sqlite3"
+    store = PaperStore(database)
+    for ordinal in range(52):
+        store.create_run(
+            f"bounded-dashboard-{ordinal:02d}",
+            {"fixture": ordinal},
+            seed=ordinal,
+            created_at=f"2026-08-17T08:{ordinal:02d}:00Z",
+        )
+    store.close()
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/api/paper")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["runs_truncated"] is True
+    assert [run["run_id"] for run in payload["runs"]] == [
+        f"bounded-dashboard-{ordinal:02d}" for ordinal in range(2, 52)
+    ]
+
+
 def test_legacy_status_queries_do_not_initialize_or_mutate_sqlite(tmp_path: Path) -> None:
     database = tmp_path / "hyperlab.sqlite3"
+
     initialize(database)
     with sqlite3.connect(database) as connection:
         connection.execute(

@@ -142,15 +142,21 @@ class PublicCollector:
     ) -> None:
         self.config = config
         subscriptions = config.subscriptions()
+        critical_channels = {"activeAssetCtx", "l2Book"}
+        if critical_channels.isdisjoint(config.subscription_channels):
+            critical_channels.add("bbo")
         self._critical_stream_keys = frozenset(
-            subscription.key
-            for subscription in subscriptions
-            if subscription.channel
-            in {
-                "activeAssetCtx",
-                "l2Book",
-            }
+            subscription.key for subscription in subscriptions if subscription.channel in critical_channels
         )
+        if config.critical_funding_history:
+            self._critical_stream_keys = frozenset(
+                set(self._critical_stream_keys)
+                | {
+                    f"fundingHistory:{asset}"
+                    for asset in config.assets
+                    if not asset.startswith("@") and "/" not in asset
+                }
+            )
         self._candle_intervals_by_stream_key = {
             subscription.key: subscription.interval
             for subscription in subscriptions
@@ -575,6 +581,7 @@ class PublicCollector:
                     if (
                         live
                         and self._rest_future is None
+                        and self.config.rest_refresh_enabled
                         and (observed_mono - last_rest_refresh >= self.config.rest_refresh_interval_seconds)
                     ):
                         self._schedule_rest_refresh(connection_id, epoch, observed_at)
@@ -1075,17 +1082,18 @@ class PublicCollector:
                 interval = self._candle_intervals_by_stream_key[key]
                 if age > _candle_interval_seconds(interval) + self.config.stale_after_seconds:
                     stale.append(key)
-        expected_funding = (now - timedelta(seconds=self.config.funding_grace_seconds)).replace(
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        for asset in self.config.assets:
-            if asset.startswith("@") or "/" in asset:
-                continue
-            latest = self.metrics.last_funding_by_asset.get(asset)
-            if latest is None or latest < expected_funding - timedelta(seconds=60):
-                stale.append(f"fundingHistory:{asset}")
+        if self.config.collect_funding_history:
+            expected_funding = (now - timedelta(seconds=self.config.funding_grace_seconds)).replace(
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            for asset in self.config.assets:
+                if asset.startswith("@") or "/" in asset:
+                    continue
+                latest = self.metrics.last_funding_by_asset.get(asset)
+                if latest is None or latest < expected_funding - timedelta(seconds=60):
+                    stale.append(f"fundingHistory:{asset}")
         self.metrics.stale_channels = tuple(sorted(stale))
 
     def _publish_status(self, *, error: str | None = None) -> None:
@@ -1224,7 +1232,7 @@ class PublicCollector:
         for asset in self.config.assets:
             if self._stop_requested:
                 return
-            if not asset.startswith("@") and "/" not in asset:
+            if self.config.collect_funding_history and not asset.startswith("@") and "/" not in asset:
                 funding_pages = getattr(self.rest, "funding_history_pages", None)
                 if callable(funding_pages):
                     pages = funding_pages(asset, start_ms, end_ms)
@@ -1275,8 +1283,10 @@ class PublicCollector:
                 arrival_sequence=rest_sequence,
             )
             rest_sequence += 1
-            yield from parse_l2_snapshot(l2_payload, l2_envelope)
-            yield from parse_bbo_from_l2(l2_payload, l2_envelope)
+            if "l2Book" in self.config.subscription_channels:
+                yield from parse_l2_snapshot(l2_payload, l2_envelope)
+            if "bbo" in self.config.subscription_channels:
+                yield from parse_bbo_from_l2(l2_payload, l2_envelope)
 
     def _schedule_rest_refresh(
         self,
@@ -1288,8 +1298,9 @@ class PublicCollector:
             return
         self._rest_refresh_counter += 1
         refresh_id = f"rest-refresh-{connection_epoch}-{self._rest_refresh_counter}-{connection_id}"
-        longest_interval_hours = (
-            max(_candle_interval_seconds(interval) for interval in self.config.candle_intervals) // 3_600
+        longest_interval_hours = max(
+            (_candle_interval_seconds(interval) // 3_600 for interval in self.config.candle_intervals),
+            default=0,
         )
         history_hours = max(2, longest_interval_hours + 1)
         self._rest_future = self._rest_executor.submit(
@@ -1350,6 +1361,8 @@ class PublicCollector:
                     reason=f"coverage_unknown:{error}",
                 )
                 self._publish_status(error=error)
+                if self.config.reconnect_on_rest_refresh_failure:
+                    raise RuntimeError(error) from exc
                 return
             row_count = len(records)
             self._last_rest_refresh_rows_materialized = row_count

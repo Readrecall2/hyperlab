@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import FrameType, MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -71,6 +71,8 @@ from hyperlab.environment_authorization import (
     EnvironmentReadinessManifest,
     EvidenceCheck,
     compiled_evidence_verifier_status,
+    current_paper_release_code_sha256,
+    current_paper_runtime_environment_sha256,
     issue_environment_receipt,
     profile_for,
     receipt_scope_blockers,
@@ -90,9 +92,11 @@ from hyperlab.strategies.market_making_l2 import (
 from hyperlab.strategies.registry import STRATEGY_CATALOG, STRATEGY_FACTORIES, create_strategy
 
 if TYPE_CHECKING:
-    from hyperlab.paper.models import PaperRunConfig
+    from hyperlab.paper.engine import PaperCommandResult
+    from hyperlab.paper.models import PaperProjection, PaperRunConfig
     from hyperlab.paper.runner import FrozenPaperStrategy
     from hyperlab.paper.runtime import NormalizedPublicMarketSource
+    from hyperlab.paper.store import PaperStore
 
 app = typer.Typer(
     name="hyperlab",
@@ -134,6 +138,7 @@ app.add_typer(paper_app, name="paper")
 class _ApprovedPaperRuntimeFactories:
     candidate_id: str
     config_hash: str
+    config_artifact_path: Path
     readiness_manifest_path: Path
     readiness_manifest_sha256: str
     readiness_profile_sha256: str
@@ -149,20 +154,71 @@ class _ApprovedPaperRuntimeFactories:
             ("readiness_manifest_sha256", self.readiness_manifest_sha256),
             ("readiness_profile_sha256", self.readiness_profile_sha256),
         ):
-            if len(digest) != 64 or any(
-                character not in "0123456789abcdef" for character in digest
-            ):
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
                 raise ValueError(f"approved paper {label} must be a lowercase SHA-256")
+        if not isinstance(self.config_artifact_path, Path):
+            raise TypeError("approved paper config_artifact_path must be a Path")
         if not isinstance(self.readiness_manifest_path, Path):
             raise TypeError("approved paper readiness_manifest_path must be a Path")
         if not isinstance(self.readiness_evidence_root, Path):
             raise TypeError("approved paper readiness_evidence_root must be a Path")
 
 
-# Deliberately empty until a frozen strategy artifact and a normalized public
-# source adapter have both passed an explicit review.  The CLI never imports a
-# user-supplied module or constructs a strategy from an arbitrary name.
-_APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = MappingProxyType({})
+_PHASE12_PAPER_CANDIDATE_ID = "phase08-robust-pairs-btc-eth-paper-v1"
+_PHASE12_PAPER_ARTIFACT_ROOT = Path("config/paper/phase08-robust-pairs-btc-eth-paper-v1")
+_PHASE12_PAPER_CONFIG_ARTIFACT = _PHASE12_PAPER_ARTIFACT_ROOT / "paper-config.json"
+_PHASE12_PAPER_READINESS_MANIFEST = _PHASE12_PAPER_ARTIFACT_ROOT / "readiness-manifest.json"
+_PHASE12_PAPER_EVIDENCE_ROOT = _PHASE12_PAPER_ARTIFACT_ROOT
+_PHASE12_PAPER_RUNTIME_TIMER_INTERVAL_SECONDS = 1.0
+_PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
+_PHASE12_PAPER_CONFIG_HASH = "0733456db3979fbe483ddc2f259269a32763fb333f3acf94dd374992ca194c06"
+_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "d39ccc9b98d4147fbb758fdd95d8d48f77de757d18c22227f43ab91c9d9f158f"
+_PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
+
+
+def _phase12_paper_strategy_factory(
+    config: PaperRunConfig,
+) -> FrozenPaperStrategy:
+    from hyperlab.paper.pairs_strategy import FrozenRobustPairsPaperStrategy
+
+    strategy = FrozenRobustPairsPaperStrategy()
+    if config.strategy_name != strategy.strategy_name or config.strategy_hash != strategy.strategy_hash:
+        raise ValueError("frozen Phase 08 strategy differs from PaperRunConfig")
+    return strategy
+
+
+def _phase12_paper_source_factory(
+    config: PaperRunConfig,
+) -> NormalizedPublicMarketSource:
+    from hyperlab.paper.collector_source import HyperliquidPaperPublicSource
+
+    source = HyperliquidPaperPublicSource.create_mainnet(
+        runtime_status_path=(_settings().app.data_dir / "paper" / "phase12-public-source-status.json")
+    )
+    descriptor = source.descriptor
+    if config.data_source != descriptor.source or config.data_hash != descriptor.data_hash:
+        source.close()
+        raise ValueError("frozen public source descriptor differs from PaperRunConfig")
+    return source
+
+
+# One exact compiled candidate only, bound to separately versioned canonical artifacts.
+# The CLI never imports a user-supplied module or resolves an arbitrary strategy.
+_APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = MappingProxyType(
+    {
+        _PHASE12_PAPER_CONFIG_HASH: _ApprovedPaperRuntimeFactories(
+            candidate_id=_PHASE12_PAPER_CANDIDATE_ID,
+            config_hash=_PHASE12_PAPER_CONFIG_HASH,
+            config_artifact_path=_PHASE12_PAPER_CONFIG_ARTIFACT,
+            readiness_manifest_path=_PHASE12_PAPER_READINESS_MANIFEST,
+            readiness_manifest_sha256=_PHASE12_PAPER_READINESS_MANIFEST_SHA256,
+            readiness_profile_sha256=_PHASE12_PAPER_READINESS_PROFILE_SHA256,
+            readiness_evidence_root=_PHASE12_PAPER_EVIDENCE_ROOT,
+            strategy_factory=_phase12_paper_strategy_factory,
+            source_factory=_phase12_paper_source_factory,
+        )
+    }
+)
 
 # Intentionally empty and non-authorizing. A future candidate must add a concrete
 # measured-result protocol whose canonical Gate B/C decision is derived by core;
@@ -181,9 +237,7 @@ def _parse_environment_class(value: str) -> EnvironmentClass:
         return EnvironmentClass(value)
     except ValueError:
         allowed = ", ".join(item.value for item in EnvironmentClass)
-        raise typer.BadParameter(
-            f"environment must be one exact compiled identity: {allowed}"
-        ) from None
+        raise typer.BadParameter(f"environment must be one exact compiled identity: {allowed}") from None
 
 
 @gate_model_app.command("requirements")
@@ -731,9 +785,7 @@ def backtest(
     if strategy == "cash_and_carry" and is_dataclass(selected):
         selected = replace(
             selected,
-            round_trip_fees_bps=(
-                2.0 * (settings.costs.spot_fee_bps + settings.costs.perp_fee_bps)
-            ),
+            round_trip_fees_bps=(2.0 * (settings.costs.spot_fee_bps + settings.costs.perp_fee_bps)),
             estimated_round_trip_slippage_bps=4.0 * settings.costs.base_slippage_bps,
             benchmark_annual_rate=settings.research.benchmark.annual_rate,
         )
@@ -783,14 +835,10 @@ def backtest(
                 else None
             ),
             liquidation_usd=(
-                panel.liquidation_usd.loc[final_index].copy()
-                if panel.liquidation_usd is not None
-                else None
+                panel.liquidation_usd.loc[final_index].copy() if panel.liquidation_usd is not None else None
             ),
             available_at=(
-                panel.available_at.loc[final_index].copy()
-                if panel.available_at is not None
-                else None
+                panel.available_at.loc[final_index].copy() if panel.available_at is not None else None
             ),
             finality=panel.finality.loc[final_index].copy() if panel.finality is not None else None,
             tradable=panel.tradable.loc[final_index].copy() if panel.tradable is not None else None,
@@ -830,10 +878,7 @@ def backtest(
             status = "BLOCKED_INSUFFICIENT_REAL_DATA"
         elif not audit.passed:
             status = "BLOCKED_UNCALIBRATED_OR_SURVIVORSHIP_BIAS"
-        elif any(
-            result.diagnostics.get("audit_status") != "CALIBRATED"
-            for result in (base_result, ranking)
-        ):
+        elif any(result.diagnostics.get("audit_status") != "CALIBRATED" for result in (base_result, ranking)):
             status = "BLOCKED_UNCALIBRATED_EXECUTION_MODEL"
         else:
             status = "VALIDATED_RESEARCH_ONLY"
@@ -1041,9 +1086,7 @@ def pairs_audit(
 @app.command("pairs-backtest")
 def pairs_backtest(
     data: Annotated[Path, typer.Option(help="Export CSV Phase 08 point-in-time")],
-    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 08")] = Path(
-        "reports/pairs"
-    ),
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 08")] = Path("reports/pairs"),
     minimum_history_hours: Annotated[int, typer.Option(min=24)] = 180 * 24,
     minimum_assets: Annotated[int, typer.Option(min=4)] = 6,
     maximum_pairs: Annotated[int, typer.Option(min=2)] = 3,
@@ -1097,9 +1140,7 @@ def pairs_backtest(
 def momentum_audit(
     data: Annotated[
         Path,
-        typer.Option(
-            help="Export Phase 09 point-in-time avec volume, OI, funding et liquidations"
-        ),
+        typer.Option(help="Export Phase 09 point-in-time avec volume, OI, funding et liquidations"),
     ],
     output: Annotated[
         Path,
@@ -1134,9 +1175,7 @@ def momentum_audit(
 @app.command("momentum-backtest")
 def momentum_backtest(
     data: Annotated[Path, typer.Option(help="Export CSV Phase 09 point-in-time")],
-    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 09")] = Path(
-        "reports/momentum"
-    ),
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 09")] = Path("reports/momentum"),
     minimum_history_hours: Annotated[int, typer.Option(min=24)] = 365 * 24,
     minimum_assets: Annotated[int, typer.Option(min=2)] = 6,
     minimum_non_bull_pnl: Annotated[float, typer.Option()] = 0.0,
@@ -1234,9 +1273,7 @@ def market_making_audit(
 @app.command("market-making-replay")
 def market_making_replay(
     data: Annotated[Path, typer.Option(help="Racine du lake Parquet immuable")],
-    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 11")] = Path(
-        "reports/market-making"
-    ),
+    output: Annotated[Path, typer.Option(help="Dossier du rapport Phase 11")] = Path("reports/market-making"),
     asset: Annotated[str, typer.Option(help="Actif public a rejouer")] = "BTC",
     target_venue: Annotated[str, typer.Option(help="Venue simulee")] = "hyperliquid",
     reference_venues: Annotated[
@@ -1289,9 +1326,7 @@ def market_making_replay(
         quote_latency_ms=quote_latency_ms,
         cancel_latency_ms=cancel_latency_ms,
         venue_weights=weights,
-        calibration_status=(
-            "CALIBRATED" if calibration_evidence_hash is not None else "UNCALIBRATED"
-        ),
+        calibration_status=("CALIBRATED" if calibration_evidence_hash is not None else "UNCALIBRATED"),
         calibration_evidence_hash=calibration_evidence_hash,
         data_label="IMMUTABLE_LAKE_REPLAY",
     )
@@ -1325,9 +1360,7 @@ def cross_exchange_backtest(
     conventions = default_funding_conventions()
     market = load_cross_venue_csv(data, conventions=conventions)
     if len(market.mark_prices) < 25:
-        raise typer.BadParameter(
-            "la matrice de panne exige 24 heures d'incident puis une barre de reprise"
-        )
+        raise typer.BadParameter("la matrice de panne exige 24 heures d'incident puis une barre de reprise")
     risk_rules = venue_risk_rules_from_metadata(market.metadata)
     audit = audit_cross_venue_data(
         market,
@@ -1340,10 +1373,7 @@ def cross_exchange_backtest(
         resolved_outage_start = market.mark_prices.index[position]
     else:
         resolved_outage_start = pd.Timestamp(outage_start)
-        if (
-            resolved_outage_start.tz is None
-            or resolved_outage_start.utcoffset() != pd.Timedelta(0)
-        ):
+        if resolved_outage_start.tz is None or resolved_outage_start.utcoffset() != pd.Timedelta(0):
             raise typer.BadParameter("outage-start doit être un horodatage UTC explicite")
         resolved_outage_start = resolved_outage_start.tz_convert("UTC")
     config = CrossVenueConfig(
@@ -1415,9 +1445,7 @@ def collect(
     settings = _settings()
     strict_persistence = _validate_service_mounts(settings, service="collector")
     if settings.app.mode not in {"readonly", "research"}:
-        raise typer.BadParameter(
-            f"Le collecteur {__version__} refuse tout mode autre que readonly/research"
-        )
+        raise typer.BadParameter(f"Le collecteur {__version__} refuse tout mode autre que readonly/research")
     try:
         config = CollectorConfig(
             network=network,
@@ -1732,11 +1760,7 @@ def status() -> None:
 
 
 def _paper_database_path(database: Path | None) -> Path:
-    return (
-        database
-        if database is not None
-        else _settings().app.data_dir / "paper" / "paper.sqlite3"
-    )
+    return database if database is not None else _settings().app.data_dir / "paper" / "paper.sqlite3"
 
 
 def _strict_paper_config_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1774,9 +1798,7 @@ def _load_frozen_paper_config(path: Path) -> PaperRunConfig:
     except (KeyError, TypeError, ValueError) as error:
         raise typer.BadParameter(f"Artefact paper invalide: {error}") from None
     if raw != canonical_json(config.to_dict()).encode("utf-8"):
-        raise typer.BadParameter(
-            "L'artefact paper n'est pas le snapshot canonique complet de PaperRunConfig"
-        )
+        raise typer.BadParameter("L'artefact paper n'est pas le snapshot canonique complet de PaperRunConfig")
     return config
 
 
@@ -1801,18 +1823,14 @@ def _verify_approved_paper_readiness(
     except (AuthorizationManifestError, OSError) as error:
         raise typer.BadParameter(f"Readiness paper illisible: {error}") from None
     if manifest.manifest_sha256 != approval.readiness_manifest_sha256:
-        raise typer.BadParameter(
-            "Le manifeste de readiness paper ne correspond pas au SHA-256 approuvé"
-        )
+        raise typer.BadParameter("Le manifeste de readiness paper ne correspond pas au SHA-256 approuvé")
 
     decision = verify_environment_readiness(
         manifest,
         evidence_root=approval.readiness_evidence_root,
     )
     if decision.blockers:
-        detail = "; ".join(
-            f"{blocker.code}@{blocker.location}" for blocker in decision.blockers
-        )
+        detail = "; ".join(f"{blocker.code}@{blocker.location}" for blocker in decision.blockers)
         raise typer.BadParameter(f"Readiness paper bloquée par les artefacts: {detail}")
     if decision.profile_sha256 != approval.readiness_profile_sha256:
         raise typer.BadParameter(
@@ -1820,6 +1838,22 @@ def _verify_approved_paper_readiness(
         )
 
     blockers: list[str] = []
+    try:
+        release_code_sha256 = current_paper_release_code_sha256()
+    except (OSError, TypeError, ValueError) as error:
+        release_code_sha256 = None
+        blockers.append(f"current release-code digest unavailable: {error}")
+    try:
+        runtime_environment_sha256 = current_paper_runtime_environment_sha256()
+    except (OSError, TypeError, ValueError) as error:
+        runtime_environment_sha256 = None
+        blockers.append(
+            f"current runtime-environment digest unavailable: {error}"
+        )
+    if release_code_sha256 != frozen.release_code_sha256:
+        blockers.append("frozen release_code_sha256 differs from the current reviewed checkout")
+    if runtime_environment_sha256 != frozen.runtime_environment_sha256:
+        blockers.append("frozen runtime_environment_sha256 differs from the current runtime")
     if (
         manifest.environment is not EnvironmentClass.PAPER
         or manifest.purpose is not AuthorizationPurpose.PAPER_RUNTIME
@@ -1845,13 +1879,16 @@ def _verify_approved_paper_readiness(
         blockers.append("paper runtime requires a TECHNICAL or VALIDATION run_kind")
     if not frozen.required_instruments:
         blockers.append("paper runtime requires a non-empty frozen instrument universe")
+    if (
+        frozen.runtime_timer_interval_seconds != _PHASE12_PAPER_RUNTIME_TIMER_INTERVAL_SECONDS
+        or frozen.runtime_source_poll_timeout_seconds != _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS
+    ):
+        blockers.append("paper runtime cadence differs from the exact compiled Phase 12 cadence")
 
-    config_binding = manifest.evidence.get(EvidenceCheck.FROZEN_STRATEGY_CONFIG)
-    if config_binding is None or config_binding.sha256 != config_artifact_sha256:
-        blockers.append("frozen config bytes differ from FROZEN_STRATEGY_CONFIG evidence")
-    source_binding = manifest.evidence.get(EvidenceCheck.PUBLIC_MARKET_SOURCE)
-    if source_binding is None or source_binding.sha256 != frozen.data_hash:
-        blockers.append("public source bytes differ from PaperRunConfig.data_hash")
+    if EvidenceCheck.FROZEN_STRATEGY_CONFIG not in manifest.evidence:
+        blockers.append("compiled FROZEN_STRATEGY_CONFIG evidence is missing")
+    if EvidenceCheck.PUBLIC_MARKET_SOURCE not in manifest.evidence:
+        blockers.append("compiled PUBLIC_MARKET_SOURCE evidence is missing")
 
     cost_schedule = frozen.execution.cost_schedule
     if cost_schedule is None:
@@ -1870,9 +1907,7 @@ def _verify_approved_paper_readiness(
         purpose=AuthorizationPurpose.PAPER_RUNTIME,
         config_hash=frozen.config_hash,
     )
-    blockers.extend(
-        f"{blocker.code}@{blocker.location}" for blocker in scope_blockers
-    )
+    blockers.extend(f"{blocker.code}@{blocker.location}" for blocker in scope_blockers)
     if receipt.authorizes_real_money:
         blockers.append("PAPER readiness receipt must never authorize real money")
 
@@ -1882,12 +1917,14 @@ def _verify_approved_paper_readiness(
             final_manifest_bytes,
             require_canonical=True,
         )
+        final_release_code_sha256 = current_paper_release_code_sha256()
+        final_runtime_environment_sha256 = current_paper_runtime_environment_sha256()
         final_decision = verify_environment_readiness(
             final_manifest,
             evidence_root=approval.readiness_evidence_root,
         )
         final_config_sha256 = hashlib.sha256(config_artifact.read_bytes()).hexdigest()
-    except (AuthorizationManifestError, OSError) as error:
+    except (AuthorizationManifestError, OSError, TypeError, ValueError) as error:
         blockers.append(f"readiness artifacts became unreadable: {error}")
     else:
         if (
@@ -1896,6 +1933,8 @@ def _verify_approved_paper_readiness(
             or final_decision.blockers
             or final_decision.profile_sha256 != approval.readiness_profile_sha256
             or final_config_sha256 != config_artifact_sha256
+            or final_release_code_sha256 != release_code_sha256
+            or final_runtime_environment_sha256 != runtime_environment_sha256
         ):
             blockers.append("readiness artifacts changed during readiness verification")
     if blockers:
@@ -1904,6 +1943,8 @@ def _verify_approved_paper_readiness(
 
 def _reverify_gate_readiness(config: PaperRunConfig) -> tuple[bool, str]:
     """Report the compiled PAPER readiness status for the read-only Gate diagnostic."""
+
+    import hashlib
 
     approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
     if approval is None or approval.config_hash != config.config_hash:
@@ -1927,14 +1968,11 @@ def _reverify_gate_readiness(config: PaperRunConfig) -> tuple[bool, str]:
             return False, "APPROVED_READINESS_REVERIFICATION_FAILED"
         if decision.profile_sha256 != approval.readiness_profile_sha256:
             return False, "APPROVED_READINESS_PROFILE_MISMATCH"
-        binding = manifest.evidence[EvidenceCheck.FROZEN_STRATEGY_CONFIG]
-        relative = PurePosixPath(binding.relative_path)
-        config_artifact = approval.readiness_evidence_root.joinpath(*relative.parts)
+        config_artifact = approval.config_artifact_path
+        if hashlib.sha256(config_artifact.read_bytes()).hexdigest() != approval.config_hash:
+            return False, "FROZEN_CONFIG_ARTIFACT_HASH_MISMATCH"
         artifact_config = _load_frozen_paper_config(config_artifact)
-        if (
-            artifact_config.config_hash != config.config_hash
-            or artifact_config.run_id != config.run_id
-        ):
+        if artifact_config.config_hash != config.config_hash or artifact_config.run_id != config.run_id:
             return False, "FROZEN_CONFIG_IDENTITY_MISMATCH"
         _verify_approved_paper_readiness(approval, artifact_config, config_artifact)
     except Exception:
@@ -1949,14 +1987,17 @@ def _load_stored_paper_config(database: Path, run_id: str) -> PaperRunConfig:
     if not database.is_file():
         raise typer.BadParameter(f"Store paper introuvable: {database.resolve()}")
     store = PaperStore(database, initialize=False)
-    run = store.get_run(run_id)
     try:
-        config = PaperRunConfig.from_dict(run.config_snapshot)
-    except (KeyError, TypeError, ValueError) as error:
-        raise typer.BadParameter(f"Snapshot paper durable invalide: {error}") from None
-    if config.config_hash != run.config_hash or config.run_id != run.run_id:
-        raise typer.BadParameter("Le snapshot paper durable ne correspond pas à son run_id")
-    return config
+        run = store.get_run(run_id)
+        try:
+            config = PaperRunConfig.from_dict(run.config_snapshot)
+        except (KeyError, TypeError, ValueError) as error:
+            raise typer.BadParameter(f"Snapshot paper durable invalide: {error}") from None
+        if config.config_hash != run.config_hash or config.run_id != run.run_id:
+            raise typer.BadParameter("Le snapshot paper durable ne correspond pas à son run_id")
+        return config
+    finally:
+        _close_preserving_active_exception(store.close)
 
 
 def _paper_as_of(value: str | None) -> datetime:
@@ -1971,29 +2012,237 @@ def _paper_as_of(value: str | None) -> datetime:
     return parsed.astimezone(UTC)
 
 
-@paper_app.command("status")
-def paper_status(
-    database: Annotated[
-        Path | None,
-        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
-    ] = None,
-    run_id: Annotated[str | None, typer.Option(help="Run déterministe à détailler")] = None,
-) -> None:
-    """Lit l'état paper durable sans créer ni modifier le store."""
-    from hyperlab.paper.store import PaperStore
+def _paper_runtime_settings() -> Settings:
+    settings = _settings()
+    if settings.app.mode not in {"readonly", "research"}:
+        raise typer.BadParameter("Le runtime paper refuse tout HYPERLAB_MODE non readonly/research")
+    return settings
 
-    resolved = _paper_database_path(database)
-    if not resolved.is_file():
-        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
-    store = PaperStore(resolved, initialize=False)
+
+def _require_current_paper_release(config: PaperRunConfig) -> None:
+    try:
+        current_release_code_sha256 = current_paper_release_code_sha256()
+    except (OSError, TypeError, ValueError) as error:
+        raise typer.BadParameter(f"Le digest release-code paper courant est invérifiable: {error}") from None
+    if current_release_code_sha256 != config.release_code_sha256:
+        raise typer.BadParameter("Le code Paper courant diffère du release_code_sha256 durable")
+    try:
+        current_runtime_environment_sha256 = (
+            current_paper_runtime_environment_sha256()
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise typer.BadParameter(
+            f"Paper runtime-environment digest is unverifiable: {error}"
+        ) from None
+    if (
+        current_runtime_environment_sha256
+        != config.runtime_environment_sha256
+    ):
+        raise typer.BadParameter(
+            "Paper runtime environment differs from durable "
+            "runtime_environment_sha256"
+        )
+
+
+def _approved_paper_runtime_for(
+    config: PaperRunConfig,
+) -> _ApprovedPaperRuntimeFactories:
+    approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
+    if approval is None or approval.config_hash != config.config_hash:
+        raise typer.BadParameter(
+            "Aucune liaison figee strategie + source publique n'est approuvee pour ce config_hash"
+        )
+    return approval
+
+
+def _paper_exact_operator_reason(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise typer.BadParameter(f"{label} ne peut pas etre vide")
+    if value != value.strip():
+        raise typer.BadParameter(f"{label} doit etre exact, sans espace initial ou final")
+    if len(value) > 1_024:
+        raise typer.BadParameter(f"{label} depasse 1024 caracteres")
+    return value
+
+
+def _paper_operator_artifact_hash(
+    *,
+    action: str,
+    config: PaperRunConfig,
+    reason: str,
+    as_of: datetime,
+    incident_artifact_hash: str | None = None,
+) -> str:
+    from hyperlab.paper.models import deterministic_id, utc_text
+
+    components: list[object] = [
+        action,
+        config.run_id,
+        config.config_hash,
+        utc_text(as_of),
+        reason,
+    ]
+    if incident_artifact_hash is not None:
+        components.append(incident_artifact_hash)
+    return deterministic_id("paper_operator_artifact_v1", *components)
+
+
+def _paper_reviewed_incident_summary(
+    projection: PaperProjection,
+) -> tuple[int, str | None]:
+    from hyperlab.paper.models import utc_text
+
+    return (
+        projection.critical_incident_count,
+        (
+            utc_text(projection.last_critical_incident_at)
+            if projection.last_critical_incident_at is not None
+            else None
+        ),
+    )
+
+
+def _paper_resume_incident_artifact_hash(
+    config: PaperRunConfig,
+    projection: PaperProjection,
+) -> str:
+    from hyperlab.paper.models import deterministic_id, utc_text
+
+    critical_incident_count, last_critical_incident_at = (
+        _paper_reviewed_incident_summary(projection)
+    )
+    return deterministic_id(
+        "paper_resume_incident_artifact_v2",
+        config.run_id,
+        config.config_hash,
+        projection.state.value,
+        utc_text(projection.state_since or config.validation_started_at),
+        critical_incident_count,
+        last_critical_incident_at or "NO_CRITICAL_INCIDENT",
+    )
+
+
+def _paper_operator_time(
+    projection: PaperProjection,
+    value: str | None,
+) -> datetime:
+    logical_time = _paper_as_of(value)
+    if projection.last_received_at is not None and logical_time < projection.last_received_at:
+        raise typer.BadParameter("as-of precede le dernier evenement durable du run paper")
+    return logical_time
+
+
+@paper_app.command("preflight")
+def paper_preflight(
+    config_artifact: Annotated[
+        Path,
+        typer.Argument(help="Snapshot JSON canonique approuve; defaut: artefact Phase 08 compile"),
+    ] = _PHASE12_PAPER_CONFIG_ARTIFACT,
+) -> None:
+    """Verifie l'admission Paper et les identites sans store ni transport reseau."""
+
+    _paper_runtime_settings()
+    frozen = _load_frozen_paper_config(config_artifact)
+    approval = _approved_paper_runtime_for(frozen)
+    _verify_approved_paper_readiness(approval, frozen, config_artifact)
+
+    source: NormalizedPublicMarketSource | None = None
+    try:
+        strategy = approval.strategy_factory(frozen)
+        if strategy.strategy_name != frozen.strategy_name or strategy.strategy_hash != frozen.strategy_hash:
+            raise typer.BadParameter("La strategie compilee differe de la configuration Paper")
+        source = approval.source_factory(frozen)
+        descriptor = source.descriptor
+        if descriptor.source != frozen.data_source or descriptor.data_hash != frozen.data_hash:
+            raise typer.BadParameter("La source publique compilee differe de la configuration Paper")
+        payload = {
+            "authorization_purpose": "PAPER_RUNTIME",
+            "authorizes_real_money": False,
+            "candidate_id": approval.candidate_id,
+            "config_artifact": str(config_artifact.resolve()),
+            "config_hash": frozen.config_hash,
+            "credential_scope": "NONE",
+            "database_created": False,
+            "environment": "PAPER",
+            "execution_network": "NONE",
+            "mode": "PAPER_ONLY",
+            "orders_enabled": False,
+            "public_source": asdict(descriptor),
+            "public_transport_started": False,
+            "readiness_manifest_sha256": approval.readiness_manifest_sha256,
+            "readiness_profile_sha256": approval.readiness_profile_sha256,
+            "run_id": frozen.run_id,
+            "status": "READY",
+            "strategy_hash": strategy.strategy_hash,
+            "strategy_name": strategy.strategy_name,
+            "wallet_or_signer_required": False,
+        }
+    except typer.BadParameter:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise typer.BadParameter(f"Preflight Paper bloque: {error}") from None
+    finally:
+        if source is not None:
+            _close_preserving_active_exception(source.close)
+    console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+class _PaperStatusHeadChangedError(RuntimeError):
+    """One bounded status read raced a durable Paper commit."""
+
+
+def _paper_status_payload_once(
+    store: PaperStore,
+    *,
+    database: Path,
+    run_id: str | None,
+    run_limit: int,
+) -> dict[str, object]:
+    from hyperlab.paper.reporting import paper_runtime_session_health
+
     if run_id is not None:
         run = store.get_run(run_id)
-        integrity = store.inspect_integrity_readonly(run_id)
+        integrity = store.inspect_head_integrity_readonly(run_id)
         if integrity.ok:
-            payload: dict[str, object] = dict(store.read_snapshot(run_id))
-            payload.update(
-                {"integrity": "VERIFIED_READONLY", "orders_enabled": False}
+            alert_limit = 50
+            recent_alerts = store.get_recent_alerts(
+                run_id,
+                limit=alert_limit + 1,
             )
+            alerts_truncated = len(recent_alerts) > alert_limit
+            projection = store.get_projection(run_id).to_dict()
+            runtime_session = paper_runtime_session_health(projection)
+            runtime_session["recent_incidents"] = [
+                {
+                    "alert": alert.alert,
+                    "alert_id": alert.alert_id,
+                    "code": alert.code,
+                    "created_at": alert.created_at,
+                    "event_sequence": alert.event_sequence,
+                    "severity": alert.severity,
+                }
+                for alert in recent_alerts[-alert_limit:]
+                if alert.code == "PAPER_RUNTIME_FAILURE"
+            ]
+            payload: dict[str, object] = {
+                "alert_limit": alert_limit,
+                "alerts": [alert.alert for alert in recent_alerts[-alert_limit:]],
+                "alerts_truncated": alerts_truncated,
+                "commit_head_hash": run.commit_head_hash,
+                "commit_sequence": run.commit_sequence,
+                "config_hash": run.config_hash,
+                "event_head_hash": run.event_head_hash,
+                "event_sequence": run.event_sequence,
+                "head_read_attempt_limit": 2,
+                "integrity": "HEAD_ANCHORS_VERIFIED_READONLY",
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+                "projection": projection,
+                "run_id": run.run_id,
+                "runtime_session": runtime_session,
+                "same_head_assembly": True,
+                "status": run.status,
+            }
         else:
             payload = {
                 "alerts": [],
@@ -2002,36 +2251,106 @@ def paper_status(
                 "config_hash": run.config_hash,
                 "event_head_hash": run.event_head_hash,
                 "event_sequence": run.event_sequence,
-                "integrity": "FAILED_READONLY",
+                "head_read_attempt_limit": 2,
+                "integrity": "HEAD_ANCHORS_FAILED_READONLY",
                 "integrity_issue_codes": [issue.code for issue in integrity.issues],
                 "mode": "PAPER_ONLY",
                 "orders_enabled": False,
                 "projection": None,
                 "run_id": run.run_id,
+                "same_head_assembly": True,
                 "status": "MANUAL_REVIEW",
             }
-    else:
-        runs: list[dict[str, object]] = []
-        for run in store.list_runs():
-            integrity = store.inspect_integrity_readonly(run.run_id)
-            runs.append(
-                {
-                    "commit_sequence": run.commit_sequence,
-                    "config_hash": run.config_hash,
-                    "event_sequence": run.event_sequence,
-                    "integrity": (
-                        "VERIFIED_READONLY" if integrity.ok else "FAILED_READONLY"
-                    ),
-                    "run_id": run.run_id,
-                    "status": run.status if integrity.ok else "MANUAL_REVIEW",
-                }
+        if store.get_run(run_id).head_identity != run.head_identity:
+            raise _PaperStatusHeadChangedError
+        return payload
+
+    listed_runs = store.list_runs(limit=run_limit + 1)
+    runs_truncated = len(listed_runs) > run_limit
+    selected_runs = listed_runs[-run_limit:]
+    runs: list[dict[str, object]] = []
+    for run in selected_runs:
+        integrity = store.inspect_head_integrity_readonly(run.run_id)
+        listed_projection = store.get_projection_payload(run.run_id) if integrity.ok else None
+        runs.append(
+            {
+                "commit_sequence": run.commit_sequence,
+                "config_hash": run.config_hash,
+                "event_sequence": run.event_sequence,
+                "integrity": (
+                    "HEAD_ANCHORS_VERIFIED_READONLY" if integrity.ok else "HEAD_ANCHORS_FAILED_READONLY"
+                ),
+                "run_id": run.run_id,
+                "runtime_session": (
+                    paper_runtime_session_health(listed_projection)
+                    if listed_projection is not None
+                    else None
+                ),
+                "status": run.status if integrity.ok else "MANUAL_REVIEW",
+            }
+        )
+    final_listed_runs = store.list_runs(limit=run_limit + 1)
+    if tuple(run.head_identity for run in final_listed_runs) != tuple(
+        run.head_identity for run in listed_runs
+    ):
+        raise _PaperStatusHeadChangedError
+    return {
+        "database": str(database.resolve()),
+        "head_read_attempt_limit": 2,
+        "mode": "PAPER_ONLY",
+        "orders_enabled": False,
+        "run_limit": run_limit,
+        "runs": runs,
+        "runs_truncated": runs_truncated,
+        "same_head_assembly": True,
+    }
+
+
+def _paper_status_payload(
+    store: PaperStore,
+    *,
+    database: Path,
+    run_id: str | None,
+    run_limit: int,
+) -> dict[str, object]:
+    for _attempt in range(2):
+        try:
+            return _paper_status_payload_once(
+                store,
+                database=database,
+                run_id=run_id,
+                run_limit=run_limit,
             )
-        payload = {
-            "database": str(resolved.resolve()),
-            "mode": "PAPER_ONLY",
-            "orders_enabled": False,
-            "runs": runs,
-        }
+        except _PaperStatusHeadChangedError:
+            continue
+    raise typer.BadParameter("HEAD_CHANGED_RETRY: durable Paper head changed during two reads")
+
+
+@paper_app.command("status")
+def paper_status(
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    run_id: Annotated[str | None, typer.Option(help="Run déterministe à détailler")] = None,
+    run_limit: Annotated[
+        int,
+        typer.Option(min=1, max=100, help="Runs récents retournés en mode liste"),
+    ] = 50,
+) -> None:
+    """Lit l'état paper durable sans créer ni modifier le store."""
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    if not resolved.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
+    store = PaperStore(resolved, initialize=False)
+    payload = _paper_status_payload(
+        store,
+        database=resolved,
+        run_id=run_id,
+        run_limit=run_limit,
+    )
     console.print_json(json.dumps(payload))
 
 
@@ -2090,13 +2409,29 @@ def paper_replay(
     ] = None,
 ) -> None:
     """Vérifie en lecture seule le replay exact de la projection durable."""
-    from hyperlab.paper.runtime import replay_paper_run
+    _paper_runtime_settings()
+    from hyperlab.paper.runtime import (
+        PaperAdmissionError,
+        PaperRuntimeLease,
+        replay_paper_run,
+    )
     from hyperlab.paper.store import PaperStore
 
     resolved = _paper_database_path(database)
     if not resolved.is_file():
         raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
-    result = replay_paper_run(PaperStore(resolved, initialize=False), run_id)
+    config = _load_stored_paper_config(resolved, run_id)
+    _require_current_paper_release(config)
+    try:
+        with PaperRuntimeLease(resolved, run_id):
+            _require_current_paper_release(config)
+            store = PaperStore(resolved, initialize=False)
+            try:
+                result = replay_paper_run(store, run_id)
+            finally:
+                _close_preserving_active_exception(store.close)
+    except PaperAdmissionError as error:
+        raise typer.BadParameter(f"Paper replay blocked: {error}") from None
     console.print_json(json.dumps(result.to_dict()))
 
 
@@ -2113,19 +2448,31 @@ def paper_reconcile(
     ] = None,
 ) -> None:
     """Restaure puis réconcilie le ledger paper avant toute nouvelle admission."""
+
+    _paper_runtime_settings()
     from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.runtime import PaperAdmissionError, PaperRuntimeLease
     from hyperlab.paper.store import PaperStore
 
     resolved = _paper_database_path(database)
     config = _load_stored_paper_config(resolved, run_id)
-    store = PaperStore(resolved, initialize=False)
-    projection = store.get_projection(run_id)
+    _require_current_paper_release(config)
     logical_time = _paper_as_of(as_of)
-    if projection.last_received_at is not None and logical_time < projection.last_received_at:
-        raise typer.BadParameter("as-of précède le dernier événement durable du run paper")
-    engine = PaperEngine(store, config)
-    engine.start()
-    result = engine.reconcile(as_of=logical_time)
+    try:
+        with PaperRuntimeLease(resolved, run_id):
+            _require_current_paper_release(config)
+            store = PaperStore(resolved, initialize=False)
+            try:
+                projection = store.get_projection(run_id)
+                if projection.last_received_at is not None and logical_time < projection.last_received_at:
+                    raise typer.BadParameter("as-of précède le dernier événement durable du run paper")
+                engine = PaperEngine(store, config)
+                engine.start()
+                result = engine.reconcile(as_of=logical_time)
+            finally:
+                _close_preserving_active_exception(store.close)
+    except PaperAdmissionError as error:
+        raise typer.BadParameter(f"Réconciliation paper bloquée: {error}") from None
     console.print_json(
         json.dumps(
             {
@@ -2142,6 +2489,351 @@ def paper_reconcile(
     )
 
 
+@paper_app.command("report")
+def paper_report(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    after_sequence: Annotated[
+        int,
+        typer.Option(min=0, help="Premier curseur de timeline exclusif"),
+    ] = 0,
+    timeline_limit: Annotated[
+        int,
+        typer.Option(min=1, max=500, help="événements de timeline retournés"),
+    ] = 100,
+    day_limit: Annotated[
+        int,
+        typer.Option(min=1, max=366, help="Jours UTC retournés"),
+    ] = 31,
+    alert_limit: Annotated[
+        int,
+        typer.Option(min=1, max=200, help="Alertes récentes retournées"),
+    ] = 50,
+) -> None:
+    """Produit un rapport borné et strictement read-only depuis le journal."""
+
+    _paper_runtime_settings()
+    from hyperlab.paper.reporting import (
+        PaperReportIntegrityError,
+        build_paper_report,
+    )
+    from hyperlab.paper.store import PaperStore
+
+    resolved = _paper_database_path(database)
+    if not resolved.is_file():
+        raise typer.BadParameter(f"Store paper introuvable: {resolved.resolve()}")
+    store = PaperStore(resolved, initialize=False)
+    try:
+        payload = build_paper_report(
+            store,
+            run_id,
+            after_sequence=after_sequence,
+            timeline_limit=timeline_limit,
+            day_limit=day_limit,
+            alert_limit=alert_limit,
+        )
+    except (OSError, PaperReportIntegrityError, ValueError) as error:
+        raise typer.BadParameter(f"Rapport paper bloqué: {error}") from None
+    finally:
+        store.close()
+    console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+@paper_app.command("pause")
+def paper_pause(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Motif opérateur exact, journalisé"),
+    ],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option(help="Horodatage logique UTC; défaut: horloge UTC courante"),
+    ] = None,
+) -> None:
+    """Suspend durablement les nouvelles entrées simulées, sans transport."""
+
+    _paper_runtime_settings()
+    from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.store import PaperStore
+
+    normalized_reason = _paper_exact_operator_reason(reason, label="reason")
+    resolved = _paper_database_path(database)
+    config = _load_stored_paper_config(resolved, run_id)
+    store = PaperStore(resolved, initialize=False)
+    try:
+        projection = store.get_projection(run_id)
+        logical_time = _paper_operator_time(projection, as_of)
+        artifact_hash = _paper_operator_artifact_hash(
+            action="PAUSE",
+            config=config,
+            reason=normalized_reason,
+            as_of=logical_time,
+        )
+        engine = PaperEngine(store, config)
+        engine.start()
+        result = engine.pause(
+            as_of=logical_time,
+            reason=normalized_reason,
+            operator_artifact_hash=artifact_hash,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(f"Pause paper bloquée: {error}") from None
+    finally:
+        store.close()
+    console.print_json(
+        json.dumps(
+            {
+                "action": "PAUSE",
+                "config_hash": config.config_hash,
+                "event_sequence": result.projection.last_sequence,
+                "mode": "PAPER_ONLY",
+                "operator_artifact_hash": artifact_hash,
+                "orders_enabled": False,
+                "run_id": run_id,
+                "state": result.projection.state.value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _paper_resume_from_store(
+    *,
+    store: PaperStore,
+    config: PaperRunConfig,
+    run_id: str,
+    normalized_review: str,
+    as_of: str | None,
+    recovery_mode: str,
+) -> tuple[PaperCommandResult, str, str]:
+    from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.models import PaperState
+
+    projection = store.get_projection(run_id)
+    if projection.state is PaperState.MANUAL_REVIEW:
+        raise typer.BadParameter("MANUAL_REVIEW est terminal et ne peut jamais être repris")
+    if projection.state is not PaperState.PAUSED:
+        raise typer.BadParameter("resume exige un état durable PAUSED")
+    logical_time = _paper_operator_time(projection, as_of)
+    reviewed_critical_incident_count = projection.critical_incident_count
+    reviewed_last_critical_incident_at = projection.last_critical_incident_at
+    incident_artifact_hash = _paper_resume_incident_artifact_hash(
+        config,
+        projection,
+    )
+    review_artifact_hash = _paper_operator_artifact_hash(
+        action=f"RESUME_AFTER_REVIEW:{recovery_mode}",
+        config=config,
+        reason=normalized_review,
+        as_of=logical_time,
+        incident_artifact_hash=incident_artifact_hash,
+    )
+    engine = PaperEngine(store, config)
+    engine.start()
+    if engine.projection().state is PaperState.MANUAL_REVIEW:
+        raise typer.BadParameter("MANUAL_REVIEW est terminal et ne peut jamais être repris")
+    reconciliation = engine.reconcile(as_of=logical_time)
+    if reconciliation.projection.state is PaperState.MANUAL_REVIEW:
+        raise typer.BadParameter("La réconciliation a verrouillé MANUAL_REVIEW; reprise interdite")
+    result = engine.resume_from_pause(
+        as_of=logical_time,
+        review_artifact_hash=review_artifact_hash,
+        reviewed_critical_incident_count=reviewed_critical_incident_count,
+        reviewed_last_critical_incident_at=reviewed_last_critical_incident_at,
+        recovery_mode=recovery_mode,
+    )
+    return result, incident_artifact_hash, review_artifact_hash
+
+
+@paper_app.command("resume")
+def paper_resume(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    review_reason: Annotated[
+        str,
+        typer.Option("--review-reason", help="Conclusion exacte de la revue opérateur"),
+    ],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option(help="Horodatage logique UTC; défaut: horloge UTC courante"),
+    ] = None,
+    offline_unclosed_recovery: Annotated[
+        bool,
+        typer.Option(
+            "--offline-unclosed-recovery",
+            help=(
+                "Reprise explicite d'une session runtime durable non fermée; "
+                "exige que le runtime soit arrêté"
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Réconcilie puis reprend un PAUSED selon un mode de revue explicite."""
+
+    _paper_runtime_settings()
+    from hyperlab.paper.runtime import PaperAdmissionError, PaperRuntimeLease
+    from hyperlab.paper.store import PaperStore
+
+    normalized_review = _paper_exact_operator_reason(
+        review_reason,
+        label="review-reason",
+    )
+    resolved = _paper_database_path(database)
+    config = _load_stored_paper_config(resolved, run_id)
+    _require_current_paper_release(config)
+    recovery_mode = (
+        "OFFLINE_UNCLOSED_SESSION" if offline_unclosed_recovery else "STANDARD"
+    )
+    try:
+        if offline_unclosed_recovery:
+            with PaperRuntimeLease(resolved, run_id):
+                leased_config = _load_stored_paper_config(resolved, run_id)
+                _require_current_paper_release(leased_config)
+                if leased_config.to_dict() != config.to_dict():
+                    raise typer.BadParameter(
+                        "Le snapshot paper durable a changé avant la reprise offline"
+                    )
+                store = PaperStore(resolved, initialize=False)
+                try:
+                    result, incident_artifact_hash, review_artifact_hash = (
+                        _paper_resume_from_store(
+                            store=store,
+                            config=leased_config,
+                            run_id=run_id,
+                            normalized_review=normalized_review,
+                            as_of=as_of,
+                            recovery_mode=recovery_mode,
+                        )
+                    )
+                finally:
+                    _close_preserving_active_exception(store.close)
+        else:
+            store = PaperStore(resolved, initialize=False)
+            try:
+                result, incident_artifact_hash, review_artifact_hash = (
+                    _paper_resume_from_store(
+                        store=store,
+                        config=config,
+                        run_id=run_id,
+                        normalized_review=normalized_review,
+                        as_of=as_of,
+                        recovery_mode=recovery_mode,
+                    )
+                )
+            finally:
+                _close_preserving_active_exception(store.close)
+    except typer.BadParameter:
+        raise
+    except (OSError, PaperAdmissionError, ValueError) as error:
+        raise typer.BadParameter(f"Reprise paper bloquée: {error}") from None
+    console.print_json(
+        json.dumps(
+            {
+                "action": "RESUME_AFTER_REVIEW",
+                "config_hash": config.config_hash,
+                "event_sequence": result.projection.last_sequence,
+                "incident_artifact_hash": incident_artifact_hash,
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+                "reconciled": result.projection.reconciled,
+                "recovery_mode": recovery_mode,
+                "review_artifact_hash": review_artifact_hash,
+                "run_id": run_id,
+                "state": result.projection.state.value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+@paper_app.command("kill")
+def paper_kill(
+    run_id: Annotated[str, typer.Argument(help="Run paper déterministe")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Motif opérateur exact, journalisé"),
+    ],
+    confirm_run_id: Annotated[
+        str,
+        typer.Option(
+            "--confirm-run-id",
+            help="Confirmation irréversible: répéter exactement le run_id",
+        ),
+    ],
+    database: Annotated[
+        Path | None,
+        typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
+    ] = None,
+    as_of: Annotated[
+        str | None,
+        typer.Option(help="Horodatage logique UTC; défaut: horloge UTC courante"),
+    ] = None,
+) -> None:
+    """Verrouille irréversiblement MANUAL_REVIEW et termine les ordres simulés."""
+
+    _paper_runtime_settings()
+    from hyperlab.paper.engine import PaperEngine
+    from hyperlab.paper.store import PaperStore
+
+    normalized_reason = _paper_exact_operator_reason(reason, label="reason")
+    if confirm_run_id != run_id:
+        raise typer.BadParameter("confirm-run-id doit correspondre exactement au run_id")
+    resolved = _paper_database_path(database)
+    config = _load_stored_paper_config(resolved, run_id)
+    store = PaperStore(resolved, initialize=False)
+    try:
+        projection = store.get_projection(run_id)
+        logical_time = _paper_operator_time(projection, as_of)
+        artifact_hash = _paper_operator_artifact_hash(
+            action="KILL",
+            config=config,
+            reason=normalized_reason,
+            as_of=logical_time,
+        )
+        engine = PaperEngine(store, config)
+        engine.start()
+        result = engine.kill(
+            as_of=logical_time,
+            reason=normalized_reason,
+            operator_artifact_hash=artifact_hash,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(f"Kill paper bloqué: {error}") from None
+    finally:
+        store.close()
+    console.print_json(
+        json.dumps(
+            {
+                "action": "KILL",
+                "config_hash": config.config_hash,
+                "event_sequence": result.projection.last_sequence,
+                "mode": "PAPER_ONLY",
+                "operator_artifact_hash": artifact_hash,
+                "orders_enabled": False,
+                "resumable": False,
+                "run_id": run_id,
+                "state": result.projection.state.value,
+                "terminal": True,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
 @paper_app.command("run")
 def paper_run(
     config_artifact: Annotated[
@@ -2153,13 +2845,13 @@ def paper_run(
         typer.Option(help="Store SQLite paper; défaut: HYPERLAB_DATA_DIR/paper/paper.sqlite3"),
     ] = None,
     timer_interval_seconds: Annotated[
-        float,
-        typer.Option(min=0.001, help="Cadence des contrôles de timeout paper"),
-    ] = 1.0,
+        float | None,
+        typer.Option(min=0.001, help="Doit égaler la cadence figée du PaperRunConfig"),
+    ] = None,
     source_poll_timeout_seconds: Annotated[
-        float,
-        typer.Option(min=0.001, help="Attente maximale de la source publique normalisée"),
-    ] = 0.25,
+        float | None,
+        typer.Option(min=0.001, help="Doit égaler l'attente source figée du PaperRunConfig"),
+    ] = None,
 ) -> None:
     """Exécute exclusivement une liaison paper pré-approuvée et compilée dans ce checkout."""
     from hyperlab.paper.engine import PaperEngine
@@ -2175,6 +2867,15 @@ def paper_run(
         raise typer.BadParameter(
             "Aucune liaison figée stratégie + source publique n'est approuvée pour ce config_hash"
         )
+    if timer_interval_seconds is not None and timer_interval_seconds != frozen.runtime_timer_interval_seconds:
+        raise typer.BadParameter("timer-interval-seconds diffère de la cadence figée du PaperRunConfig")
+    if (
+        source_poll_timeout_seconds is not None
+        and source_poll_timeout_seconds != frozen.runtime_source_poll_timeout_seconds
+    ):
+        raise typer.BadParameter("source-poll-timeout-seconds diffère de l'attente figée du PaperRunConfig")
+    frozen_timer_interval_seconds = frozen.runtime_timer_interval_seconds
+    frozen_source_poll_timeout_seconds = frozen.runtime_source_poll_timeout_seconds
 
     _verify_approved_paper_readiness(approval, frozen, config_artifact)
     resolved = _paper_database_path(database)
@@ -2191,8 +2892,8 @@ def paper_run(
             strategy,
             source,
             config=PaperRuntimeConfig(
-                timer_interval_seconds=timer_interval_seconds,
-                source_poll_timeout_seconds=source_poll_timeout_seconds,
+                timer_interval_seconds=frozen_timer_interval_seconds,
+                source_poll_timeout_seconds=frozen_source_poll_timeout_seconds,
                 mode=settings.app.mode,
             ),
         )
@@ -2220,6 +2921,8 @@ def paper_run(
                 "mode": "PAPER_ONLY",
                 "orders_enabled": False,
                 "run_id": frozen.run_id,
+                "runtime_source_poll_timeout_seconds": frozen_source_poll_timeout_seconds,
+                "runtime_timer_interval_seconds": frozen_timer_interval_seconds,
                 "state": projection.state.value,
             }
         )

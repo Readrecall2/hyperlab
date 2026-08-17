@@ -10,14 +10,21 @@ import websocket
 
 from hyperlab.collector.websocket import (
     ReceivedWireMessage,
+    UrlWebsocketClientFactory,
     WebsocketClientFactory,
     WebsocketClientSocket,
 )
 
 
 class FakeConnection:
-    def __init__(self, messages: Iterator[object] | None = None) -> None:
+    def __init__(
+        self,
+        messages: Iterator[object] | None = None,
+        *,
+        handshake_status: object = 101,
+    ) -> None:
         self._messages = messages
+        self._handshake_status = handshake_status
         self._closed = threading.Event()
         self.timeout: float | None = None
         self.sent: list[str] = []
@@ -25,6 +32,9 @@ class FakeConnection:
 
     def settimeout(self, timeout: float) -> None:
         self.timeout = timeout
+
+    def getstatus(self) -> object:
+        return self._handshake_status
 
     def send(self, message: str) -> None:
         self.sent.append(message)
@@ -364,7 +374,16 @@ def test_factory_uses_public_network_url_and_connection_options(
 
     socket = factory.connect(network, timeout_seconds=3.5)
     try:
-        assert calls == [(expected_url, {"timeout": 3.5, "enable_multithread": True})]
+        assert calls == [
+            (
+                expected_url,
+                {
+                    "timeout": 3.5,
+                    "enable_multithread": True,
+                    "redirect_limit": 0,
+                },
+            )
+        ]
         assert socket._messages.maxsize == 7
         assert socket.receive(0.2) == ReceivedWireMessage("wire", received_at)
     finally:
@@ -381,6 +400,64 @@ def test_factory_rejects_unknown_network_without_opening_connection(
 
     with pytest.raises(ValueError, match="unsupported network: devnet"):
         WebsocketClientFactory().connect("devnet", timeout_seconds=1.0)
+
+
+def test_url_factory_requires_public_network_and_exact_http_101(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_create_connection(url: str, **kwargs: Any) -> FakeConnection:
+        calls.append((url, kwargs))
+        return connection
+
+    monkeypatch.setattr(websocket, "create_connection", fake_create_connection)
+    factory = UrlWebsocketClientFactory(
+        "wss://fixture.invalid/public",
+        queue_capacity=3,
+    )
+
+    socket = factory.connect_paused("public", timeout_seconds=2.5)
+    try:
+        assert calls == [
+            (
+                "wss://fixture.invalid/public",
+                {
+                    "timeout": 2.5,
+                    "enable_multithread": True,
+                    "redirect_limit": 0,
+                },
+            )
+        ]
+        assert not socket._reader.is_alive()
+    finally:
+        socket.close()
+
+    with pytest.raises(ValueError, match="only supports the public network"):
+        factory.connect("mainnet", timeout_seconds=2.5)
+
+
+@pytest.mark.parametrize("factory_kind", ["network", "url"])
+@pytest.mark.parametrize("handshake_status", [302, None, True])
+def test_factories_close_and_reject_any_non_101_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_kind: str,
+    handshake_status: object,
+) -> None:
+    connection = FakeConnection(handshake_status=handshake_status)
+    monkeypatch.setattr(websocket, "create_connection", lambda *_args, **_kwargs: connection)
+
+    with pytest.raises(ConnectionError, match="exact HTTP 101"):
+        if factory_kind == "network":
+            WebsocketClientFactory().connect("mainnet", timeout_seconds=1.0)
+        else:
+            UrlWebsocketClientFactory("wss://fixture.invalid/public").connect(
+                "public",
+                timeout_seconds=1.0,
+            )
+
+    assert connection.close_calls == 1
 
 
 @pytest.mark.parametrize("capacity", [0, -1])

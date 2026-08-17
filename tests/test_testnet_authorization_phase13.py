@@ -214,7 +214,7 @@ def test_all_compiled_testnet_artifacts_are_ready_and_receipt_cannot_escalate(
     } <= escalation_codes
 
 
-def test_compiled_registry_is_exactly_testnet_scoped_with_stable_identities() -> None:
+def test_compiled_testnet_registry_keeps_stable_identities_and_no_real_money_scope() -> None:
     status = compiled_evidence_verifier_status(EnvironmentClass.TESTNET)
 
     assert status['complete'] is True
@@ -239,8 +239,10 @@ def test_compiled_registry_is_exactly_testnet_scoped_with_stable_identities() ->
         f'hyperlab:testnet-execution:{check.value.casefold()}'
         for check in _TESTNET_CHECKS
     }
+    paper = compiled_evidence_verifier_status(EnvironmentClass.PAPER)
+    assert paper['complete'] is True
+    assert paper['purpose'] == 'PAPER_RUNTIME'
     for environment in (
-        EnvironmentClass.PAPER,
         EnvironmentClass.MICRO_MAINNET,
         EnvironmentClass.MAINNET,
     ):

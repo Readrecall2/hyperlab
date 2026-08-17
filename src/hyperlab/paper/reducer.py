@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from datetime import datetime
 from decimal import Decimal
 from typing import cast
 
 from hyperlab.paper.models import (
     AlertSeverity,
+    DecisionAction,
     OrderSide,
     OrderStatus,
     PaperEvent,
@@ -26,6 +28,44 @@ def _payload_string(payload: Mapping[str, object], key: str) -> str:
         raise ValueError(f"{key} must be a non-empty string")
     return value
 
+def _payload_digest(payload: Mapping[str, object], key: str) -> str:
+    value = _payload_string(payload, key)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{key} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _source_received_at(event: PaperEvent) -> datetime:
+    raw = event.payload.get("source_received_at")
+    source_received_at = (
+        parse_utc(raw)
+        if isinstance(raw, str)
+        else event.received_at
+    )
+    if source_received_at > event.received_at:
+        raise ValueError("public source time cannot exceed durable processing time")
+    return source_received_at
+
+
+def _observe_public_source_time(
+    projection: PaperProjection,
+    event: PaperEvent,
+    *,
+    instrument: str | None = None,
+) -> datetime:
+    source_received_at = _source_received_at(event)
+    previous = projection.last_public_source_received_at
+    if previous is None or source_received_at > previous:
+        projection.last_public_source_received_at = source_received_at
+    if instrument is not None:
+        prior_market = projection.last_market_received_at_by_instrument.get(instrument)
+        if prior_market is None or source_received_at > prior_market:
+            projection.last_market_received_at_by_instrument[instrument] = source_received_at
+        projection.last_market_received_at = max(
+            projection.last_market_received_at_by_instrument.values()
+        )
+    return source_received_at
+
 
 def _order(projection: PaperProjection, event: PaperEvent) -> PaperOrder:
     order_id = _payload_string(event.payload, "order_id")
@@ -35,6 +75,29 @@ def _order(projection: PaperProjection, event: PaperEvent) -> PaperOrder:
         raise ValueError(
             f"event {cast(PaperEventType, event.event_type).value} references unknown order {order_id}"
         ) from error
+
+
+def _archive_unrelated_terminal_orders(
+    projection: PaperProjection,
+    *,
+    incoming_decision_id: str,
+) -> None:
+    retained_decision_ids = {incoming_decision_id}
+    if projection.current_entry_decision_id is not None:
+        retained_decision_ids.add(projection.current_entry_decision_id)
+    if projection.current_exit_decision_id is not None:
+        retained_decision_ids.add(projection.current_exit_decision_id)
+    archived_order_ids = tuple(
+        sorted(
+            order_id
+            for order_id, order in projection.orders.items()
+            if not order.status.active
+            and order.intent.decision_id not in retained_decision_ids
+        )
+    )
+    for order_id in archived_order_ids:
+        del projection.orders[order_id]
+    projection.archived_order_count += len(archived_order_ids)
 
 
 def _transition(projection: PaperProjection, event: PaperEvent) -> None:
@@ -65,6 +128,8 @@ def _transition(projection: PaperProjection, event: PaperEvent) -> None:
     }:
         projection.suspended_from = None
     projection.state = target
+    if target is PaperState.MANUAL_REVIEW:
+        projection.reconciled = False
     projection.state_since = event.received_at
 
 
@@ -160,7 +225,6 @@ def _apply_fill(projection: PaperProjection, event: PaperEvent, *, full: bool) -
         projection.positions[instrument] = new_quantity
         projection.cost_basis[instrument] = new_basis
         projection.inventory_value[instrument] = new_inventory_value
-    projection.marks[instrument] = price
     projection.peak_equity = max(projection.peak_equity, projection.equity)
 
 
@@ -208,6 +272,63 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
         if config_hash != projection.config_hash:
             raise ValueError("RUN_STARTED config hash differs from the frozen projection")
         projection.state_since = event.received_at
+    elif event_type is PaperEventType.RUNTIME_SESSION_STARTED:
+        session_id = _payload_digest(event.payload, "session_id")
+        raw_generation = event.payload.get("generation")
+        if (
+            isinstance(raw_generation, bool)
+            or not isinstance(raw_generation, int)
+            or raw_generation != projection.runtime_session_generation + 1
+        ):
+            raise ValueError(
+                "runtime session generation must advance by exactly one"
+            )
+        raw_replaced = event.payload.get("replaces_unclosed_session_id")
+        replaced_session_id = (
+            None
+            if raw_replaced is None
+            else _payload_digest(event.payload, "replaces_unclosed_session_id")
+        )
+        active_session_id = (
+            projection.runtime_session_id
+            if projection.runtime_session_active
+            else None
+        )
+        if replaced_session_id != active_session_id:
+            raise ValueError(
+                "runtime session replacement differs from the active durable session"
+            )
+        started_at = parse_utc(_payload_string(event.payload, "started_at"))
+        if started_at != event.received_at:
+            raise ValueError(
+                "runtime session start time must equal durable processing time"
+            )
+        projection.runtime_session_generation = raw_generation
+        projection.runtime_session_id = session_id
+        projection.runtime_session_started_at = started_at
+        projection.runtime_session_stopped_at = None
+    elif event_type is PaperEventType.RUNTIME_SESSION_STOPPED:
+        session_id = _payload_digest(event.payload, "session_id")
+        raw_generation = event.payload.get("generation")
+        if (
+            isinstance(raw_generation, bool)
+            or not isinstance(raw_generation, int)
+            or not projection.runtime_session_active
+            or session_id != projection.runtime_session_id
+            or raw_generation != projection.runtime_session_generation
+        ):
+            raise ValueError(
+                "runtime session stop differs from the active durable session"
+            )
+        stopped_at = parse_utc(_payload_string(event.payload, "stopped_at"))
+        if stopped_at != event.received_at:
+            raise ValueError(
+                "runtime session stop time must equal durable processing time"
+            )
+        reason = _payload_string(event.payload, "reason")
+        if reason not in {"NORMAL_COMPLETION", "COOPERATIVE_STOP"}:
+            raise ValueError("unsupported clean runtime session stop reason")
+        projection.runtime_session_stopped_at = stopped_at
     elif event_type is PaperEventType.STATE_TRANSITIONED:
         _transition(projection, event)
     elif event_type is PaperEventType.DECISION_RECORDED:
@@ -235,8 +356,24 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
                 "status": OrderStatus.PLANNED.value,
             }
         )
+        if order.intent.run_id != projection.run_id:
+            raise ValueError("ORDER_PLANNED order belongs to another run")
+        if order.action is DecisionAction.ENTRY:
+            current_decision_id = projection.current_entry_decision_id
+        elif order.action is DecisionAction.EXIT:
+            current_decision_id = projection.current_exit_decision_id
+        else:
+            raise ValueError("ORDER_PLANNED requires an ENTRY or EXIT action")
+        if current_decision_id != order.intent.decision_id:
+            raise ValueError(
+                f"ORDER_PLANNED must belong to the current {order.action.value} decision"
+            )
         if order.intent.order_id in projection.orders:
             raise ValueError("ORDER_PLANNED duplicates an existing order")
+        _archive_unrelated_terminal_orders(
+            projection,
+            incoming_decision_id=order.intent.decision_id,
+        )
         projection.orders[order.intent.order_id] = order
     elif event_type is PaperEventType.RISK_ACCEPTED:
         order = _order(projection, event)
@@ -300,17 +437,30 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
         order.fill_attempts += 1
     elif event_type is PaperEventType.MARK_RECORDED:
         instrument = _payload_string(event.payload, "instrument")
-        projection.marks[instrument] = decimal_value(
+        price = decimal_value(
             _payload_string(event.payload, "price"), label="mark price", positive=True
         )
+        source_received_at = _observe_public_source_time(
+            projection,
+            event,
+            instrument=instrument,
+        )
+        projection.marks[instrument] = price
+        projection.public_bbo_mids[instrument] = price
+        projection.public_bbo_received_at_by_instrument[instrument] = source_received_at
         projection.peak_equity = max(projection.peak_equity, projection.equity)
-        projection.last_market_received_at_by_instrument[instrument] = event.received_at
-        projection.last_market_received_at = event.received_at
     elif event_type is PaperEventType.FUNDING_POSTED:
+        _observe_public_source_time(projection, event)
         amount = decimal_value(_payload_string(event.payload, "amount"), label="funding amount")
         projection.cash += amount
         projection.realized_pnl += amount
         projection.peak_equity = max(projection.peak_equity, projection.equity)
+    elif event_type is PaperEventType.PUBLIC_SOURCE_HEALTH_RECORDED:
+        instrument = _payload_string(event.payload, "instrument")
+        _observe_public_source_time(projection, event, instrument=instrument)
+        if bool(event.payload.get("gap")) or bool(event.payload.get("stale")):
+            projection.public_bbo_mids.pop(instrument, None)
+            projection.public_bbo_received_at_by_instrument.pop(instrument, None)
     elif event_type is PaperEventType.CYCLE_COMPLETED:
         if projection.positions:
             raise ValueError("a cycle cannot complete with an open position")
@@ -319,7 +469,8 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
         projection.current_exit_decision_id = None
     elif event_type is PaperEventType.ALERT_RAISED:
         if AlertSeverity(_payload_string(event.payload, "severity")) is AlertSeverity.CRITICAL:
-            projection.critical_incidents.append(event.received_at)
+            projection.critical_incident_count += 1
+            projection.last_critical_incident_at = event.received_at
     elif event_type is PaperEventType.RECONCILIATION_SUCCEEDED:
         projection.reconciled = True
     elif event_type is PaperEventType.RECONCILIATION_FAILED:
@@ -356,7 +507,7 @@ def replay_projection(
     run_id: str,
     config_hash: str,
     initial_cash: Decimal,
-    events: tuple[StoredPaperEvent, ...],
+    events: Iterable[StoredPaperEvent],
 ) -> PaperProjection:
     projection = PaperProjection(
         run_id=run_id,

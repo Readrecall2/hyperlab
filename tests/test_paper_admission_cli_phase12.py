@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 
+import pytest
 from typer.testing import CliRunner
 
 import hyperlab.cli as cli_module
@@ -97,7 +98,12 @@ def _install_paper_fixture_verifiers(monkeypatch) -> None:  # type: ignore[no-un
     )
 
 
-def _config(root: Path) -> PaperRunConfig:
+def _config(
+    root: Path,
+    *,
+    runtime_timer_interval_seconds: float = 1.0,
+    runtime_source_poll_timeout_seconds: float = 0.25,
+) -> PaperRunConfig:
     source_payload = b'{"public_only":true,"schema_version":2}'
     (root / "identity").mkdir(parents=True, exist_ok=True)
     (root / "identity/public-source.json").write_bytes(source_payload)
@@ -131,14 +137,22 @@ def _config(root: Path) -> PaperRunConfig:
         run_kind="TECHNICAL",
         data_source=_SOURCE_IDENTITY,
         required_instruments=(_INSTRUMENT,),
+        runtime_timer_interval_seconds=runtime_timer_interval_seconds,
+        runtime_source_poll_timeout_seconds=runtime_source_poll_timeout_seconds,
         minimum_validation_cycles=1,
     )
 
-
 def _readiness_fixture(
     root: Path,
+    *,
+    runtime_timer_interval_seconds: float = 1.0,
+    runtime_source_poll_timeout_seconds: float = 0.25,
 ) -> tuple[PaperRunConfig, Path, EnvironmentReadinessManifest, Path]:
-    config = _config(root)
+    config = _config(
+        root,
+        runtime_timer_interval_seconds=runtime_timer_interval_seconds,
+        runtime_source_poll_timeout_seconds=runtime_source_poll_timeout_seconds,
+    )
     config_artifact = root / "paper-config.json"
     config_artifact.write_text(canonical_json(config.to_dict()), encoding="utf-8")
     profile = profile_for(EnvironmentClass.PAPER)
@@ -222,6 +236,7 @@ def test_registered_runtime_rechecks_technical_readiness_before_factories_or_sto
     approval = cli_module._ApprovedPaperRuntimeFactories(
         candidate_id="cash_and_carry",
         config_hash=config.config_hash,
+        config_artifact_path=config_artifact,
         readiness_manifest_path=tmp_path / "missing-readiness.json",
         readiness_manifest_sha256="c" * 64,
         readiness_profile_sha256="d" * 64,
@@ -302,6 +317,7 @@ def test_valid_technical_readiness_reaches_store_and_factory_without_gate_b_c_d(
     approval = cli_module._ApprovedPaperRuntimeFactories(
         candidate_id="cash_and_carry",
         config_hash=config.config_hash,
+        config_artifact_path=config_artifact,
         readiness_manifest_path=manifest_path,
         readiness_manifest_sha256=manifest.manifest_sha256,
         readiness_profile_sha256=decision.profile_sha256,
@@ -342,6 +358,75 @@ def test_valid_technical_readiness_reaches_store_and_factory_without_gate_b_c_d(
     assert calls == ["store", "strategy", "close"]
 
 
+
+
+@pytest.mark.parametrize(
+    ("timer_interval_seconds", "poll_timeout_seconds"),
+    [(2.0, 0.25), (1.0, 0.5)],
+)
+def test_swapped_frozen_cadence_blocks_before_store_or_factories(
+    tmp_path: Path,
+    monkeypatch,
+    timer_interval_seconds: float,
+    poll_timeout_seconds: float,
+) -> None:  # type: ignore[no-untyped-def]
+    _install_paper_fixture_verifiers(monkeypatch)
+    config, config_artifact, manifest, manifest_path = _readiness_fixture(
+        tmp_path,
+        runtime_timer_interval_seconds=timer_interval_seconds,
+        runtime_source_poll_timeout_seconds=poll_timeout_seconds,
+    )
+    decision = verify_environment_readiness(manifest, evidence_root=tmp_path)
+    assert decision.ready
+    calls: list[str] = []
+    database = tmp_path / "must-not-exist.sqlite3"
+
+    def strategy_factory(_config: PaperRunConfig):  # type: ignore[no-untyped-def]
+        calls.append("strategy")
+        raise AssertionError("strategy factory must not run")
+
+    def source_factory(_config: PaperRunConfig):  # type: ignore[no-untyped-def]
+        calls.append("source")
+        raise AssertionError("source factory must not run")
+
+    class ForbiddenStore:
+        def __init__(self, _path: Path) -> None:
+            calls.append("store")
+            raise AssertionError("store must not open")
+
+    approval = cli_module._ApprovedPaperRuntimeFactories(
+        candidate_id="cash_and_carry",
+        config_hash=config.config_hash,
+        config_artifact_path=config_artifact,
+        readiness_manifest_path=manifest_path,
+        readiness_manifest_sha256=manifest.manifest_sha256,
+        readiness_profile_sha256=decision.profile_sha256,
+        readiness_evidence_root=tmp_path,
+        strategy_factory=strategy_factory,
+        source_factory=source_factory,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_APPROVED_PAPER_RUNTIMES",
+        {config.config_hash: approval},
+    )
+    monkeypatch.setattr("hyperlab.paper.store.PaperStore", ForbiddenStore)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "paper",
+            "run",
+            str(config_artifact),
+            "--database",
+            str(database),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "paper runtime cadence differs" in result.output
+    assert calls == []
+    assert not database.exists()
 def test_stale_approved_readiness_profile_blocks_before_store_or_factories(
     tmp_path: Path,
     monkeypatch,
@@ -371,6 +456,7 @@ def test_stale_approved_readiness_profile_blocks_before_store_or_factories(
     approval = cli_module._ApprovedPaperRuntimeFactories(
         candidate_id="cash_and_carry",
         config_hash=config.config_hash,
+        config_artifact_path=config_artifact,
         readiness_manifest_path=manifest_path,
         readiness_manifest_sha256=manifest.manifest_sha256,
         readiness_profile_sha256=stale_profile_sha256,

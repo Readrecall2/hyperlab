@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -136,16 +137,19 @@ _REQUIRED_EXERCISES = frozenset(
 
 
 def _latest_persisted_evidence(
-    events: tuple[StoredPaperEvent, ...],
+    events: Iterable[StoredPaperEvent],
     as_of: datetime,
     config: PaperRunConfig,
-) -> tuple[Decimal | None, bool, set[str], bool]:
+) -> tuple[Decimal | None, bool, set[str], bool, int, int, str | None]:
     stressed_pnl: Decimal | None = None
     stress_covers_final_economic_prefix = False
     exercises: set[str] = set()
     continuous_coverage = False
     latest_economic_sequence = 0
     latest_stress_sequence = 0
+    event_count = 0
+    last_event_sequence = 0
+    last_event_hash: str | None = None
     economic_types = {
         PaperEventType.DECISION_RECORDED,
         PaperEventType.ORDER_PLANNED,
@@ -164,6 +168,9 @@ def _latest_persisted_evidence(
         PaperEventType.CYCLE_COMPLETED,
     }
     for stored in events:
+        event_count += 1
+        last_event_sequence = stored.sequence
+        last_event_hash = stored.event_hash
         event = stored.event
         if event.received_at > as_of:
             continue
@@ -188,7 +195,9 @@ def _latest_persisted_evidence(
                 == stored.previous_event_hash
             )
         elif event.event_type is PaperEventType.RESILIENCE_EXERCISE_RECORDED:
-            exercises.add(str(event.payload["exercise"]).upper())
+            exercise = str(event.payload["exercise"]).upper()
+            if exercise in _REQUIRED_EXERCISES:
+                exercises.add(exercise)
         elif event.event_type is PaperEventType.OBSERVATION_COVERAGE_RECORDED:
             continuous_coverage = (
                 bool(event.payload.get("continuous"))
@@ -208,6 +217,9 @@ def _latest_persisted_evidence(
         stress_covers_final_economic_prefix,
         exercises,
         continuous_coverage,
+        event_count,
+        last_event_sequence,
+        last_event_hash,
     )
 
 
@@ -219,7 +231,9 @@ def _require_stable_snapshot(
     after: RunRecord,
     projection_sequence: int,
     projection_event_hash: str | None,
-    events: tuple[StoredPaperEvent, ...],
+    event_count: int,
+    last_event_sequence: int,
+    last_event_hash: str | None,
 ) -> None:
     """Reject a Gate D read if any authoritative durable anchor changed."""
 
@@ -235,12 +249,17 @@ def _require_stable_snapshot(
         run.commit_sequence,
         run.commit_head_hash,
     )
-    events_bound = (
-        (run.event_sequence == 0 and not events)
+    journal_bound = (
+        (
+            run.event_sequence == 0
+            and event_count == 0
+            and last_event_sequence == 0
+            and last_event_hash is None
+        )
         or (
-            len(events) == run.event_sequence
-            and events[-1].sequence == run.event_sequence
-            and events[-1].event_hash == run.event_head_hash
+            event_count == run.event_sequence
+            and last_event_sequence == run.event_sequence
+            and last_event_hash == run.event_head_hash
         )
     )
     if (
@@ -249,7 +268,7 @@ def _require_stable_snapshot(
         or report_anchor != run_anchor
         or projection_sequence != run.event_sequence
         or projection_event_hash != run.event_head_hash
-        or not events_bound
+        or not journal_bound
     ):
         raise ConcurrentWriteError(
             "paper Gate D durable head changed during read-only evaluation; "
@@ -274,7 +293,19 @@ def evaluate_paper_gate(
         run = store.get_run(run_id)
         config = PaperRunConfig.from_dict(run.config_snapshot)
         projection = store.get_projection(run_id)
-        events = store.get_events(run_id)
+        (
+            stressed_pnl,
+            stress_bound,
+            exercises,
+            continuous_coverage,
+            journal_event_count,
+            journal_last_event_sequence,
+            journal_last_event_hash,
+        ) = _latest_persisted_evidence(
+            store.iter_events(run_id),
+            evidence.as_of,
+            config,
+        )
         after = store.get_run(run_id)
     except (IntegrityError, RunNotFoundError):
         raise
@@ -285,7 +316,9 @@ def evaluate_paper_gate(
         after=after,
         projection_sequence=projection.last_sequence,
         projection_event_hash=projection.last_event_hash,
-        events=events,
+        event_count=journal_event_count,
+        last_event_sequence=journal_last_event_sequence,
+        last_event_hash=journal_last_event_hash,
     )
     if run.config_hash != config.config_hash or run.run_id != config.run_id:
         raise ValueError("paper gate durable run is not bound to its frozen configuration")
@@ -300,14 +333,9 @@ def evaluate_paper_gate(
         raise ValueError("paper gate as_of precedes the durable paper state")
 
     elapsed = evidence.as_of - config.validation_started_at
-    last_incident = max(projection.critical_incidents, default=None)
+    last_incident = projection.last_critical_incident_at
     incident_free_since = last_incident or config.validation_started_at
     incident_free_duration = evidence.as_of - incident_free_since
-    stressed_pnl, stress_bound, exercises, continuous_coverage = _latest_persisted_evidence(
-        events,
-        evidence.as_of,
-        config,
-    )
     required_instruments = set(config.required_instruments)
     required_instruments.update(projection.positions)
     required_instruments.update(
@@ -466,7 +494,7 @@ def evaluate_paper_gate(
         projection_revision=run.projection_revision,
         projection_hash=run.projection_hash,
         completed_cycles=projection.completed_cycles,
-        critical_incident_count=len(projection.critical_incidents),
+        critical_incident_count=projection.critical_incident_count,
         incident_free_days_completed=max(incident_free_duration.days, 0),
         minimum_cycles_required=config.minimum_validation_cycles,
         minimum_incident_free_days=14,

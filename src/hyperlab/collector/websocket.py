@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -18,6 +19,41 @@ def _utc_now() -> datetime:
 
 
 _READER_SEQUENCE = itertools.count(1)
+PUBLIC_WEBSOCKET_REDIRECT_LIMIT = 0
+PUBLIC_WEBSOCKET_REQUIRED_HTTP_STATUS = 101
+
+
+def _close_rejected_connection(connection: Any) -> None:
+    # The admission error remains primary; the connection is never exposed.
+    with suppress(Exception):
+        connection.close()
+
+
+def _open_public_websocket(url: str, timeout_seconds: float) -> Any:
+    import websocket
+
+    connection = websocket.create_connection(
+        url,
+        timeout=timeout_seconds,
+        enable_multithread=True,
+        redirect_limit=PUBLIC_WEBSOCKET_REDIRECT_LIMIT,
+    )
+    getstatus = getattr(connection, "getstatus", None)
+    if not callable(getstatus):
+        _close_rejected_connection(connection)
+        raise ConnectionError("public websocket handshake status is unavailable")
+    try:
+        status = getstatus()
+    except Exception as exc:
+        _close_rejected_connection(connection)
+        raise ConnectionError("public websocket handshake status is unavailable") from exc
+    if type(status) is not int or status != PUBLIC_WEBSOCKET_REQUIRED_HTTP_STATUS:
+        _close_rejected_connection(connection)
+        raise ConnectionError(
+            "public websocket handshake did not return exact HTTP 101 "
+            f"(received {status!r})"
+        )
+    return connection
 
 
 def _reader_name(
@@ -449,19 +485,13 @@ class WebsocketClientFactory:
         self._reader_name = reader_name
 
     def connect(self, network: str, timeout_seconds: float) -> WebsocketClientSocket:
-        import websocket
-
         if network == "mainnet":
             url = "wss://api.hyperliquid.xyz/ws"
         elif network == "testnet":
             url = "wss://api.hyperliquid-testnet.xyz/ws"
         else:
             raise ValueError(f"unsupported network: {network}")
-        connection = websocket.create_connection(
-            url,
-            timeout=timeout_seconds,
-            enable_multithread=True,
-        )
+        connection = _open_public_websocket(url, timeout_seconds)
         return WebsocketClientSocket(
             connection,
             queue_capacity=self.queue_capacity,
@@ -506,15 +536,9 @@ class UrlWebsocketClientFactory:
         *,
         start_immediately: bool,
     ) -> WebsocketClientSocket:
-        import websocket
-
         if network != "public":
             raise ValueError("URL websocket factory only supports the public network label")
-        connection = websocket.create_connection(
-            self.url,
-            timeout=timeout_seconds,
-            enable_multithread=True,
-        )
+        connection = _open_public_websocket(self.url, timeout_seconds)
         return WebsocketClientSocket(
             connection,
             queue_capacity=self.queue_capacity,

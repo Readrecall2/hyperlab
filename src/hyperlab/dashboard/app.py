@@ -5,21 +5,28 @@ import sqlite3
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from hyperlab import __version__
 from hyperlab.storage.sqlite import database_status
 from hyperlab.strategies.registry import STRATEGY_CATALOG
 
+if TYPE_CHECKING:
+    from hyperlab.paper.store import PaperStore
+
+
+_PAPER_READINESS_RUN_LIMIT = 100
+_PAPER_STATUS_ALERT_LIMIT = 50
+_PAPER_STATUS_RUN_LIMIT = 50
+
 _RUNTIME_STATUS_MAX_AGE_SECONDS = 60.0
 _MAX_RUNTIME_STATUS_BYTES = 1024 * 1024
 _MAX_LATEST_REPORT_BYTES = 1024 * 1024
-_SAFE_REPORT_SUFFIXES = frozenset(
-    {".csv", ".html", ".json", ".md", ".parquet", ".pdf", ".txt", ".zip"}
-)
+_SAFE_REPORT_SUFFIXES = frozenset({".csv", ".html", ".json", ".md", ".parquet", ".pdf", ".txt", ".zip"})
 
 
 def _fmt_timestamp(value: int | None) -> str:
@@ -78,6 +85,21 @@ def _runtime_readiness(runtime: dict[str, object] | None) -> str:
     return "ready"
 
 
+class _PaperDashboardHeadChangedError(RuntimeError):
+    """One bounded dashboard read raced a durable Paper commit."""
+
+
+def _paper_readiness_once(store: PaperStore) -> str:
+    runs = store.list_runs(limit=_PAPER_READINESS_RUN_LIMIT + 1)
+    if len(runs) > _PAPER_READINESS_RUN_LIMIT:
+        return "too_many_runs"
+    corrupt = any(not store.inspect_head_integrity_readonly(run.run_id).ok for run in runs)
+    final_runs = store.list_runs(limit=_PAPER_READINESS_RUN_LIMIT + 1)
+    if tuple(run.head_identity for run in final_runs) != tuple(run.head_identity for run in runs):
+        raise _PaperDashboardHeadChangedError
+    return "corrupt" if corrupt else "ready"
+
+
 def _paper_readiness(path: Path) -> str:
     """Verify an optional paper store without creating, migrating, or mutating it."""
 
@@ -89,12 +111,14 @@ def _paper_readiness(path: Path) -> str:
         from hyperlab.paper.store import PaperStore
 
         store = PaperStore(path, initialize=False)
-        runs = store.list_runs()
-        if any(not store.inspect_integrity_readonly(run.run_id).ok for run in runs):
-            return "corrupt"
+        for _attempt in range(2):
+            try:
+                return _paper_readiness_once(store)
+            except _PaperDashboardHeadChangedError:
+                continue
+        return "head_changed_retry"
     except (OSError, RuntimeError, ValueError, sqlite3.Error):
         return "unreadable"
-    return "ready"
 
 
 def _resolve_report_download(reports_dir: Path, report_path: str) -> Path | None:
@@ -103,10 +127,7 @@ def _resolve_report_download(reports_dir: Path, report_path: str) -> Path | None
     if not report_path or "\\" in report_path or "\x00" in report_path or ":" in report_path:
         return None
     segments = report_path.split("/")
-    if any(
-        not segment or segment in {".", ".."} or segment.startswith(".")
-        for segment in segments
-    ):
+    if any(not segment or segment in {".", ".."} or segment.startswith(".") for segment in segments):
         return None
     requested = PurePosixPath(report_path)
     if requested.is_absolute() or requested.suffix.lower() not in _SAFE_REPORT_SUFFIXES:
@@ -201,6 +222,102 @@ def _runtime_summary(
         "stale_detail": stale_detail,
         "updated_at": str(updated_at) if isinstance(updated_at, str) else "Inconnue",
     }
+
+
+def _paper_api_payload_once(store: PaperStore) -> dict[str, object]:
+    from hyperlab.paper.reporting import paper_runtime_session_health
+
+    listed_runs = store.list_runs(limit=_PAPER_STATUS_RUN_LIMIT + 1)
+    runs_truncated = len(listed_runs) > _PAPER_STATUS_RUN_LIMIT
+    selected_runs = listed_runs[-_PAPER_STATUS_RUN_LIMIT:]
+    runs: list[dict[str, object]] = []
+    for run in selected_runs:
+        integrity = store.inspect_head_integrity_readonly(run.run_id)
+        if not integrity.ok:
+            runs.append(
+                {
+                    "alert_limit": _PAPER_STATUS_ALERT_LIMIT,
+                    "alerts": [],
+                    "alerts_truncated": False,
+                    "commit_sequence": run.commit_sequence,
+                    "config_hash": run.config_hash,
+                    "event_sequence": run.event_sequence,
+                    "integrity": "HEAD_ANCHORS_FAILED_READONLY",
+                    "orders_enabled": False,
+                    "projection": None,
+                    "run_id": run.run_id,
+                    "runtime_session": None,
+                    "same_head_assembly": True,
+                    "status": "MANUAL_REVIEW",
+                }
+            )
+            continue
+        recent_alerts = store.get_recent_alerts(
+            run.run_id,
+            limit=_PAPER_STATUS_ALERT_LIMIT + 1,
+        )
+        alerts_truncated = len(recent_alerts) > _PAPER_STATUS_ALERT_LIMIT
+        projection = store.get_projection_payload(run.run_id)
+        runtime_session = paper_runtime_session_health(projection)
+        runtime_session["recent_incidents"] = [
+            {
+                "alert": alert.alert,
+                "alert_id": alert.alert_id,
+                "code": alert.code,
+                "created_at": alert.created_at,
+                "event_sequence": alert.event_sequence,
+                "severity": alert.severity,
+            }
+            for alert in recent_alerts[-_PAPER_STATUS_ALERT_LIMIT:]
+            if alert.code == "PAPER_RUNTIME_FAILURE"
+        ]
+        runs.append(
+            {
+                "alert_limit": _PAPER_STATUS_ALERT_LIMIT,
+                "alerts": [alert.alert for alert in recent_alerts[-_PAPER_STATUS_ALERT_LIMIT:]],
+                "alerts_truncated": alerts_truncated,
+                "commit_sequence": run.commit_sequence,
+                "config_hash": run.config_hash,
+                "event_sequence": run.event_sequence,
+                "integrity": "HEAD_ANCHORS_VERIFIED_READONLY",
+                "integrity_scope": {
+                    "contract": "CURRENT_AND_APPEND_HEAD_V1",
+                    "full_history_verified": False,
+                    "full_replay_verified": False,
+                    "same_head_assembly": True,
+                },
+                "orders_enabled": False,
+                "projection": projection,
+                "run_id": run.run_id,
+                "runtime_session": runtime_session,
+                "same_head_assembly": True,
+                "status": run.status,
+            }
+        )
+    final_listed_runs = store.list_runs(limit=_PAPER_STATUS_RUN_LIMIT + 1)
+    if tuple(run.head_identity for run in final_listed_runs) != tuple(
+        run.head_identity for run in listed_runs
+    ):
+        raise _PaperDashboardHeadChangedError
+    return {
+        "head_read_attempt_limit": 2,
+        "mode": "paper-simulation-only",
+        "orders_enabled": False,
+        "run_limit": _PAPER_STATUS_RUN_LIMIT,
+        "runs": runs,
+        "runs_truncated": runs_truncated,
+        "same_head_assembly": True,
+        "status": "AVAILABLE",
+    }
+
+
+def _paper_api_payload(store: PaperStore) -> dict[str, object]:
+    for _attempt in range(2):
+        try:
+            return _paper_api_payload_once(store)
+        except _PaperDashboardHeadChangedError:
+            continue
+    raise _PaperDashboardHeadChangedError("HEAD_CHANGED_RETRY: durable Paper head changed during two reads")
 
 
 def create_app(
@@ -311,37 +428,18 @@ def create_app(
             from hyperlab.paper.store import PaperStore
 
             store = PaperStore(paper_database, initialize=False)
-            runs = []
-            for run in store.list_runs():
-                integrity = store.inspect_integrity_readonly(run.run_id)
-                if not integrity.ok:
-                    runs.append(
-                        {
-                            "alerts": [],
-                            "commit_sequence": run.commit_sequence,
-                            "config_hash": run.config_hash,
-                            "event_sequence": run.event_sequence,
-                            "integrity": "FAILED_READONLY",
-                            "orders_enabled": False,
-                            "projection": None,
-                            "run_id": run.run_id,
-                            "status": "MANUAL_REVIEW",
-                        }
-                    )
-                    continue
-                runs.append(
-                    {
-                    "alerts": [alert.alert for alert in store.get_alerts(run.run_id)],
-                    "commit_sequence": run.commit_sequence,
-                    "config_hash": run.config_hash,
-                    "event_sequence": run.event_sequence,
-                    "integrity": "VERIFIED_READONLY",
+            payload = _paper_api_payload(store)
+        except _PaperDashboardHeadChangedError:
+            return JSONResponse(
+                {
+                    "mode": "paper-simulation-only",
                     "orders_enabled": False,
-                    "projection": store.get_projection_payload(run.run_id),
-                    "run_id": run.run_id,
-                    "status": run.status,
-                    }
-                )
+                    "retryable": True,
+                    "runs": [],
+                    "status": "HEAD_CHANGED_RETRY",
+                },
+                status_code=409,
+            )
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             return JSONResponse(
                 {
@@ -352,14 +450,89 @@ def create_app(
                 },
                 status_code=503,
             )
-        return JSONResponse(
-            {
-                "mode": "paper-simulation-only",
-                "orders_enabled": False,
-                "runs": runs,
-                "status": "AVAILABLE",
-            }
-        )
+        return JSONResponse(payload)
+
+    @app.get("/api/paper/{run_id}/report")
+    def paper_report(
+        run_id: str,
+        after_sequence: int = Query(default=0, ge=0),
+        timeline_limit: int = Query(default=100, ge=1, le=500),
+        day_limit: int = Query(default=31, ge=1, le=366),
+        alert_limit: int = Query(default=50, ge=1, le=200),
+    ) -> JSONResponse:
+        """Expose one integrity-verified, bounded Paper report without writes."""
+
+        if not paper_database.exists():
+            return JSONResponse(
+                {
+                    "mode": "paper-simulation-only",
+                    "orders_enabled": False,
+                    "status": "NOT_STARTED",
+                },
+                status_code=404,
+            )
+        if paper_database.is_symlink() or not paper_database.is_file():
+            return JSONResponse(
+                {
+                    "mode": "paper-simulation-only",
+                    "orders_enabled": False,
+                    "status": "UNREADABLE_FAIL_CLOSED",
+                },
+                status_code=503,
+            )
+        try:
+            from hyperlab.paper.reporting import (
+                PaperReportHeadChangedError,
+                PaperReportIntegrityError,
+                build_paper_report,
+            )
+            from hyperlab.paper.store import PaperStore, RunNotFoundError
+
+            store = PaperStore(paper_database, initialize=False)
+            report = build_paper_report(
+                store,
+                run_id,
+                after_sequence=after_sequence,
+                timeline_limit=timeline_limit,
+                day_limit=day_limit,
+                alert_limit=alert_limit,
+            )
+        except RunNotFoundError:
+            return JSONResponse(
+                {"orders_enabled": False, "run_id": run_id, "status": "UNKNOWN_RUN"},
+                status_code=404,
+            )
+        except PaperReportHeadChangedError:
+            return JSONResponse(
+                {
+                    "integrity": "HEAD_CHANGED_RETRY",
+                    "orders_enabled": False,
+                    "retryable": True,
+                    "run_id": run_id,
+                    "status": "HEAD_CHANGED_RETRY",
+                },
+                status_code=409,
+            )
+        except PaperReportIntegrityError:
+            return JSONResponse(
+                {
+                    "integrity": "FAILED_READONLY",
+                    "orders_enabled": False,
+                    "run_id": run_id,
+                    "status": "MANUAL_REVIEW",
+                },
+                status_code=503,
+            )
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            return JSONResponse(
+                {
+                    "orders_enabled": False,
+                    "run_id": run_id,
+                    "status": "UNREADABLE_FAIL_CLOSED",
+                },
+                status_code=503,
+            )
+        return JSONResponse(report)
 
     @app.get("/api/reports/{report_path:path}")
     def download_report(report_path: str) -> FileResponse:
@@ -398,15 +571,12 @@ def create_app(
                     raise ValueError("latest report summary must be an object")
                 latest_report = str(payload.get("title", "Rapport disponible"))
                 download_value = payload.get("download_path", report_file.name)
-                download_path = (
-                    download_value if isinstance(download_value, str) else report_file.name
-                )
+                download_path = download_value if isinstance(download_value, str) else report_file.name
                 if _resolve_report_download(resolved_reports_dir, download_path) is None:
                     raise ValueError("latest report download target is invalid")
                 download_url = quote(download_path, safe="/")
                 latest_report_link = (
-                    f' <a class="download" href="/api/reports/{download_url}">'
-                    "Télécharger</a>"
+                    f' <a class="download" href="/api/reports/{download_url}">Télécharger</a>'
                 )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 latest_report = "Rapport illisible"

@@ -31,8 +31,8 @@ if ($Launcher.Count -eq 2) {
     & $Launcher[0] -m venv .venv
 }
 
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -e ".[dev,research]"
+& .\.venv\Scripts\python.exe -m pip install --require-hashes --requirement requirements-ci.lock
+& .\.venv\Scripts\python.exe -m pip install --no-deps --editable .
 & .\.venv\Scripts\python.exe -m pytest
 & .\.venv\Scripts\python.exe -m hyperlab doctor
 

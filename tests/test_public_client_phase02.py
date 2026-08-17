@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -24,8 +24,16 @@ class FakeInfo:
 
 
 class _FakeHttpResponse:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        final_url: str = "https://api.hyperliquid.xyz/info",
+        status: int = 200,
+    ) -> None:
         self.payload = payload
+        self.final_url = final_url
+        self.status = status
 
     def __enter__(self) -> _FakeHttpResponse:
         return self
@@ -36,40 +44,101 @@ class _FakeHttpResponse:
     def read(self, size: int = -1) -> bytes:
         return self.payload if size < 0 else self.payload[:size]
 
+    def geturl(self) -> str:
+        return self.final_url
+
+    def getcode(self) -> int:
+        return self.status
+
+
+class _FakeOpener:
+    def __init__(self, responses: Iterator[_FakeHttpResponse]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[Request, float]] = []
+
+    def open(self, request: Request, *, timeout: float) -> _FakeHttpResponse:
+        self.calls.append((request, timeout))
+        return next(self.responses)
+
 
 def test_default_transport_is_public_info_only_and_sdk_is_not_a_dependency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[Request, float]] = []
-    responses = iter(
-        (
-            b'[{"universe":[]},[]]',
-            b'[{"tokens":[],"universe":[]},[]]',
+    opener = _FakeOpener(
+        iter(
+            (
+                _FakeHttpResponse(b'[{"universe":[]},[]]'),
+                _FakeHttpResponse(b'[{"tokens":[],"universe":[]},[]]'),
+            )
         )
     )
+    redirect_handlers: list[object] = []
 
-    def fake_urlopen(request: Request, *, timeout: float) -> _FakeHttpResponse:
-        calls.append((request, timeout))
-        return _FakeHttpResponse(next(responses))
+    def fake_build_opener(*handlers: object) -> _FakeOpener:
+        redirect_handlers.extend(handlers)
+        return opener
 
-    monkeypatch.setattr("hyperlab.api.public.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("hyperlab.api.public.urllib.request.build_opener", fake_build_opener)
 
     result = HyperliquidPublicClient(network="mainnet", timeout_seconds=7.0).bootstrap(
         observed_at_ms=123
     )
 
     assert result.observed_at_ms == 123
-    assert [request.full_url for request, _ in calls] == [
+    assert [request.full_url for request, _ in opener.calls] == [
         "https://api.hyperliquid.xyz/info",
         "https://api.hyperliquid.xyz/info",
     ]
-    assert [request.method for request, _ in calls] == ["POST", "POST"]
-    assert [timeout for _, timeout in calls] == [7.0, 7.0]
-    assert b'"type":"metaAndAssetCtxs"' in calls[0][0].data
-    assert b'"type":"spotMetaAndAssetCtxs"' in calls[1][0].data
+    assert [request.method for request, _ in opener.calls] == ["POST", "POST"]
+    assert [timeout for _, timeout in opener.calls] == [7.0, 7.0]
+    assert b'"type":"metaAndAssetCtxs"' in opener.calls[0][0].data
+    assert b'"type":"spotMetaAndAssetCtxs"' in opener.calls[1][0].data
+    assert len(redirect_handlers) == 1
+    redirect_handler = redirect_handlers[0]
+    assert redirect_handler.__class__.__name__ == "_NoRedirectHandler"
+    assert (
+        redirect_handler.redirect_request(
+            opener.calls[0][0],
+            None,
+            302,
+            "Found",
+            {},
+            "https://redirect.invalid/info",
+        )
+        is None
+    )
 
     project = Path(__file__).resolve().parents[1] / "pyproject.toml"
     assert "hyperliquid-python-sdk" not in project.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (
+            _FakeHttpResponse(
+                b"{}",
+                final_url="https://redirect.invalid/info",
+            ),
+            "response URL differs",
+        ),
+        (_FakeHttpResponse(b"{}", status=204), "exact HTTP 200"),
+    ],
+)
+def test_default_transport_rejects_unbound_final_url_or_status(
+    monkeypatch: pytest.MonkeyPatch,
+    response: _FakeHttpResponse,
+    error: str,
+) -> None:
+    opener = _FakeOpener(iter((response,)))
+    monkeypatch.setattr(
+        "hyperlab.api.public.urllib.request.build_opener",
+        lambda *_handlers: opener,
+    )
+
+    client = HyperliquidPublicClient(network="mainnet", timeout_seconds=7.0)
+    with pytest.raises(RuntimeError, match=error):
+        client.bootstrap(observed_at_ms=123)
 
 
 def _perp_context(*, mid: str, volume: str) -> dict[str, str]:

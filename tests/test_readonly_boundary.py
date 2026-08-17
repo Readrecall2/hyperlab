@@ -69,6 +69,23 @@ def test_paper_package_has_no_network_wallet_signer_exchange_or_order_transport_
         "place_order",
         "send_order",
     }
+    allowed_public_source_imports = {
+        (
+            "collector_source.py",
+            "hyperlab.api.public",
+            "PUBLIC_INFO_REDIRECTS_ALLOWED",
+        ),
+        (
+            "collector_source.py",
+            "hyperlab.api.public",
+            "PUBLIC_INFO_REQUIRED_HTTP_STATUS",
+        ),
+        (
+            "collector_source.py",
+            "hyperlab.api.public",
+            "HyperliquidPublicClient",
+        ),
+    }
     violations: list[str] = []
     for path in paper_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -81,11 +98,12 @@ def test_paper_package_has_no_network_wallet_signer_exchange_or_order_transport_
                 continue
             for module, symbol in imports:
                 module_parts = set(module.casefold().split("."))
-                if (
+                is_forbidden = (
                     any(module == root or module.startswith(f"{root}.") for root in forbidden_roots)
                     or module_parts & forbidden_module_parts
                     or symbol in forbidden_symbols
-                ):
+                )
+                if is_forbidden and (path.name, module, symbol) not in allowed_public_source_imports:
                     violations.append(f"{path.name}: {module} -> {symbol}")
 
     assert violations == []

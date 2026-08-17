@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import replace
@@ -14,6 +15,7 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 import hyperlab.cli as cli_module
+import hyperlab.environment_authorization as authorization_module
 from hyperlab.backtest.protocol import canonical_json
 from hyperlab.cli import app
 from hyperlab.paper.engine import PaperCommandResult, PaperEngine
@@ -29,6 +31,10 @@ from hyperlab.paper.models import (
 from hyperlab.paper.runner import PaperStrategyView
 from hyperlab.paper.runtime import PaperRuntimeLease, PublicSourceDescriptor
 from hyperlab.paper.store import PaperStore
+from scripts.generate_phase12_live_paper_artifacts import (
+    CONFIG_ARTIFACT,
+    build_phase12_artifacts,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _START = datetime(2026, 8, 17, 9, tzinfo=UTC)
@@ -122,6 +128,52 @@ def _write_config(root: Path, config: PaperRunConfig) -> Path:
     path = root / "paper-config.json"
     path.write_text(canonical_json(config.to_dict()), encoding="utf-8")
     return path
+
+
+def _runtime_attestation_for(
+    *,
+    platform_system: str,
+    python_micro: int,
+) -> bytes:
+    artifact = json.loads(authorization_module.paper_runtime_environment_attestation_bytes())
+    interpreter = artifact["interpreter"]
+    version = {
+        "major": 3,
+        "micro": python_micro,
+        "minor": 12,
+        "releaselevel": "final",
+        "serial": 0,
+    }
+    interpreter.update(
+        {
+            "abi_flags": "",
+            "byteorder": "little",
+            "cache_tag": "cpython-312",
+            "hexversion": (3 << 24) | (12 << 16) | (python_micro << 8) | (0xF << 4),
+            "implementation": "cpython",
+            "implementation_version": version,
+            "platform_machine": ("AMD64" if platform_system == "Windows" else "x86_64"),
+            "platform_system": platform_system,
+            "platform_tag": ("win-amd64" if platform_system == "Windows" else "linux-x86_64"),
+            "pointer_bits": 64,
+            "python_compiler": (
+                "MSC v.1941 64 bit (AMD64)" if platform_system == "Windows" else "GCC 12.2.0"
+            ),
+            "python_version": f"3.12.{python_micro}",
+            "version_info": version,
+        }
+    )
+    core = dict(artifact)
+    core.pop("runtime_environment_sha256")
+    artifact["runtime_environment_sha256"] = hashlib.sha256(canonical_json(core).encode("utf-8")).hexdigest()
+    return canonical_json(artifact).encode("utf-8")
+
+
+def _write_artifact_set(root: Path, artifacts: Mapping[str, bytes]) -> None:
+    for relative_path, payload in artifacts.items():
+        target = root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
 
 
 def _approval(
@@ -287,6 +339,84 @@ def test_default_preflight_accepts_exact_compiled_candidate_without_transport_or
     assert payload["credential_scope"] == "NONE"
     assert payload["orders_enabled"] is False
     assert status_path.exists() is False
+
+
+def test_operator_environment_bundles_are_exact_and_cross_platform_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    windows_attestation = _runtime_attestation_for(
+        platform_system="Windows",
+        python_micro=10,
+    )
+    linux_attestation = _runtime_attestation_for(
+        platform_system="Linux",
+        python_micro=13,
+    )
+    assert windows_attestation != linux_attestation
+
+    roots: dict[str, Path] = {}
+    configs: dict[str, PaperRunConfig] = {}
+    for name, attestation in (
+        ("windows", windows_attestation),
+        ("linux", linux_attestation),
+    ):
+        root = tmp_path / name
+        artifacts = build_phase12_artifacts(
+            repository_root=_ROOT,
+            operator_runtime_environment_attestation_bytes=attestation,
+        )
+        _write_artifact_set(root, artifacts)
+        roots[name] = root
+        configs[name] = PaperRunConfig.from_dict(json.loads(artifacts[CONFIG_ARTIFACT]))
+
+    windows_config = configs["windows"].to_dict()
+    linux_config = configs["linux"].to_dict()
+    windows_digest = windows_config.pop("runtime_environment_sha256")
+    linux_digest = linux_config.pop("runtime_environment_sha256")
+    assert windows_config == linux_config
+    compiled_config = PaperRunConfig.from_dict(
+        json.loads((_ROOT / cli_module._PHASE12_PAPER_CONFIG_ARTIFACT).read_bytes())
+    ).to_dict()
+    compiled_config.pop("runtime_environment_sha256")
+    assert windows_config == compiled_config
+    assert configs["windows"].strategy_hash == configs["linux"].strategy_hash
+    assert configs["windows"].risk.to_dict() == configs["linux"].risk.to_dict()
+    assert windows_digest != linux_digest
+
+    monkeypatch.setattr(
+        cli_module,
+        "_settings",
+        lambda: SimpleNamespace(app=SimpleNamespace(mode="readonly", data_dir=tmp_path / "data")),
+    )
+
+    for name, attestation in (
+        ("windows", windows_attestation),
+        ("linux", linux_attestation),
+    ):
+        monkeypatch.setattr(
+            authorization_module,
+            "paper_runtime_environment_attestation_bytes",
+            lambda _root=None, payload=attestation: payload,
+        )
+        accepted = CliRunner().invoke(
+            app,
+            ["paper", "preflight", str(roots[name] / CONFIG_ARTIFACT)],
+        )
+        assert accepted.exit_code == 0, accepted.output
+        payload = json.loads(accepted.stdout)
+        assert payload["authorizes_real_money"] is False
+        assert payload["orders_enabled"] is False
+        assert payload["public_transport_started"] is False
+        assert payload["database_created"] is False
+
+        other = "linux" if name == "windows" else "windows"
+        rejected = CliRunner().invoke(
+            app,
+            ["paper", "preflight", str(roots[other] / CONFIG_ARTIFACT)],
+        )
+        assert rejected.exit_code == 2, rejected.output
+        assert "runtime" in rejected.output.casefold()
 
 
 def test_preflight_rejects_runtime_environment_drift_before_factories_or_store(

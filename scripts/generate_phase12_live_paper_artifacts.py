@@ -594,14 +594,17 @@ def _readiness_artifacts(
 def build_phase12_artifacts(
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    operator_runtime_environment_attestation_bytes: bytes | None = None,
 ) -> dict[str, bytes]:
     fee_bytes = (repository_root / FEE_ARTIFACT_PATH).read_bytes()
     source_bytes = build_source_identity_artifact_bytes()
     release_code_manifest_bytes = build_release_code_manifest_bytes(
         repository_root=repository_root
     )
-    runtime_environment_bytes = paper_runtime_environment_attestation_bytes(
-        repository_root
+    runtime_environment_bytes = (
+        paper_runtime_environment_attestation_bytes(repository_root)
+        if operator_runtime_environment_attestation_bytes is None
+        else operator_runtime_environment_attestation_bytes
     )
     distribution_count, runtime_environment_sha256 = _runtime_environment_metadata(runtime_environment_bytes)
     release_file_count, release_code_sha256 = _release_code_manifest_metadata(

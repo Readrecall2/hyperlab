@@ -41,14 +41,14 @@ source identity, independently generated release-code manifest, runtime-environm
 16 compiled PAPER/PAPER_RUNTIME semantic evidence files, readiness manifest, and index: 22
 canonical files in total. Deterministic regeneration currently yields:
 
-- config hash: `0733456db3979fbe483ddc2f259269a32763fb333f3acf94dd374992ca194c06`
-- run ID: `9a6e48600569b329e4a6246369e9571537ad520aef5419be9e7dde489dbf76db`
+- config hash: `62ebaaf09977f88d4a75e7dc056ba23300c48453370fc9c196bd8193bec6aa3f`
+- run ID: `e0a68aa1ec8b746bc877c537e35a0d5f97deba7e4a97832a75ff04002da4fcba`
 - readiness manifest SHA-256:
-  `d39ccc9b98d4147fbb758fdd95d8d48f77de757d18c22227f43ab91c9d9f158f`
+  `5a3742e3c0ae101bcaa5bcfc540fa88be522f6c20d05b6b7400d15b0a6a9846f`
 - readiness profile SHA-256:
   `e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a`
 - release-code SHA-256:
-  `3e3d7a6b3329ecfe14537d6a3e6c60c279b9e3d00b371283d65d00246a7b6afa`
+  `bb44d725ebb152c845111868fb2bfb9526105cadc0f9487e3505178aba87e0db`
 - runtime-environment SHA-256:
   `f51df86b54d5505159841d6c8320b1b06a3d6c902f0460334d42953bb1884183`
 
@@ -145,13 +145,65 @@ $env:HYPERLAB_DATA_DIR = $DataRoot
 $env:HYPERLAB_PAPER_DIR = $PaperDir
 
 $RunId = (& $Python -c "import json,sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['run_id'])" (Join-Path $CandidateRoot "artifact-index.json")).Trim()
-if ($RunId -ne "9a6e48600569b329e4a6246369e9571537ad520aef5419be9e7dde489dbf76db") { throw "Unexpected run identity" }
+if ($RunId -ne "e0a68aa1ec8b746bc877c537e35a0d5f97deba7e4a97832a75ff04002da4fcba") { throw "Unexpected run identity" }
 
 Get-ChildItem Env: | Where-Object Name -Match 'PRIVATE_KEY|SEED_PHRASE|MNEMONIC|WALLET_KEY|API_KEY' | Select-Object Name
 ```
 
 The final command lists names only, never values. Paper needs none of them. If any credential
 variable is present in the operator shell, open a clean shell without it before continuing.
+
+## Linux/VPS operator-specific runtime attestation
+
+The checked-in artifact set is the reviewed Windows realization. Never copy, rename, or relabel
+its `runtime-environment-attestation.json` for Linux. On the reviewed Linux VPS, generate a
+separate complete 22-file operator bundle with that machine's Python. The generator rebinds the
+runtime attestation, Paper config hash/run ID, readiness subject, semantic evidence, and artifact
+index together. Admission accepts the operator bundle only when every Paper config field except
+`runtime_environment_sha256` is byte-semantically identical to the compiled candidate. Release
+code, lock file, all 34 exact distributions, strategy, risk, source identity, costs, cadence, and
+Paper-only scope therefore remain unchanged.
+
+Use a new local persistent directory outside the Git checkout. Replace
+`<FINAL_REVIEWED_COMMIT>` with the single final commit from the reviewed change report:
+
+```bash
+cd /opt/hyperlab-multistrategy
+PYTHON=.venv/bin/python
+EXPECTED_COMMIT="<FINAL_REVIEWED_COMMIT>"
+OPERATOR_ROOT="/var/lib/hyperlab/phase12-live-paper/authorization-$EXPECTED_COMMIT-linux-cpython-3.12.13"
+
+test "$(git branch --show-current)" = "phase-12-live-paper"
+test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+test -z "$(git status --porcelain)"
+test ! -e "$OPERATOR_ROOT"
+
+"$PYTHON" scripts/generate_phase12_live_paper_artifacts.py \
+  --output-root "$OPERATOR_ROOT"
+"$PYTHON" scripts/generate_phase12_live_paper_artifacts.py \
+  --output-root "$OPERATOR_ROOT" --check
+"$PYTHON" -m hyperlab gate-model check \
+  "$OPERATOR_ROOT/readiness-manifest.json" \
+  --evidence-root "$OPERATOR_ROOT"
+"$PYTHON" -m hyperlab paper preflight "$OPERATOR_ROOT/paper-config.json"
+```
+
+Generation fails if the lock is not exact, any required distribution is missing or drifted, or
+CPython/platform facts change during capture. Readiness and preflight independently regenerate
+the current runtime identity and fail before factories, public transport, or SQLite creation when
+the operator bundle belongs to another OS/interpreter. Keep using the same operator config for
+the runtime:
+
+```bash
+"$PYTHON" -m hyperlab paper run \
+  "$OPERATOR_ROOT/paper-config.json" \
+  --database /var/lib/hyperlab/phase12-live-paper/paper/paper.sqlite3
+```
+
+The Windows checked-in config remains valid only for its exact Windows attestation; the Linux
+operator config remains valid only for its exact Linux attestation. Neither is convertible into
+the other, and both retain `authorizes_real_money=false` and `orders_enabled=false`.
+
 
 ## A–K manual smoke and restart workflow
 

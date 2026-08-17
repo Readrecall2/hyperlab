@@ -40,6 +40,7 @@ reports/*
 *.keystore
 *keystore*
 *wallet*
+!config/paper/phase08-robust-pairs-btc-eth-paper-v1/evidence/no_wallet_or_signer.json
 *seed*
 *.sqlite
 *.sqlite3

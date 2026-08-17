@@ -171,8 +171,8 @@ _PHASE12_PAPER_READINESS_MANIFEST = _PHASE12_PAPER_ARTIFACT_ROOT / "readiness-ma
 _PHASE12_PAPER_EVIDENCE_ROOT = _PHASE12_PAPER_ARTIFACT_ROOT
 _PHASE12_PAPER_RUNTIME_TIMER_INTERVAL_SECONDS = 1.0
 _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
-_PHASE12_PAPER_CONFIG_HASH = "0733456db3979fbe483ddc2f259269a32763fb333f3acf94dd374992ca194c06"
-_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "d39ccc9b98d4147fbb758fdd95d8d48f77de757d18c22227f43ab91c9d9f158f"
+_PHASE12_PAPER_CONFIG_HASH = "62ebaaf09977f88d4a75e7dc056ba23300c48453370fc9c196bd8193bec6aa3f"
+_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "5a3742e3c0ae101bcaa5bcfc540fa88be522f6c20d05b6b7400d15b0a6a9846f"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -2046,13 +2046,62 @@ def _require_current_paper_release(config: PaperRunConfig) -> None:
 
 def _approved_paper_runtime_for(
     config: PaperRunConfig,
+    config_artifact: Path | None = None,
 ) -> _ApprovedPaperRuntimeFactories:
     approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
-    if approval is None or approval.config_hash != config.config_hash:
+    if approval is not None and approval.config_hash == config.config_hash:
+        return approval
+
+    canonical_approval = _APPROVED_PAPER_RUNTIMES.get(_PHASE12_PAPER_CONFIG_HASH)
+    if canonical_approval is None or config_artifact is None:
         raise typer.BadParameter(
             "Aucune liaison figee strategie + source publique n'est approuvee pour ce config_hash"
         )
-    return approval
+    if config_artifact.name != _PHASE12_PAPER_CONFIG_ARTIFACT.name:
+        raise typer.BadParameter("Le bundle operateur Paper doit utiliser le nom canonique paper-config.json")
+    canonical_config = _load_frozen_paper_config(
+        canonical_approval.config_artifact_path
+    )
+    if (
+        canonical_config.config_hash != _PHASE12_PAPER_CONFIG_HASH
+        or canonical_approval.config_hash != _PHASE12_PAPER_CONFIG_HASH
+    ):
+        raise typer.BadParameter(
+            "La configuration Paper compilee de reference a derive"
+        )
+
+    canonical_payload = canonical_config.to_dict()
+    operator_payload = config.to_dict()
+    canonical_payload.pop("runtime_environment_sha256")
+    operator_payload.pop("runtime_environment_sha256")
+    if operator_payload != canonical_payload:
+        raise typer.BadParameter(
+            "Aucune liaison fig\u00e9e strat\u00e9gie + source publique n'est approuv\u00e9e "
+            "pour ce config_hash"
+        )
+
+    manifest_path = config_artifact.parent / "readiness-manifest.json"
+    try:
+        manifest = EnvironmentReadinessManifest.from_json_bytes(
+            manifest_path.read_bytes(),
+            require_canonical=True,
+        )
+    except (AuthorizationManifestError, OSError) as error:
+        raise typer.BadParameter(
+            f"Bundle operateur Paper illisible: {error}"
+        ) from None
+
+    return _ApprovedPaperRuntimeFactories(
+        candidate_id=canonical_approval.candidate_id,
+        config_hash=config.config_hash,
+        config_artifact_path=config_artifact,
+        readiness_manifest_path=manifest_path,
+        readiness_manifest_sha256=manifest.manifest_sha256,
+        readiness_profile_sha256=(canonical_approval.readiness_profile_sha256),
+        readiness_evidence_root=config_artifact.parent,
+        strategy_factory=canonical_approval.strategy_factory,
+        source_factory=canonical_approval.source_factory,
+    )
 
 
 def _paper_exact_operator_reason(value: str, *, label: str) -> str:
@@ -2143,7 +2192,7 @@ def paper_preflight(
 
     _paper_runtime_settings()
     frozen = _load_frozen_paper_config(config_artifact)
-    approval = _approved_paper_runtime_for(frozen)
+    approval = _approved_paper_runtime_for(frozen, config_artifact)
     _verify_approved_paper_readiness(approval, frozen, config_artifact)
 
     source: NormalizedPublicMarketSource | None = None
@@ -2862,7 +2911,7 @@ def paper_run(
     if settings.app.mode not in {"readonly", "research"}:
         raise typer.BadParameter("Le runtime paper refuse tout HYPERLAB_MODE non readonly/research")
     frozen = _load_frozen_paper_config(config_artifact)
-    approval = _APPROVED_PAPER_RUNTIMES.get(frozen.config_hash)
+    approval = _approved_paper_runtime_for(frozen, config_artifact)
     if approval is None or approval.config_hash != frozen.config_hash:
         raise typer.BadParameter(
             "Aucune liaison figée stratégie + source publique n'est approuvée pour ce config_hash"

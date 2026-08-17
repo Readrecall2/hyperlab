@@ -65,12 +65,16 @@ C'est volontaire. La première version doit construire une base que l'on peut au
                                 │ export des données
                                 ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ RECHERCHE                                                        │
-│                                                                  │
-│ Backtests → stress tests → forward paper                         │
-│                  Gate humaine → testnet séparé → micro-live      │
+│ SANS ARGENT RÉEL                                                 │
+│ Gates B/C ───────────────────────┐                                │
+│ Paper technique → Gate D* ───────┼→ revue → micro-mainnet         │
+│ Testnet séparé → Gate E ─────────┘              │ Gate F          │
+│ ARGENT RÉEL : Mainnet exige un reçu distinct ←─┘                 │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+`*` La fenêtre Gate D ne commence qu'après Gates B/C et calibration ; aucun temps
+ni cycle d'un run Paper technique antérieur n'est repris.
 
 ### Pourquoi les deux machines
 
@@ -481,7 +485,10 @@ git commit -m "fix: harden initial read-only research lab"
 15 durcissement Umbrel
 ```
 
-Les phases 13 et 14 ne sont ouvertes qu'après validation explicite. Elles ne doivent pas être fusionnées avec les phases de recherche.
+La Phase 13 Testnet peut être développée avant Gate D après revue de sa politique
+technique séparée. La Phase 14 et tout argent réel restent fermés jusqu'aux preuves
+B/C/D/E et à la décision humaine. Ces phases ne sont jamais fusionnées avec le
+collecteur/dashboard read-only.
 
 ---
 
@@ -906,6 +913,19 @@ Ces deux modules ne doivent pas retarder le déploiement du collecteur lent : le
 
 # PARTIE H — PAPER, TESTNET ET VRAI ARGENT
 
+Les classes exactes sont `RESEARCH_REPLAY`, `PAPER`, `TESTNET`,
+`MICRO_MAINNET` et `MAINNET`. Chaque reçu porte un but unique et doit correspondre
+exactement à la classe, la configuration, le build, la source/endpoint et les
+limites demandées. Il n'existe ni ordre implicite ni conversion : aucun reçu Paper
+ou Testnet ne peut jamais autoriser Mainnet.
+
+Une empreinte SHA-256 prouve seulement quels octets ont été examinés ; elle ne
+prouve pas leur sens. Chaque check requis doit donc avoir un vérificateur compilé
+pour le triplet exact environnement/but/check. Son identifiant et sa version sont
+liés au profil, à la décision et au reçu. Vérificateur absent, exception, résultat
+autre que le booléen `true`, changement d'octets ou dérive de version : la décision
+reste bloquée.
+
 ## 41. Paper live
 
 La Phase 12 fait tourner une stratégie figée sur les données publiques live sans
@@ -932,28 +952,36 @@ idempotents. Au restart, la chaîne est vérifiée puis le run est rejoué et
 réconcilié avant toute nouvelle décision. Une divergence bloque les entrées et
 force `MANUAL_REVIEW`.
 
-La configuration figée couvre stratégie, paramètres, univers de canaux requis,
-limites, seed, hash de
-l'artefact Gates B/C et hashes des preuves de coûts/latence/fills ainsi que la
-version sémantique du moteur. Une
-configuration `CALIBRATED` inclut une grille de coûts point-in-time ; deux frais
-globaux restent une hypothèse de démo. Toute modification démarre un nouveau run. Toutes les
-stratégies passent par le contrôle de risque pré-acceptation et le simulateur Phase
-04 ; aucune ne peut écrire directement un fill ou une position. Un IOC, y compris
+La configuration figée couvre l'environnement `PAPER`, le but `PAPER_RUNTIME`,
+stratégie, paramètres, univers de canaux requis, limites, seed, identité de source,
+hashes des preuves disponibles de coûts/latence/fills et version du moteur. Les
+artefacts Gates B/C ne sont requis que pour une campagne destinée à Gate D, pas
+pour la préparation technique. Une configuration `CALIBRATED` inclut une grille
+de coûts point-in-time ; deux frais globaux restent une hypothèse de démo. Toute
+modification démarre un nouveau run. Toutes les stratégies passent par le contrôle
+de risque pré-acceptation et le simulateur Phase 04 ; aucune ne peut écrire
+directement un fill ou une position. Un IOC, y compris
 d'urgence, peut rester partiel ou non rempli.
 
-Conditions d'un run de validation :
+Conditions techniques d'un run Paper :
 
 - stratégie figée ;
 - décisions en temps réel ;
 - ordres simulés ;
-- modèle de fill, latence et coûts calibré sur des artefacts audités ;
+- modèle de fill, latence et coûts conservateur, clairement étiqueté
+  `CALIBRATED`, `UNCALIBRATED` ou `SYNTHETIC` ;
 - grille de frais publique versionnée et hashée, jamais lue depuis un compte ;
 - replay exact et ledger cash/positions/frais/PnL réconcilié ;
 - dashboard et alertes sans aucun canal de commande ;
 - aucun ajustement pendant la fenêtre de validation.
 
-Minimum recommandé :
+Un reçu exact `PAPER` / `PAPER_RUNTIME` peut être émis sans Gate B/C/D et porte
+toujours `authorizes_real_money=false`. Un run non calibré exerce le logiciel mais ne peut
+pas franchir Gate D. Son temps et ses cycles ne sont jamais repris rétroactivement :
+la fenêtre qualifiante commence avec une configuration `VALIDATION` nouvellement
+figée après Gates B/C et calibration.
+
+Minimum Gate D avant argent réel :
 
 ```text
 6 à 8 semaines visées, avec minimum dur de 42 jours
@@ -963,7 +991,7 @@ beaucoup plus pour les rapides
 résultat net positif sous coûts stressés
 ```
 
-Le gate diagnostique ces assertions dans le journal vérifié : seuil de cycles figé,
+Gate D diagnostique ces assertions dans le journal vérifié : seuil de cycles figé,
 incidents, couverture, stress et exercices restart/déconnexion/fill partiel/crash.
 Chaque canal requis doit rester frais, l'état doit être `FLAT` ou `HEDGED` et le
 stress doit référencer le dernier préfixe économique. Cependant, les octets des
@@ -973,44 +1001,66 @@ checkout ; un run de plus de huit semaines ne sera pas expiré.
 
 Le runtime et les commandes `paper status|gate|replay|reconcile|run` sont présents.
 `paper gate` lit le store en lecture seule sans override et lie les métriques à une
-tête durable stable, mais reste explicitement non autorisant. Les registres runtime
-et sémantique candidat sont vides/non implémentés. L'adaptateur public accepte des
-BBO et événements de connexion exacts ; il bloque les trades tant que leur identité
-n'est pas durable aux redémarrages et n'est pas raccordé au writer unique. Faute de
-candidat économiquement éligible et de source complète approuvée, `paper run`
-échoue fermé avant les factories et avant de créer un store.
+tête durable stable, mais reste explicitement non autorisant. Les registres runtime,
+sémantique candidat et vérificateurs sémantiques de readiness Paper sont
+vides/non implémentés. L'adaptateur public accepte des BBO et événements de
+connexion exacts ; il bloque les trades tant que leur identité n'est pas durable
+aux redémarrages et n'est pas raccordé au writer unique. Faute de stratégie +
+source publique candidate complète, d'inscription et de vérificateurs compilés
+pour tous les checks, `paper run` échoue fermé avant les factories et avant de
+créer un store. Ce blocage est technique, pas une conséquence de Gates B/C/D.
 
-Ces critères ne sont pas encore observés dans ce checkout. Les fixtures et démos
-`SYNTHETIC`, même entièrement vertes, ne comptent ni pour la durée, ni pour les
+Les critères Gate D ne sont pas encore observés dans ce checkout. Les fixtures et
+démos `SYNTHETIC`, même entièrement vertes, ne comptent ni pour la durée, ni pour les
 cycles, ni pour les 14 jours. Le statut économique Phase 12 est donc
-**`BLOCKED`**. Une stratégie ne peut pas réutiliser les prérequis inachevés d'une
-autre phase comme s'ils étaient calibrés. La Phase 10 n'est requise que si la
+**`BLOCKED`**, sans bloquer la préparation Paper/Testnet. Une stratégie ne peut pas
+réutiliser les prérequis inachevés d'une autre phase comme s'ils étaient calibrés.
+La Phase 10 n'est requise que si la
 stratégie choisie consomme explicitement ses artefacts ; elle n'est pas un prérequis
 global de la Phase 12. Voir
 [`PAPER_ENGINE_PHASE12.md`](PAPER_ENGINE_PHASE12.md).
 
 ## 42. Testnet
 
-Le futur exécuteur testnet doit vivre dans une branche/version séparée (`0.3.0-dev` ou service distinct). Le collecteur et le dashboard `0.2.x` restent read-only ; on ne leur ajoute jamais une clé « temporairement ».
+Le futur exécuteur Testnet vit dans une branche/version séparée (`0.3.0-dev` ou
+service distinct). Le collecteur, le dashboard et `HYPERLAB_MODE` 0.2.x restent
+read-only/research ; on ne leur ajoute jamais une clé « temporairement ».
+
+Sa préparation ne requiert ni rentabilité, ni Gate B/C/D, ni 42 jours Paper. Le
+reçu exact `TESTNET` / `TESTNET_EXECUTION` lie build, configuration, endpoint,
+chain ID, credential scope, stratégie et limites. Il ne peut jamais être consommé
+par micro-mainnet ou Mainnet.
 
 Le testnet valide :
 
+- endpoint/chain ID Testnet allowlistés, sans fallback Mainnet ;
+- credentials Testnet dédiés, séparés de Mainnet et hors dépôt/logs ;
 - signature ;
 - ordres post-only/IOC/reduce-only ;
-- annulations ;
-- CLOID ;
+- CLOID déterministes, machine à états et cancel/replace ;
 - fills partiels ;
 - WebSocket coupé ;
-- réponse perdue ;
-- redémarrage ;
-- réconciliation ;
-- dead-man switch.
+- réponse perdue résolue par recherche, jamais renvoi aveugle ;
+- redémarrage et réconciliation exchange-first des ordres/positions/comptes ;
+- limites position/notionnel, pause d'urgence, dead-man switch et audit complet.
 
-Il ne valide pas parfaitement la rentabilité ou la liquidité.
+Il ne valide pas la rentabilité. Gate E est la preuve durable de ces exercices
+terminés pour une future autorisation avec argent réel ; elle ne sert pas à
+démarrer Testnet. Aucun adaptateur Testnet n'existe encore dans ce checkout : le
+développement est permis, l'exécution reste techniquement bloquée. Les
+vérificateurs sémantiques exacts `TESTNET` / `TESTNET_EXECUTION` sont eux aussi
+absents ; des fichiers simplement étiquetés `PASS` ne peuvent donc pas produire
+une décision `READY`.
 
 ## 43. Micro-mainnet
 
-Seulement après toutes les gates :
+Seulement avec un reçu exact `MICRO_MAINNET` / `MICRO_MAINNET_EXECUTION`, PASS
+Gates B/C/D et preuve Gate E terminée, tous reliés avec vérification octet par octet
+à une même lignée figée de stratégie, modèle économique et risque. Les configurations et reçus
+Testnet et micro-mainnet restent distincts ; le reçu Testnet n'est jamais consommé
+comme autorisation micro-mainnet. S'ajoutent une décision humaine, une configuration
+signée, un signer isolé, des secrets révocables, réconciliation, kill switch et
+limites codées :
 
 ```text
 100 à 300 USDC
@@ -1030,7 +1080,15 @@ fees prévus vs réels
 PnL paper vs PnL live
 ```
 
+Gate F est la preuve durable de cette campagne micro-mainnet terminée, liée à sa
+configuration exacte. Elle n'autorise aucune hausse automatique.
+
 ## 44. Augmentation
+
+`MAINNET` n'est pas une augmentation implicite du reçu micro-mainnet. Il exige un
+reçu séparé exact `MAINNET` / `MAINNET_EXECUTION`, la preuve Gate F, deux
+confirmations humaines indépendantes, une nouvelle configuration signée et des limites exactes. Aucun
+reçu Research, Paper, Testnet ou micro-mainnet ne peut être réutilisé.
 
 ```text
 100–300 USDC : 4 à 8 semaines
@@ -1157,12 +1215,10 @@ L'ordre rationnel reste :
 
 ```text
 infrastructure sûre
-→ collecte
-→ backtests non bridés
-→ stress tests
-→ forward paper
-→ testnet
-→ micro-mainnet
+→ collecte + Gates B/C ─────────────────┐
+→ Paper technique → Gate D qualifiante ─┼→ micro-mainnet → Gate F
+→ Testnet séparé → Gate E ──────────────┘
+→ autorisation Mainnet distincte
 ```
 
 Umbrel commence à accumuler les données immédiatement, tandis que Windows et Codex développent et auditent les modèles. C'est la façon la plus rapide d'être ambitieux sans sacrifier la rigueur.

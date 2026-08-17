@@ -46,9 +46,19 @@ cash. Elle soumet seulement une décision au contrôle de risque et au moteur de
 simulation. Cette séparation empêche un module de stratégie de contourner le cycle
 d'ordre paper.
 
-## Futur exécuteur
+## Futures classes d'exécution
 
-Il sera dans un service séparé avec :
+Tout reçu est lié à une classe et un but exacts. Une identité absente ou ambiguë
+échoue fermée ; il n'existe aucune conversion de reçu ni fallback
+Testnet/Mainnet.
+
+L'exécuteur Testnet sera un service séparé avec endpoint/chain ID allowlistés,
+credentials Testnet dédiés non réutilisés depuis Mainnet, CLOID déterministes,
+réconciliation exchange-first, limites bornées, kill switch et audit complet. Sa
+préparation technique ne requiert pas Gates B/C/D.
+
+Un futur exécuteur avec argent réel exige en plus Gates B/C/D/E, revue humaine,
+configuration signée et :
 
 - API wallet dédiée ;
 - adresse principale publique séparée du signer ;
@@ -59,6 +69,10 @@ Il sera dans un service séparé avec :
 - journal append-only ;
 - dead-man switch ;
 - bouton de révocation documenté.
+
+`MICRO_MAINNET` et `MAINNET` consomment des reçus distincts ; Mainnet exige
+la preuve Gate F et deux confirmations humaines. HyperLab 0.2.x conserve
+`HYPERLAB_MODE=readonly|research` et ne contient aucun de ces exécuteurs.
 
 ## Menaces à tester
 

@@ -329,7 +329,7 @@ def evaluate_paper_gate(
         and fresh_channels
     )
     checks = {
-        "approved_admission": False,
+        "paper_readiness_receipt_bound": False,
         "calibrated_models": config.economically_eligible,
         "config_frozen": report.ok and run.config_hash == config.config_hash,
         "continuous_observation": continuous_coverage and fresh_at_gate,
@@ -425,8 +425,11 @@ def evaluate_paper_gate(
     )
     production_blockers = (
         (
-            "approved_admission",
-            "no durable production admission receipt is bound to this run",
+            "paper_readiness_receipt_bound",
+            (
+                "no durable exact PAPER/PAPER_RUNTIME readiness receipt is bound "
+                "to this Gate D run"
+            ),
         ),
         (
             "durable_runtime_source_attestation",

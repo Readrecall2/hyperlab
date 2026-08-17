@@ -63,6 +63,19 @@ from hyperlab.config import Settings, load_settings
 from hyperlab.data.cli import data_app
 from hyperlab.data.io import load_cross_venue_csv, load_panel_csv, save_panel_csv
 from hyperlab.data.synthetic import generate_demo_panel, generate_microstructure_demo
+from hyperlab.environment_authorization import (
+    REAL_MONEY_EXECUTION_ENABLED_IN_BUILD,
+    AuthorizationManifestError,
+    AuthorizationPurpose,
+    EnvironmentClass,
+    EnvironmentReadinessManifest,
+    EvidenceCheck,
+    compiled_evidence_verifier_status,
+    issue_environment_receipt,
+    profile_for,
+    receipt_scope_blockers,
+    verify_environment_readiness,
+)
 from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
 from hyperlab.strategies.funding_basket import FundingBasketStrategy
@@ -103,6 +116,12 @@ operations_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(operations_app, name="ops")
+gate_model_app = typer.Typer(
+    name="gate-model",
+    help="Inspection read-only des exigences et manifestes liés à un environnement.",
+    no_args_is_help=True,
+)
+app.add_typer(gate_model_app, name="gate-model")
 paper_app = typer.Typer(
     name="paper",
     help="Supervision locale du moteur paper-only Phase 12.",
@@ -115,9 +134,10 @@ app.add_typer(paper_app, name="paper")
 class _ApprovedPaperRuntimeFactories:
     candidate_id: str
     config_hash: str
-    admission_manifest_path: Path
-    admission_manifest_sha256: str
-    admission_evidence_root: Path
+    readiness_manifest_path: Path
+    readiness_manifest_sha256: str
+    readiness_profile_sha256: str
+    readiness_evidence_root: Path
     strategy_factory: Callable[[PaperRunConfig], FrozenPaperStrategy]
     source_factory: Callable[[PaperRunConfig], NormalizedPublicMarketSource]
 
@@ -126,16 +146,17 @@ class _ApprovedPaperRuntimeFactories:
             raise ValueError("approved paper candidate_id cannot be empty")
         for label, digest in (
             ("config_hash", self.config_hash),
-            ("admission_manifest_sha256", self.admission_manifest_sha256),
+            ("readiness_manifest_sha256", self.readiness_manifest_sha256),
+            ("readiness_profile_sha256", self.readiness_profile_sha256),
         ):
             if len(digest) != 64 or any(
                 character not in "0123456789abcdef" for character in digest
             ):
                 raise ValueError(f"approved paper {label} must be a lowercase SHA-256")
-        if not isinstance(self.admission_manifest_path, Path):
-            raise TypeError("approved paper admission_manifest_path must be a Path")
-        if not isinstance(self.admission_evidence_root, Path):
-            raise TypeError("approved paper admission_evidence_root must be a Path")
+        if not isinstance(self.readiness_manifest_path, Path):
+            raise TypeError("approved paper readiness_manifest_path must be a Path")
+        if not isinstance(self.readiness_evidence_root, Path):
+            raise TypeError("approved paper readiness_evidence_root must be a Path")
 
 
 # Deliberately empty until a frozen strategy artifact and a normalized public
@@ -153,6 +174,124 @@ def _production_semantic_admission_blockers(candidate_id: str) -> tuple[str, ...
     if candidate_id not in _TRUSTED_PAPER_SEMANTIC_EVALUATORS:
         return ("NO_TRUSTED_CANDIDATE_SEMANTIC_EVALUATOR",)
     return ("SEMANTIC_EVALUATOR_PROTOCOL_NOT_IMPLEMENTED",)
+
+
+def _parse_environment_class(value: str) -> EnvironmentClass:
+    try:
+        return EnvironmentClass(value)
+    except ValueError:
+        allowed = ", ".join(item.value for item in EnvironmentClass)
+        raise typer.BadParameter(
+            f"environment must be one exact compiled identity: {allowed}"
+        ) from None
+
+
+@gate_model_app.command("requirements")
+def gate_model_requirements(
+    environment: Annotated[
+        str,
+        typer.Argument(help="Identité exacte: RESEARCH_REPLAY, PAPER, TESTNET, MICRO_MAINNET ou MAINNET"),
+    ],
+) -> None:
+    """Publie le profil compilé sans créer de reçu ni modifier un artefact."""
+
+    profile = profile_for(_parse_environment_class(environment))
+    payload = profile.to_dict()
+    payload.update(
+        {
+            "profile_sha256": profile.profile_sha256,
+            "real_money_execution_enabled_in_build": REAL_MONEY_EXECUTION_ENABLED_IN_BUILD,
+            "semantic_verifiers": compiled_evidence_verifier_status(profile.environment),
+            "status": "REQUIREMENTS",
+        }
+    )
+    console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+@gate_model_app.command("check")
+def gate_model_check(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="Manifeste JSON canonique EnvironmentReadinessManifest"),
+    ],
+    evidence_root: Annotated[
+        Path,
+        typer.Option(help="Racine immuable contenant les preuves byte-bound"),
+    ],
+) -> None:
+    """Vérifie un manifeste en lecture seule; un reçu n'existe que pour READY."""
+
+    import hashlib
+
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        payload: dict[str, object] = {
+            "blockers": [
+                {
+                    "code": "MANIFEST_UNREADABLE",
+                    "location": "$",
+                    "message": str(error),
+                }
+            ],
+            "manifest_sha256": None,
+            "ready": False,
+            "status": "BLOCKED",
+        }
+        console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        raise typer.Exit(2) from None
+    try:
+        manifest = EnvironmentReadinessManifest.from_json_bytes(raw, require_canonical=True)
+    except AuthorizationManifestError as error:
+        payload = {
+            "blockers": [
+                {
+                    "code": error.code,
+                    "location": error.location,
+                    "message": error.message,
+                }
+            ],
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "ready": False,
+            "status": "BLOCKED",
+        }
+        console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        raise typer.Exit(2) from None
+
+    decision = verify_environment_readiness(manifest, evidence_root=evidence_root)
+    result: dict[str, object] = {
+        "authorizes_real_money": False,
+        "blockers": [
+            {
+                "code": blocker.code,
+                "location": blocker.location,
+                "message": blocker.message,
+            }
+            for blocker in decision.blockers
+        ],
+        "environment": manifest.environment.value,
+        "manifest_sha256": decision.manifest_sha256,
+        "profile_sha256": decision.profile_sha256,
+        "purpose": manifest.purpose.value,
+        "ready": decision.ready,
+        "semantic_verifiers": compiled_evidence_verifier_status(manifest.environment),
+        "status": "READY" if decision.ready else "BLOCKED",
+        "verifier_set_sha256": decision.verifier_set_sha256,
+    }
+    if decision.ready:
+        receipt = issue_environment_receipt(decision)
+        receipt_payload = receipt.to_dict()
+        receipt_payload.update(
+            {
+                "authorizes_real_money": receipt.authorizes_real_money,
+                "receipt_sha256": receipt.receipt_sha256,
+            }
+        )
+        result["authorizes_real_money"] = receipt.authorizes_real_money
+        result["receipt"] = receipt_payload
+    console.print_json(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if not decision.ready:
+        raise typer.Exit(2)
 
 
 def _settings() -> Settings:
@@ -1641,137 +1780,165 @@ def _load_frozen_paper_config(path: Path) -> PaperRunConfig:
     return config
 
 
-def _verify_approved_paper_admission(
+def _verify_approved_paper_readiness(
     approval: _ApprovedPaperRuntimeFactories,
     frozen: PaperRunConfig,
     config_artifact: Path,
 ) -> None:
-    """Reject until byte bindings and a measured semantic protocol both exist."""
+    """Verify exact PAPER technical readiness without consulting economic gates."""
+
     import hashlib
 
-    from hyperlab.paper.admission import (
-        AdmissionManifestError,
-        load_admission_manifest,
-        verify_admission_manifest_file,
-    )
+    from hyperlab.backtest.protocol import canonical_sha256
 
-    verification = verify_admission_manifest_file(
-        approval.admission_manifest_path,
-        evidence_root=approval.admission_evidence_root,
-    )
-    if verification.manifest_sha256 != approval.admission_manifest_sha256:
-        raise typer.BadParameter(
-            "Le manifeste d'admission paper ne correspond pas au SHA-256 approuvé"
-        )
-    if verification.blockers:
-        detail = "; ".join(
-            f"{blocker.code}@{blocker.location}" for blocker in verification.blockers
-        )
-        raise typer.BadParameter(f"Admission paper bloquée par les artefacts: {detail}")
     try:
-        manifest = load_admission_manifest(approval.admission_manifest_path)
+        manifest_bytes = approval.readiness_manifest_path.read_bytes()
+        manifest = EnvironmentReadinessManifest.from_json_bytes(
+            manifest_bytes,
+            require_canonical=True,
+        )
         config_artifact_sha256 = hashlib.sha256(config_artifact.read_bytes()).hexdigest()
-    except (AdmissionManifestError, OSError) as error:
-        raise typer.BadParameter(f"Admission paper illisible: {error}") from None
+    except (AuthorizationManifestError, OSError) as error:
+        raise typer.BadParameter(f"Readiness paper illisible: {error}") from None
+    if manifest.manifest_sha256 != approval.readiness_manifest_sha256:
+        raise typer.BadParameter(
+            "Le manifeste de readiness paper ne correspond pas au SHA-256 approuvé"
+        )
+
+    decision = verify_environment_readiness(
+        manifest,
+        evidence_root=approval.readiness_evidence_root,
+    )
+    if decision.blockers:
+        detail = "; ".join(
+            f"{blocker.code}@{blocker.location}" for blocker in decision.blockers
+        )
+        raise typer.BadParameter(f"Readiness paper bloquée par les artefacts: {detail}")
+    if decision.profile_sha256 != approval.readiness_profile_sha256:
+        raise typer.BadParameter(
+            "Le profil readiness paper et ses vérificateurs ne correspondent pas au profil approuvé"
+        )
 
     blockers: list[str] = []
-    if manifest.candidate_id != approval.candidate_id:
+    if (
+        manifest.environment is not EnvironmentClass.PAPER
+        or manifest.purpose is not AuthorizationPurpose.PAPER_RUNTIME
+    ):
+        blockers.append("readiness receipt is not scoped to PAPER/PAPER_RUNTIME")
+    if manifest.subject.candidate_id != approval.candidate_id:
         blockers.append("candidate identity differs from the approved registration")
-    if frozen.run_kind != "VALIDATION" or not frozen.economically_eligible:
-        blockers.append("only an economically eligible VALIDATION config may be approved")
-    if frozen.economic_prerequisites_evidence_hash != manifest.evidence.gate_c_report.sha256:
-        blockers.append("frozen Gate B/C receipt differs from the bound Gate C report")
-    if frozen.strategy_hash not in {
-        artifact.sha256 for artifact in manifest.evidence.strategy
-    }:
-        blockers.append("frozen strategy hash is not among the bound strategy artifacts")
+    expected_subject = {
+        "build_hash": frozen.engine_build_hash,
+        "config_hash": frozen.config_hash,
+        "risk_limits_hash": canonical_sha256(frozen.risk.to_dict()),
+        "source_identity": frozen.data_source,
+        "strategy_hash": frozen.strategy_hash,
+    }
+    for label, expected in expected_subject.items():
+        if getattr(manifest.subject, label) != expected:
+            blockers.append(f"readiness subject {label} differs from the frozen paper config")
+    if approval.config_hash != frozen.config_hash:
+        blockers.append("approved registration config_hash differs from the frozen paper config")
+    if frozen.schema_version != 2 or frozen.environment != "PAPER":
+        blockers.append("paper runtime requires schema v2 with explicit PAPER environment")
+    if frozen.run_kind not in {"TECHNICAL", "VALIDATION"}:
+        blockers.append("paper runtime requires a TECHNICAL or VALIDATION run_kind")
+    if not frozen.required_instruments:
+        blockers.append("paper runtime requires a non-empty frozen instrument universe")
 
-    frozen_identity = manifest.identities.frozen_config
-    if frozen_identity.identity != frozen.config_hash:
-        blockers.append("frozen config identity differs from PaperRunConfig.config_hash")
-    if frozen_identity.artifact.sha256 != config_artifact_sha256:
-        blockers.append("frozen config bytes differ from the admission artifact")
-
-    source_identity = manifest.identities.market_source
-    if source_identity.identity != frozen.data_source:
-        blockers.append("public source identity differs from PaperRunConfig.data_source")
-    if source_identity.artifact.sha256 != frozen.data_hash:
-        blockers.append("public source artifact differs from PaperRunConfig.data_hash")
+    config_binding = manifest.evidence.get(EvidenceCheck.FROZEN_STRATEGY_CONFIG)
+    if config_binding is None or config_binding.sha256 != config_artifact_sha256:
+        blockers.append("frozen config bytes differ from FROZEN_STRATEGY_CONFIG evidence")
+    source_binding = manifest.evidence.get(EvidenceCheck.PUBLIC_MARKET_SOURCE)
+    if source_binding is None or source_binding.sha256 != frozen.data_hash:
+        blockers.append("public source bytes differ from PaperRunConfig.data_hash")
 
     cost_schedule = frozen.execution.cost_schedule
-    if (
-        cost_schedule is None
-        or cost_schedule.calibration_evidence_hash
-        != manifest.identities.cost_schedule.artifact.sha256
-    ):
-        blockers.append("cost schedule evidence differs from the bound cost artifact")
+    if cost_schedule is None:
+        blockers.append("paper runtime requires a point-in-time cost schedule")
+    else:
+        for instrument in frozen.required_instruments:
+            try:
+                cost_schedule.lookup(pd.Timestamp(frozen.validation_started_at), instrument)
+            except ValueError as error:
+                blockers.append(str(error))
 
-    calibration_hashes = {
-        artifact.sha256 for artifact in manifest.evidence.calibration
-    }
-    data_hashes = {artifact.sha256 for artifact in manifest.evidence.data}
-    required_calibrations = {
-        "data": frozen.data_calibration_evidence_hash,
-        "execution": frozen.execution.calibration_evidence_hash,
-        "maker_fill": frozen.execution.maker_fill.calibration_evidence_hash,
-    }
-    for label, digest in required_calibrations.items():
-        if digest not in calibration_hashes | data_hashes:
-            blockers.append(f"{label} calibration evidence is not byte-bound")
-
-    blockers.extend(_production_semantic_admission_blockers(manifest.candidate_id))
-
-    final_verification = verify_admission_manifest_file(
-        approval.admission_manifest_path,
-        evidence_root=approval.admission_evidence_root,
+    receipt = issue_environment_receipt(decision)
+    scope_blockers = receipt_scope_blockers(
+        receipt,
+        environment=EnvironmentClass.PAPER,
+        purpose=AuthorizationPurpose.PAPER_RUNTIME,
+        config_hash=frozen.config_hash,
     )
-    if (
-        final_verification.manifest_sha256 != approval.admission_manifest_sha256
-        or final_verification.blockers
-    ):
-        blockers.append("admission artifacts changed during admission verification")
+    blockers.extend(
+        f"{blocker.code}@{blocker.location}" for blocker in scope_blockers
+    )
+    if receipt.authorizes_real_money:
+        blockers.append("PAPER readiness receipt must never authorize real money")
+
+    try:
+        final_manifest_bytes = approval.readiness_manifest_path.read_bytes()
+        final_manifest = EnvironmentReadinessManifest.from_json_bytes(
+            final_manifest_bytes,
+            require_canonical=True,
+        )
+        final_decision = verify_environment_readiness(
+            final_manifest,
+            evidence_root=approval.readiness_evidence_root,
+        )
+        final_config_sha256 = hashlib.sha256(config_artifact.read_bytes()).hexdigest()
+    except (AuthorizationManifestError, OSError) as error:
+        blockers.append(f"readiness artifacts became unreadable: {error}")
+    else:
+        if (
+            final_manifest.manifest_sha256 != approval.readiness_manifest_sha256
+            or final_manifest.to_dict() != manifest.to_dict()
+            or final_decision.blockers
+            or final_decision.profile_sha256 != approval.readiness_profile_sha256
+            or final_config_sha256 != config_artifact_sha256
+        ):
+            blockers.append("readiness artifacts changed during readiness verification")
     if blockers:
-        raise typer.BadParameter("Admission paper bloquée: " + "; ".join(blockers))
+        raise typer.BadParameter("Readiness paper bloquée: " + "; ".join(blockers))
 
 
-def _reverify_gate_admission(config: PaperRunConfig) -> tuple[bool, str]:
-    """Report the compiled-admission blocker for the read-only Gate diagnostic."""
-
-    from hyperlab.paper.admission import (
-        load_admission_manifest,
-        verify_admission_manifest_file,
-    )
+def _reverify_gate_readiness(config: PaperRunConfig) -> tuple[bool, str]:
+    """Report the compiled PAPER readiness status for the read-only Gate diagnostic."""
 
     approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
     if approval is None or approval.config_hash != config.config_hash:
-        return False, "NO_COMPILED_APPROVAL"
-    semantic_blockers = _production_semantic_admission_blockers(approval.candidate_id)
-    if semantic_blockers:
-        return False, semantic_blockers[0]
+        return False, "NO_COMPILED_READINESS"
     try:
-        verification = verify_admission_manifest_file(
-            approval.admission_manifest_path,
-            evidence_root=approval.admission_evidence_root,
+        manifest = EnvironmentReadinessManifest.from_json_bytes(
+            approval.readiness_manifest_path.read_bytes(),
+            require_canonical=True,
         )
         if (
-            verification.manifest_sha256 != approval.admission_manifest_sha256
-            or verification.blockers
+            manifest.manifest_sha256 != approval.readiness_manifest_sha256
+            or manifest.environment is not EnvironmentClass.PAPER
+            or manifest.purpose is not AuthorizationPurpose.PAPER_RUNTIME
         ):
-            return False, "APPROVED_ARTIFACT_REVERIFICATION_FAILED"
-        manifest = load_admission_manifest(approval.admission_manifest_path)
-        relative = PurePosixPath(
-            manifest.identities.frozen_config.artifact.relative_path
+            return False, "APPROVED_READINESS_REVERIFICATION_FAILED"
+        decision = verify_environment_readiness(
+            manifest,
+            evidence_root=approval.readiness_evidence_root,
         )
-        config_artifact = approval.admission_evidence_root.joinpath(*relative.parts)
+        if decision.blockers:
+            return False, "APPROVED_READINESS_REVERIFICATION_FAILED"
+        if decision.profile_sha256 != approval.readiness_profile_sha256:
+            return False, "APPROVED_READINESS_PROFILE_MISMATCH"
+        binding = manifest.evidence[EvidenceCheck.FROZEN_STRATEGY_CONFIG]
+        relative = PurePosixPath(binding.relative_path)
+        config_artifact = approval.readiness_evidence_root.joinpath(*relative.parts)
         artifact_config = _load_frozen_paper_config(config_artifact)
         if (
             artifact_config.config_hash != config.config_hash
             or artifact_config.run_id != config.run_id
         ):
             return False, "FROZEN_CONFIG_IDENTITY_MISMATCH"
-        _verify_approved_paper_admission(approval, artifact_config, config_artifact)
+        _verify_approved_paper_readiness(approval, artifact_config, config_artifact)
     except Exception:
-        return False, "APPROVED_ADMISSION_REVERIFICATION_ERROR"
+        return False, "APPROVED_READINESS_REVERIFICATION_ERROR"
     return True, "VERIFIED"
 
 
@@ -1889,7 +2056,7 @@ def paper_gate(
     config = PaperRunConfig.from_dict(run.config_snapshot)
     if config.config_hash != run.config_hash or config.run_id != run.run_id:
         raise typer.BadParameter("Le snapshot paper durable ne correspond pas à son run_id")
-    _, admission_status = _reverify_gate_admission(config)
+    _, readiness_status = _reverify_gate_readiness(config)
     evaluated_at = datetime.now(tz=UTC)
     result = evaluate_paper_gate(
         store,
@@ -1899,11 +2066,14 @@ def paper_gate(
     payload = result.to_dict()
     payload.update(
         {
-            "admission_status": admission_status,
+            "authorization_purpose": "PAPER_RUNTIME",
+            "authorizes_real_money": False,
             "blockers": list(result.reasons),
+            "environment": "PAPER",
             "mode": "PAPER_ONLY",
             "orders_enabled": False,
             "passed": result.eligible,
+            "readiness_status": readiness_status,
         }
     )
     console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -2006,9 +2176,9 @@ def paper_run(
             "Aucune liaison figée stratégie + source publique n'est approuvée pour ce config_hash"
         )
 
-    _verify_approved_paper_admission(approval, frozen, config_artifact)
+    _verify_approved_paper_readiness(approval, frozen, config_artifact)
     resolved = _paper_database_path(database)
-    # Approval is checked before this point, so an unapproved invocation cannot
+    # Readiness is checked before this point, so an unapproved invocation cannot
     # create state.  An approved first run still needs the authoritative schema.
     store = PaperStore(resolved)
     runtime: PaperRuntime | None = None
@@ -2042,7 +2212,10 @@ def paper_run(
     console.print_json(
         json.dumps(
             {
+                "authorization_purpose": "PAPER_RUNTIME",
+                "authorizes_real_money": False,
                 "config_hash": frozen.config_hash,
+                "environment": "PAPER",
                 "event_sequence": projection.last_sequence,
                 "mode": "PAPER_ONLY",
                 "orders_enabled": False,

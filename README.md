@@ -53,9 +53,11 @@ dashboard ne lit qu'un snapshot read-only.
 
 Les frais proviennent d'un artefact **public, versionné et hashé**, jamais d'un
 compte ou d'un endpoint privé. Sans preuve publique d'une remise, le palier public
-conservateur est retenu. Le statut économique Phase 12 reste **`BLOCKED`** : les 6 à
-8 semaines, le nombre suffisant de cycles, les 14 jours sans incident critique et
-le résultat positif sous coûts stressés ne sont pas encore observés. Les fixtures
+conservateur est retenu. Le statut de promotion économique Phase 12 reste
+**`BLOCKED`** : les 42 jours minimum, le nombre suffisant de cycles, les 14 jours
+sans incident critique et le résultat positif sous coûts stressés ne sont pas
+encore observés. Gate D reste obligatoire avant tout argent réel, mais ne
+conditionne plus la préparation technique `PAPER` ou `TESTNET`. Les fixtures
 `SYNTHETIC` valident seulement le logiciel. Voir
 [`docs/PAPER_ENGINE_PHASE12.md`](docs/PAPER_ENGINE_PHASE12.md).
 
@@ -65,9 +67,17 @@ rattache les métriques à une seule tête durable stable, sans override de preu
 de seuil. Dans ce checkout, il est volontairement **non autorisant** : aucune preuve
 durable ne lie encore le run au runtime/source compilé, et les octets des artefacts
 de stress, résilience et couverture ne sont pas revérifiés. Le registre runtime et
-le protocole sémantique candidat restent vides/non implémentés ; `paper run` échoue
-fermé avant les factories et le store. Aucun mode global `paper` et aucune route
-d'ordre réelle ne sont ajoutés.
+le protocole candidat complet restent vides/non implémentés ; aucun vérificateur
+sémantique scope-bound n'est compilé. `paper run` échoue fermé avant les factories
+et le store. Ce blocage est technique (stratégie + source publique non inscrites),
+pas causé par Gates B/C/D. Aucun mode global `paper` et aucune route d'ordre réelle
+ne sont ajoutés.
+
+Les classes exactes `RESEARCH_REPLAY`, `PAPER`, `TESTNET`, `MICRO_MAINNET` et
+`MAINNET` ainsi que leurs buts non réutilisables sont définis dans
+[`docs/RELEASE_GATES.md`](docs/RELEASE_GATES.md). Paper et Testnet peuvent être
+préparés sans preuve de rentabilité ; leurs reçus ne peuvent jamais autoriser
+du capital réel.
 
 ## Données publiques Hyperliquid
 

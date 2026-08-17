@@ -59,7 +59,7 @@ def test_gate_result_metrics_are_bound_to_one_read_only_durable_head(
     assert result.to_dict()["metrics"] == result.snapshot.to_metrics_dict()
     assert result.to_dict()["run_id"] == config.run_id
     assert result.to_dict()["config_hash"] == config.config_hash
-    assert result.checks["approved_admission"] is False
+    assert result.checks["paper_readiness_receipt_bound"] is False
     assert result.checks["durable_runtime_source_attestation"] is False
     assert result.checks["gate_d_artifact_bytes_verified"] is False
     assert database.read_bytes() == before

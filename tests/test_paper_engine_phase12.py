@@ -431,6 +431,33 @@ def test_identifiers_config_hashes_and_seeded_draws_are_deterministic() -> None:
     assert replace(config_a, seed=43).run_id != config_a.run_id
 
 
+def test_v1_snapshot_identity_and_legacy_positional_run_kind_remain_compatible() -> None:
+    legacy = replace(_config(), schema_version=1)
+    payload = legacy.to_dict()
+
+    assert payload["schema_version"] == 1
+    assert "environment" not in payload
+    assert legacy.config_hash == "6c5c6061764468f93131a9e54bc3d96edcbcb2f440d27456824e377550e25790"
+    assert legacy.run_id == "8ffd2193e39e62474f0919c95fb19bc9e1352ca4273d81ceea06916120eb5d7f"
+    assert PaperRunConfig.from_dict(payload) == legacy
+
+    positional = PaperRunConfig(
+        "phase12_fixture",
+        _STRATEGY_HASH,
+        {"version": 1},
+        _DATA_HASH,
+        _execution_config(),
+        PaperRiskLimits(),
+        42,
+        Decimal("100000"),
+        _START,
+        "DEMO",
+    )
+    assert positional.run_kind == "DEMO"
+    assert positional.schema_version == 2
+    assert positional.environment == "PAPER"
+
+
 def test_forged_decision_and_order_identifiers_are_rejected_at_the_boundary() -> None:
     config = _config()
     market = _market("identifier-boundary", _START + timedelta(seconds=1))
@@ -522,6 +549,33 @@ def test_validation_prerequisites_and_cycle_floor_require_durable_evidence() -> 
         replace(calibrated, economic_prerequisites_evidence_hash=None)
     with pytest.raises(ValueError, match="at least 30"):
         replace(calibrated, minimum_validation_cycles=29)
+
+
+def test_technical_paper_run_is_explicitly_paper_and_does_not_require_gate_bc() -> None:
+    technical = PaperRunConfig(
+        strategy_name="phase12_fixture",
+        strategy_hash=_STRATEGY_HASH,
+        parameters={"version": 1},
+        data_hash=_DATA_HASH,
+        execution=_execution_config(calibrated=False),
+        risk=PaperRiskLimits(),
+        seed=42,
+        initial_cash=Decimal("100000"),
+        validation_started_at=_START,
+        run_kind="TECHNICAL",
+        data_calibration_status="UNCALIBRATED",
+        data_source="public-normalized-source-v1",
+        required_instruments=(_INSTRUMENT,),
+        minimum_validation_cycles=1,
+    )
+
+    assert technical.environment == "PAPER"
+    assert technical.schema_version == 2
+    assert technical.economic_prerequisites_satisfied is False
+    assert technical.economically_eligible is False
+    assert PaperRunConfig.from_dict(technical.to_dict()) == technical
+    with pytest.raises(ValueError, match="environment must be PAPER"):
+        replace(technical, environment="TESTNET")
 
 
 def test_missing_point_in_time_cost_rule_is_rejected_before_simulated_ack(
@@ -2072,7 +2126,7 @@ def test_gate_d_is_store_bound_enforces_thresholds_and_blocks_demo(
     assert non_authorizing.status is PaperGateStatus.BLOCKED_PRECONDITIONS
     assert non_authorizing.eligible is False
     production_checks = {
-        "approved_admission",
+        "paper_readiness_receipt_bound",
         "durable_runtime_source_attestation",
         "gate_d_artifact_bytes_verified",
     }

@@ -9,26 +9,33 @@ transport d'ordre et ne peut pas envoyer, modifier ou annuler un ordre sur une
 venue. `EMERGENCY_FLATTEN` signifie donc « réduction simulée urgente » et ne
 constitue jamais une action exchange.
 
-La conformité technique du moteur ne vaut pas validation économique. Dans ce
-checkout, le statut de promotion économique reste **`BLOCKED`** : aucune fenêtre
-forward paper de 6 à 8 semaines, aucun nombre suffisant de cycles et aucune période
-de 14 jours sans incident critique ne sont encore démontrés. Les données et
-calibrations propres à chaque candidat restent fermées ; la Phase 10 n'est requise
-que si la stratégie retenue en consomme un artefact. Un run sur fixture, un modèle
-`SYNTHETIC` ou une hypothèse `UNCALIBRATED` sert uniquement à tester le logiciel.
+La préparation technique et la promotion économique sont deux décisions distinctes.
+Un reçu exact `PAPER` / `PAPER_RUNTIME` peut autoriser ce simulateur sans
+PASS Gates B/C/D ; il reste lié au config/build/source et porte
+`authorizes_real_money=false`. Un run sur fixture, un modèle `SYNTHETIC` ou une
+hypothèse `UNCALIBRATED` peut tester le logiciel, mais ne constitue jamais une
+preuve économique.
+
+Dans ce checkout, la promotion économique reste **`BLOCKED`** : aucune fenêtre
+forward d'au moins 42 jours, aucun nombre suffisant de cycles et aucune période de
+14 jours sans incident critique ne sont démontrés. La Phase 10 n'est requise que si
+la stratégie retenue en consomme un artefact.
 
 Le runtime continu et le sous-groupe CLI `paper` sont implémentés, avec reprise,
 réconciliation, timers et arrêt propre. Cependant, le registre statique
 `config_hash → stratégie + source publique` est intentionnellement vide, et aucun
-protocole sémantique candidat mesuré n'est implémenté. L'adaptateur générique
+protocole candidat complet ni jeu de vérificateurs sémantiques scope-bound n'est
+implémenté. Un hash ou un champ `PASS` fourni par l'appelant ne peut pas remplacer
+ces vérificateurs. L'adaptateur générique
 BBO/connexion n'est ni raccordé au writer unique ni suffisant pour les canaux
 propres aux candidats ; les trades sont refusés tant que leur déduplication durable
 aux redémarrages n'existe pas. `paper run` échoue donc fermé avant les factories et
-avant de créer un store. `paper status`, `paper gate`, `paper replay` et
+avant de créer un store pour ces raisons techniques, pas parce que Gates B/C/D
+sont fermées. `paper status`, `paper gate`, `paper replay` et
 `paper reconcile` restent disponibles pour les stores de démonstration et de test.
-`paper gate` est read-only, sans override, et publie une tête durable stable, mais
-reste non autorisant tant qu'il ne revérifie pas une attestation runtime/source et
-les octets des artefacts Gate D.
+`paper gate` est le diagnostic économique Gate D : read-only, sans override et lié
+à une tête durable stable. Il ne décide pas si un runtime Paper technique peut
+démarrer.
 
 ## Périmètre
 
@@ -54,10 +61,12 @@ et promotion automatique vers une phase suivante.
 Chaque run commence avec une configuration immuable. Son hash canonique couvre au
 minimum :
 
+- la classe exacte `PAPER`, le but `PAPER_RUNTIME` et l'interdiction d'argent réel ;
 - l'identifiant et la version de la stratégie ;
 - tous ses paramètres et son univers autorisé ;
 - la liste figée des instruments dont chaque canal doit rester frais ;
-- le hash de l'artefact prouvant les Gates B/C applicables ;
+- les preuves Gates B/C disponibles si le run vise ultérieurement Gate D, sans les
+  rendre nécessaires au démarrage technique ;
 - les limites de risque ;
 - le capital paper initial et les règles de valorisation ;
 - les modèles de frais, spread, slippage, profondeur, latence et fill ;
@@ -174,8 +183,8 @@ Un fill n'existe que si le modèle figé le produit à partir d'une observation
 éligible reçue avant la décision et de son seed. Le mid-price seul ne devient pas
 un prix exécutable. Une donnée stale, un gap non réconcilié ou une profondeur
 absente alors qu'elle est requise bloque l'acceptation au lieu de fabriquer un
-fill. Une latence ou un fill model non calibré reste utilisable uniquement pour un
-run `DEMO` non promouvable ; il bloque une configuration `VALIDATION` et Gate D.
+fill. Une latence ou un fill model non calibré reste utilisable pour un run Paper
+technique explicitement non promouvable ; il bloque Gate D et tout argent réel.
 La règle de coûts point-in-time est contrôlée avant acceptation puis à l'instant du
 fill ; si son intervalle expire entre les deux, l'ordre devient terminal, une
 alerte critique est persistée et le run passe en `PAUSED`.
@@ -262,10 +271,11 @@ en lecture seule signale sa divergence à l'appelant sans modifier le store sour
 Le canal de notification ne reçoit aucun secret de trading et ne peut pas commander
 le moteur.
 
-## Gate de sortie Phase 12
+## Gate D — preuve forward pour argent réel
 
-La Gate D reste fermée tant que toutes les conditions suivantes ne sont pas prouvées
-sur des artefacts reproductibles :
+Gate D ne sert pas à démarrer Paper ou Testnet. Elle reste fermée pour toute
+autorisation `MICRO_MAINNET` ou `MAINNET` tant que toutes les conditions suivantes
+ne sont pas prouvées sur des artefacts reproductibles :
 
 - stratégie et paramètres gelés avant le début ;
 - prérequis économiques des Gates B et C satisfaits pour la stratégie concernée,
@@ -283,9 +293,10 @@ sur des artefacts reproductibles :
 
 La réussite de `ruff`, `mypy` et `pytest` valide la conformité technique, pas cette
 gate économique. Une fixture ou une démo ne compte ni dans la durée, ni dans les
-cycles, ni dans les 14 jours. Le franchissement de la Gate D exige une revue humaine
-explicite ; il autorise au plus la création séparée d'un executor **testnet** en
-Phase 13 et ne crée jamais de capacité de trading dans la Phase 12.
+cycles, ni dans les 14 jours. Le franchissement de Gate D exige une revue humaine
+et reste seulement une des preuves nécessaires avant argent réel. La préparation
+d'un executor **Testnet** séparé en Phase 13 ne dépend pas de Gate D ; son reçu
+`TESTNET_EXECUTION` reste non convertible en Mainnet.
 
 Le gate logiciel lit exclusivement le store autoritaire vérifié. Les cycles et
 incidents viennent du journal ; le seuil de cycles, jamais inférieur à 30, est figé
@@ -295,8 +306,9 @@ head et la séquence du préfixe économique exact qu'il évalue ; tout événem
 économique ultérieur invalide cette assertion jusqu'à un nouveau stress. Cependant,
 les méthodes actuelles acceptent encore des hashes et valeurs fournis par l'appelant
 sans relire les octets des artefacts. Le gate expose donc explicitement trois checks
-faux — admission durable, attestation runtime/source et vérification byte-bound des
-artefacts Gate D — et ne peut pas produire `PASS`. Une future implémentation devra
+faux — `paper_readiness_receipt_bound` (reçu exact `PAPER` / `PAPER_RUNTIME`),
+attestation runtime/source et vérification des octets des artefacts Gate D — et ne
+peut pas produire `PASS`. Une future implémentation devra
 persister ces preuves, dériver la couverture depuis la lignée source et les
 revérifier dans le snapshot stable. Un run au-delà de huit semaines ne sera pas
 expiré : huit semaines reste une cible, pas une date d'expiration.

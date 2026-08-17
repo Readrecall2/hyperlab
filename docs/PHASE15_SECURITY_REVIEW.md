@@ -157,9 +157,10 @@ sauvegarde de désinstallation.
 Le runbook exécutable complet, y compris la présentation des six répertoires
 persistants au conteneur d'opérations, se trouve dans `docs/UMBREL_SETUP.md`.
 
-## Prérequis hérités toujours BLOCKED
+## Préparation et promotion toujours séparées
 
-Le durcissement Umbrel ne lève aucun gate :
+Le durcissement Umbrel ne satisfait aucune preuve économique ni autorisation
+d'exécution. Paper/Testnet ne sont toutefois plus bloqués par héritage de Gate D :
 
 - **Phase 10 — `BLOCKED_PRECONDITION_NOT_MET`** : pas encore de preuve de flux
   multi-venues sub-seconde continus, horodatés et rejouables, clock sync, latences
@@ -168,13 +169,26 @@ Le durcissement Umbrel ne lève aucun gate :
 - **Phase 11 — `BLOCKED_INSUFFICIENT_REAL_DATA` / séquences inobservables** : pas de
   replay L2 réel suffisant ni de calibration auditée des frais, files, latences,
   toxicité et markouts ;
-- **Phase 12 — Gate D économique `BLOCKED`** : Gates B/C non prouvées, registre live
-  vide, minimum 42 jours forward, cycles préenregistrés, 14 jours sans incident,
-  coûts/latence/fills calibrés et exercices crash/recovery non démontrés ;
-- **Phase 13 — Gate E `BLOCKED`** : aucune revue humaine de Gate D et aucun service
-  testnet séparé validé ; aucun code testnet n'est promu par Phase 15 ;
-- **Phase 14 — Gate F `BLOCKED`** : aucun testnet validé, audit indépendant ou décision
-  humaine micro-mainnet. Umbrel ne reçoit jamais automatiquement un exécuteur.
+- **Phase 12 — runtime Paper techniquement bloqué** : registre vide et
+  aucune stratégie + source candidate complète ; Gates B/C/D ne sont pas des
+  prérequis du reçu exact `PAPER` / `PAPER_RUNTIME` ;
+- **Gate D économique `BLOCKED`** : Gates B/C non prouvées, minimum 42 jours
+  forward, au moins 30 cycles, 14 jours sans incident, coûts/latence/fills calibrés
+  et exercices crash/recovery non démontrés ; ce statut bloque l'argent réel, pas
+  le démarrage technique Paper/Testnet ;
+- **Phase 13 — techniquement bloquée** : aucun service/adaptateur Testnet
+  séparé, endpoint/credential scope, FSM, réconciliation, reprise, limites, kill
+  switch ou audit validé. Gate D n'est pas requis pour le développer ; Gate E sera
+  la preuve Testnet terminée pour argent réel ;
+- **Phase 14 — autorisation micro-mainnet bloquée** : Gates B/C/D/E, audit
+  indépendant, signer isolé, secrets/kill/reconciliation et décision humaine sont
+  absents. Gate F ne pourra être produite qu'après une campagne micro-mainnet
+  terminée. Umbrel ne reçoit jamais automatiquement un exécuteur.
+
+Les reçus `RESEARCH_REPLAY`, `PAPER`, `TESTNET`, `MICRO_MAINNET` et `MAINNET` sont
+liés à un environnement et un but exacts, sans conversion. HyperLab 0.2.x peut
+évaluer cette politique mais ne peut ni émettre ni consommer de reçu avec argent
+réel.
 
 ## Revue adversariale de déploiement
 

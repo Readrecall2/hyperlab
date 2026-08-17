@@ -14,8 +14,11 @@ UMBREL — fonctionnement 24/24, sans accès privé aux venues
 WINDOWS / SERVICE LOCAL SÉPARÉ — jamais inclus dans le paquet Umbrel 0.2.x
   source publique normalisée ---> paper engine local ---> journal SQLite
 
-PHASES ULTÉRIEURES, services et versions séparés
-  Phase 13 testnet executor -> Phase 14 micro-mainnet executor
+ENVIRONNEMENTS SANS ARGENT RÉEL, autorisations exactes et non convertibles
+  Paper local (`PAPER_RUNTIME`) || Phase 13 Testnet séparé (`TESTNET_EXECUTION`)
+
+ARGENT RÉEL, services/versions séparés et preuves B/C/D/E
+  Phase 14 micro-mainnet -> autorisation Mainnet distincte
 ```
 
 ## Principe de séparation
@@ -82,15 +85,20 @@ vérification de la chaîne, replay et réconciliation exacte. Une divergence fo
 `paper/runtime.py` supervise une source normalisée strictement publique : reprise
 et réconciliation avant le premier poll, cadence des timers, filtrage des
 redéliveries et arrêt propre. La CLI ne charge aucun module utilisateur ; elle ne
-peut démarrer que des factories inscrites statiquement pour le `config_hash`
-exact. Le registre reste vide : aucun candidat Phase 05-09/11 n'a de preuves Gates
-B/C calibrées, et aucun protocole sémantique mesuré ne peut encore les autoriser.
+peut démarrer que des factories inscrites statiquement pour le `config_hash` exact
+et un reçu exact `PAPER` / `PAPER_RUNTIME`, dont chaque preuve est validée par
+un vérificateur compilé exact environnement/but/check. Cette préparation technique
+n'exige pas Gates B/C/D et ne peut jamais autoriser une autre classe. Le registre
+reste néanmoins vide : aucune stratégie + source publique candidate complète
+n'est encore inscrite et aucun jeu de vérificateurs candidat n'est compilé.
 L'adaptateur générique accepte uniquement les BBO et événements de connexion
 normalisés ; les trades restent bloqués jusqu'à une identité durable aux
 redémarrages, et le raccord au writer unique n'existe pas. Les commandes de statut,
 Gate D et replay restent read-only. Gate D lie son diagnostic à une tête stable mais
-ne peut pas produire un PASS de promotion tant que l'attestation runtime/source et
-les octets des artefacts Gate D ne sont pas persistés puis revérifiés. Le replay
+ne peut pas produire un PASS de promotion avec argent réel tant que l'attestation
+runtime/source et les octets des artefacts Gate D ne sont pas persistés puis
+revérifiés. Elle conserve les 42 jours et exigences économiques sans bloquer le
+démarrage technique Paper ou Testnet. Le replay
 réexécute l'inbox dans un store temporaire isolé. La Phase 10 n'est une dépendance
 que pour une stratégie qui consomme explicitement ses artefacts, jamais pour la
 Phase 12 entière.

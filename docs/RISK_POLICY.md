@@ -31,20 +31,29 @@ peut qu'abaisser l'exposition absolue ; `PAUSED` interdit les nouvelles entrées
 réduction simulée qui peut rester partielle ou non remplie. Toute décision, y
 compris un rejet de risque, est persistée et reliée au ledger.
 
-Le statut économique de la Phase 12 reste `BLOCKED` jusqu'à satisfaction de la
-Gate D. Les limites ne sont jamais assouplies pour rendre un résultat positif et
-les runs `SYNTHETIC`/`UNCALIBRATED` ne comptent pas dans la fenêtre de validation.
+Le statut de promotion économique de la Phase 12 reste `BLOCKED` jusqu'à Gate D.
+Cela ne bloque pas un reçu technique exact `PAPER` / `PAPER_RUNTIME` : un
+run `SYNTHETIC` ou `UNCALIBRATED` peut exercer le logiciel, reste clairement
+non-promouvable et ne compte pas dans la fenêtre de validation. Les limites ne sont
+jamais assouplies pour rendre un résultat positif.
 
 ## Testnet futur
 
-- composant et version séparés après revue humaine explicite ;
+- composant/version séparés et reçu exact `TESTNET` / `TESTNET_EXECUTION` ;
+- ni Gate B/C/D ni résultat de rentabilité requis pour le démarrage technique ;
+- endpoint/chain ID Testnet allowlistés sans fallback Mainnet et credentials dédiés ;
 - réconciliation exchange-first au redémarrage ;
 - dead-man switch renouvelé sur la venue ;
-- aucune réutilisation implicite d'une autorisation paper ;
+- aucune réutilisation d'un reçu Paper ni conversion vers Mainnet ;
 - mêmes limites codées, avec comportement fail-closed en cas d'état exchange
   inconnu.
 
 ## Mainnet futur
+
+Le micro-mainnet exige Gates B/C/D/E, revue humaine, configuration signée, signer
+isolé, secrets révocables, kill switch/réconciliation et limites codées. `MAINNET`
+exige ensuite un reçu distinct, la preuve Gate F et deux revues humaines ;
+aucun reçu de classe inférieure ne peut être réutilisé.
 
 - sous-compte réservé au bot ;
 - API wallet dédiée et révocable ;

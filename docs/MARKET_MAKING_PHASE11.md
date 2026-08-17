@@ -162,7 +162,7 @@ Sans preuve, séquences et historique réel suffisant, ces commandes doivent sor
 avec un statut bloqué. C'est le comportement attendu ; il est interdit de remplacer
 une donnée manquante par un résultat synthétique présenté comme réel.
 
-## Limites restantes avant paper/testnet
+## Limites restantes avant promotion économique
 
 - Le L2 agrégé n'identifie ni notre ordre ni la liquidité cachée.
 - Les rejets privés, acknowledgements et règles précises de self-trade prevention
@@ -173,6 +173,8 @@ une donnée manquante par un résultat synthétique présenté comme réel.
   testées sur une fenêtre finale jamais utilisée pour régler les paramètres. La
   Phase 12 paper-only ne consulte jamais les données privées d'un compte ; sans
   preuve publique d'une remise, elle utilise le palier public conservateur.
-- La Phase 12 réconcilie un paper engine persistant, sans lever les prérequis
-  économiques ci-dessus ; la Phase 13 reste une branche/version distincte avec
-  revue humaine explicite.
+- La Phase 12 peut exercer techniquement un paper engine persistant sans Gates B/C/D,
+  à condition d'étiqueter ces hypothèses et de rester non-promouvable. La Phase 13
+  Testnet peut aussi progresser sans rentabilité ni Gate D dans une branche/version
+  distincte. Les prérequis économiques ci-dessus restent obligatoires avant tout
+  argent réel.

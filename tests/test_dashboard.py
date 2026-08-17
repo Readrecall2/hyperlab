@@ -63,6 +63,8 @@ def test_dashboard_is_explicitly_read_only(tmp_path: Path) -> None:
     page = client.get("/")
     assert page.status_code == 200
     assert "ORDRES IMPOSSIBLES" in page.text
+    assert "sans attendre Gate D" in page.text
+    assert "Tout exécuteur Micro/Mainnet" in page.text
 
 
 def test_liveness_is_distinct_from_fail_closed_readiness(tmp_path: Path) -> None:

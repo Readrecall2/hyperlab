@@ -443,7 +443,7 @@ h1{{font-size:clamp(2.2rem,6vw,4.5rem);letter-spacing:-.05em;margin:4px 0 8px}}.
 <p class="runtime-detail"><strong>Détail fraîcheur :</strong> {escape(runtime["stale_detail"])}<br><span class="muted">Statut runtime publié : {escape(runtime["updated_at"])}</span></p>
 <p class="muted">Compatibilité legacy SQLite : {status["snapshot_count"]} snapshot(s), dernière observation {_fmt_timestamp(status["last_observed_at_ms"])}. Ce compteur ne mesure pas les lignes Parquet du collecteur Phase 02.</p>
 <p class="muted">Dernier rapport : {escape(latest_report)}.{latest_report_link}</p>
-<div class="warning"><strong>Règle de sécurité :</strong> le dashboard et le collecteur sont publics/read-only. Le futur exécuteur testnet/mainnet devra être un composant distinct, ajouté après les portes de validation.</div>
+<div class="warning"><strong>Règle de sécurité :</strong> le dashboard et le collecteur sont publics/read-only. Un futur exécuteur Testnet restera un composant distinct et pourra être développé après sa readiness technique, sans attendre Gate D. Tout exécuteur Micro/Mainnet restera séparé et bloqué par les preuves économiques, opérationnelles et humaines applicables.</div>
 <h2>Catalogue de recherche</h2><section class="grid">{cards}</section>
 <p class="muted">Santé API locale : <code>/health</code> — état JSON : <code>/api/status</code></p>
 </main></body></html>"""

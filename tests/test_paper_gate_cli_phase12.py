@@ -46,8 +46,11 @@ def test_paper_gate_cli_is_read_only_and_exits_nonzero_when_blocked(
     assert payload["eligible"] is False
     assert payload["status"] == "BLOCKED_PRECONDITIONS"
     assert payload["blockers"] == payload["reasons"]
-    assert payload["admission_status"] == "NO_COMPILED_APPROVAL"
-    assert payload["checks"]["approved_admission"] is False
+    assert payload["readiness_status"] == "NO_COMPILED_READINESS"
+    assert payload["environment"] == "PAPER"
+    assert payload["authorization_purpose"] == "PAPER_RUNTIME"
+    assert payload["authorizes_real_money"] is False
+    assert payload["checks"]["paper_readiness_receipt_bound"] is False
     assert payload["checks"]["durable_runtime_source_attestation"] is False
     assert payload["checks"]["gate_d_artifact_bytes_verified"] is False
     assert payload["mode"] == "PAPER_ONLY"

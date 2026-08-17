@@ -703,8 +703,18 @@ class PaperRunConfig:
     required_instruments: tuple[str, ...] = ()
     engine_build_hash: str = PAPER_ENGINE_BUILD_HASH
     minimum_validation_cycles: int = 30
+    schema_version: int = 2
+    environment: str = "PAPER"
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version not in {1, 2}
+        ):
+            raise ValueError("paper configuration schema_version must be 1 or 2")
+        if self.environment != "PAPER":
+            raise ValueError("paper configuration environment must be PAPER")
         object.__setattr__(self, "strategy_name", _identifier(self.strategy_name, label="strategy_name"))
         object.__setattr__(self, "strategy_hash", _digest(self.strategy_hash, label="strategy_hash"))
         object.__setattr__(self, "data_hash", _digest(self.data_hash, label="data_hash"))
@@ -732,8 +742,8 @@ class PaperRunConfig:
             _utc(self.validation_started_at, label="validation_started_at"),
         )
         kind = self.run_kind.strip().upper()
-        if kind not in {"DEMO", "VALIDATION"}:
-            raise ValueError("run_kind must be DEMO or VALIDATION")
+        if kind not in {"DEMO", "TECHNICAL", "VALIDATION"}:
+            raise ValueError("run_kind must be DEMO, TECHNICAL, or VALIDATION")
         object.__setattr__(self, "run_kind", kind)
         status = self.data_calibration_status.strip().upper()
         if status not in _CALIBRATION_STATUSES:
@@ -792,9 +802,11 @@ class PaperRunConfig:
         if (
             isinstance(self.minimum_validation_cycles, bool)
             or not isinstance(self.minimum_validation_cycles, int)
-            or self.minimum_validation_cycles < 30
+            or self.minimum_validation_cycles < 1
         ):
-            raise ValueError("minimum_validation_cycles must be at least 30")
+            raise ValueError("minimum_validation_cycles must be at least 1")
+        if kind == "VALIDATION" and self.minimum_validation_cycles < 30:
+            raise ValueError("VALIDATION minimum_validation_cycles must be at least 30")
         if kind == "VALIDATION" and not self.economically_eligible:
             raise ValueError(
                 "VALIDATION paper runs require satisfied economic prerequisites and calibrated data/execution"
@@ -813,7 +825,7 @@ class PaperRunConfig:
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "data_calibration_evidence_hash": self.data_calibration_evidence_hash,
             "data_calibration_status": self.data_calibration_status,
             "data_hash": self.data_hash,
@@ -830,12 +842,15 @@ class PaperRunConfig:
             "required_instruments": list(self.required_instruments),
             "risk": self.risk.to_dict(),
             "run_kind": self.run_kind,
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "seed": self.seed,
             "strategy_hash": self.strategy_hash,
             "strategy_name": self.strategy_name,
             "validation_started_at": utc_text(self.validation_started_at),
         }
+        if self.schema_version >= 2:
+            payload["environment"] = self.environment
+        return payload
 
     @property
     def config_hash(self) -> str:
@@ -854,6 +869,12 @@ class PaperRunConfig:
             raise ValueError("paper run config lacks execution or risk")
         if not isinstance(parameters, Mapping):
             raise ValueError("paper run config parameters must be an object")
+        raw_schema_version = value.get("schema_version", 1)
+        if isinstance(raw_schema_version, bool):
+            raise ValueError("paper configuration schema_version must be 1 or 2")
+        schema_version = int(str(raw_schema_version))
+        if schema_version == 2 and "environment" not in value:
+            raise ValueError("schema v2 paper configuration requires explicit environment PAPER")
         return cls(
             strategy_name=str(value["strategy_name"]),
             strategy_hash=str(value["strategy_hash"]),
@@ -864,6 +885,8 @@ class PaperRunConfig:
             seed=int(str(value["seed"])),
             initial_cash=decimal_value(str(value["initial_cash"]), label="initial_cash"),
             validation_started_at=parse_utc(str(value["validation_started_at"])),
+            schema_version=schema_version,
+            environment=str(value.get("environment", "PAPER")),
             run_kind=str(value.get("run_kind", "DEMO")),
             data_calibration_status=str(value.get("data_calibration_status", "UNCALIBRATED")),
             data_calibration_evidence_hash=(

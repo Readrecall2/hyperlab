@@ -19,9 +19,10 @@ Seul le premier statut, avec Gates B et C satisfaites, permet une conclusion
 
 ## Contrat paper Phase 12
 
-Seule une variante figée selon le protocole ci-dessus peut ouvrir un run paper.
+Une variante figée et une source publique techniquement admissible peuvent ouvrir
+un run Paper avec un reçu exact `PAPER` / `PAPER_RUNTIME`, sans attendre Gates B/C/D.
 Chaque décision porte la version de stratégie, le hash de tous ses paramètres, le
-hash des limites, le seed, l'artefact Gates B/C et les preuves de calibration.
+hash des limites, le seed, l'identité de source et les preuves disponibles.
 Toutes les stratégies,
 mono- ou multi-jambes, passent par le même contrôle de risque et le même paper
 engine ; aucune ne peut écrire directement un ordre, un fill, une position, le cash
@@ -31,13 +32,16 @@ Le moteur conserve le lien décision → ordre simulé → ack/reject → non-fi
 partiel ou complet/cancel → position/cash/frais/PnL. Les sémantiques Phase 04 de
 profondeur, slippage, non-fill maker, IOC et délais de jambes sont réutilisées à la
 granularité applicable. Une stratégie dont les données, latences ou fills requis ne
-sont pas calibrés reste `BLOCKED` ; une hypothèse Phase 10/11 inachevée ne peut pas
-être promue silencieusement en paper.
+ne sont pas calibrés reste explicitement `UNCALIBRATED` et non-promouvable, mais
+peut exercer le logiciel avec des hypothèses conservatrices visibles. Une hypothèse
+Phase 10/11 inachevée ne peut jamais être présentée comme preuve économique.
 
-La Gate D est commune : 6 à 8 semaines, nombre de cycles préenregistré, 14 jours
-sans incident critique, réconciliation exacte, replay déterministe et résultat net
-positif sous coûts stressés. Aucun run n'a encore satisfait ces critères dans ce
-checkout ; le statut économique Phase 12 reste **`BLOCKED`**. Voir
+Gate D est commune aux futures autorisations avec argent réel : minimum 42 jours,
+seuil préenregistré d'au moins 30 cycles, 14 jours sans incident critique,
+réconciliation
+exacte, replay déterministe et résultat net positif sous coûts stressés. Elle ne
+sert pas à démarrer Paper ou Testnet. Aucun run n'a encore satisfait ces critères ;
+la promotion économique reste **`BLOCKED`**. Voir
 [`PAPER_ENGINE_PHASE12.md`](PAPER_ENGINE_PHASE12.md).
 
 ## Niveau 1 — cash-and-carry spot/perp

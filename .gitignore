@@ -44,6 +44,12 @@ reports/*
 *.sqlite
 *.sqlite3
 *.db
+services/testnet-executor/local/
+services/testnet-executor/var/
+services/testnet-executor/evidence/
+services/testnet-executor/.wheelhouse/
+services/testnet-executor/config/*.json
+!services/testnet-executor/config/testnet.example.json
 jjlab-hyperlab/data/*
 !jjlab-hyperlab/data/.gitkeep
 !jjlab-hyperlab/data/runtime/

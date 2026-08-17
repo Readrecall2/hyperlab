@@ -1,0 +1,4 @@
+# Isolated Testnet service build backend. Runtime dependencies are locked in
+# requirements-external.lock and HyperLab is installed from the reviewed local
+# wheel with --no-deps.
+hatchling==1.27.0

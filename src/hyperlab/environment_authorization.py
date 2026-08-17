@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -321,6 +322,54 @@ class EvidenceVerifierIdentity:
         if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
             raise ValueError("evidence verifier version must be a positive integer")
 
+    @classmethod
+    def from_object(
+        cls,
+        value: object,
+        *,
+        location: str,
+    ) -> EvidenceVerifierIdentity:
+        raw = _require_mapping(value, location=location)
+        _require_exact_keys(
+            raw,
+            frozenset({'check', 'environment', 'purpose', 'verifier_id', 'version'}),
+            location=location,
+        )
+        version = raw['version']
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise _error(
+                'INVALID_RECEIPT',
+                f'{location}.version',
+                'must be an integer',
+            )
+        try:
+            return cls(
+                environment=_parse_enum(
+                    EnvironmentClass,
+                    raw['environment'],
+                    location=f'{location}.environment',
+                ),
+                purpose=_parse_enum(
+                    AuthorizationPurpose,
+                    raw['purpose'],
+                    location=f'{location}.purpose',
+                ),
+                check=_parse_enum(
+                    EvidenceCheck,
+                    raw['check'],
+                    location=f'{location}.check',
+                ),
+                verifier_id=_require_identity(
+                    raw['verifier_id'],
+                    location=f'{location}.verifier_id',
+                ),
+                version=version,
+            )
+        except AuthorizationManifestError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise _error('INVALID_RECEIPT', location, str(error)) from error
+
     def to_dict(self) -> dict[str, object]:
         return {
             "check": self.check.value,
@@ -348,6 +397,355 @@ class EvidenceVerificationContext:
 EvidenceVerifier = Callable[[EvidenceVerificationContext], bool]
 _VerifierScope = tuple[EnvironmentClass, AuthorizationPurpose, EvidenceCheck]
 
+_TESTNET_HTTP_ENDPOINT = 'https://api.hyperliquid-testnet.xyz'
+_TESTNET_WEBSOCKET_ENDPOINT = 'wss://api.hyperliquid-testnet.xyz/ws'
+_TESTNET_IDENTITY = 'TESTNET'
+_TESTNET_CREDENTIAL_NAMESPACE = 'HYPERLAB_TESTNET'
+_TESTNET_EVIDENCE_KEYS = frozenset(
+    {
+        'check',
+        'environment',
+        'facts',
+        'purpose',
+        'schema_version',
+        'subject',
+        'validation',
+    }
+)
+_TESTNET_VALIDATION_KEYS = frozenset({'report_sha256', 'validation_id'})
+_TESTNET_RISK_FACT_KEYS = frozenset(
+    {'enforcement', 'limits', 'limits_sha256', 'namespace'}
+)
+_TESTNET_RISK_LIMIT_KEYS = frozenset(
+    {
+        'cancel_requests_per_minute',
+        'deadman_interval_seconds',
+        'market_stale_after_seconds',
+        'max_concurrent_orders',
+        'max_gross_notional',
+        'max_order_notional',
+        'max_order_quantity',
+        'max_position_notional',
+        'max_position_quantity',
+        'reconciliation_stale_after_seconds',
+        'replace_requests_per_minute',
+        'submit_requests_per_minute',
+    }
+)
+_CANONICAL_POSITIVE_DECIMAL_RE = re.compile(r'(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z')
+_TESTNET_RISK_DECIMAL_CEILINGS = {
+    'max_gross_notional': Decimal('1000'),
+    'max_order_notional': Decimal('100'),
+    'max_order_quantity': Decimal('1'),
+    'max_position_notional': Decimal('500'),
+    'max_position_quantity': Decimal('5'),
+}
+_TESTNET_RISK_INTEGER_CEILINGS = {
+    'cancel_requests_per_minute': 24,
+    'deadman_interval_seconds': 30,
+    'market_stale_after_seconds': 5,
+    'max_concurrent_orders': 4,
+    'reconciliation_stale_after_seconds': 10,
+    'replace_requests_per_minute': 6,
+    'submit_requests_per_minute': 12,
+}
+
+
+def _fixed_testnet_facts(check: EvidenceCheck) -> dict[str, object] | None:
+    if check is EvidenceCheck.EXPLICIT_TESTNET_ENDPOINT:
+        return {
+            'chain_identity': _TESTNET_IDENTITY,
+            'http_endpoint': _TESTNET_HTTP_ENDPOINT,
+            'redirects_allowed': False,
+            'websocket_endpoint': _TESTNET_WEBSOCKET_ENDPOINT,
+        }
+    if check is EvidenceCheck.TESTNET_CONFIG_NAMESPACE:
+        return {
+            'chain_identity': _TESTNET_IDENTITY,
+            'configuration_namespace': _TESTNET_CREDENTIAL_NAMESPACE,
+            'environment_identity': _TESTNET_IDENTITY,
+        }
+    if check is EvidenceCheck.NO_MAINNET_FALLBACK:
+        return {
+            'default_endpoint_present': False,
+            'fallback_present': False,
+            'mainnet_route_present': False,
+        }
+    if check is EvidenceCheck.ISOLATED_TESTNET_CREDENTIALS:
+        return {
+            'credential_material_present': False,
+            'credential_namespace': _TESTNET_CREDENTIAL_NAMESPACE,
+            'mainnet_namespace_reused': False,
+            'paper_identity_reused': False,
+        }
+    if check is EvidenceCheck.CREDENTIAL_SCOPE_VALIDATION:
+        return {
+            'credential_namespace': _TESTNET_CREDENTIAL_NAMESPACE,
+            'expected_scope': _TESTNET_IDENTITY,
+            'mainnet_scope_accepted': False,
+            'scope_validation_required': True,
+        }
+    if check is EvidenceCheck.DETERMINISTIC_CLIENT_ORDER_IDS:
+        return {
+            'domain': 'hyperliquid_testnet_cloid_v1',
+            'format': '0x+32_lowercase_hex',
+            'pattern': '^0x[0-9a-f]{32}$',
+            'retry_reuses_identifier': True,
+        }
+    if check is EvidenceCheck.ORDER_LIFECYCLE_STATE_MACHINE:
+        return {
+            'ambiguous_state': 'UNKNOWN',
+            'persistent': True,
+            'states': [
+                'REQUESTED',
+                'SUBMITTED',
+                'ACKNOWLEDGED',
+                'OPEN',
+                'PARTIALLY_FILLED',
+                'FILLED',
+                'CANCEL_REQUESTED',
+                'CANCELLED',
+                'REJECTED',
+                'EXPIRED',
+                'INVALID',
+                'UNKNOWN',
+            ],
+        }
+    if check is EvidenceCheck.CANCEL_REPLACE_SEMANTICS:
+        return {
+            'ambiguous_cancel_action': 'RECONCILE',
+            'ambiguous_modify_action': 'RECONCILE',
+            'blind_resubmit_allowed': False,
+            'cancel_ack_required': True,
+            'replace_semantics': 'NATIVE_MODIFY',
+        }
+    if check is EvidenceCheck.RECONCILIATION:
+        return {
+            'authority': 'EXCHANGE_FIRST',
+            'covers': [
+                'OPEN_ORDERS',
+                'POSITIONS',
+                'FILLS',
+                'BALANCES_EQUITY',
+                'UNKNOWN_CLOIDS',
+                'MISSING_ACKNOWLEDGEMENTS',
+            ],
+            'idempotent': True,
+            'unresolved_action': 'PAUSED_MANUAL_REVIEW',
+        }
+    if check is EvidenceCheck.RESTART_RECOVERY:
+        return {
+            'before_new_orders': 'RECONCILE',
+            'cancellation_recovery': True,
+            'duplicate_submission_allowed': False,
+            'fill_deduplication': True,
+            'open_order_recovery': True,
+            'position_invention_allowed': False,
+        }
+    if check is EvidenceCheck.KILL_SWITCH:
+        return {
+            'kill_persistent': True,
+            'kill_state': 'KILLED',
+            'manual_reset_required': True,
+            'new_orders_blocked_when_killed': True,
+            'new_orders_blocked_when_paused': True,
+            'pause_persistent': True,
+            'pause_state': 'PAUSED',
+        }
+    if check is EvidenceCheck.FAIL_CLOSED_ENVIRONMENT_IDENTITY:
+        return {
+            'accepted_chain_identity': _TESTNET_IDENTITY,
+            'accepted_environment': _TESTNET_IDENTITY,
+            'accepted_purpose': AuthorizationPurpose.TESTNET_EXECUTION.value,
+            'ambiguous_identity_action': 'BLOCK',
+            'mainnet_identity_accepted': False,
+        }
+    if check is EvidenceCheck.FULL_AUDIT_LOG:
+        return {
+            'append_only': True,
+            'categories': [
+                'RUNTIME_START',
+                'RUNTIME_STOP',
+                'ENVIRONMENT_AUTHORIZATION',
+                'ORDER_INTENT',
+                'SUBMISSION',
+                'ACKNOWLEDGEMENT',
+                'FILLS',
+                'CANCEL_REPLACE',
+                'RECONCILIATION',
+                'RISK_REJECTION',
+                'PAUSE',
+                'KILL',
+                'RECOVERY',
+            ],
+            'persistent': True,
+            'redaction_required': True,
+            'secret_categories_excluded': [
+                'API_KEY',
+                'MNEMONIC',
+                'PRIVATE_KEY',
+                'SEED_PHRASE',
+                'WALLET_KEY',
+            ],
+            'secret_material_persisted': False,
+        }
+    return None
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    if not isinstance(value, str) or _CANONICAL_POSITIVE_DECIMAL_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    decimal_tuple = parsed.as_tuple()
+    exponent = decimal_tuple.exponent
+    if (
+        not isinstance(exponent, int)
+        or len(decimal_tuple.digits) > 64
+        or abs(exponent) > 64
+        or abs(parsed.adjusted()) > 64
+    ):
+        return None
+    canonical = format(parsed, 'f')
+    if '.' in canonical:
+        canonical = canonical.rstrip('0').rstrip('.')
+    return parsed if value == canonical else None
+
+
+def _validate_testnet_risk_limits(
+    limits: Mapping[str, object],
+    *,
+    expected_sha256: str,
+) -> bool:
+    if frozenset(limits) != _TESTNET_RISK_LIMIT_KEYS:
+        return False
+    max_gross_notional = _positive_decimal(limits.get('max_gross_notional'))
+    max_order_notional = _positive_decimal(limits.get('max_order_notional'))
+    max_order_quantity = _positive_decimal(limits.get('max_order_quantity'))
+    max_position_notional = _positive_decimal(limits.get('max_position_notional'))
+    max_position_quantity = _positive_decimal(limits.get('max_position_quantity'))
+    if (
+        max_gross_notional is None
+        or max_order_notional is None
+        or max_order_quantity is None
+        or max_position_notional is None
+        or max_position_quantity is None
+        or max_order_notional > max_position_notional
+        or max_position_notional > max_gross_notional
+        or max_order_quantity > max_position_quantity
+        or max_gross_notional > _TESTNET_RISK_DECIMAL_CEILINGS['max_gross_notional']
+        or max_order_notional > _TESTNET_RISK_DECIMAL_CEILINGS['max_order_notional']
+        or max_order_quantity > _TESTNET_RISK_DECIMAL_CEILINGS['max_order_quantity']
+        or max_position_notional
+        > _TESTNET_RISK_DECIMAL_CEILINGS['max_position_notional']
+        or max_position_quantity
+        > _TESTNET_RISK_DECIMAL_CEILINGS['max_position_quantity']
+    ):
+        return False
+    for name in (
+        'cancel_requests_per_minute',
+        'deadman_interval_seconds',
+        'market_stale_after_seconds',
+        'max_concurrent_orders',
+        'reconciliation_stale_after_seconds',
+        'replace_requests_per_minute',
+        'submit_requests_per_minute',
+    ):
+        value = limits.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value > _TESTNET_RISK_INTEGER_CEILINGS[name]
+        ):
+            return False
+    limits_sha256 = hashlib.sha256(_canonical_json_bytes(dict(limits))).hexdigest()
+    return limits_sha256 == expected_sha256
+
+
+def _validate_testnet_risk_facts(
+    facts: Mapping[str, object],
+    context: EvidenceVerificationContext,
+) -> bool:
+    if frozenset(facts) != _TESTNET_RISK_FACT_KEYS:
+        return False
+    if (
+        facts.get('enforcement') != 'FAIL_CLOSED'
+        or facts.get('namespace') != _TESTNET_CREDENTIAL_NAMESPACE
+        or facts.get('limits_sha256') != context.subject.risk_limits_hash
+    ):
+        return False
+    limits = facts.get('limits')
+    return isinstance(limits, Mapping) and _validate_testnet_risk_limits(
+        limits,
+        expected_sha256=context.subject.risk_limits_hash,
+    )
+
+
+def _verify_testnet_evidence(
+    context: EvidenceVerificationContext,
+    *,
+    expected_check: EvidenceCheck,
+) -> bool:
+    if (
+        context.check is not expected_check
+        or context.environment is not EnvironmentClass.TESTNET
+        or context.purpose is not AuthorizationPurpose.TESTNET_EXECUTION
+        or context.environment_identity != _TESTNET_IDENTITY
+        or context.execution_network is not ExecutionNetwork.TESTNET
+        or context.credential_scope is not CredentialScope.TESTNET
+        or context.order_capability is not OrderCapability.TESTNET_ONLY
+    ):
+        return False
+    try:
+        decoded = json.loads(
+            context.artifact_bytes.decode('utf-8'),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (AuthorizationManifestError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, Mapping) or frozenset(decoded) != _TESTNET_EVIDENCE_KEYS:
+        return False
+    if context.artifact_bytes != _canonical_json_bytes(dict(decoded)):
+        return False
+    subject = decoded.get('subject')
+    facts = decoded.get('facts')
+    validation = decoded.get('validation')
+    if (
+        type(decoded.get('schema_version')) is not int
+        or decoded.get('schema_version') != 1
+        or decoded.get('environment') != EnvironmentClass.TESTNET.value
+        or decoded.get('purpose') != AuthorizationPurpose.TESTNET_EXECUTION.value
+        or decoded.get('check') != expected_check.value
+        or not isinstance(subject, Mapping)
+        or dict(subject) != context.subject.to_dict()
+        or not isinstance(facts, Mapping)
+        or not isinstance(validation, Mapping)
+        or frozenset(validation) != _TESTNET_VALIDATION_KEYS
+        or not all(
+            isinstance(validation.get(name), str)
+            and _SHA256_RE.fullmatch(cast(str, validation.get(name))) is not None
+            for name in _TESTNET_VALIDATION_KEYS
+        )
+    ):
+        return False
+    if expected_check is EvidenceCheck.BOUNDED_POSITION_NOTIONAL:
+        return _validate_testnet_risk_facts(facts, context)
+    expected_facts = _fixed_testnet_facts(expected_check)
+    return expected_facts is not None and dict(facts) == expected_facts
+
+
+def _make_testnet_evidence_verifier(check: EvidenceCheck) -> EvidenceVerifier:
+    def verify(context: EvidenceVerificationContext) -> bool:
+        return _verify_testnet_evidence(context, expected_check=check)
+
+    return verify
+
 
 @dataclass(frozen=True, slots=True)
 class _CompiledEvidenceVerifier:
@@ -364,12 +762,12 @@ class _CompiledEvidenceVerifier:
             raise TypeError("compiled evidence verifier callback must be callable")
 
 
-# Deliberately private, immutable, and empty in this build. Production callers
-# cannot inject callbacks through the readiness API. A reviewed build must compile
-# concrete scope-specific semantic verifiers here before a receipt can be issued.
+# Deliberately private and immutable. Production callers cannot inject callbacks
+# through the readiness API. The exact TESTNET registry is compiled below after the
+# required-check set is declared; Paper and real-money scopes remain absent.
 _COMPILED_EVIDENCE_VERIFIERS: Mapping[
     _VerifierScope, _CompiledEvidenceVerifier
-] = MappingProxyType({})
+]
 
 
 def _verifier_scope(
@@ -515,6 +913,79 @@ _TESTNET_CHECKS = frozenset(
         EvidenceCheck.KILL_SWITCH,
         EvidenceCheck.FAIL_CLOSED_ENVIRONMENT_IDENTITY,
         EvidenceCheck.FULL_AUDIT_LOG,
+    }
+)
+
+
+def testnet_evidence_payload(
+    check: EvidenceCheck,
+    subject: ReadinessSubject,
+    risk_limits: Mapping[str, object] | None = None,
+    *,
+    validation_id: str,
+    validation_report_sha256: str,
+) -> dict[str, object]:
+    '''Build the exact semantic evidence object accepted for TESTNET execution.'''
+
+    if not isinstance(check, EvidenceCheck) or check not in _TESTNET_CHECKS:
+        raise ValueError('check is not a TESTNET execution evidence check')
+    if not isinstance(subject, ReadinessSubject):
+        raise TypeError('subject must be an exact ReadinessSubject')
+    if (
+        not isinstance(validation_id, str)
+        or _SHA256_RE.fullmatch(validation_id) is None
+        or not isinstance(validation_report_sha256, str)
+        or _SHA256_RE.fullmatch(validation_report_sha256) is None
+    ):
+        raise ValueError('validation identity must contain exact lowercase SHA-256 values')
+    if risk_limits is not None and (
+        not isinstance(risk_limits, Mapping)
+        or not _validate_testnet_risk_limits(
+            risk_limits,
+            expected_sha256=subject.risk_limits_hash,
+        )
+    ):
+        raise ValueError('risk_limits do not match the exact bounded TESTNET schema')
+    if check is EvidenceCheck.BOUNDED_POSITION_NOTIONAL:
+        if risk_limits is None:
+            raise ValueError('risk_limits are required for bounded TESTNET evidence')
+        facts: dict[str, object] = {
+            'enforcement': 'FAIL_CLOSED',
+            'limits': dict(risk_limits),
+            'limits_sha256': subject.risk_limits_hash,
+            'namespace': _TESTNET_CREDENTIAL_NAMESPACE,
+        }
+    else:
+        fixed_facts = _fixed_testnet_facts(check)
+        if fixed_facts is None:
+            raise ValueError('check has no compiled TESTNET evidence facts')
+        facts = fixed_facts
+    return {
+        'check': check.value,
+        'environment': EnvironmentClass.TESTNET.value,
+        'facts': facts,
+        'purpose': AuthorizationPurpose.TESTNET_EXECUTION.value,
+        'schema_version': 1,
+        'subject': subject.to_dict(),
+        'validation': {
+            'report_sha256': validation_report_sha256,
+            'validation_id': validation_id,
+        },
+    }
+
+
+_COMPILED_EVIDENCE_VERIFIERS = MappingProxyType(
+    {
+        _verifier_scope(
+            EnvironmentClass.TESTNET,
+            AuthorizationPurpose.TESTNET_EXECUTION,
+            check,
+        ): _CompiledEvidenceVerifier(
+            verifier_id=f'hyperlab:testnet-execution:{check.value.casefold()}',
+            version=3 if check is EvidenceCheck.BOUNDED_POSITION_NOTIONAL else 2,
+            verify=_make_testnet_evidence_verifier(check),
+        )
+        for check in _TESTNET_CHECKS
     }
 )
 _REAL_MONEY_COMMON_CHECKS = frozenset(
@@ -1299,6 +1770,177 @@ class EnvironmentAuthorizationReceipt:
                 "authorization receipt required_checks must be unique and canonically sorted"
             )
 
+    @classmethod
+    def from_object(
+        cls,
+        value: object,
+        *,
+        location: str = '$',
+    ) -> EnvironmentAuthorizationReceipt:
+        raw = _require_mapping(value, location=location)
+        _require_exact_keys(
+            raw,
+            frozenset(
+                {
+                    'credential_scope',
+                    'environment',
+                    'environment_identity',
+                    'execution_network',
+                    'manifest_sha256',
+                    'order_capability',
+                    'profile_sha256',
+                    'purpose',
+                    'required_checks',
+                    'schema_version',
+                    'subject',
+                    'verifier_identities',
+                    'verifier_set_sha256',
+                }
+            ),
+            location=location,
+        )
+        schema_version = raw['schema_version']
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise _error(
+                'INVALID_RECEIPT',
+                f'{location}.schema_version',
+                'must be an integer',
+            )
+        raw_checks = raw['required_checks']
+        if not isinstance(raw_checks, list):
+            raise _error(
+                'INVALID_RECEIPT',
+                f'{location}.required_checks',
+                'must be a JSON array',
+            )
+        raw_identities = raw['verifier_identities']
+        if not isinstance(raw_identities, list):
+            raise _error(
+                'INVALID_RECEIPT',
+                f'{location}.verifier_identities',
+                'must be a JSON array',
+            )
+        try:
+            receipt = cls(
+                schema_version=schema_version,
+                environment=_parse_enum(
+                    EnvironmentClass,
+                    raw['environment'],
+                    location=f'{location}.environment',
+                ),
+                purpose=_parse_enum(
+                    AuthorizationPurpose,
+                    raw['purpose'],
+                    location=f'{location}.purpose',
+                ),
+                environment_identity=_require_string(
+                    raw['environment_identity'],
+                    location=f'{location}.environment_identity',
+                ),
+                execution_network=_parse_enum(
+                    ExecutionNetwork,
+                    raw['execution_network'],
+                    location=f'{location}.execution_network',
+                ),
+                credential_scope=_parse_enum(
+                    CredentialScope,
+                    raw['credential_scope'],
+                    location=f'{location}.credential_scope',
+                ),
+                order_capability=_parse_enum(
+                    OrderCapability,
+                    raw['order_capability'],
+                    location=f'{location}.order_capability',
+                ),
+                subject=ReadinessSubject.from_object(
+                    raw['subject'],
+                    location=f'{location}.subject',
+                ),
+                manifest_sha256=_require_sha256(
+                    raw['manifest_sha256'],
+                    location=f'{location}.manifest_sha256',
+                ),
+                profile_sha256=_require_sha256(
+                    raw['profile_sha256'],
+                    location=f'{location}.profile_sha256',
+                ),
+                verifier_identities=tuple(
+                    EvidenceVerifierIdentity.from_object(
+                        item,
+                        location=f'{location}.verifier_identities[{index}]',
+                    )
+                    for index, item in enumerate(raw_identities)
+                ),
+                verifier_set_sha256=_require_sha256(
+                    raw['verifier_set_sha256'],
+                    location=f'{location}.verifier_set_sha256',
+                ),
+                required_checks=tuple(
+                    _parse_enum(
+                        EvidenceCheck,
+                        item,
+                        location=f'{location}.required_checks[{index}]',
+                    )
+                    for index, item in enumerate(raw_checks)
+                ),
+            )
+        except AuthorizationManifestError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise _error('INVALID_RECEIPT', location, str(error)) from error
+
+        profile = profile_for(receipt.environment)
+        expected_checks = tuple(
+            sorted(profile.required_checks, key=lambda check: check.value)
+        )
+        if (
+            receipt.purpose is not profile.purpose
+            or receipt.execution_network is not profile.execution_network
+            or receipt.credential_scope is not profile.credential_scope
+            or receipt.order_capability is not profile.order_capability
+            or receipt.required_checks != expected_checks
+            or tuple(identity.check for identity in receipt.verifier_identities)
+            != expected_checks
+        ):
+            raise _error(
+                'INVALID_RECEIPT_SCOPE',
+                location,
+                'receipt fields do not match one exact compiled environment profile',
+            )
+        return receipt
+
+    @classmethod
+    def from_json_bytes(
+        cls,
+        payload: bytes,
+        *,
+        require_canonical: bool = True,
+    ) -> EnvironmentAuthorizationReceipt:
+        if not isinstance(payload, bytes):
+            raise TypeError('authorization receipt payload must be bytes')
+        try:
+            text = payload.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise _error('INVALID_UTF8', '$', 'receipt must be UTF-8') from error
+        try:
+            value = json.loads(
+                text,
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_constant,
+            )
+        except AuthorizationManifestError:
+            raise
+        except json.JSONDecodeError as error:
+            raise _error('INVALID_JSON', '$', str(error)) from error
+        receipt = cls.from_object(value)
+        if require_canonical and payload != receipt.canonical_json_bytes():
+            raise _error(
+                'NON_CANONICAL_RECEIPT',
+                '$',
+                'bytes differ from canonical sorted compact UTF-8 JSON',
+            )
+        return receipt
+
     @property
     def authorizes_real_money(self) -> bool:
         return (
@@ -1310,7 +1952,7 @@ class EnvironmentAuthorizationReceipt:
 
     @property
     def receipt_sha256(self) -> str:
-        return hashlib.sha256(_canonical_json_bytes(self.to_dict())).hexdigest()
+        return hashlib.sha256(self.canonical_json_bytes()).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1330,6 +1972,8 @@ class EnvironmentAuthorizationReceipt:
             ],
             "verifier_set_sha256": self.verifier_set_sha256,
         }
+    def canonical_json_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.to_dict())
 
 
 EnvironmentReadinessReceipt = EnvironmentAuthorizationReceipt
@@ -1556,5 +2200,6 @@ __all__ = [
     "issue_environment_receipt",
     "profile_for",
     "receipt_scope_blockers",
+    "testnet_evidence_payload",
     "verify_environment_readiness",
 ]

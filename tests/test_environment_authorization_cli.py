@@ -208,7 +208,10 @@ def test_gate_model_check_issues_only_a_ready_paper_receipt_and_is_read_only(
 def test_gate_model_check_rejects_self_asserted_files_without_compiled_verifiers(
     tmp_path: Path,
 ) -> None:
-    assert not authorization_module._COMPILED_EVIDENCE_VERIFIERS
+    assert not any(
+        environment is EnvironmentClass.PAPER
+        for environment, _purpose, _check in authorization_module._COMPILED_EVIDENCE_VERIFIERS
+    )
     manifest = _manifest(tmp_path, EnvironmentClass.PAPER)
     manifest_path = tmp_path / "self-asserted-readiness.json"
     manifest_path.write_bytes(manifest.canonical_json_bytes())

@@ -1,0 +1,9 @@
+# External runtime graph only. HyperLab itself must be installed from the
+# reviewed local root wheel with --no-deps; it is intentionally absent here so
+# an index package named "hyperlab" can never satisfy the local-source boundary.
+eth-account==0.13.7
+hyperliquid-python-sdk==0.24.0
+requests==2.34.2
+rich==14.3.4
+typer==0.27.1
+websocket-client==1.9.0

@@ -153,30 +153,69 @@ Un reçu `TESTNET` / `TESTNET_EXECUTION` ne requiert ni rentabilité, ni Gates
 B/C/D, ni campagne Paper de 42 jours. Il exige :
 
 - service/version Phase 13 séparé et identité exactement `TESTNET` ;
+- venv opérateur dédié, deux wheels locaux revus installés `--no-index --no-deps`
+  et graphes build/runtime issus des locks hashés et du wheelhouse offline fixe ;
 - endpoint, chain ID et namespace Testnet explicitement allowlistés, sans fallback
   Mainnet ;
-- credentials Testnet dédiés et séparés, avec scope contrôlé lorsque possible ;
-  aucune réutilisation implicite d'un credential Mainnet ;
+- credentials Testnet dédiés et séparés, rôle compte exact `user` et exactement
+  une API wallet active configurée ; aucune réutilisation implicite d'un credential
+  Mainnet, vault ou sous-compte ;
 - CLOID déterministes, machine à états d'ordres, post-only/IOC/reduce-only et
   cancel/replace explicitement testés ;
 - réponses ambiguës recherchées/réconciliées, jamais renvoyées aveuglément ;
 - positions et compte réconciliés exchange-first au démarrage et après restart ;
-- limites bornées de position/notionnel, pause d'urgence/dead-man switch et journal
-  d'audit complet ;
+- douze limites avec défauts/plafonds compilés non relevables par configuration,
+  décimaux à représentation bornée, pause/dead-man switch et audit complet ;
+- tombstones account-global submit/cancel/replace sans éviction, capacité compilée
+  `100000` surveillée bien avant saturation ; `scheduleCancel` protecteur exempt ;
+- kill compte durable avant réseau, avec résultat DMS explicitement confirmé ou
+  dégradé ; aucun `DEADMAN_ARMED` interprété comme cancel déjà appliqué ;
 - échec fermé pour toute identité, URL, chain ID, credential ou réponse ambiguë.
 
-Dans ce checkout, aucun adaptateur/exécuteur Phase 13 ni vérificateur sémantique
-Testnet n'existe. Son développement est autorisé sans Gate D, mais son exécution
-reste techniquement bloquée jusqu'à la preuve de ces conditions et à la revue de
-la politique séparée.
+Le checkout contient désormais le service séparé
+`services/testnet-executor` 0.3.0.dev0 et les vérificateurs sémantiques compilés
+pour ces quatorze checks. L'identité est exactement `TESTNET` /
+`TESTNET_EXECUTION`, avec HTTP
+`https://api.hyperliquid-testnet.xyz`, WebSocket
+`wss://api.hyperliquid-testnet.xyz/ws` et credential namespace
+`HYPERLAB_TESTNET`. Les preuves sont canoniques et liées au build, à la
+configuration, à la source, à la stratégie et aux limites ; une étiquette `PASS`
+non vérifiée ne produit jamais un reçu.
+
+La chaîne d'autorité commence par `build-identity` puis
+`validate-software`, invoqués dans le venv dédié qui exécutera le runtime. Les
+gates de développement s'exécutent avec le Python revu au chemin fixe `.venv` de
+la racine, distinct du Python opérateur minimal ; le rapport lie leurs chemins et
+hashes. Il lie aussi
+branche/baseline, inventaire worktree avant/après, Python/exécutables, locks,
+wheelhouse, wheels, lints/type checks/tests, diff/conflict/manifest/release checks
+et build isolé. `evidence` recharge ce rapport absolu et lie son identité/hash aux
+quatorze preuves avant de créer manifest et reçu. Chaque commande online recharge
+les cinq chemins `config/receipt/manifest/evidence-root/validation-report` ; le
+seul reçu n'est pas une autorité suffisante.
+
+Cette présence logicielle n'est pas une preuve d'exécution live. Avant le premier
+preflight réel, l'opérateur doit encore créer une API wallet Testnet dédiée,
+pré-provisionner `%ProgramData%\HyperLab\TestnetExecutor\control-v1` avec la DACL
+restreinte du SID d'exécution appliquée à chacun des trois composants projet,
+injecter ses credentials hors dépôt, produire le
+rapport logiciel puis le reçu exact sur le commit validé et approuver la
+configuration. Le service refuse un registre absent, reparse ou writable par un
+SID tiers ; il ne l'auto-crée pas. Avant le premier ordre,
+le preflight et la
+réconciliation read-only doivent réussir, puis l'ordre minimal exige la
+confirmation `TESTNET-ORDER`. Le workflow A–H et Gate E restent non observés dans
+ce checkout. Voir [`TESTNET_EXECUTOR_PHASE13.md`](TESTNET_EXECUTOR_PHASE13.md).
 
 ## Gate E — preuve opérationnelle Testnet pour argent réel
 
 Gate E est produite après des exercices Testnet réussis ; elle n'autorise pas le
 démarrage de Testnet. Elle lie aux octets vérifiés les signatures, CLOID, cycles
-complets d'ordre, annulations/cancel-replace, partial fills, réponses perdues, doublons, perte
-WebSocket, restart, réconciliation, limites et dead-man switch. Une revue humaine
-explicite de cette preuve est obligatoire avant tout capital réel.
+complets d'ordre, annulations/cancel-replace, partial fills, réponses perdues,
+doublons, perte WebSocket, restart, réconciliation, limites, kill dégradé et
+dead-man switch confirmé/non confirmé. Une
+revue humaine explicite de cette preuve est obligatoire avant tout capital réel.
+Les tests locaux et transports simulés Phase 13 ne comptent pas comme Gate E.
 
 ## Autorisation `MICRO_MAINNET`
 

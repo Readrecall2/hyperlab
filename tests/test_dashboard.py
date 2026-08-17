@@ -126,10 +126,14 @@ def test_readiness_requires_fresh_connected_readonly_collector_status(tmp_path: 
         ({"updated_at": "2026-08-13T00:00:00+00:00"}, "stale"),
         ({"orders_enabled": True}, "unsafe_mode"),
         ({"ok": False}, "collector_unhealthy"),
-        ({"metrics": {"state": "live", "connection_alive": False, "stale_channels": []}},
-         "collector_disconnected"),
-        ({"metrics": {"state": "live", "connection_alive": True, "stale_channels": ["l2Book:BTC"]}},
-         "stale_data"),
+        (
+            {"metrics": {"state": "live", "connection_alive": False, "stale_channels": []}},
+            "collector_disconnected",
+        ),
+        (
+            {"metrics": {"state": "live", "connection_alive": True, "stale_channels": ["l2Book:BTC"]}},
+            "stale_data",
+        ),
     ],
 )
 def test_readiness_rejects_stale_unsafe_or_unhealthy_runtime(
@@ -304,7 +308,10 @@ def test_report_download_uses_explicit_root_and_safe_attachment_headers(tmp_path
         assert getattr(client, method)("/api/reports/research/result.csv").status_code == 405
 
 
-def test_report_download_rejects_symlink_escape(tmp_path: Path) -> None:
+def test_report_download_rejects_symlink_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()
     outside = tmp_path / "outside.json"
@@ -313,7 +320,13 @@ def test_report_download_rejects_symlink_escape(tmp_path: Path) -> None:
     try:
         link.symlink_to(outside)
     except OSError:
-        pytest.skip("symlink creation is not available for this test account")
+        path_type = type(link)
+        original_is_symlink = path_type.is_symlink
+        monkeypatch.setattr(
+            path_type,
+            "is_symlink",
+            lambda self: self == link or original_is_symlink(self),
+        )
 
     assert _resolve_report_download(reports_dir, link.name) is None
     response = TestClient(create_app(data_dir=tmp_path / "data", reports_dir=reports_dir)).get(

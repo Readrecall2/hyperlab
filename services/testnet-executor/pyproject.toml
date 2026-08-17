@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyperlab-testnet-executor"
+version = "0.3.0.dev0"
+description = "Isolated, fail-closed Hyperliquid Testnet execution service for HyperLab"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Jj" }]
+dependencies = [
+  "hyperliquid-python-sdk==0.24.0",
+  "eth-account==0.13.7",
+  "requests==2.34.2",
+  "rich==14.3.4",
+  "typer==0.27.1",
+  "websocket-client==1.9.0",
+]
+
+# HyperLab is intentionally not a registry-resolvable dependency of this
+# isolated service. Install the reviewed local 0.2.1 wheel with --no-deps, then
+# install the executor wheel with --no-deps and the hash-locked external graph.
+
+[project.scripts]
+hyperlab-testnet = "hyperlab_testnet.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hyperlab_testnet"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"requirements-external.lock" = "hyperlab_testnet/locks/requirements-external.lock"
+"requirements-build.lock" = "hyperlab_testnet/locks/requirements-build.lock"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src", "../../src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["hyperlab_testnet"]
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+ignore_missing_imports = true

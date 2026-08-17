@@ -3,10 +3,12 @@
 Audit date: 2026-08-16. Baseline: `da6354ee5372e8f32fc190a5f18bc2641d605f1d`.
 
 Policy status: `PAPER` and `TESTNET` technical readiness are independent of Gates
-B/C/D. Current implementation remains **technically blocked**: the Paper runtime
-registry has no complete strategy + public-source candidate or compiled
-scope-bound semantic verifier set, and no Phase 13 Testnet adapter exists. Gate D
-promotion evidence also remains **blocked**. These
+B/C/D. At this audit's Phase 12 baseline, the Paper runtime registry had no
+complete strategy + public-source candidate or compiled scope-bound semantic
+verifier set, and no Phase 13 Testnet adapter existed. The later Phase 13 branch
+adds a separate Testnet-only service; it does not change the Paper finding or
+constitute a live Testnet/Gate E result. Gate D promotion evidence also remains
+**blocked**. These
 are documentation findings, not new runtime status tokens. This audit is not itself
 an authorization receipt.
 
@@ -206,4 +208,6 @@ Phase 13 Testnet may be developed and become technically ready without Gate D.
 Its exact `TESTNET_EXECUTION` receipt requires isolated endpoint/credentials, order
 FSM, reconciliation, recovery, limits, kill behavior and audit. Gate E is the
 completed Testnet evidence later required for real-money promotion; it is not
-permission to begin Testnet. No Testnet adapter exists in this checkout.
+permission to begin Testnet. The later `services/testnet-executor` implementation
+is documented in [`TESTNET_EXECUTOR_PHASE13.md`](TESTNET_EXECUTOR_PHASE13.md); its
+local tests do not themselves establish a completed Testnet exercise or Gate E.

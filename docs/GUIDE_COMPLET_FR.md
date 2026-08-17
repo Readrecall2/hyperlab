@@ -1,6 +1,6 @@
 # HyperLab — guide complet Windows 11 + Umbrel + Codex
 
-**Version : 0.2.1 — 13 août 2026**
+**Version racine : 0.2.1 — service Testnet Phase 13 : 0.3.0.dev0 — 17 août 2026**
 
 Ce guide remplace le précédent tutoriel centré presque uniquement sur le cash-and-carry. HyperLab devient un **laboratoire multi-stratégies** : il commence par les approches les plus défensives, puis permet de tester des stratégies plus ambitieuses, sans plafonner les résultats et sans confondre un beau backtest avec une preuve de rentabilité.
 
@@ -19,6 +19,8 @@ Le dépôt livré contient :
 - un lecteur public Hyperliquid spot/perp ;
 - un stockage SQLite ;
 - un paper engine persistant qui simule localement le cycle complet des ordres ;
+- un service local Phase 13 séparé, capable d'exercer Hyperliquid Testnet après
+  autorisation et preflight manuels ;
 - un dashboard local ;
 - Docker et un package Community App Store Umbrel ;
 - des tests ;
@@ -26,20 +28,23 @@ Le dépôt livré contient :
 - seize prompts Codex séquentiels ;
 - des portes de validation jusqu'au futur micro-mainnet.
 
-### Ce qu'il ne fait pas
+### Ce que le paquet racine 0.2.1 ne fait pas
 
-- aucun ordre réel, testnet ou mainnet ;
-- aucune clé ;
-- aucun wallet ;
-- aucune donnée privée de compte ;
+- aucun ordre Testnet ou Mainnet ;
+- aucune clé, wallet ou donnée privée de compte ;
 - aucune signature ou route d'exécution ;
 - aucune validation économique L2 calibrée sur données réelles ;
 - aucune preuve qu'une stratégie est rentable ;
-- aucun passage automatique vers testnet ou mainnet.
+- aucun passage automatique vers Testnet ou Mainnet.
 
 La Phase 12 ajoute seulement des ordres, acknowledgements, rejets, fills et cancels
 **simulés localement**. Son statut économique reste `BLOCKED` tant que la fenêtre
 forward, les cycles et les calibrations requis ne sont pas observés.
+
+Le service `services/testnet-executor` n'appartient pas au paquet racine ni à
+Umbrel. Il possède seul un credential scope `HYPERLAB_TESTNET` et ne peut cibler
+que les endpoints Hyperliquid Testnet allowlistés. Aucun preflight ou ordre live
+Testnet, ni Gate E, n'est déclaré accompli par la seule présence du logiciel.
 
 C'est volontaire. La première version doit construire une base que l'on peut auditer, pas une boîte noire autorisée à risquer de l'argent.
 
@@ -52,7 +57,7 @@ C'est volontaire. La première version doit construire une base que l'on peut au
 │ WINDOWS 11                                                       │
 │                                                                  │
 │ Codex + Git + Python + tests + backtests + rapports + Docker     │
-│ Aucun secret                                                     │
+│ Racine 0.2.1 sans secret ; executor Testnet local isolé          │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │ code revu / image versionnée
                                 ▼
@@ -83,6 +88,11 @@ ni cycle d'un run Paper technique antérieur n'est repris.
 **Umbrel** est réservé à la collecte publique 24/24 et au dashboard read-only. Le
 runtime paper local reste un service séparé, hors du paquet Umbrel 0.2.x. Umbrel
 accumule les données pendant que le code évolue sur Windows.
+
+L'exécuteur Testnet Phase 13 est un troisième périmètre local : version
+`0.3.0.dev0`, configuration, SQLite et variables de processus dédiés. Il n'est
+jamais installé dans Umbrel et ne partage pas les secrets avec le collecteur,
+Paper ou un futur exécuteur argent réel.
 
 Pour une stratégie sub-seconde, le mini-PC domestique pourra servir de laboratoire, mais le live nécessitera probablement une machine dédiée et une meilleure latence.
 
@@ -1022,35 +1032,184 @@ global de la Phase 12. Voir
 
 ## 42. Testnet
 
-Le futur exécuteur Testnet vit dans une branche/version séparée (`0.3.0-dev` ou
-service distinct). Le collecteur, le dashboard et `HYPERLAB_MODE` 0.2.x restent
-read-only/research ; on ne leur ajoute jamais une clé « temporairement ».
+L'exécuteur Testnet existe comme service distinct
+`services/testnet-executor`, version `0.3.0.dev0`. Le collecteur, le dashboard,
+le paper engine, Umbrel et `HYPERLAB_MODE` 0.2.x restent read-only/research ; on
+ne leur ajoute jamais une clé « temporairement ».
 
-Sa préparation ne requiert ni rentabilité, ni Gate B/C/D, ni 42 jours Paper. Le
-reçu exact `TESTNET` / `TESTNET_EXECUTION` lie build, configuration, endpoint,
-chain ID, credential scope, stratégie et limites. Il ne peut jamais être consommé
-par micro-mainnet ou Mainnet.
+Son identité réseau est immuable :
 
-Le testnet valide :
+```text
+environment          = TESTNET
+purpose              = TESTNET_EXECUTION
+chain_identity       = TESTNET
+credential_namespace = HYPERLAB_TESTNET
+HTTP                  = https://api.hyperliquid-testnet.xyz
+WebSocket             = wss://api.hyperliquid-testnet.xyz/ws
+```
 
-- endpoint/chain ID Testnet allowlistés, sans fallback Mainnet ;
-- credentials Testnet dédiés, séparés de Mainnet et hors dépôt/logs ;
-- signature ;
-- ordres post-only/IOC/reduce-only ;
-- CLOID déterministes, machine à états et cancel/replace ;
-- fills partiels ;
-- WebSocket coupé ;
-- réponse perdue résolue par recherche, jamais renvoi aveugle ;
-- redémarrage et réconciliation exchange-first des ordres/positions/comptes ;
-- limites position/notionnel, pause d'urgence, dead-man switch et audit complet.
+Toute autre valeur, URL Mainnet, redirect ou fallback échoue avant l'envoi. Le
+service ne contient aucune commande ou autorisation micro-mainnet/Mainnet. Sa
+préparation ne requiert ni rentabilité, ni Gate B/C/D, ni 42 jours Paper. Le reçu
+exact lie build, configuration, source, stratégie et limites ; il ne peut jamais
+être consommé par une classe argent réel.
 
-Il ne valide pas la rentabilité. Gate E est la preuve durable de ces exercices
-terminés pour une future autorisation avec argent réel ; elle ne sert pas à
-démarrer Testnet. Aucun adaptateur Testnet n'existe encore dans ce checkout : le
-développement est permis, l'exécution reste techniquement bloquée. Les
-vérificateurs sémantiques exacts `TESTNET` / `TESTNET_EXECUTION` sont eux aussi
-absents ; des fichiers simplement étiquetés `PASS` ne peuvent donc pas produire
-une décision `READY`.
+Les credentials sont fournis uniquement au processus exécuteur via
+`HYPERLAB_TESTNET_PRIVATE_KEY`, `HYPERLAB_TESTNET_ACCOUNT_ADDRESS` et
+`HYPERLAB_TESTNET_API_WALLET_ADDRESS`. La clé est celle d'une API wallet Testnet
+dédiée et révocable, distincte de l'adresse principale. Sa valeur n'est jamais
+écrite dans Git, `.env`, JSON, SQLite, logs, dashboard ou preuves. Le compte doit
+avoir le rôle venue exact `user` et une seule API wallet active : celle configurée.
+Vault, sous-compte, second agent actif ou opération manuelle simultanée sont
+refusés par la frontière de writer unique.
+
+La FSM persistante couvre `REQUESTED`, `SUBMITTED`, `ACKNOWLEDGED`, `OPEN`,
+`PARTIALLY_FILLED`, `FILLED`, `CANCEL_REQUESTED`, `CANCELLED`, `REJECTED`,
+`EXPIRED`, `INVALID` et `UNKNOWN`. Une tentative et son nonce sont persistés
+avant l'appel signé. `UNKNOWN` réserve l'exposition et déclenche une recherche
+CLOID/OID : aucune réponse perdue ne provoque un renvoi aveugle. Pour submit ou
+replace potentiellement envoyé, une absence distante répétée n'est jamais une
+preuve de non-acceptation ; la tentative reste ambiguë et force la revue manuelle
+jusqu'à une preuve venue autoritaire.
+
+La réconciliation exchange-first compare ordres, CLOID/OID, fills, positions,
+soldes et equity. Après crash, restart ou perte WebSocket, elle précède toute
+nouvelle entrée. Ordre/fill distant inconnu, doublon divergent, position incohérente
+ou snapshot incomplet force `MANUAL_REVIEW`. Les douze défauts sont aussi des
+plafonds compilés :
+notionnel brut/position/ordre à `1000/500/100`, quantités position/ordre à `5/1`,
+ordres simultanés à `4`, débits submit/cancel/replace à `12/24/6` par minute,
+staleness marché/réconciliation à `5/10 s` et dead-man switch à `30 s`.
+La configuration peut uniquement les abaisser et toute baisse change son hash. Les
+décimaux exacts sont bornés à 64 chiffres de coefficient, 64 d'exposant absolu et
+64 d'exposant ajusté absolu ; floats, non-finis et exposants extrêmes sont refusés
+avant formatage.
+
+Les indices d'actifs et `szDecimals` sont figés depuis `meta` pour le run, puis les
+contraintes live sont relues avant chaque `submit` ou `replace`. Un `cancel`
+protecteur utilise au contraire ce mapping figé et le CLOID : une panne de `meta`
+ne doit pas pouvoir le supprimer. `scheduleCancel` est lui aussi indépendant de
+`meta`.
+
+Le service n'est jamais installé dans le venv racine ni en editable. Le workflow
+revu utilise Python 3.12 AMD64, le wheelhouse offline fixe
+`services/testnet-executor/.wheelhouse` et un venv exécuteur dédié. Un venv de
+production `hyperlab_testnet` n'importe ni `hyperlab.paper` ni `hyperlab.data` ;
+ses primitives canoniques sont locales. Le wheel racine sert à l'autorisation
+d'environnement et aux artefacts partagés explicitement hashés. Un venv de
+build frais installe `requirements-build.lock` avec
+`--no-index --only-binary=:all: --require-hashes --no-deps --find-links`, puis
+construit exactement les wheels locaux `hyperlab 0.2.1` et
+`hyperlab-testnet-executor 0.3.0.dev0` avec
+`pip wheel --no-index --no-deps --no-build-isolation`. Le venv exécuteur installe
+ensuite `requirements-external.lock` avec les mêmes contrôles de hashes, puis les
+deux wheels locaux avec `pip install --no-index --no-deps`. Un paquet d'index nommé
+`hyperlab` n'est jamais acceptable. Le rapport logiciel lie le chemin absolu de
+Python : ce venv n'est ni déplacé ni recréé après validation.
+
+Le venv opérateur minimal invoque `validate-software`, mais ne reçoit pas Ruff,
+mypy ou pytest. Le plan compilé exécute ces gates et les vérifications
+manifest/release avec le Python revu au chemin fixe `.venv\Scripts\python.exe` de
+la racine ; le scan de conflits et le build isolé utilisent le Python opérateur.
+Le rapport lie les chemins et hashes des deux exécutables. Le `.venv` racine reste
+un environnement de gate local revu, jamais le runtime Testnet.
+
+Avant toute commande active, le registre Windows fixe
+`%ProgramData%\HyperLab\TestnetExecutor\control-v1` doit être créé une seule fois
+depuis un PowerShell élevé sous le compte exact de l'opérateur. Le service ne crée
+aucun des trois composants projet et la CLI ne permet pas de changer leur chemin.
+La DACL non nulle
+doit être appliquée indépendamment aux composants projet `HyperLab`,
+`TestnetExecutor` et `control-v1` ; elle autorise le contrôle uniquement au SID
+opérateur, à `SYSTEM` et aux Administrateurs. Chaque composant du chemin doit être
+un vrai répertoire non-reparse. Lease,
+nonce, rate ledger, send gate et kill latch y survivent aux processus et aux bases :
+ne jamais supprimer ou recréer ce répertoire. La commande `icacls` exacte se trouve
+dans [`TESTNET_EXECUTOR_PHASE13.md`](TESTNET_EXECUTOR_PHASE13.md).
+
+Chaque identité ordinaire submit/cancel/replace y reste comme tombstone account-global
+permanent. La capacité compilée est `100000`, sans éviction ni reset online ; au
+débit agrégé maximal de `42/min`, elle correspond à environ `39,7 h` d'actions.
+Surveiller le couple `(used, capacity)` et arrêter largement avant cette borne pour
+revue offline. Le `scheduleCancel` protecteur ne consomme pas ces tombstones.
+
+L'ordre local obligatoire, avant toute lecture Testnet, est :
+
+```text
+1. hyperlab-testnet build-identity
+2. reporter les cinq identités exactes dans le JSON de configuration
+3. hyperlab-testnet validate-software --config ... --output-directory <NOM_NEUF>
+4. hyperlab-testnet evidence --config ... --validation-report ... \
+     --evidence-root ... --manifest ... --receipt ...
+5. pré-provisionner/auditer le registre ProgramData une seule fois
+6. preflight puis reconcile avec le même venv et les mêmes octets
+```
+
+`validate-software` est offline. Il exige la branche `phase-13-testnet`, la
+baseline `88e8224797684b9bf44be426b79ee01cccbe6e46`, un worktree stable, le
+wheelhouse intact, toutes les suites/lints/type checks, `git diff --check`, le
+scan de conflits, les manifest/release checks et un build/smoke isolé. Le Python
+opérateur et le Python de gate fixe sont tous deux liés par chemin et SHA-256.
+`evidence`
+ne remplace pas ce gate : il recharge le rapport absolu, lie ses hashes aux
+quatorze preuves, puis écrit sans overwrite le manifest et le reçu.
+
+Les commandes dédiées sont :
+
+```text
+hyperlab-testnet build-identity
+hyperlab-testnet validate-software
+hyperlab-testnet evidence
+hyperlab-testnet preflight
+hyperlab-testnet status
+hyperlab-testnet reconcile
+hyperlab-testnet run
+hyperlab-testnet pause
+hyperlab-testnet kill
+hyperlab-testnet smoke-order
+hyperlab-testnet cancel
+```
+
+`preflight` vérifie endpoint, identité, credentials, reçu, SQLite, limites et
+connectivité sans envoyer d'ordre. Le premier ordre est une action humaine
+explicite et `smoke-order` exige `--confirm TESTNET-ORDER`. `preflight`,
+`reconcile`, `run`, `smoke-order` et `cancel` exigent ensemble
+`--config --receipt --manifest --evidence-root --validation-report --database`.
+`pause` exige `--database --run-id --confirm TESTNET-PAUSE` ; `cancel` exige
+`--confirm TESTNET-CANCEL`. Le booléen du smoke est le choix de flags
+`--reduce-only/--allow-increase`, jamais `--reduce-only true|false`.
+L'option `--ordinal` est un entier `>= 0` (défaut `0`) intégré à l'identité
+déterministe. Elle distingue seulement un nouvel intent manuel approuvé et ne doit
+jamais servir à contourner l'interdiction de renvoyer un submit ambigu.
+
+`kill` exige toujours `--database --run-id --confirm TESTNET-KILL`. Le latch
+compte `KILLED` est persisté avant toute tentative réseau et ne possède pas de
+reset online. Les cinq chemins d'autorisation sont optionnels uniquement pour
+permettre un kill local dégradé : sans eux, la commande ne signe rien et sort `3`.
+Si le runtime propriétaire détient le lease, il doit appliquer le latch et tenter
+le DMS ; la commande kill sort également `3`. Même `DEADMAN_ARMED` prouve seulement
+la programmation de `scheduleCancel`, pas l'annulation déjà effective des ordres
+ni la fermeture d'une position.
+
+Le workflow manuel progresse sans sauter d'étape :
+
+```text
+A. preflight seulement, zéro ordre
+B. lecture compte + reconcile + status
+C. plus petit ordre Testnet valide, confirmation TESTNET-ORDER
+D. cancel du CLOID observé, puis réconciliation
+E. exercices séparés de fill partiel et complet si la venue le permet
+F. restart contrôlé avec état ouvert
+G. réconciliation après restart/perte de flux
+H. runtime Testnet soutenu, puis exercices pause/kill approuvés
+```
+
+Ce workflow n'a pas été exécuté pendant la construction logicielle. Les transports
+simulés et tests locaux ne valent pas Gate E. Gate E est la preuve durable des
+exercices Testnet observés et revus pour une future autorisation avec argent réel ;
+elle ne sert pas à démarrer Testnet et ne valide jamais une rentabilité. Le contrat
+complet et les commandes opérateur sont dans
+[`TESTNET_EXECUTOR_PHASE13.md`](TESTNET_EXECUTOR_PHASE13.md).
 
 ## 43. Micro-mainnet
 
@@ -1112,7 +1271,10 @@ Ne donne jamais à ChatGPT ou Codex :
 - fichier wallet ;
 - keystore et mot de passe ensemble.
 
-La future clé API doit être dédiée, révocable et limitée au capital du sous-compte.
+La clé API wallet Phase 13 doit être dédiée à Hyperliquid Testnet, révocable et
+injectée uniquement dans le processus `services/testnet-executor`. Elle n'est
+jamais inscrite dans une commande, `.env`, Git, SQLite, les logs ou les preuves. Une
+future clé argent réel sera différente et appartiendra à un autre service.
 
 ## 46. Umbrel
 
@@ -1126,28 +1288,39 @@ Le package actuel :
 - aucun port public direct ;
 - aucun secret.
 
-## 47. Séparation future
+## 47. Séparation des runtimes
 
 ```text
 collector : public
 research : sans clé
 dashboard : lecture seule
 paper : sans clé
-executor testnet : clé testnet
-executor mainnet : clé dédiée et service séparé
+executor testnet 0.3.0.dev0 : API wallet Testnet dédiée
+executor mainnet : absent ; future clé dédiée et autre service
 ```
 
 ## 48. Kill switches
 
-Le futur live doit avoir :
+Le service Testnet applique :
 
 - données stale → aucune entrée ;
 - erreurs répétées → pause ;
 - position inconnue → revue manuelle ;
-- perte journalière → arrêt ;
-- drawdown → arrêt ;
-- jambe non couverte → hedge/débouclement ;
-- process mort → annulation programmée des ordres.
+- état local/venue divergent → `MANUAL_REVIEW` ;
+- pause humaine avec `--database --run-id --confirm TESTNET-PAUSE` → `PAUSED` local, aucun
+  appel réseau ;
+- kill humain avec `--database --run-id --confirm TESTNET-KILL` → latch compte `KILLED`
+  durable avant toute protection venue ;
+- kill sans bundle complet, owner déjà actif ou DMS non confirmé → code `3`,
+  latch conservé et intervention opérateur requise ;
+- process mort → dead-man switch et annulation programmée des ordres ;
+- dead-man armé → aucune preuve que l'annulation est déjà appliquée et aucune
+  liquidation de position ;
+- annulation non confirmée → état ambigu et réconciliation, jamais succès inventé.
+
+Les limites de perte/drawdown et le hedge/débouclement économique restent des
+exigences supplémentaires d'un futur service avec argent réel ; Phase 13 ne crée
+aucune autorisation de ce type.
 
 ---
 

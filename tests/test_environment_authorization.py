@@ -361,7 +361,10 @@ def test_receipt_is_bound_to_exact_config_and_current_requirement_profile(
 def test_byte_bound_files_are_blocked_without_compiled_semantic_verifiers(
     tmp_path: Path,
 ) -> None:
-    assert not authorization_module._COMPILED_EVIDENCE_VERIFIERS
+    assert not any(
+        environment is EnvironmentClass.PAPER
+        for environment, _purpose, _check in authorization_module._COMPILED_EVIDENCE_VERIFIERS
+    )
     manifest = _manifest(tmp_path, EnvironmentClass.PAPER)
     arbitrary_evidence: dict[EvidenceCheck, ReadinessArtifactBinding] = {}
     for check, binding in manifest.evidence.items():

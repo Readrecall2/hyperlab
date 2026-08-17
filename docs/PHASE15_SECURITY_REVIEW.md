@@ -176,10 +176,19 @@ d'exécution. Paper/Testnet ne sont toutefois plus bloqués par héritage de Gat
   forward, au moins 30 cycles, 14 jours sans incident, coûts/latence/fills calibrés
   et exercices crash/recovery non démontrés ; ce statut bloque l'argent réel, pas
   le démarrage technique Paper/Testnet ;
-- **Phase 13 — techniquement bloquée** : aucun service/adaptateur Testnet
-  séparé, endpoint/credential scope, FSM, réconciliation, reprise, limites, kill
-  switch ou audit validé. Gate D n'est pas requis pour le développer ; Gate E sera
-  la preuve Testnet terminée pour argent réel ;
+- **Phase 13 — logiciel séparé, validation venue non observée** :
+  `services/testnet-executor` 0.3.0.dev0 fournit l'identité/endpoint/credential
+  scope Testnet, venv/wheels/locks dédiés, validation logicielle liée au worktree,
+  preuves/reçu, FSM, réconciliation, reprise, limites, kill switch et audit. Son
+  registre account-global sous ProgramData doit être pré-provisionné, non-reparse
+  et sous DACL restreinte sur ses trois composants projet ; il n'est ni créé ni
+  remplaçable par la CLI. Les tombstones d'actions ordinaires ont une capacité
+  permanente de `100000`, ce qui borne l'exploitation à une campagne smoke. Le kill
+  persiste un latch compte mais sa protection DMS reste best-effort et sort
+  `3` lorsqu'elle est déléguée ou non confirmée. Le premier preflight et ordre
+  restent manuels ; aucun workflow live ni Gate E n'est déclaré terminé. Gate D
+  n'est pas requis pour cette préparation, et Gate E sera la preuve Testnet
+  terminée pour argent réel ;
 - **Phase 14 — autorisation micro-mainnet bloquée** : Gates B/C/D/E, audit
   indépendant, signer isolé, secrets/kill/reconciliation et décision humaine sont
   absents. Gate F ne pourra être produite qu'après une campagne micro-mainnet

@@ -1,0 +1,640 @@
+{
+  "authorization": {
+    "authorizes_real_money": false,
+    "credential_scope": "NONE",
+    "environment": "PAPER",
+    "execution_network": "NONE",
+    "mode": "PAPER_ONLY",
+    "orders_enabled": false
+  },
+  "benchmark": {
+    "contract": "REAL_PHASE08_VS_REAL_PHASE08_PLUS_PHASE05_DURABLE_V1",
+    "path": "reports/phase12-phase05/benchmark.json",
+    "sha256": "2633cf75410dfc7af194825837d51d20b13200d76c063ee344757807a4dd1c34",
+    "synthetic_warning": "SYNTHETIC TECHNICAL THROUGHPUT ONLY; NOT ECONOMIC OR DEPLOYMENT EVIDENCE"
+  },
+  "economic_status": {
+    "data_calibration_status": "UNCALIBRATED",
+    "economic_prerequisites_satisfied": false,
+    "economically_eligible": false,
+    "execution_calibration_status": "UNCALIBRATED",
+    "status": "TECHNICAL_ONLY_UNCALIBRATED"
+  },
+  "evidence_contract": "PHASE12_PHASE05_MULTISTRATEGY_TECHNICAL_EVIDENCE_V1",
+  "identity": {
+    "config_hash": "79049391ac63ca089900787b239b26ef80826877a924f23b3ccaf01789d3c75c",
+    "engine_build_hash": "a443b7723fd96fad8ef116b8fc061ad53ede0c49d228a514fbd4375bbd5cc1ef",
+    "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
+    "release_code_sha256": "ec0f5408aa2a1b0a888723add65babf4452874b0fff9a389f1d2030760724339",
+    "run_id": "213e9597702c8331892788c7b2841e283c14868e88987ef5d61765200b6b7601",
+    "runtime_environment_sha256": "f51df86b54d5505159841d6c8320b1b06a3d6c902f0460334d42953bb1884183",
+    "source_data_hash": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671"
+  },
+  "paper_configuration": {
+    "data_calibration_evidence_hash": null,
+    "data_calibration_status": "UNCALIBRATED",
+    "data_hash": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671",
+    "data_source": "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1",
+    "economic_prerequisites_evidence_hash": null,
+    "economic_prerequisites_satisfied": false,
+    "engine_build_hash": "a443b7723fd96fad8ef116b8fc061ad53ede0c49d228a514fbd4375bbd5cc1ef",
+    "environment": "PAPER",
+    "execution": {
+      "ack_latency_ms": 0,
+      "calibration_evidence_hash": null,
+      "calibration_status": "UNCALIBRATED",
+      "cancel_latency_ms": 0,
+      "cost_multiplier": "1",
+      "cost_schedule": null,
+      "fill_latency_ms": 0,
+      "ioc_extra_slippage_bps": "0",
+      "ioc_fill_probability": "1",
+      "leg_delay_ms": 0,
+      "maker_fee_bps": "0",
+      "maker_fill": {
+        "base_probability": 0.65,
+        "calibration_evidence_hash": null,
+        "calibration_id": "uncalibrated-default",
+        "calibration_status": "UNCALIBRATED",
+        "participation_decay": 2.0
+      },
+      "maker_timeout_ms": 1000,
+      "slippage": {
+        "base_bps": 0.0,
+        "exponent": 0.5,
+        "impact_coefficient_bps": 0.0,
+        "max_participation": 0.1
+      },
+      "source": "phase05-phase08-technical-placeholder",
+      "taker_fee_bps": "0"
+    },
+    "initial_cash": "2000",
+    "minimum_validation_cycles": 30,
+    "parameters": {
+      "economic_status": "TECHNICAL_ONLY_UNCALIBRATED",
+      "implementation": "phase05-reviewed-cash-and-carry-paper-adapter-v1",
+      "operational_binding": {
+        "maximum_execution_skew_seconds": 5,
+        "maximum_gross_notional": "500",
+        "perp_instrument": "HL:HYPE:perp",
+        "perp_max_quantity": "10",
+        "perp_product_identity_sha256": "16ff5b9cd29a8bfd6c61947dce5703706da67b95af3c72e623af87fbfa3b3a1f",
+        "perp_quantity_step": "0.01",
+        "retained_hours": 96,
+        "spot_instrument": "HL:HYPE:spot",
+        "spot_max_quantity": "10",
+        "spot_product_identity_sha256": "5c3bf7bb6ca5bdcc3d32810ce4bc69fac53855f51912174bb7fe95c721c8809b",
+        "spot_quantity_step": "0.01"
+      },
+      "phase": "05",
+      "reviewed_economics": {
+        "basis_speed_lookback_hours": 8,
+        "benchmark_annual_rate": "0.045",
+        "capital_fraction": "0.50",
+        "edge_horizons_hours": [
+          8,
+          24,
+          72
+        ],
+        "estimated_round_trip_slippage_bps": "4.0",
+        "funding_trend": "mean_8h_minus_mean_24h",
+        "lookback_hours": 72,
+        "maker_attempt_then_engine_emergency_ioc": true,
+        "max_abs_basis_bps": "150.0",
+        "max_annualized_volatility": "1.50",
+        "max_positions": 1,
+        "min_depth_usd": "100000.0",
+        "min_mean_funding_hourly": "0.000005",
+        "min_open_interest_usd": "5000000.0",
+        "min_positive_share": "0.70",
+        "min_volume_usd": "1000000.0",
+        "minimum_net_edge_bps": "0.0",
+        "perp_margin_fraction": "1.0",
+        "rebalance_hours": 8,
+        "round_trip_fees_bps": "11.0"
+      },
+      "source_contract": "ONE_SHARED_PUBLIC_NORMALIZED_FEED_NO_PRIVATE_API"
+    },
+    "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
+    "release_code_sha256": "ec0f5408aa2a1b0a888723add65babf4452874b0fff9a389f1d2030760724339",
+    "required_instruments": [
+      "HL:BTC:perp",
+      "HL:ETH:perp",
+      "HL:HYPE:perp",
+      "HL:HYPE:spot"
+    ],
+    "risk": {
+      "max_concurrent_orders": 4,
+      "max_daily_loss": "175",
+      "max_drawdown": "350",
+      "max_gross_notional": "750",
+      "max_instrument_notional": "500",
+      "max_net_notional": "500",
+      "max_order_notional": "250",
+      "max_order_quantity": "10",
+      "max_position_quantity": "11",
+      "stale_after_seconds": 15,
+      "unhedged_timeout_seconds": 20
+    },
+    "run_kind": "TECHNICAL",
+    "runtime_environment_sha256": "f51df86b54d5505159841d6c8320b1b06a3d6c902f0460334d42953bb1884183",
+    "runtime_source_poll_timeout_seconds": 0.25,
+    "runtime_timer_interval_seconds": 1.0,
+    "schema_version": 3,
+    "seed": 12508,
+    "strategies": [
+      {
+        "parameters": {
+          "economic_status": "TECHNICAL_ONLY_UNCALIBRATED",
+          "implementation": "phase05-reviewed-cash-and-carry-paper-adapter-v1",
+          "operational_binding": {
+            "maximum_execution_skew_seconds": 5,
+            "maximum_gross_notional": "500",
+            "perp_instrument": "HL:HYPE:perp",
+            "perp_max_quantity": "10",
+            "perp_product_identity_sha256": "16ff5b9cd29a8bfd6c61947dce5703706da67b95af3c72e623af87fbfa3b3a1f",
+            "perp_quantity_step": "0.01",
+            "retained_hours": 96,
+            "spot_instrument": "HL:HYPE:spot",
+            "spot_max_quantity": "10",
+            "spot_product_identity_sha256": "5c3bf7bb6ca5bdcc3d32810ce4bc69fac53855f51912174bb7fe95c721c8809b",
+            "spot_quantity_step": "0.01"
+          },
+          "phase": "05",
+          "reviewed_economics": {
+            "basis_speed_lookback_hours": 8,
+            "benchmark_annual_rate": "0.045",
+            "capital_fraction": "0.50",
+            "edge_horizons_hours": [
+              8,
+              24,
+              72
+            ],
+            "estimated_round_trip_slippage_bps": "4.0",
+            "funding_trend": "mean_8h_minus_mean_24h",
+            "lookback_hours": 72,
+            "maker_attempt_then_engine_emergency_ioc": true,
+            "max_abs_basis_bps": "150.0",
+            "max_annualized_volatility": "1.50",
+            "max_positions": 1,
+            "min_depth_usd": "100000.0",
+            "min_mean_funding_hourly": "0.000005",
+            "min_open_interest_usd": "5000000.0",
+            "min_positive_share": "0.70",
+            "min_volume_usd": "1000000.0",
+            "minimum_net_edge_bps": "0.0",
+            "perp_margin_fraction": "1.0",
+            "rebalance_hours": 8,
+            "round_trip_fees_bps": "11.0"
+          },
+          "source_contract": "ONE_SHARED_PUBLIC_NORMALIZED_FEED_NO_PRIVATE_API"
+        },
+        "required_instruments": [
+          "HL:HYPE:perp",
+          "HL:HYPE:spot"
+        ],
+        "risk": {
+          "max_concurrent_orders": 2,
+          "max_daily_loss": "100",
+          "max_drawdown": "200",
+          "max_gross_notional": "500",
+          "max_instrument_notional": "250",
+          "max_net_notional": "300",
+          "max_order_notional": "250",
+          "max_order_quantity": "10",
+          "max_position_quantity": "10",
+          "stale_after_seconds": 15,
+          "unhedged_timeout_seconds": 20
+        },
+        "strategy_hash": "76e4b4ab6c1af42bb408a2f22163affbb88b0e717d49f2e88696c5abd0063f0f",
+        "strategy_id": "phase05_cash_and_carry",
+        "strategy_name": "cash_and_carry"
+      },
+      {
+        "parameters": {
+          "economic_status": "TECHNICAL_ONLY_NOT_VALIDATED",
+          "phase": "08",
+          "reviewed_config": {
+            "asset_a": "HL:ETH:perp",
+            "asset_a_max_quantity": "0.25",
+            "asset_a_quantity_step": "0.001",
+            "asset_b": "HL:BTC:perp",
+            "asset_b_max_quantity": "0.01",
+            "asset_b_quantity_step": "0.00001",
+            "bar_seconds": 30,
+            "cooldown_bars": 12,
+            "enter_z": 2.0,
+            "exit_z": 0.5,
+            "hedge_ratio": 1.0,
+            "intercept": 0.0,
+            "lookback_bars": 12,
+            "max_holding_bars": 120,
+            "maximum_close_skew_seconds": 2,
+            "maximum_execution_skew_seconds": 2,
+            "maximum_gross_notional": "250",
+            "maximum_pair_gross": 0.2,
+            "model_method": "rolling",
+            "retained_bars": 256,
+            "stop_z": 4.0,
+            "target_spread_volatility": 0.01,
+            "volatility_lookback_bars": 12
+          }
+        },
+        "required_instruments": [
+          "HL:BTC:perp",
+          "HL:ETH:perp"
+        ],
+        "risk": {
+          "max_concurrent_orders": 2,
+          "max_daily_loss": "75",
+          "max_drawdown": "150",
+          "max_gross_notional": "250",
+          "max_instrument_notional": "250",
+          "max_net_notional": "250",
+          "max_order_notional": "250",
+          "max_order_quantity": "1",
+          "max_position_quantity": "1",
+          "stale_after_seconds": 15,
+          "unhedged_timeout_seconds": 20
+        },
+        "strategy_hash": "239ca1f27b9563a8fcacb5faa756364b6fc70240246dc086ac0be1633d8abb0d",
+        "strategy_id": "phase08_robust_pairs",
+        "strategy_name": "pairs_mean_reversion_phase08"
+      }
+    ],
+    "strategy_hash": "76e4b4ab6c1af42bb408a2f22163affbb88b0e717d49f2e88696c5abd0063f0f",
+    "strategy_name": "cash_and_carry",
+    "validation_started_at": "2026-08-18T12:00:00.000000Z"
+  },
+  "risk_hierarchy": {
+    "portfolio": {
+      "max_concurrent_orders": 4,
+      "max_daily_loss": "175",
+      "max_drawdown": "350",
+      "max_gross_notional": "750",
+      "max_instrument_notional": "500",
+      "max_net_notional": "500",
+      "max_order_notional": "250",
+      "max_order_quantity": "10",
+      "max_position_quantity": "11",
+      "stale_after_seconds": 15,
+      "unhedged_timeout_seconds": 20
+    },
+    "strategies": {
+      "phase05_cash_and_carry": {
+        "max_concurrent_orders": 2,
+        "max_daily_loss": "100",
+        "max_drawdown": "200",
+        "max_gross_notional": "500",
+        "max_instrument_notional": "250",
+        "max_net_notional": "300",
+        "max_order_notional": "250",
+        "max_order_quantity": "10",
+        "max_position_quantity": "10",
+        "stale_after_seconds": 15,
+        "unhedged_timeout_seconds": 20
+      },
+      "phase08_robust_pairs": {
+        "max_concurrent_orders": 2,
+        "max_daily_loss": "75",
+        "max_drawdown": "150",
+        "max_gross_notional": "250",
+        "max_instrument_notional": "250",
+        "max_net_notional": "250",
+        "max_order_notional": "250",
+        "max_order_quantity": "1",
+        "max_position_quantity": "1",
+        "stale_after_seconds": 15,
+        "unhedged_timeout_seconds": 20
+      }
+    }
+  },
+  "scope": {
+    "deployed_phase08_v9_artifacts_regenerated": false,
+    "live_database_accessed": false,
+    "network_source_started": false,
+    "private_api_added": false,
+    "real_order_route_added": false,
+    "vps_accessed": false
+  },
+  "source": {
+    "collector_config": {
+      "assets": [
+        "BTC",
+        "ETH",
+        "HYPE",
+        "@107"
+      ],
+      "backoff_initial_seconds": 1.0,
+      "backoff_jitter_ratio": 0.2,
+      "backoff_max_seconds": 30.0,
+      "backoff_reset_after_seconds": 60.0,
+      "batch_size": 500,
+      "candle_intervals": [],
+      "collect_funding_history": true,
+      "critical_funding_history": true,
+      "flush_interval_seconds": 5.0,
+      "funding_grace_seconds": 600.0,
+      "heartbeat_interval_seconds": 20.0,
+      "history_lookback_hours": 72,
+      "network": "mainnet",
+      "pong_timeout_seconds": 45.0,
+      "queue_capacity": 10000,
+      "reconnect_on_rest_refresh_failure": true,
+      "rest_refresh_interval_seconds": 300.0,
+      "stale_after_seconds": 15.0,
+      "subscription_channels": [
+        "activeAssetCtx",
+        "bbo"
+      ],
+      "ws_connect_timeout_seconds": 15.0
+    },
+    "data_hash": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671",
+    "identity_artifact": {
+      "adapter_schema_version": 10,
+      "bbo_tradability_policy": "REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2",
+      "feed_contract": "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_MARKET_CONTEXT_BOUNDED_PENDING_BBO_LATEST_VALUE_V10",
+      "funding_dedupe_capacity_settlements": 4096,
+      "global_connection_policy": "MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4",
+      "instrument_route_policy": "EXPLICIT_MAPPING_PRODUCT_IDENTITY_BOUND_V2",
+      "instruments": [
+        {
+          "asset": "@107",
+          "instrument": "HL:HYPE:spot",
+          "venue": "hyperliquid"
+        },
+        {
+          "asset": "BTC",
+          "instrument": "HL:BTC:perp",
+          "venue": "hyperliquid"
+        },
+        {
+          "asset": "ETH",
+          "instrument": "HL:ETH:perp",
+          "venue": "hyperliquid"
+        },
+        {
+          "asset": "HYPE",
+          "instrument": "HL:HYPE:perp",
+          "venue": "hyperliquid"
+        }
+      ],
+      "malformed_bbo_policy": "TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1",
+      "market_context_policy": "LATEST_CAUSAL_CONTEXT_ATTACHED_TO_BBO_V1",
+      "normalized_record_schema_versions": {
+        "bbo": 2,
+        "connection_event": 2,
+        "funding": 2,
+        "market_context": 1
+      },
+      "paper_market_schema_version": 1,
+      "pending_bbo_coalescing": "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1",
+      "product_identity_hashes": {
+        "HL:BTC:perp": "b08b026f003c0ac42a0eea522b3daa6ec547f3b003832b531103aef61b3f7602",
+        "HL:ETH:perp": "cf62386258ff6aa7ac361af69a19257d67068a6ed12234838f558ca32c7896ab",
+        "HL:HYPE:perp": "16ff5b9cd29a8bfd6c61947dce5703706da67b95af3c72e623af87fbfa3b3a1f",
+        "HL:HYPE:spot": "5c3bf7bb6ca5bdcc3d32810ce4bc69fac53855f51912174bb7fe95c721c8809b"
+      },
+      "public_only": true,
+      "queue_capacity_frames": 4096,
+      "source_venue_aliases": [
+        {
+          "paper_exchange": "HL",
+          "source_venue": "hyperliquid"
+        }
+      ],
+      "trade_projection": "BLOCKED_RESTART_DURABLE_IDENTITY_UNAVAILABLE",
+      "transport": {
+        "assets": [
+          "BTC",
+          "ETH",
+          "HYPE",
+          "@107"
+        ],
+        "bootstrap_timeout_seconds": 120.0,
+        "collector_config": {
+          "assets": [
+            "BTC",
+            "ETH",
+            "HYPE",
+            "@107"
+          ],
+          "backoff_initial_seconds": 1.0,
+          "backoff_jitter_ratio": 0.2,
+          "backoff_max_seconds": 30.0,
+          "backoff_reset_after_seconds": 60.0,
+          "batch_size": 500,
+          "candle_intervals": [],
+          "collect_funding_history": true,
+          "critical_funding_history": true,
+          "flush_interval_seconds": 5.0,
+          "funding_grace_seconds": 600.0,
+          "heartbeat_interval_seconds": 20.0,
+          "history_lookback_hours": 72,
+          "network": "mainnet",
+          "pong_timeout_seconds": 45.0,
+          "queue_capacity": 10000,
+          "reconnect_on_rest_refresh_failure": true,
+          "rest_refresh_interval_seconds": 300.0,
+          "stale_after_seconds": 15.0,
+          "subscription_channels": [
+            "activeAssetCtx",
+            "bbo"
+          ],
+          "ws_connect_timeout_seconds": 15.0
+        },
+        "credential_scope": "NONE",
+        "execution_routes_present": false,
+        "http_final_url_must_equal_request": true,
+        "http_info_endpoint": "https://api.hyperliquid.xyz",
+        "http_required_status": 200,
+        "join_timeout_seconds": 10.0,
+        "network": "mainnet",
+        "orders_enabled": false,
+        "paper_queue_capacity_frames": 4096,
+        "public_rest_methods": [
+          "metaAndAssetCtxs",
+          "spotMetaAndAssetCtxs",
+          "fundingHistory",
+          "l2Book"
+        ],
+        "redirects_allowed": false,
+        "request_timeout_seconds": 10.0,
+        "rest_l2_book_projection": "BBO_BOOTSTRAP_AND_RESYNC_ONLY",
+        "subscription_payloads": [
+          {
+            "coin": "BTC",
+            "type": "activeAssetCtx"
+          },
+          {
+            "coin": "BTC",
+            "type": "bbo"
+          },
+          {
+            "coin": "ETH",
+            "type": "activeAssetCtx"
+          },
+          {
+            "coin": "ETH",
+            "type": "bbo"
+          },
+          {
+            "coin": "HYPE",
+            "type": "activeAssetCtx"
+          },
+          {
+            "coin": "HYPE",
+            "type": "bbo"
+          },
+          {
+            "coin": "@107",
+            "type": "activeAssetCtx"
+          },
+          {
+            "coin": "@107",
+            "type": "bbo"
+          }
+        ],
+        "transport_schema": "hyperliquid-paper-public-transport-v2",
+        "wallet_or_signer_present": false,
+        "websocket_endpoint": "wss://api.hyperliquid.xyz/ws",
+        "websocket_redirect_limit": 0,
+        "websocket_required_http_status": 101,
+        "wire_queue_capacity_messages": 10000
+      }
+    },
+    "identity_artifact_sha256": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671",
+    "name": "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1",
+    "one_shared_collector": true,
+    "public_read_only": true,
+    "required_instruments": [
+      "HL:BTC:perp",
+      "HL:ETH:perp",
+      "HL:HYPE:perp",
+      "HL:HYPE:spot"
+    ]
+  },
+  "strategies": [
+    {
+      "parameters": {
+        "economic_status": "TECHNICAL_ONLY_UNCALIBRATED",
+        "implementation": "phase05-reviewed-cash-and-carry-paper-adapter-v1",
+        "operational_binding": {
+          "maximum_execution_skew_seconds": 5,
+          "maximum_gross_notional": "500",
+          "perp_instrument": "HL:HYPE:perp",
+          "perp_max_quantity": "10",
+          "perp_product_identity_sha256": "16ff5b9cd29a8bfd6c61947dce5703706da67b95af3c72e623af87fbfa3b3a1f",
+          "perp_quantity_step": "0.01",
+          "retained_hours": 96,
+          "spot_instrument": "HL:HYPE:spot",
+          "spot_max_quantity": "10",
+          "spot_product_identity_sha256": "5c3bf7bb6ca5bdcc3d32810ce4bc69fac53855f51912174bb7fe95c721c8809b",
+          "spot_quantity_step": "0.01"
+        },
+        "phase": "05",
+        "reviewed_economics": {
+          "basis_speed_lookback_hours": 8,
+          "benchmark_annual_rate": "0.045",
+          "capital_fraction": "0.50",
+          "edge_horizons_hours": [
+            8,
+            24,
+            72
+          ],
+          "estimated_round_trip_slippage_bps": "4.0",
+          "funding_trend": "mean_8h_minus_mean_24h",
+          "lookback_hours": 72,
+          "maker_attempt_then_engine_emergency_ioc": true,
+          "max_abs_basis_bps": "150.0",
+          "max_annualized_volatility": "1.50",
+          "max_positions": 1,
+          "min_depth_usd": "100000.0",
+          "min_mean_funding_hourly": "0.000005",
+          "min_open_interest_usd": "5000000.0",
+          "min_positive_share": "0.70",
+          "min_volume_usd": "1000000.0",
+          "minimum_net_edge_bps": "0.0",
+          "perp_margin_fraction": "1.0",
+          "rebalance_hours": 8,
+          "round_trip_fees_bps": "11.0"
+        },
+        "source_contract": "ONE_SHARED_PUBLIC_NORMALIZED_FEED_NO_PRIVATE_API"
+      },
+      "required_instruments": [
+        "HL:HYPE:perp",
+        "HL:HYPE:spot"
+      ],
+      "risk": {
+        "max_concurrent_orders": 2,
+        "max_daily_loss": "100",
+        "max_drawdown": "200",
+        "max_gross_notional": "500",
+        "max_instrument_notional": "250",
+        "max_net_notional": "300",
+        "max_order_notional": "250",
+        "max_order_quantity": "10",
+        "max_position_quantity": "10",
+        "stale_after_seconds": 15,
+        "unhedged_timeout_seconds": 20
+      },
+      "strategy_config_hash": "d5d0c18e77a3e1a5ba1a11f9fda646ce9bd8d4a68c476d4d620a62886bc4af24",
+      "strategy_hash": "76e4b4ab6c1af42bb408a2f22163affbb88b0e717d49f2e88696c5abd0063f0f",
+      "strategy_id": "phase05_cash_and_carry",
+      "strategy_name": "cash_and_carry"
+    },
+    {
+      "parameters": {
+        "economic_status": "TECHNICAL_ONLY_NOT_VALIDATED",
+        "phase": "08",
+        "reviewed_config": {
+          "asset_a": "HL:ETH:perp",
+          "asset_a_max_quantity": "0.25",
+          "asset_a_quantity_step": "0.001",
+          "asset_b": "HL:BTC:perp",
+          "asset_b_max_quantity": "0.01",
+          "asset_b_quantity_step": "0.00001",
+          "bar_seconds": 30,
+          "cooldown_bars": 12,
+          "enter_z": 2.0,
+          "exit_z": 0.5,
+          "hedge_ratio": 1.0,
+          "intercept": 0.0,
+          "lookback_bars": 12,
+          "max_holding_bars": 120,
+          "maximum_close_skew_seconds": 2,
+          "maximum_execution_skew_seconds": 2,
+          "maximum_gross_notional": "250",
+          "maximum_pair_gross": 0.2,
+          "model_method": "rolling",
+          "retained_bars": 256,
+          "stop_z": 4.0,
+          "target_spread_volatility": 0.01,
+          "volatility_lookback_bars": 12
+        }
+      },
+      "required_instruments": [
+        "HL:BTC:perp",
+        "HL:ETH:perp"
+      ],
+      "risk": {
+        "max_concurrent_orders": 2,
+        "max_daily_loss": "75",
+        "max_drawdown": "150",
+        "max_gross_notional": "250",
+        "max_instrument_notional": "250",
+        "max_net_notional": "250",
+        "max_order_notional": "250",
+        "max_order_quantity": "1",
+        "max_position_quantity": "1",
+        "stale_after_seconds": 15,
+        "unhedged_timeout_seconds": 20
+      },
+      "strategy_config_hash": "3c41aff21544b83e03bf53a991b268a3e3c9e97c448ec353e47bfd470eadd75d",
+      "strategy_hash": "239ca1f27b9563a8fcacb5faa756364b6fc70240246dc086ac0be1633d8abb0d",
+      "strategy_id": "phase08_robust_pairs",
+      "strategy_name": "pairs_mean_reversion_phase08"
+    }
+  ],
+  "validation_started_at": "2026-08-18T12:00:00.000000+00:00"
+}

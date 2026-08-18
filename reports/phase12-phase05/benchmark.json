@@ -1,0 +1,105 @@
+{
+  "benchmark_contract": "REAL_PHASE08_VS_REAL_PHASE08_PLUS_PHASE05_DURABLE_V1",
+  "comparison": {
+    "combined_elapsed_relative_to_phase08_only": 2.3278120768171813,
+    "combined_frames_per_second_relative_to_phase08_only": 0.42958794223943564
+  },
+  "frames_per_repetition": 200,
+  "identities": {
+    "phase08_only": {
+      "config_hash": "252eb9e41076cfd6f08cbc773596775c8234ded60433a271189e76bc612fa2b3",
+      "portfolio_id": "d78559492d205e89b3a8e771a5d97bf178851651a81f7b1ecf79f4538fa696e6",
+      "required_instruments": [
+        "HL:BTC:perp",
+        "HL:ETH:perp"
+      ],
+      "run_id": "ed63b289c80268f32df4e26e760af73c6056acafdf8ad4b232e0f2fcc07a665d",
+      "strategy_ids": [
+        "phase08_robust_pairs"
+      ]
+    },
+    "phase08_plus_phase05": {
+      "config_hash": "79049391ac63ca089900787b239b26ef80826877a924f23b3ccaf01789d3c75c",
+      "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
+      "required_instruments": [
+        "HL:BTC:perp",
+        "HL:ETH:perp",
+        "HL:HYPE:perp",
+        "HL:HYPE:spot"
+      ],
+      "run_id": "213e9597702c8331892788c7b2841e283c14868e88987ef5d61765200b6b7601",
+      "strategy_ids": [
+        "phase05_cash_and_carry",
+        "phase08_robust_pairs"
+      ]
+    }
+  },
+  "input": "DETERMINISTIC_SYNTHETIC_CANONICAL_BBO",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "queue_behavior": {
+    "after_drain": {
+      "adapted_items": 800,
+      "capacity_frames": 32,
+      "coalesced_bbo_frames": 796,
+      "enqueued_items": 800,
+      "high_water_frames": 4,
+      "latest_adapted_age_seconds": 0.001,
+      "latest_adapted_received_at": "2026-08-18T12:00:00.199000+00:00",
+      "newest_pending_received_at": null,
+      "oldest_pending_age_seconds": null,
+      "oldest_pending_received_at": null,
+      "pending_bbo_coalescing": "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1",
+      "pending_frames": 0,
+      "polled_items": 4
+    },
+    "before_drain": {
+      "adapted_items": 800,
+      "capacity_frames": 32,
+      "coalesced_bbo_frames": 796,
+      "enqueued_items": 800,
+      "high_water_frames": 4,
+      "latest_adapted_age_seconds": 0.001,
+      "latest_adapted_received_at": "2026-08-18T12:00:00.199000+00:00",
+      "newest_pending_received_at": "2026-08-18T12:00:00.199000+00:00",
+      "oldest_pending_age_seconds": 0.001,
+      "oldest_pending_received_at": "2026-08-18T12:00:00.199000+00:00",
+      "pending_bbo_coalescing": "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1",
+      "pending_frames": 4,
+      "polled_items": 0
+    },
+    "input_bbo_records": 800,
+    "persistent_backlog": false,
+    "probe_capacity_frames": 32,
+    "production_capacity_frames": 4096
+  },
+  "repetitions": 3,
+  "results": {
+    "phase08_only": {
+      "durable_commits_per_repetition": 400,
+      "durable_commits_per_second_median": 69.6570593154452,
+      "elapsed_seconds_median": 5.742418699999689,
+      "elapsed_seconds_samples": [
+        5.528636199996981,
+        5.826723899997887,
+        5.742418699999689
+      ],
+      "frames_per_second_median": 34.8285296577226,
+      "strategy_evaluations_per_repetition": 200,
+      "strategy_evaluations_per_second_median": 34.8285296577226
+    },
+    "phase08_plus_phase05": {
+      "durable_commits_per_repetition": 800,
+      "durable_commits_per_second_median": 59.84766554754482,
+      "elapsed_seconds_median": 13.367271600000095,
+      "elapsed_seconds_samples": [
+        13.727985700003046,
+        13.135790499996801,
+        13.367271600000095
+      ],
+      "frames_per_second_median": 14.961916386886205,
+      "strategy_evaluations_per_repetition": 400,
+      "strategy_evaluations_per_second_median": 29.92383277377241
+    }
+  },
+  "synthetic_warning": "SYNTHETIC TECHNICAL THROUGHPUT ONLY; NOT ECONOMIC OR DEPLOYMENT EVIDENCE"
+}

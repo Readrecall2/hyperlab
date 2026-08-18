@@ -20,7 +20,9 @@ from hyperlab.paper.models import (
     OrderIntent,
     OrderSide,
     PaperOrderType,
+    PaperRiskLimits,
     PaperState,
+    PaperStrategyConfig,
     TimeInForce,
     utc_text,
 )
@@ -29,6 +31,7 @@ from hyperlab.strategies.pairs import HedgeMethod, PairModel, RobustPairsStrateg
 
 _IMPLEMENTATION_ID = "phase08-robust-pairs-paper-adapter-v2"
 _PAIR_ID = "phase08-robust-eth-btc"
+PHASE08_PAIRS_STRATEGY_ID = "phase08_robust_pairs"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,36 @@ class FrozenRobustPairsPaperConfig:
         }
 
 
+def _pairs_strategy_hash(config: FrozenRobustPairsPaperConfig) -> str:
+    return canonical_sha256(
+        {
+            "adapter": _IMPLEMENTATION_ID,
+            "configuration": config.to_dict(),
+            "reviewed_strategy": "pairs_mean_reversion_phase08",
+            "semantics": "completed_bar_pending_until_complete_post_bar_pair_frame_ioc_v2",
+        }
+    )
+
+
+def make_phase08_paper_strategy_config(
+    *,
+    config: FrozenRobustPairsPaperConfig,
+    risk: PaperRiskLimits,
+) -> PaperStrategyConfig:
+    return PaperStrategyConfig(
+        strategy_id=PHASE08_PAIRS_STRATEGY_ID,
+        strategy_name="pairs_mean_reversion_phase08",
+        strategy_hash=_pairs_strategy_hash(config),
+        parameters={
+            "economic_status": "TECHNICAL_ONLY_NOT_VALIDATED",
+            "phase": "08",
+            "reviewed_config": config.to_dict(),
+        },
+        risk=risk,
+        required_instruments=(config.asset_a, config.asset_b),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _CompletedBar:
     ended_at: datetime
@@ -162,8 +195,15 @@ class FrozenRobustPairsPaperStrategy:
 
     strategy_name = "pairs_mean_reversion_phase08"
 
-    def __init__(self, config: FrozenRobustPairsPaperConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: FrozenRobustPairsPaperConfig | None = None,
+        *,
+        strategy_config: PaperStrategyConfig | None = None,
+    ) -> None:
         self.config = config or FrozenRobustPairsPaperConfig()
+        self.strategy_id = PHASE08_PAIRS_STRATEGY_ID
+        self._bound_strategy_id: str | None = None
         self._model = self.config.pair_model()
         self._reviewed = RobustPairsStrategy(
             models=(self._model,),
@@ -176,14 +216,17 @@ class FrozenRobustPairsPaperStrategy:
             target_spread_volatility=self.config.target_spread_volatility,
             maximum_pair_gross=self.config.maximum_pair_gross,
         )
-        self.strategy_hash = canonical_sha256(
-            {
-                "adapter": _IMPLEMENTATION_ID,
-                "configuration": self.config.to_dict(),
-                "reviewed_strategy": self._reviewed.name,
-                "semantics": "completed_bar_pending_until_complete_post_bar_pair_frame_ioc_v2",
-            }
-        )
+        self.strategy_hash = _pairs_strategy_hash(self.config)
+        self.strategy_config_hash: str | None = None
+        if strategy_config is not None:
+            expected = make_phase08_paper_strategy_config(
+                config=self.config,
+                risk=strategy_config.risk,
+            )
+            if strategy_config != expected:
+                raise ValueError("Phase 08 adapter differs from its frozen strategy configuration")
+            self._bound_strategy_id = strategy_config.strategy_id
+            self.strategy_config_hash = strategy_config.strategy_config_hash
         self._bars: deque[_CompletedBar] = deque(maxlen=self.config.retained_bars)
         self._latest: dict[str, MarketEvent] = {}
         self._open_bucket_start: datetime | None = None
@@ -254,13 +297,19 @@ class FrozenRobustPairsPaperStrategy:
     ) -> DecisionIntent | None:
         if not markets:
             raise ValueError("the robust-pairs Paper adapter requires a non-empty frame")
-        unexpected = set(markets).difference(self._instruments)
-        if unexpected or any(key != market.instrument for key, market in markets.items()):
-            raise ValueError("the robust-pairs frame must use only canonical frozen pair keys")
+        if any(key != market.instrument for key, market in markets.items()):
+            raise ValueError("the robust-pairs frame must use canonical instrument keys")
+        pair_markets = {
+            instrument: market
+            for instrument, market in markets.items()
+            if instrument in self._instruments
+        }
+        if not pair_markets:
+            return None
 
         completed = False
         for market in sorted(
-            markets.values(),
+            pair_markets.values(),
             key=lambda item: (item.received_at, item.capture_ordinal, item.event_id),
         ):
             completed = self._ingest(market) or completed
@@ -271,7 +320,7 @@ class FrozenRobustPairsPaperStrategy:
         if signal_bar_ended_at is None:
             return None
 
-        execution = self._execution_snapshot(markets)
+        execution = self._execution_snapshot(pair_markets)
         if execution is None:
             return None
         if any(
@@ -507,6 +556,7 @@ class FrozenRobustPairsPaperStrategy:
             action=DecisionAction.ENTRY,
             ordinal=0,
             signal=self.diagnostic_snapshot,
+            strategy_id=self._bound_strategy_id,
         )
         capital = self.config.maximum_gross_notional / Decimal(str(self.config.maximum_pair_gross))
         orders: list[OrderIntent] = []
@@ -534,6 +584,7 @@ class FrozenRobustPairsPaperStrategy:
                 OrderIntent.create(
                     decision_id=decision_id,
                     run_id=view.run_id,
+                    strategy_id=self._bound_strategy_id,
                     instrument=instrument,
                     side=side,
                     quantity=quantity,
@@ -549,7 +600,12 @@ class FrozenRobustPairsPaperStrategy:
         return DecisionIntent(
             decision_id=decision_id,
             run_id=view.run_id,
+            strategy_id=self._bound_strategy_id,
             strategy_name=self.strategy_name,
+            strategy_hash=(self.strategy_hash if self._bound_strategy_id is not None else None),
+            strategy_config_hash=(
+                self.strategy_config_hash if self._bound_strategy_id is not None else None
+            ),
             action=DecisionAction.ENTRY,
             decided_at=anchor.received_at,
             received_at=anchor.received_at,
@@ -573,11 +629,13 @@ class FrozenRobustPairsPaperStrategy:
             action=DecisionAction.EXIT,
             ordinal=0,
             signal=self.diagnostic_snapshot,
+            strategy_id=self._bound_strategy_id,
         )
         orders = tuple(
             OrderIntent.create(
                 decision_id=decision_id,
                 run_id=view.run_id,
+                strategy_id=self._bound_strategy_id,
                 instrument=instrument,
                 side=OrderSide.SELL if positions[instrument] > 0 else OrderSide.BUY,
                 quantity=abs(positions[instrument]),
@@ -597,7 +655,12 @@ class FrozenRobustPairsPaperStrategy:
         return DecisionIntent(
             decision_id=decision_id,
             run_id=view.run_id,
+            strategy_id=self._bound_strategy_id,
             strategy_name=self.strategy_name,
+            strategy_hash=(self.strategy_hash if self._bound_strategy_id is not None else None),
+            strategy_config_hash=(
+                self.strategy_config_hash if self._bound_strategy_id is not None else None
+            ),
             action=DecisionAction.EXIT,
             decided_at=anchor.received_at,
             received_at=anchor.received_at,
@@ -632,6 +695,8 @@ class FrozenRobustPairsPaperStrategy:
 
 
 __all__ = [
+    "PHASE08_PAIRS_STRATEGY_ID",
     "FrozenRobustPairsPaperConfig",
     "FrozenRobustPairsPaperStrategy",
+    "make_phase08_paper_strategy_config",
 ]

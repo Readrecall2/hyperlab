@@ -447,13 +447,36 @@ class PaperEngine:
         )
         if decision.action is DecisionAction.ENTRY and decision_state is not PaperState.FLAT:
             raise ValueError("ENTRY decisions are accepted only from FLAT")
-        if decision.action is DecisionAction.EXIT and decision_state not in {
-            PaperState.HEDGED,
-            PaperState.PAUSED,
-            PaperState.REDUCE_ONLY,
-            PaperState.EMERGENCY_FLATTEN,
-        }:
-            raise ValueError("EXIT decisions require HEDGED, PAUSED, REDUCE_ONLY, or EMERGENCY_FLATTEN")
+        protective_pending_exit = (
+            decision.action is DecisionAction.EXIT
+            and bool(self.config.strategies)
+            and projection.state in {
+                PaperState.REDUCE_ONLY,
+                PaperState.EMERGENCY_FLATTEN,
+            }
+            and decision_state in {
+                PaperState.LEG_1_PENDING,
+                PaperState.HEDGE_PENDING,
+                PaperState.EXIT_PENDING,
+            }
+            and bool(decision.orders)
+            and all(order.reduce_only for order in decision.orders)
+        )
+        if (
+            decision.action is DecisionAction.EXIT
+            and decision_state
+            not in {
+                PaperState.HEDGED,
+                PaperState.PAUSED,
+                PaperState.REDUCE_ONLY,
+                PaperState.EMERGENCY_FLATTEN,
+            }
+            and not protective_pending_exit
+        ):
+            raise ValueError(
+                "EXIT decisions require a hedged/protective state or a global "
+                "protective reduce-only unwind"
+            )
 
         events: list[PaperEvent] = []
         working = projection.clone()
@@ -495,12 +518,27 @@ class PaperEngine:
         protective_exit_state = (
             working_state
             if decision.action is DecisionAction.EXIT
-            and working_state
-            in {
-                PaperState.PAUSED,
-                PaperState.REDUCE_ONLY,
-                PaperState.EMERGENCY_FLATTEN,
-            }
+            and (
+                working_state
+                in {
+                    PaperState.PAUSED,
+                    PaperState.REDUCE_ONLY,
+                    PaperState.EMERGENCY_FLATTEN,
+                }
+                or (
+                    working.state
+                    in {
+                        PaperState.REDUCE_ONLY,
+                        PaperState.EMERGENCY_FLATTEN,
+                    }
+                    and working_state
+                    in {
+                        PaperState.LEG_1_PENDING,
+                        PaperState.HEDGE_PENDING,
+                        PaperState.EXIT_PENDING,
+                    }
+                )
+            )
             else None
         )
         if protective_exit_state is None:
@@ -619,7 +657,11 @@ class PaperEngine:
         }:
             target = protective_exit_state
         elif protective_exit_state is not None:
-            target = PaperState.EXIT_PENDING if accepted else protective_exit_state
+            target = (
+                working.state
+                if protective_pending_exit and accepted
+                else PaperState.EXIT_PENDING if accepted else protective_exit_state
+            )
         else:
             target = PaperState.EXIT_PENDING if accepted else PaperState.HEDGED
         final_state = (
@@ -1486,14 +1528,22 @@ class PaperEngine:
             )
             state_since = working.state_since or self.config.validation_started_at
         if working.strategy_projections:
-            unhedged_timed_out = any(
-                as_of - (strategy.state_since or self.config.validation_started_at)
-                >= timedelta(
-                    seconds=self.config.strategy_config(strategy.strategy_id).risk.unhedged_timeout_seconds
+            timed_out_strategies = tuple(
+                strategy
+                for strategy in sorted(
+                    unhedged_strategies,
+                    key=lambda item: item.strategy_id,
                 )
-                for strategy in unhedged_strategies
+                if as_of - (strategy.state_since or self.config.validation_started_at)
+                >= timedelta(
+                    seconds=self.config.strategy_config(
+                        strategy.strategy_id
+                    ).risk.unhedged_timeout_seconds
+                )
             )
+            unhedged_timed_out = bool(timed_out_strategies)
         else:
+            timed_out_strategies = ()
             unhedged_timed_out = unhedged and as_of - state_since >= timedelta(
                 seconds=self.config.risk.unhedged_timeout_seconds
             )
@@ -1551,9 +1601,30 @@ class PaperEngine:
             )
 
         if unhedged_timed_out:
-            emit(
-                PaperEventType.ALERT_RAISED,
-                self._alert_payload(
+            if working.strategy_projections:
+                for strategy in timed_out_strategies:
+                    strategy_since = (
+                        strategy.state_since or self.config.validation_started_at
+                    )
+                    alert_payload = self._alert_payload(
+                        code="UNHEDGED_TIMEOUT",
+                        severity=AlertSeverity.CRITICAL,
+                        message=(
+                            "strategy unhedged simulated exposure exceeded its frozen timeout"
+                        ),
+                        causation_id=deterministic_id(
+                            "paper_strategy_unhedged_episode",
+                            self.run_id,
+                            strategy.strategy_id,
+                            utc_text(strategy_since),
+                        ),
+                        at=as_of,
+                    )
+                    alert_payload["strategy_id"] = strategy.strategy_id
+                    if not self._alert_is_durable(str(alert_payload["alert_id"])):
+                        emit(PaperEventType.ALERT_RAISED, alert_payload)
+            else:
+                alert_payload = self._alert_payload(
                     code="UNHEDGED_TIMEOUT",
                     severity=AlertSeverity.CRITICAL,
                     message="unhedged simulated exposure exceeded its frozen timeout",
@@ -1561,8 +1632,9 @@ class PaperEngine:
                         "paper_unhedged_episode", self.run_id, utc_text(state_since)
                     ),
                     at=as_of,
-                ),
-            )
+                )
+                if not self._alert_is_durable(str(alert_payload["alert_id"])):
+                    emit(PaperEventType.ALERT_RAISED, alert_payload)
             if working.state is not PaperState.EMERGENCY_FLATTEN:
                 emit(
                     PaperEventType.STATE_TRANSITIONED,

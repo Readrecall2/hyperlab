@@ -14,6 +14,7 @@ from hyperlab.api.public import (
     PUBLIC_INFO_REQUIRED_HTTP_STATUS,
     HyperliquidPublicClient,
 )
+from hyperlab.backtest.protocol import canonical_sha256
 from hyperlab.collector.models import CollectorConfig, ParsedRecord
 from hyperlab.collector.runtime import PublicCollector
 from hyperlab.collector.storage import CoordinatedWriterError, FlushResult
@@ -41,6 +42,42 @@ PHASE12_PUBLIC_INSTRUMENTS: Mapping[tuple[str, str], str] = MappingProxyType(
     {
         ("hyperliquid", "BTC"): "HL:BTC:perp",
         ("hyperliquid", "ETH"): "HL:ETH:perp",
+    }
+)
+PHASE12_PHASE05_PUBLIC_SOURCE_NAME = (
+    "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1"
+)
+PHASE12_PHASE05_PUBLIC_ASSETS = ("BTC", "ETH", "HYPE", "@107")
+PHASE12_PHASE05_PUBLIC_INSTRUMENTS: Mapping[tuple[str, str], str] = MappingProxyType(
+    {
+        ("hyperliquid", "BTC"): "HL:BTC:perp",
+        ("hyperliquid", "ETH"): "HL:ETH:perp",
+        ("hyperliquid", "HYPE"): "HL:HYPE:perp",
+        ("hyperliquid", "@107"): "HL:HYPE:spot",
+    }
+)
+PHASE12_PHASE05_PRODUCT_IDENTITY_HASHES: Mapping[str, str] = MappingProxyType(
+    {
+        instrument: canonical_sha256(identity)
+        for instrument, identity in {
+            "HL:BTC:perp": {
+                "kind": "hyperliquid_canonical_perp",
+                "source_symbol": "BTC",
+            },
+            "HL:ETH:perp": {
+                "kind": "hyperliquid_canonical_perp",
+                "source_symbol": "ETH",
+            },
+            "HL:HYPE:perp": {
+                "kind": "hyperliquid_canonical_perp",
+                "source_symbol": "HYPE",
+            },
+            "HL:HYPE:spot": {
+                "hip1_token_id": "0x0d01dc56dcaaca66ad901c959b4011ec",
+                "kind": "hyperliquid_verified_spot",
+                "source_symbol": "@107",
+            },
+        }.items()
     }
 )
 
@@ -88,6 +125,34 @@ def phase12_public_collector_config() -> CollectorConfig:
     )
 
 
+def phase12_phase05_public_collector_config() -> CollectorConfig:
+    """Frozen one-collector profile for Phase 08 plus Phase 05 Paper inputs."""
+
+    return CollectorConfig(
+        network="mainnet",
+        assets=PHASE12_PHASE05_PUBLIC_ASSETS,
+        candle_intervals=(),
+        subscription_channels=("activeAssetCtx", "bbo"),
+        collect_funding_history=True,
+        reconnect_on_rest_refresh_failure=True,
+        critical_funding_history=True,
+        batch_size=500,
+        flush_interval_seconds=5.0,
+        heartbeat_interval_seconds=20.0,
+        pong_timeout_seconds=45.0,
+        ws_connect_timeout_seconds=15.0,
+        stale_after_seconds=15.0,
+        backoff_initial_seconds=1.0,
+        backoff_max_seconds=30.0,
+        backoff_jitter_ratio=0.2,
+        backoff_reset_after_seconds=60.0,
+        history_lookback_hours=72,
+        rest_refresh_interval_seconds=300.0,
+        funding_grace_seconds=600.0,
+        queue_capacity=10_000,
+    )
+
+
 def _validate_phase12_public_config(config: CollectorConfig) -> None:
     if config.network != "mainnet":
         raise ValueError("Phase 12 Paper public source is frozen to mainnet public data")
@@ -103,6 +168,13 @@ def _validate_phase12_public_config(config: CollectorConfig) -> None:
         raise ValueError("Phase 12 Paper source must reconnect after a REST refresh failure")
     if config.critical_funding_history is not True:
         raise ValueError("Phase 12 Paper source requires critical public funding health")
+
+
+def _validate_phase12_phase05_public_config(config: CollectorConfig) -> None:
+    if config != phase12_phase05_public_collector_config():
+        raise ValueError(
+            "Phase 05 portfolio source requires the exact frozen public collector profile"
+        )
 
 
 class _PaperCollectorSink:
@@ -202,9 +274,20 @@ class HyperliquidPaperPublicSource:
         wire_queue_capacity: int = 10_000,
         request_timeout_seconds: float = 10.0,
         join_timeout_seconds: float = 10.0,
+        include_phase05_cash_and_carry: bool = False,
     ) -> HyperliquidPaperPublicSource:
-        config = phase12_public_collector_config() if collector_config is None else collector_config
-        _validate_phase12_public_config(config)
+        if not isinstance(include_phase05_cash_and_carry, bool):
+            raise TypeError("include_phase05_cash_and_carry must be a boolean")
+        default_config = (
+            phase12_phase05_public_collector_config()
+            if include_phase05_cash_and_carry
+            else phase12_public_collector_config()
+        )
+        config = default_config if collector_config is None else collector_config
+        if include_phase05_cash_and_carry:
+            _validate_phase12_phase05_public_config(config)
+        else:
+            _validate_phase12_public_config(config)
         if (
             isinstance(wire_queue_capacity, bool)
             or not isinstance(wire_queue_capacity, int)
@@ -227,7 +310,7 @@ class HyperliquidPaperPublicSource:
             raise ValueError("join_timeout_seconds must be finite and positive")
 
         transport_identity = {
-            "assets": list(PHASE12_PUBLIC_ASSETS),
+            "assets": list(config.assets),
             "bootstrap_timeout_seconds": PHASE12_PUBLIC_BOOTSTRAP_TIMEOUT_SECONDS,
             "collector_config": asdict(config),
             "credential_scope": "NONE",
@@ -257,12 +340,26 @@ class HyperliquidPaperPublicSource:
             "wire_queue_capacity_messages": wire_queue_capacity,
         }
         adapter = PublicRecordMarketEventAdapter(
-            instruments=PHASE12_PUBLIC_INSTRUMENTS,
+            instruments=(
+                PHASE12_PHASE05_PUBLIC_INSTRUMENTS
+                if include_phase05_cash_and_carry
+                else PHASE12_PUBLIC_INSTRUMENTS
+            ),
             queue_capacity=paper_queue_capacity,
             identity_context=transport_identity,
+            include_market_context=include_phase05_cash_and_carry,
+            product_identity_hashes=(
+                PHASE12_PHASE05_PRODUCT_IDENTITY_HASHES
+                if include_phase05_cash_and_carry
+                else None
+            ),
         )
         descriptor = PublicSourceDescriptor(
-            source=PHASE12_PUBLIC_SOURCE_NAME,
+            source=(
+                PHASE12_PHASE05_PUBLIC_SOURCE_NAME
+                if include_phase05_cash_and_carry
+                else PHASE12_PUBLIC_SOURCE_NAME
+            ),
             data_hash=adapter.identity_hash,
             bootstrap_timeout_seconds=PHASE12_PUBLIC_BOOTSTRAP_TIMEOUT_SECONDS,
         )
@@ -296,6 +393,27 @@ class HyperliquidPaperPublicSource:
             collector_factory=build_collector,
             collector_config=config,
             join_timeout_seconds=join_timeout_seconds,
+        )
+
+    @classmethod
+    def create_mainnet_portfolio(
+        cls,
+        *,
+        runtime_status_path: Path,
+        collector_config: CollectorConfig | None = None,
+        paper_queue_capacity: int = 4_096,
+        wire_queue_capacity: int = 10_000,
+        request_timeout_seconds: float = 10.0,
+        join_timeout_seconds: float = 10.0,
+    ) -> HyperliquidPaperPublicSource:
+        return cls.create_mainnet(
+            runtime_status_path=runtime_status_path,
+            collector_config=collector_config,
+            paper_queue_capacity=paper_queue_capacity,
+            wire_queue_capacity=wire_queue_capacity,
+            request_timeout_seconds=request_timeout_seconds,
+            join_timeout_seconds=join_timeout_seconds,
+            include_phase05_cash_and_carry=True,
         )
 
     @property

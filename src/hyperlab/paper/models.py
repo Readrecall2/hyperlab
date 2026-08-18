@@ -1590,6 +1590,8 @@ class MarketEvent:
     source_connection_id: str | None = None
     source_connection_epoch: int | None = None
 
+    context: Mapping[str, object] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_id", _digest(self.event_id, label="market event_id"))
         object.__setattr__(self, "received_at", _utc(self.received_at, label="received_at"))
@@ -1634,6 +1636,13 @@ class MarketEvent:
             or self.source_connection_epoch < 0
         ):
             raise ValueError("source_connection_epoch must be a non-negative integer")
+        if not isinstance(self.context, Mapping):
+            raise TypeError("market context must be a mapping")
+        object.__setattr__(
+            self,
+            "context",
+            frozen_json_mapping(self.context, label="market context"),
+        )
         if (self.trade_price is None) != (self.trade_quantity is None):
             raise ValueError("trade_price and trade_quantity must be supplied together")
         if self.trade_price is not None:
@@ -1701,6 +1710,7 @@ class MarketEvent:
         source_event_kind: str | None = None,
         source_connection_id: str | None = None,
         source_connection_epoch: int | None = None,
+        context: Mapping[str, object] | None = None,
     ) -> MarketEvent:
         return cls(
             event_id=cls.identifier(
@@ -1726,10 +1736,11 @@ class MarketEvent:
             source_event_kind=source_event_kind,
             source_connection_id=source_connection_id,
             source_connection_epoch=source_connection_epoch,
+            context={} if context is None else context,
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "aggressor_side": (cast(OrderSide, self.aggressor_side).value if self.aggressor_side else None),
             "ask_depth": decimal_text(self.ask_depth),
             "ask_price": decimal_text(self.ask_price),
@@ -1755,9 +1766,18 @@ class MarketEvent:
                 decimal_text(self.trade_quantity) if self.trade_quantity is not None else None
             ),
         }
+        if self.context:
+            payload["context"] = cast(
+                dict[str, JsonValue],
+                json.loads(canonical_json(self.context)),
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> MarketEvent:
+        raw_context = value.get("context", {})
+        if not isinstance(raw_context, Mapping):
+            raise TypeError("market context payload must be a mapping")
         return cls(
             event_id=str(value["event_id"]),
             received_at=parse_utc(str(value["received_at"]), label="received_at"),
@@ -1797,6 +1817,7 @@ class MarketEvent:
             stale=bool(value.get("stale", False)),
             gap=bool(value.get("gap", False)),
             tradable=bool(value.get("tradable", True)),
+            context=cast(Mapping[str, object], raw_context),
         )
 
 

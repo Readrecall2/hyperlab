@@ -869,27 +869,76 @@ class PaperRuntime:
             if market.source_event_kind == "connect":
                 self._bootstrap_connect_health[market.instrument] = market
 
+    def _durable_public_inputs(
+        self,
+        *,
+        after_commit_sequence: int = 0,
+    ) -> Iterable[object]:
+        from hyperlab.paper.public_source import PublicFundingSettlement
+
+        for record in self.engine.store.iter_inputs(
+            self.engine.run_id,
+            after_commit_sequence=after_commit_sequence,
+        ):
+            self._check_startup_interrupted()
+            input_type = record.payload.get("input_type")
+            if input_type == "PUBLIC_MARKET_EVENT":
+                raw_market = record.payload.get("market")
+                if not isinstance(raw_market, Mapping):
+                    raise PaperAdmissionError("durable public market input is malformed")
+                try:
+                    market = MarketEvent.from_dict(cast(Mapping[str, object], raw_market))
+                except (KeyError, TypeError, ValueError) as error:
+                    raise PaperAdmissionError(
+                        "durable public market input cannot be reconstructed"
+                    ) from error
+                self._latest_markets[market.instrument] = market
+                self._observe_connection_health((market,))
+                yield market
+            elif input_type == "PUBLIC_FUNDING_SETTLEMENT":
+                payload = record.payload
+                try:
+                    settlement = PublicFundingSettlement(
+                        event_id=str(payload["source_event_id"]),
+                        instrument=str(payload["instrument"]),
+                        funding_time=parse_utc(str(payload["occurred_at"])),
+                        received_at=parse_utc(str(payload["received_at"])),
+                        funding_rate=Decimal(str(payload["funding_rate"])),
+                        funding_interval_seconds=int(str(payload["funding_interval_seconds"])),
+                        rate_kind=str(payload["rate_kind"]),
+                        mark_price=(
+                            Decimal(str(payload["source_mark_price"]))
+                            if payload.get("source_mark_price") is not None
+                            else None
+                        ),
+                        oracle_price=(
+                            Decimal(str(payload["oracle_price"]))
+                            if payload.get("oracle_price") is not None
+                            else None
+                        ),
+                        source_observation_id=str(payload["source_observation_id"]),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise PaperAdmissionError(
+                        "durable public funding input cannot be reconstructed"
+                    ) from error
+                yield settlement
+
     def _durable_markets(
         self,
         *,
         after_commit_sequence: int = 0,
+        instruments: Iterable[str] | None = None,
     ) -> Iterable[MarketEvent]:
-        for record in self.engine.store.iter_inputs(
-            self.engine.run_id,
-            input_type="PUBLIC_MARKET_EVENT",
-            after_commit_sequence=after_commit_sequence,
+        admitted = frozenset(instruments) if instruments is not None else None
+        for item in self._durable_public_inputs(
+            after_commit_sequence=after_commit_sequence
         ):
-            self._check_startup_interrupted()
-            raw_market = record.payload.get("market")
-            if not isinstance(raw_market, Mapping):
-                raise PaperAdmissionError("durable public market input is malformed")
-            try:
-                market = MarketEvent.from_dict(cast(Mapping[str, object], raw_market))
-            except (KeyError, TypeError, ValueError) as error:
-                raise PaperAdmissionError("durable public market input cannot be reconstructed") from error
-            self._latest_markets[market.instrument] = market
-            self._observe_connection_health((market,))
-            yield market
+            if (
+                isinstance(item, MarketEvent)
+                and (admitted is None or item.instrument in admitted)
+            ):
+                yield item
 
     def _restore_strategy(
         self,
@@ -908,26 +957,46 @@ class PaperRuntime:
             bindings = ((None, self._strategy),)
         for strategy_config, adapter in bindings:
             after_commit_sequence = self._strategy_restore_commit_sequence if incremental else 0
+            restore_public = (
+                getattr(adapter, "restore_incremental_public_inputs", None)
+                if incremental
+                else getattr(adapter, "restore_public_inputs", None)
+            )
+            if incremental and restore_public is None and hasattr(
+                adapter, "restore_public_inputs"
+            ):
+                after_commit_sequence = 0
+                restore_public = adapter.restore_public_inputs
             restore = (
                 getattr(adapter, "restore_incremental", None)
                 if incremental
                 else getattr(adapter, "restore", None)
             )
-            if incremental and restore is None:
+            if incremental and restore is None and restore_public is None:
                 after_commit_sequence = 0
                 restore = getattr(adapter, "restore", None)
-            markets = self._durable_markets(
-                after_commit_sequence=after_commit_sequence,
+            durable_inputs = (
+                self._durable_public_inputs(after_commit_sequence=after_commit_sequence)
+                if restore_public is not None
+                else self._durable_markets(
+                    after_commit_sequence=after_commit_sequence,
+                    instruments=(
+                        strategy_config.required_instruments
+                        if strategy_config is not None
+                        else None
+                    ),
+                )
             )
+            selected_restore = restore_public if restore_public is not None else restore
             try:
-                if restore is None:
-                    for _market in markets:
+                if selected_restore is None:
+                    for _item in durable_inputs:
                         pass
                 else:
-                    if not callable(restore):
+                    if not callable(selected_restore):
                         raise PaperAdmissionError("paper strategy restore attribute must be callable")
-                    restore(
-                        markets,
+                    selected_restore(
+                        durable_inputs,
                         PaperStrategyView.from_projection(
                             projection,
                             strategy_config,
@@ -1321,6 +1390,37 @@ class PaperRuntime:
             raise PaperAdmissionError("public source returned an unsupported item")
         return value.received_at
 
+    def _notify_strategy_funding(self, value: object, *, observed_at: datetime) -> None:
+        from hyperlab.paper.public_source import PublicFundingSettlement
+
+        if not isinstance(value, PublicFundingSettlement):
+            raise PaperAdmissionError("funding observer received an unsupported item")
+        bindings: Iterable[tuple[PaperStrategyConfig | None, FrozenPaperStrategy]]
+        if isinstance(self._runner, PortfolioRunner):
+            bindings = self._runner.strategies
+        else:
+            bindings = ((None, self._strategy),)
+        for strategy_config, adapter in bindings:
+            observe = getattr(adapter, "observe_funding", None)
+            if observe is None:
+                continue
+            if not callable(observe):
+                raise PaperAdmissionError("paper strategy observe_funding attribute must be callable")
+            try:
+                observe(value)
+            except Exception as error:
+                if strategy_config is None:
+                    raise PaperAdmissionError(
+                        "legacy paper strategy funding observation failed closed"
+                    ) from error
+                self.engine.record_strategy_failure(
+                    strategy_id=strategy_config.strategy_id,
+                    as_of=observed_at,
+                    phase="FUNDING_OBSERVATION",
+                    error_type=type(error).__name__,
+                    market_event_ids=(value.event_id,),
+                )
+
     def _funding_step(self, value: object, observed_at: datetime) -> PaperRuntimeStep:
         from hyperlab.paper.public_source import PublicFundingSettlement
 
@@ -1440,11 +1540,15 @@ class PaperRuntime:
             applicability=("PRE_ACTIVATION_IGNORED" if pre_activation else "APPLIED"),
             source_activation_cutoff=cutoff,
         )
+        self._notify_strategy_funding(settlement, observed_at=observed_at)
+        observed_projection = self.engine.projection()
         protective = self._ensure_automatic_emergency_flatten(
-            result.projection,
+            observed_projection,
             as_of=observed_at,
         )
-        final_projection = protective.projection if protective is not None else result.projection
+        final_projection = (
+            protective.projection if protective is not None else observed_projection
+        )
         return PaperRuntimeStep(
             kind=PaperRuntimeStepKind.FUNDING,
             projection=final_projection,

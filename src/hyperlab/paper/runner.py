@@ -312,12 +312,32 @@ class PortfolioRunner:
                 orders=tuple(replace(order, created_at=processed) for order in decision.orders),
             )
             try:
+                primary = next(
+                    (
+                        event
+                        for event in decision_frame.values()
+                        if event.event_id == decision.market_event_id
+                    ),
+                    None,
+                )
+                if primary is None:
+                    raise ValueError(
+                        "strategy decision primary market is absent from the shared frame"
+                    )
+                admission_instruments = {
+                    primary.instrument,
+                    *(order.instrument for order in decision.orders),
+                }
+                admission_markets = {
+                    instrument: decision_frame[instrument]
+                    for instrument in sorted(admission_instruments)
+                }
                 last_decision = self.engine.submit_decision(
                     decision,
-                    decision_frame,
+                    admission_markets,
                     processed_at=processed,
                 )
-            except (TypeError, ValueError) as error:
+            except (KeyError, TypeError, ValueError) as error:
                 failure = self.engine.record_strategy_failure(
                     strategy_id=config.strategy_id,
                     as_of=processed,

@@ -1,5 +1,11 @@
 """Persistent, deterministic, offline-only paper execution for Phase 12."""
 
+from hyperlab.paper.carry_strategy import (
+    PHASE05_CARRY_STRATEGY_ID,
+    FrozenCashAndCarryPaperConfig,
+    FrozenCashAndCarryPaperStrategy,
+    make_phase05_paper_strategy_config,
+)
 from hyperlab.paper.engine import PaperCommandResult, PaperEngine
 from hyperlab.paper.gate import (
     PaperGateEvidence,
@@ -31,6 +37,12 @@ from hyperlab.paper.models import (
     deterministic_id,
     keyed_uniform,
 )
+from hyperlab.paper.phase05_portfolio import (
+    Phase05Phase08PaperFoundation,
+    Phase05Phase08RiskAllocation,
+    build_phase05_phase08_paper_foundation,
+    default_phase05_phase08_risk_allocation,
+)
 from hyperlab.paper.risk import RiskDecision, evaluate_order_risk, is_risk_reducing
 from hyperlab.paper.runner import (
     FrozenPaperStrategy,
@@ -53,11 +65,14 @@ from hyperlab.paper.store import (
 )
 
 __all__ = [
+    "PHASE05_CARRY_STRATEGY_ID",
     "AlertSeverity",
     "AppendResult",
     "ConcurrentWriteError",
     "DecisionAction",
     "DecisionIntent",
+    "FrozenCashAndCarryPaperConfig",
+    "FrozenCashAndCarryPaperStrategy",
     "FrozenPaperStrategy",
     "IdempotencyConflictError",
     "InputRecord",
@@ -87,6 +102,8 @@ __all__ = [
     "PaperStrategyConfig",
     "PaperStrategyProjection",
     "PaperStrategyView",
+    "Phase05Phase08PaperFoundation",
+    "Phase05Phase08RiskAllocation",
     "PortfolioRunner",
     "RiskDecision",
     "RunConflictError",
@@ -94,9 +111,12 @@ __all__ = [
     "SchemaVersionError",
     "StoredPaperEvent",
     "TimeInForce",
+    "build_phase05_phase08_paper_foundation",
+    "default_phase05_phase08_risk_allocation",
     "deterministic_id",
     "evaluate_order_risk",
     "evaluate_paper_gate",
     "is_risk_reducing",
     "keyed_uniform",
+    "make_phase05_paper_strategy_config",
 ]

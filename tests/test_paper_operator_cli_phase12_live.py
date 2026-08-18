@@ -328,7 +328,7 @@ def test_default_preflight_accepts_exact_compiled_candidate_without_transport_or
     assert payload["config_hash"] == cli_module._PHASE12_PAPER_CONFIG_HASH
     assert payload["public_source"] == {
         "bootstrap_timeout_seconds": 120.0,
-        "data_hash": "f819fbd0a88841cfda22fbbe6a5966a86df0f4b1b453ff261e8095d59c2ddd7c",
+        "data_hash": "da9784ec2c794340c482c389dda6d278373a24429baca48d4e363adf2a872525",
         "public_only": True,
         "schema_version": 1,
         "source": "hyperliquid-mainnet-public-bbo-funding-v1",

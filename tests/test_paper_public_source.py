@@ -725,7 +725,7 @@ def test_adapter_identity_binds_canonical_transport_context() -> None:
     }
 
 
-def test_adapter_identity_binds_mapping_schema_and_fifo_capacity() -> None:
+def test_adapter_identity_binds_mapping_schema_capacity_and_coalescing() -> None:
     forward = PublicRecordMarketEventAdapter(
         instruments={
             ("hyperliquid", "BTC"): "HL:BTC:perp",
@@ -761,7 +761,11 @@ def test_adapter_identity_binds_mapping_schema_and_fifo_capacity() -> None:
     identity = json.loads(forward.identity_artifact_bytes)
     assert different_dedupe_capacity.identity_hash != forward.identity_hash
     assert identity["feed_contract"].startswith("SOLE_COLLECTOR_")
-    assert identity["adapter_schema_version"] == 8
+    assert identity["adapter_schema_version"] == 9
+    assert (
+        identity["pending_bbo_coalescing"]
+        == "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1"
+    )
     assert (
         identity["global_connection_policy"]
         == "MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4"
@@ -842,20 +846,114 @@ def test_received_time_regression_is_rejected() -> None:
         )
 
 
-def test_bounded_source_is_fifo_and_saturation_is_terminal() -> None:
+def test_bounded_source_coalesces_pending_bbo_within_one_utc_minute() -> None:
     adapter = _adapter(queue_capacity=1)
     source = _source(adapter)
     assert source.feed(_bbo(START, update_id="book-1")) is True
+    assert source.feed(
+        _bbo(
+            START + timedelta(seconds=10),
+            update_id="book-2",
+            bid_price=Decimal("102"),
+            ask_price=Decimal("103"),
+        )
+    ) is True
+
+    snapshot = source.queue_snapshot(as_of=START + timedelta(seconds=10))
+    assert snapshot == {
+        "capacity_frames": 1,
+        "pending_frames": 1,
+        "high_water_frames": 1,
+        "adapted_items": 2,
+        "enqueued_items": 2,
+        "polled_items": 0,
+        "coalesced_bbo_frames": 1,
+        "oldest_pending_received_at": "2026-08-16T12:00:10.000000+00:00",
+        "newest_pending_received_at": "2026-08-16T12:00:10.000000+00:00",
+        "oldest_pending_age_seconds": 0.0,
+        "latest_adapted_received_at": "2026-08-16T12:00:10.000000+00:00",
+        "latest_adapted_age_seconds": 0.0,
+        "pending_bbo_coalescing": (
+            "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1"
+        ),
+    }
+    latest = _event(source.poll(timeout_seconds=0))
+    assert latest.received_at == START + timedelta(seconds=10)
+    assert latest.bid_price == Decimal("102")
+    assert source.pending_count == 0
+
+
+def test_slower_consumer_stays_current_under_sustained_bbo_burst() -> None:
+    adapter = PublicRecordMarketEventAdapter(
+        instruments={
+            ("hyperliquid", "BTC"): "HL:BTC:perp",
+            ("hyperliquid", "ETH"): "HL:ETH:perp",
+        },
+        queue_capacity=4_096,
+    )
+    source = _source(adapter)
+    last_consumed_at: datetime | None = None
+
+    for second in range(30):
+        for ordinal in range(20):
+            asset = "BTC" if ordinal % 2 == 0 else "ETH"
+            assert source.feed(
+                _bbo(
+                    START + timedelta(seconds=second, milliseconds=ordinal),
+                    asset=asset,
+                    update_id=f"{asset}-{second}-{ordinal}",
+                )
+            )
+        for _ in range(10):
+            item = source.poll(timeout_seconds=0)
+            if item is None:
+                break
+            last_consumed_at = max(event.received_at for event in item.values())
+
+    produced_at = START + timedelta(seconds=29, milliseconds=19)
+    assert last_consumed_at is not None
+    assert (produced_at - last_consumed_at).total_seconds() <= 0.001
+    snapshot = source.queue_snapshot(as_of=produced_at)
+    assert snapshot["pending_frames"] == 0
+    assert snapshot["high_water_frames"] == 2
+    assert snapshot["adapted_items"] == 600
+    assert snapshot["enqueued_items"] == 600
+    assert snapshot["polled_items"] == 60
+    assert snapshot["coalesced_bbo_frames"] == 540
+    assert snapshot["latest_adapted_age_seconds"] == 0.0
+
+
+def test_bounded_source_preserves_minute_boundary_and_saturation_is_terminal() -> None:
+    adapter = _adapter(queue_capacity=1)
+    source = _source(adapter)
+    assert source.feed(_bbo(START + timedelta(seconds=59), update_id="book-1")) is True
 
     with pytest.raises(PublicRecordQueueFull, match="coverage is incomplete"):
         source.feed(
             _bbo(
-                START + timedelta(milliseconds=1),
+                START + timedelta(minutes=1),
                 update_id="book-2",
             )
         )
     with pytest.raises(PublicRecordQueueFull, match="coverage is incomplete"):
         source.poll(timeout_seconds=0)
+
+
+def test_bounded_source_never_coalesces_across_funding_barrier() -> None:
+    adapter = _adapter(queue_capacity=3)
+    source = _source(adapter)
+    first_at = START + timedelta(seconds=1)
+    funding_at = START + timedelta(seconds=2)
+    latest_at = START + timedelta(seconds=3)
+
+    assert source.feed(_bbo(first_at, update_id="book-before-funding"))
+    assert source.feed(_funding(funding_at, observation_id="funding-barrier"))
+    assert source.feed(_bbo(latest_at, update_id="book-after-funding"))
+
+    assert _event(source.poll(timeout_seconds=0)).received_at == first_at
+    assert isinstance(source.poll(timeout_seconds=0), PublicFundingSettlement)
+    assert _event(source.poll(timeout_seconds=0)).received_at == latest_at
+    assert source.queue_snapshot(as_of=latest_at)["coalesced_bbo_frames"] == 0
 
 
 def test_source_stop_and_close_reject_later_feeds() -> None:

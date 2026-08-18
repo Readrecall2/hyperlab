@@ -793,28 +793,45 @@ def test_restart_rejects_divergent_redelivery_and_latches_manual_review(
     ) == []
 
 
-def test_runtime_rejects_market_older_than_frozen_staleness_limit(
+def test_fresh_producer_fifo_backlog_reaches_old_event_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "paper.sqlite3"
     clock = MutableClock(_START + timedelta(seconds=2))
-    stale_market = _market("runtime-stale", _START + timedelta(seconds=5))
+    stale_market = _market("runtime-stale-fifo-head", _START + timedelta(seconds=20))
+    producer_latest = _market(
+        "runtime-fresh-fifo-tail",
+        _START + timedelta(seconds=30, milliseconds=900),
+    )
     strategy = HoldStrategy()
-    config = replace(_config(), runtime_timer_interval_seconds=60)
+    config = replace(
+        _config(),
+        risk=replace(_config().risk, stale_after_seconds=10),
+        runtime_timer_interval_seconds=60,
+    )
+    source = QueuePublicSource(
+        [
+            {_INSTRUMENT: stale_market},
+            {_INSTRUMENT: producer_latest},
+        ]
+    )
     runtime = _runtime(
         database,
-        QueuePublicSource([{_INSTRUMENT: stale_market}]),
+        source,
         strategy,
         clock,
         timer_interval_seconds=60,
         run_config=config,
     )
     runtime.start()
-    clock.value = _START + timedelta(seconds=40)
+    clock.value = _START + timedelta(seconds=31)
 
     with pytest.raises(PaperAdmissionError, match="stale_after_seconds"):
         runtime.run_once()
     assert strategy.calls == 0
+    assert source.frames == [{_INSTRUMENT: producer_latest}]
+    assert (clock.value - producer_latest.received_at).total_seconds() == pytest.approx(0.1)
+    assert config.risk.stale_after_seconds == 10
     durable = PaperStore(database, initialize=False)
     assert not durable.contains_input(
         config.run_id,

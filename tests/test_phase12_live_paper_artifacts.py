@@ -291,15 +291,18 @@ def test_generated_evidence_matches_implemented_store_and_transport_facts() -> N
     ]
 
     normalized = facts(EvidenceCheck.NORMALIZED_MARKET_EVENT_SCHEMA)
-    assert normalized["adapter_schema_version"] == 8
+    assert normalized["adapter_schema_version"] == 9
     assert normalized["bbo_tradability_policy"] == (
         "REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2"
     )
     assert normalized["feed_contract"] == (
-        "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8"
+        "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_PENDING_BBO_LATEST_VALUE_V9"
     )
     assert normalized["malformed_bbo_policy"] == (
         "TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1"
+    )
+    assert normalized["pending_bbo_coalescing"] == (
+        "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1"
     )
     assert normalized["gap_or_stale_action"] == "PAUSE_AND_NO_EXECUTION"
     assert normalized["global_connection_policy"] == (
@@ -443,12 +446,16 @@ def test_frozen_config_binds_strategy_source_costs_and_practical_risk() -> None:
     assert config.parameters["strategy_configuration"] == frozen_strategy.to_dict()
 
     assert source_identity["public_only"] is True
-    assert source_identity["adapter_schema_version"] == 8
+    assert source_identity["adapter_schema_version"] == 9
+    assert source_identity["pending_bbo_coalescing"] == (
+        "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1"
+    )
     assert source_identity["bbo_tradability_policy"] == (
         "REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2"
     )
     assert source_identity["feed_contract"] == (
-        "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8"
+        "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_"
+        "PENDING_BBO_LATEST_VALUE_V9"
     )
     assert source_identity["malformed_bbo_policy"] == (
         "TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1"

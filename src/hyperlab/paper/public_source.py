@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import queue
 import threading
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -103,12 +103,28 @@ class PublicFundingSettlement:
 PublicSourceItem = Mapping[str, MarketEvent] | PublicFundingSettlement
 
 
+_BboCoalesceKey = tuple[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedPublicSourceItem:
+    item: PublicSourceItem
+    received_at: datetime
+    bbo_coalesce_key: _BboCoalesceKey | None
+
+
 _SourceKey = tuple[str, str]
 _SUPPORTED_RECORD_TYPES = frozenset({RecordType.BBO, RecordType.CONNECTION_EVENT, RecordType.FUNDING})
 _GAP_EVENTS = frozenset({"disconnect", "gap", "resync_start"})
 _AWAITING_BOOK_EVENTS = frozenset({"connect", "resync_complete"})
-_ADAPTER_SCHEMA_VERSION = 8
-_FEED_CONTRACT = "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8"
+_ADAPTER_SCHEMA_VERSION = 9
+_PENDING_BBO_COALESCING = (
+    "LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1"
+)
+_FEED_CONTRACT = (
+    "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_"
+    "PENDING_BBO_LATEST_VALUE_V9"
+)
 _GLOBAL_CONNECTION_POLICY = (
     "MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4"
 )
@@ -295,6 +311,7 @@ class PublicRecordMarketEventAdapter:
             "funding_dedupe_capacity_settlements": funding_dedupe_capacity,
             "global_connection_policy": _GLOBAL_CONNECTION_POLICY,
             "malformed_bbo_policy": _MALFORMED_BBO_POLICY,
+            "pending_bbo_coalescing": _PENDING_BBO_COALESCING,
             "instrument_route_policy": _INSTRUMENT_ROUTE_POLICY,
             "instruments": [
                 {
@@ -796,10 +813,14 @@ class PublicRecordMarketEventAdapter:
 
 
 class BoundedPublicRecordSource:
-    """Bounded FIFO source a sole public collector can feed in-process.
+    """Bounded source with latest-value semantics for still-pending BBOs.
 
     Saturation and malformed supported input are terminal. Continuing after
-    either condition would make the paper stream silently incomplete.
+    either condition would make the paper stream silently incomplete. Only
+    BBOs for the same instrument and UTC minute may replace an older BBO that
+    has not yet been polled. Funding and connection events are causal barriers,
+    and minute boundaries remain FIFO so the frozen strategy retains every
+    completed close it can safely evaluate.
     """
 
     def __init__(
@@ -825,8 +846,15 @@ class BoundedPublicRecordSource:
             )
         self._descriptor = descriptor
         self._adapter = adapter
-        self._queue: queue.Queue[PublicSourceItem] = queue.Queue(maxsize=capacity)
+        self._capacity = capacity
+        self._queue: deque[_QueuedPublicSourceItem] = deque()
+        self._queue_condition = threading.Condition()
         self._high_water = 0
+        self._adapted_items = 0
+        self._enqueued_items = 0
+        self._polled_items = 0
+        self._coalesced_bbo_frames = 0
+        self._latest_adapted_received_at: datetime | None = None
         self._feed_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stopped = threading.Event()
@@ -843,11 +871,71 @@ class BoundedPublicRecordSource:
 
     @property
     def pending_count(self) -> int:
-        return self._queue.qsize()
+        with self._queue_condition:
+            return len(self._queue)
 
     @property
     def high_water(self) -> int:
-        return self._high_water
+        with self._queue_condition:
+            return self._high_water
+
+    @staticmethod
+    def _received_at(item: PublicSourceItem) -> datetime:
+        if isinstance(item, PublicFundingSettlement):
+            return item.received_at
+        received = tuple(event.received_at for event in item.values())
+        if not received:
+            raise PublicRecordAdapterError("public source item must not be empty")
+        return min(received)
+
+    @staticmethod
+    def _bbo_coalesce_key(
+        record: ParsedRecord,
+        item: PublicSourceItem,
+    ) -> _BboCoalesceKey | None:
+        if record.record_type is not RecordType.BBO:
+            return None
+        if not isinstance(item, Mapping) or len(item) != 1:
+            raise PublicRecordAdapterError(
+                "one normalized BBO must produce exactly one instrument"
+            )
+        event = next(iter(item.values()))
+        minute = int(event.received_at.timestamp()) // 60
+        return event.instrument, minute
+
+    @staticmethod
+    def _timestamp_text(value: datetime | None) -> str | None:
+        return None if value is None else value.isoformat(timespec="microseconds")
+
+    def queue_snapshot(self, *, as_of: datetime) -> dict[str, object]:
+        observed_at = _utc(as_of, label="queue snapshot as_of")
+        with self._queue_condition:
+            oldest = self._queue[0].received_at if self._queue else None
+            newest = self._queue[-1].received_at if self._queue else None
+            latest = self._latest_adapted_received_at
+            return {
+                "capacity_frames": self._capacity,
+                "pending_frames": len(self._queue),
+                "high_water_frames": self._high_water,
+                "adapted_items": self._adapted_items,
+                "enqueued_items": self._enqueued_items,
+                "polled_items": self._polled_items,
+                "coalesced_bbo_frames": self._coalesced_bbo_frames,
+                "oldest_pending_received_at": self._timestamp_text(oldest),
+                "newest_pending_received_at": self._timestamp_text(newest),
+                "oldest_pending_age_seconds": (
+                    None
+                    if oldest is None
+                    else max((observed_at - oldest).total_seconds(), 0.0)
+                ),
+                "latest_adapted_received_at": self._timestamp_text(latest),
+                "latest_adapted_age_seconds": (
+                    None
+                    if latest is None
+                    else max((observed_at - latest).total_seconds(), 0.0)
+                ),
+                "pending_bbo_coalescing": _PENDING_BBO_COALESCING,
+            }
 
     def feed(self, record: ParsedRecord) -> bool:
         """Feed one record; return whether it produced an enqueued paper frame."""
@@ -861,15 +949,40 @@ class BoundedPublicRecordSource:
                 raise
             if frame is None:
                 return False
-            try:
-                self._queue.put_nowait(frame)
-                self._high_water = max(self._high_water, self._queue.qsize())
-            except queue.Full as exc:
+            received_at = self._received_at(frame)
+            coalesce_key = self._bbo_coalesce_key(record, frame)
+            with self._queue_condition:
+                self._adapted_items += 1
+                self._latest_adapted_received_at = received_at
+                if coalesce_key is not None:
+                    for index in range(len(self._queue) - 1, -1, -1):
+                        queued = self._queue[index]
+                        if queued.bbo_coalesce_key is None:
+                            break
+                        if queued.bbo_coalesce_key == coalesce_key:
+                            del self._queue[index]
+                            self._coalesced_bbo_frames += 1
+                            break
+                if len(self._queue) >= self._capacity:
+                    full = True
+                else:
+                    self._queue.append(
+                        _QueuedPublicSourceItem(
+                            item=frame,
+                            received_at=received_at,
+                            bbo_coalesce_key=coalesce_key,
+                        )
+                    )
+                    self._enqueued_items += 1
+                    self._high_water = max(self._high_water, len(self._queue))
+                    self._queue_condition.notify()
+                    full = False
+            if full:
                 error = PublicRecordQueueFull(
                     "public paper source queue saturated; normalized coverage is incomplete"
                 )
                 self._latch(error)
-                raise error from exc
+                raise error
             return True
 
     def feed_many(self, records: Iterable[ParsedRecord]) -> int:
@@ -889,30 +1002,46 @@ class BoundedPublicRecordSource:
         self._raise_if_fatal()
         if self._stopped.is_set():
             return None
-        try:
-            frame = self._queue.get(timeout=float(timeout_seconds))
-        except queue.Empty:
+        deadline = time.monotonic() + float(timeout_seconds)
+        queued: _QueuedPublicSourceItem | None = None
+        while queued is None:
             self._raise_if_fatal()
-            return None
+            if self._stopped.is_set():
+                return None
+            with self._queue_condition:
+                if self._queue:
+                    queued = self._queue.popleft()
+                    self._polled_items += 1
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._queue_condition.wait(timeout=remaining)
         self._raise_if_fatal()
-        return frame
+        return queued.item
 
     def fail(self, error: Exception) -> None:
         self._latch(error)
 
     def stop(self) -> None:
         self._stopped.set()
+        with self._queue_condition:
+            self._queue_condition.notify_all()
 
     def close(self) -> None:
         with self._state_lock:
             self._closed = True
             self._stopped.set()
+        with self._queue_condition:
+            self._queue_condition.notify_all()
 
     def _latch(self, error: Exception) -> None:
         with self._state_lock:
             if self._fatal is None:
                 self._fatal = error
             self._stopped.set()
+        with self._queue_condition:
+            self._queue_condition.notify_all()
 
     def _raise_if_fatal(self) -> None:
         with self._state_lock:

@@ -32,7 +32,7 @@ The source identity is `hyperliquid-mainnet-public-bbo-funding-v1`:
 - REST bootstrap BBO is non-tradable; post-connect BBO requires exact websocket lineage, while
   any gap or staleness pauses the Paper engine and permits no execution
 - source identity SHA-256 / `PaperRunConfig.data_hash`:
-  `f819fbd0a88841cfda22fbbe6a5966a86df0f4b1b453ff261e8095d59c2ddd7c`
+  `da9784ec2c794340c482c389dda6d278373a24429baca48d4e363adf2a872525`
 - frozen strategy adapter: `phase08-robust-pairs-paper-adapter-v2`,
   `completed_bar_pending_until_complete_post_bar_pair_frame_ioc_v2`; strategy SHA-256:
   `239ca1f27b9563a8fcacb5faa756364b6fc70240246dc086ac0be1633d8abb0d`
@@ -279,6 +279,12 @@ Inspect `integrity`, `runtime.state`,
 instrument, reconnect/gap/connection counts, recent alerts, and risk state. A gap or
 disconnect must make the source non-tradable until a fresh BBO resynchronization; continuity is
 never interpolated.
+
+The collector status also exposes `observability.source_queue`. Monitor `pending_frames`,
+`high_water_frames`, `oldest_pending_age_seconds`, `latest_adapted_age_seconds`, and
+`coalesced_bbo_frames`; wire freshness alone does not prove that Paper is draining current BBOs.
+Pending BBOs use latest-value replacement only for the same instrument and UTC minute. Funding,
+connection/gap events, and minute boundaries remain FIFO causal barriers.
 
 SQLite remains in rollback-journal `DELETE` mode. To avoid holding a long read transaction that
 could block the writer, status, report, `/api/paper`, and Paper readiness capture the exact durable
@@ -865,11 +871,16 @@ create another run ID or database to conceal the refusal.
   UTC series (366). Output and client memory are bounded, but daily projection, source, and ledger
   SQL work still scales with retained history. Consumers must follow cursors/pages rather than
   load unbounded history. The first manual smoke must record report latency and database growth.
-- Phase 12.5 must add indexed or incremental daily summaries and evaluate source-rate profiling,
-  capacity alerts, retention/archive policy, and safe event-coalescing boundaries. Those are known
-  debts, not evidence for this Phase 12 launch.
-- A local synthetic 1,000-BBO fixture measured about 82.8 commits/second and about 6.18 KB of
-  SQLite growth per BBO. The illustrative extrapolation at exactly 1 BBO/second is about
+- Phase 12.5 must add indexed or incremental daily summaries and evaluate capacity alerts plus a
+  replay-preserving retention/archive policy. Those remain known debts, not evidence for launch.
+- Pending BBO coalescing does not delete or rewrite durable history. It only prevents an obsolete
+  not-yet-consumed BBO from entering the canonical inbox when a newer BBO for the same instrument
+  and UTC minute is already pending. The frozen pairs strategy uses minute closes; a skipped minute,
+  funding event, connection transition, gap, or resync is never coalesced.
+- A local synthetic 1,000-BBO fixture on 18 August 2026 measured about 94.6 commits/second and
+  about 6.03 KB of SQLite growth per persisted BBO. Full append-only projection history was the
+  largest logical table, followed by events and inbox payloads. The illustrative extrapolation at
+  exactly 1 persisted BBO/second is about
   0.53 GB/day; it is not a measured public-source rate and does not prove 24/7 capacity.
 - Strategy restoration streams all lifetime `PUBLIC_MARKET_EVENT` inputs from genesis. RAM use is
   bounded, but restart SQL and CPU are O(N) in retained inputs; restart time is not independent of

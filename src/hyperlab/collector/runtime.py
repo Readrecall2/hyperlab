@@ -1167,6 +1167,9 @@ class PublicCollector:
         writer_metrics = getattr(self.sink, "metrics_snapshot", None)
         if callable(writer_metrics):
             observability["writer"] = writer_metrics()
+        source_queue_metrics = getattr(self.sink, "source_queue_snapshot", None)
+        if callable(source_queue_metrics):
+            observability["source_queue"] = source_queue_metrics(as_of=now)
         payload["observability"] = observability
         if self.metrics.last_error is not None:
             payload["error"] = self.metrics.last_error

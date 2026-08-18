@@ -4,6 +4,7 @@ import math
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
@@ -123,6 +124,9 @@ class _PaperCollectorSink:
     @property
     def should_flush(self) -> bool:
         return False
+
+    def source_queue_snapshot(self, *, as_of: datetime) -> Mapping[str, object]:
+        return self._source.queue_snapshot(as_of=as_of)
 
     def add(self, record: ParsedRecord) -> bool:
         try:

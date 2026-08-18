@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -137,6 +138,14 @@ class _NullSink:
 
     def flush(self) -> FlushResult:
         return FlushResult((), 0, 0)
+
+    def source_queue_snapshot(self, *, as_of: datetime) -> Mapping[str, object]:
+        assert as_of == NOW
+        return {
+            "pending_frames": 2,
+            "coalesced_bbo_frames": 7,
+            "oldest_pending_age_seconds": 0.25,
+        }
 
     def close(self) -> None:
         return None
@@ -361,6 +370,11 @@ def test_collector_status_atomic_write_stays_in_persistent_paper_directory(
     assert payload["mode"] == "readonly"
     assert payload["orders_enabled"] is False
     assert payload["network"] == "mainnet"
+    assert payload["observability"]["source_queue"] == {
+        "pending_frames": 2,
+        "coalesced_bbo_frames": 7,
+        "oldest_pending_age_seconds": 0.25,
+    }
     assert status_path.is_relative_to(persistent_root)
     assert not status_path.with_suffix(".tmp").exists()
 

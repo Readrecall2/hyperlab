@@ -1903,15 +1903,20 @@ def _fixed_paper_facts(
         }
     if check is EvidenceCheck.NORMALIZED_MARKET_EVENT_SCHEMA:
         return {
-            'adapter_schema_version': 8,
+            'adapter_schema_version': 9,
             'bbo_tradability_policy': (
                 'REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2'
             ),
             'causal_clock': 'RECEIVED_AT_UTC',
-            'feed_contract': 'SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_FIFO_V8',
+            'feed_contract': (
+                'SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_BOUNDED_PENDING_BBO_LATEST_VALUE_V9'
+            ),
             'gap_or_stale_action': 'PAUSE_AND_NO_EXECUTION',
             'malformed_bbo_policy': (
                 'TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1'
+            ),
+            'pending_bbo_coalescing': (
+                'LATEST_PER_INSTRUMENT_PER_UTC_MINUTE_BETWEEN_CONTROL_BARRIERS_V1'
             ),
             'global_connection_policy': (
                 'MULTI_INSTRUMENT_GLOBAL_EVENT_SORTED_ORDINAL_INITIAL_BOOTSTRAP_CONNECT_HEALTH_ONLY_V4'

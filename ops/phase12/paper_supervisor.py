@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +31,8 @@ DEFAULT_MINIMUM_FREE_BYTES = 5 * 1024**3
 DEFAULT_MINIMUM_FREE_PERCENT = 10.0
 DEFAULT_SERVICE_NAME = "hyperlab-paper.service"
 MAX_LOG_LINES = 30
+PAPER_REPORT_HEALTH_MAX_ATTEMPTS = 3
+PAPER_REPORT_HEALTH_RETRY_DELAY_SECONDS = 0.1
 _CREDENTIAL_ENV_MARKERS = (
     "PRIVATE_KEY",
     "SEED_PHRASE",
@@ -64,6 +68,24 @@ class DiskStatus:
             "minimum_free_bytes": self.minimum_free_bytes,
             "minimum_free_percent": self.minimum_free_percent,
             "ok": self.ok,
+        }
+
+
+@dataclass(frozen=True)
+class PaperReportRead:
+    payload: dict[str, Any] | None
+    attempts: int
+    status: str
+
+    def to_dict(self) -> dict[str, object]:
+        ready = self.status == "READY"
+        return {
+            "attempts": self.attempts,
+            "max_attempts": PAPER_REPORT_HEALTH_MAX_ATTEMPTS,
+            "retry_delay_seconds": PAPER_REPORT_HEALTH_RETRY_DELAY_SECONDS,
+            "retryable": not ready,
+            "status": self.status,
+            "transient_failures": self.attempts - 1 if ready else self.attempts,
         }
 
 
@@ -108,6 +130,69 @@ def _run_hyperlab_json(arguments: list[str]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("reviewed HyperLab command returned a non-object payload")
     return payload
+
+
+def _run_hyperlab_process(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "hyperlab", *arguments],
+        check=False,
+        capture_output=True,
+        env=_subprocess_environment(),
+        text=True,
+        timeout=900,
+    )
+
+
+def _decode_hyperlab_json(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    if completed.returncode != 0:
+        raise RuntimeError("reviewed HyperLab command refused")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("reviewed HyperLab command returned non-JSON output") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("reviewed HyperLab command returned a non-object payload")
+    return payload
+
+
+def _is_paper_report_head_changed(
+    arguments: list[str],
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    if arguments[:2] != ["paper", "report"] or completed.returncode != 2:
+        return False
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if "head_changed_retry" in output.casefold():
+        return True
+    return bool(
+        re.search(
+            r"paper\s+report\s+retry\s+required\s+for\b.*"
+            r"durable\s+head\s+changed\s+during\s+assembly",
+            output,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _run_paper_report_json(arguments: list[str]) -> PaperReportRead:
+    for attempt in range(1, PAPER_REPORT_HEALTH_MAX_ATTEMPTS + 1):
+        completed = _run_hyperlab_process(arguments)
+        if completed.returncode == 0:
+            return PaperReportRead(
+                payload=_decode_hyperlab_json(completed),
+                attempts=attempt,
+                status="READY",
+            )
+        if not _is_paper_report_head_changed(arguments, completed):
+            _decode_hyperlab_json(completed)
+            raise AssertionError("nonzero HyperLab command unexpectedly decoded")
+        if attempt < PAPER_REPORT_HEALTH_MAX_ATTEMPTS:
+            time.sleep(PAPER_REPORT_HEALTH_RETRY_DELAY_SECONDS)
+    return PaperReportRead(
+        payload=None,
+        attempts=PAPER_REPORT_HEALTH_MAX_ATTEMPTS,
+        status="HEAD_CHANGED_RETRY",
+    )
 
 
 def _verify_preflight(config_path: Path) -> dict[str, Any]:
@@ -455,6 +540,13 @@ def _wall_clock_stale_status(report: dict[str, Any], *, now: datetime) -> dict[s
     }
 
 
+def _service_main_pid(service: dict[str, object]) -> int:
+    value = service.get("main_pid", 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
 def build_health(
     config_path: Path,
     database: Path,
@@ -469,13 +561,15 @@ def build_health(
         _verify_preflight(config_path)
     except (OSError, RuntimeError, ValueError):
         readiness = "BLOCKED"
-    report = _run_hyperlab_json(
+    report_read = _run_paper_report_json(
         [
             "paper",
             "report",
             config.run_id,
             "--database",
             str(database),
+            "--after-sequence",
+            "0",
             "--timeline-limit",
             "1",
             "--day-limit",
@@ -484,12 +578,46 @@ def build_health(
             "30",
         ]
     )
+    report = report_read.payload
+    if report is None:
+        service = _systemctl_status(service_name)
+        process = _process_status(_service_main_pid(service))
+        disk = disk_status(
+            database,
+            minimum_free_bytes=minimum_free_bytes,
+            minimum_free_percent=minimum_free_percent,
+        )
+        return {
+            **_SAFE_BOUNDARY,
+            "active_order_count": None,
+            "active_position_count": None,
+            "blockers": ["HEAD_CHANGED_RETRY"],
+            "critical_incident_count": None,
+            "disk": disk.to_dict(),
+            "gap_count": None,
+            "integrity": "HEAD_CHANGED_RETRY",
+            "latest_logs": _journal_lines(service_name),
+            "paper_state": None,
+            "preflight_readiness": readiness,
+            "process": process,
+            "readiness": "TRANSIENT_UNAVAILABLE",
+            "reconciled": None,
+            "reconnect_count": None,
+            "report_read": report_read.to_dict(),
+            "run_id": config.run_id,
+            "runtime_session": None,
+            "service": service,
+            "source_status_at_durable_head": None,
+            "stale": None,
+            "status": "TRANSIENT_UNAVAILABLE",
+            "transient_unavailable": True,
+        }
     runtime = report["runtime"]
     source = runtime["source"]
     account = report["account"]
     risk = report["risk"]
     service = _systemctl_status(service_name)
-    process = _process_status(int(service.get("main_pid", 0)))
+    process = _process_status(_service_main_pid(service))
     disk = disk_status(
         database,
         minimum_free_bytes=minimum_free_bytes,
@@ -505,15 +633,18 @@ def build_health(
         "integrity": report["integrity"],
         "latest_logs": _journal_lines(service_name),
         "paper_state": runtime["state"],
+        "preflight_readiness": readiness,
         "process": process,
         "readiness": readiness,
         "reconciled": runtime["reconciled"],
         "reconnect_count": source["reconnect_count"],
+        "report_read": report_read.to_dict(),
         "run_id": config.run_id,
         "runtime_session": runtime["session"],
         "service": service,
         "source_status_at_durable_head": source["status"],
         "stale": _wall_clock_stale_status(report, now=datetime.now(tz=UTC)),
+        "transient_unavailable": False,
     }
 
 
@@ -561,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
                 minimum_free_percent=args.minimum_free_percent,
             )
             _print(payload)
-            return 0
+            return 2 if payload.get("status") == "TRANSIENT_UNAVAILABLE" else 0
 
         credential_names = _credential_environment_names()
         if credential_names:

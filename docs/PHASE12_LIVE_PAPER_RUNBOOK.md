@@ -675,6 +675,43 @@ sudo env -i \
   --minimum-free-bytes 5368709120 --minimum-free-percent 10
 ```
 
+Health invokes the bounded report at most three times: the initial call plus at most two supervisor
+retries, with a fixed 100 ms delay between matching transient failures (200 ms maximum added delay).
+A retry is allowed only for `paper report` exit 2 carrying either the explicit
+`HEAD_CHANGED_RETRY` marker or the established `paper report retry required ... durable head
+changed during assembly` diagnostic. Any other exit, malformed success payload, or integrity error
+is not retried and remains a fail-closed supervisor error.
+
+Every successful health payload includes `report_read` with `status=READY`, `attempts` (1-3),
+`max_attempts=3`, `retry_delay_seconds=0.1`, `transient_failures` (0-2), and
+`retryable=false`. If all three calls encounter the classified race, health exits 2 and returns an
+explicit degraded payload rather than `SUPERVISOR_ERROR_RUNTIMEERROR`:
+
+```json
+{
+  "status": "TRANSIENT_UNAVAILABLE",
+  "readiness": "TRANSIENT_UNAVAILABLE",
+  "preflight_readiness": "READY",
+  "integrity": "HEAD_CHANGED_RETRY",
+  "blockers": ["HEAD_CHANGED_RETRY"],
+  "transient_unavailable": true,
+  "report_read": {
+    "status": "HEAD_CHANGED_RETRY",
+    "attempts": 3,
+    "max_attempts": 3,
+    "retry_delay_seconds": 0.1,
+    "transient_failures": 3,
+    "retryable": true
+  }
+}
+```
+
+The degraded payload retains the paper-only boundary plus systemd, process, disk, and recent-log
+facts. Report-derived state/count/freshness fields are `null` because no same-head report was
+verified; operators must not infer `FLAT`, freshness, reconciliation, or integrity from them. Retry
+the health command later without stopping or mutating the runtime. A genuine report failure still
+exits 3 with `status=REFUSED` and a `SUPERVISOR_ERROR_*` blocker and requires investigation.
+
 Recent and follow-mode logs use journald; no separate mutable log file or credential is needed:
 
 ```bash

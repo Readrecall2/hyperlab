@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -8,6 +9,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import ops.phase12.paper_supervisor as paper_supervisor
 from hyperlab.cli import _phase12_paper_source_factory
 from hyperlab.paper.collector_source import HyperliquidPaperPublicSource
 from hyperlab.paper.engine import PaperEngine
@@ -53,6 +55,262 @@ def _flat_run(root: Path, config: PaperRunConfig | None = None) -> tuple[Path, P
     engine.reconcile(as_of=_START + timedelta(seconds=1))
     store.close()
     return database, frozen
+
+
+def _paper_report_payload(config: PaperRunConfig) -> dict[str, object]:
+    return {
+        "account": {"active_order_count": 0, "positions": {}},
+        "integrity": "HEAD_ANCHORS_VERIFIED_READONLY",
+        "risk": {"critical_incident_count": 0},
+        "runtime": {
+            "reconciled": True,
+            "session": {"active": True, "generation": 4, "unclosed": True},
+            "source": {"gap_count": 0, "reconnect_count": 0, "status": "OBSERVED"},
+            "state": "FLAT",
+        },
+    }
+
+
+def _completed_report(
+    *,
+    returncode: int,
+    stdout: str = "",
+    stderr: str = "",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["python", "-m", "hyperlab", "paper", "report"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _head_changed_result(run_id: str) -> subprocess.CompletedProcess[str]:
+    return _completed_report(
+        returncode=2,
+        stderr=(
+            "Invalid value:\nPaper report blocked:\n"
+            f"paper report retry required for {run_id}:\n"
+            "durable head changed during assembly"
+        ),
+    )
+
+
+def _install_health_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    config: PaperRunConfig,
+) -> None:
+    monkeypatch.setattr(paper_supervisor, "_load_config", lambda _path: config)
+    monkeypatch.setattr(
+        paper_supervisor,
+        "_verify_preflight",
+        lambda _path: {"status": "READY"},
+    )
+    monkeypatch.setattr(
+        paper_supervisor,
+        "_systemctl_status",
+        lambda _service_name: {"active_state": "active", "main_pid": 123},
+    )
+    monkeypatch.setattr(
+        paper_supervisor,
+        "_process_status",
+        lambda pid: {"available": True, "pid": pid},
+    )
+    monkeypatch.setattr(
+        paper_supervisor,
+        "disk_status",
+        lambda _database, *, minimum_free_bytes, minimum_free_percent: (
+            paper_supervisor.DiskStatus(
+                ok=True,
+                database_size_bytes=4096,
+                filesystem_free_bytes=10_000_000_000,
+                filesystem_free_percent=50.0,
+                minimum_free_bytes=minimum_free_bytes,
+                minimum_free_percent=minimum_free_percent,
+            )
+        ),
+    )
+    monkeypatch.setattr(paper_supervisor, "_journal_lines", lambda _service_name: [])
+    monkeypatch.setattr(
+        paper_supervisor,
+        "_wall_clock_stale_status",
+        lambda _report, *, now: {"evaluated_at": now.isoformat()},
+    )
+
+
+def test_supervisor_health_report_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    _install_health_facts(monkeypatch, config)
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        return _completed_report(
+            returncode=0,
+            stdout=json.dumps(_paper_report_payload(config)),
+        )
+
+    monkeypatch.setattr(paper_supervisor, "_run_hyperlab_process", run)
+    monkeypatch.setattr(paper_supervisor.time, "sleep", sleeps.append)
+
+    health = paper_supervisor.build_health(Path("config.json"), Path("paper.sqlite3"))
+
+    assert health["integrity"] == "HEAD_ANCHORS_VERIFIED_READONLY"
+    assert health["report_read"] == {
+        "attempts": 1,
+        "max_attempts": 3,
+        "retry_delay_seconds": 0.1,
+        "retryable": False,
+        "status": "READY",
+        "transient_failures": 0,
+    }
+    assert calls == [
+        [
+            "paper",
+            "report",
+            config.run_id,
+            "--database",
+            "paper.sqlite3",
+            "--after-sequence",
+            "0",
+            "--timeline-limit",
+            "1",
+            "--day-limit",
+            "1",
+            "--alert-limit",
+            "30",
+        ]
+    ]
+    assert sleeps == []
+    assert health["authorizes_real_money"] is False
+    assert health["orders_enabled"] is False
+    assert health["credential_scope"] == "NONE"
+    assert health["execution_network"] == "NONE"
+
+
+def test_supervisor_health_retries_one_head_change_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    _install_health_facts(monkeypatch, config)
+    results = [
+        _head_changed_result(config.run_id),
+        _completed_report(returncode=0, stdout=json.dumps(_paper_report_payload(config))),
+    ]
+    sleeps: list[float] = []
+    monkeypatch.setattr(paper_supervisor, "_run_hyperlab_process", lambda _arguments: results.pop(0))
+    monkeypatch.setattr(paper_supervisor.time, "sleep", sleeps.append)
+
+    health = paper_supervisor.build_health(Path("config.json"), Path("paper.sqlite3"))
+
+    assert health["integrity"] == "HEAD_ANCHORS_VERIFIED_READONLY"
+    assert health["report_read"] == {
+        "attempts": 2,
+        "max_attempts": 3,
+        "retry_delay_seconds": 0.1,
+        "retryable": False,
+        "status": "READY",
+        "transient_failures": 1,
+    }
+    assert sleeps == [0.1]
+
+
+def test_supervisor_health_exhausts_head_change_as_explicit_transient_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    _install_health_facts(monkeypatch, config)
+    calls = 0
+    sleeps: list[float] = []
+
+    def run(_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        return _head_changed_result(config.run_id)
+
+    monkeypatch.setattr(paper_supervisor, "_run_hyperlab_process", run)
+    monkeypatch.setattr(paper_supervisor.time, "sleep", sleeps.append)
+
+    health = paper_supervisor.build_health(Path("config.json"), Path("paper.sqlite3"))
+
+    assert calls == 3
+    assert sleeps == [0.1, 0.1]
+    assert health["status"] == "TRANSIENT_UNAVAILABLE"
+    assert health["readiness"] == "TRANSIENT_UNAVAILABLE"
+    assert health["integrity"] == "HEAD_CHANGED_RETRY"
+    assert health["blockers"] == ["HEAD_CHANGED_RETRY"]
+    assert health["transient_unavailable"] is True
+    assert health["paper_state"] is None
+    assert health["report_read"] == {
+        "attempts": 3,
+        "max_attempts": 3,
+        "retry_delay_seconds": 0.1,
+        "retryable": True,
+        "status": "HEAD_CHANGED_RETRY",
+        "transient_failures": 3,
+    }
+    assert health["authorizes_real_money"] is False
+    assert health["orders_enabled"] is False
+
+    printed: list[dict[str, object]] = []
+    monkeypatch.setattr(paper_supervisor, "build_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(paper_supervisor, "_print", printed.append)
+    exit_code = paper_supervisor.main(
+        [
+            "health",
+            "--config",
+            "config.json",
+            "--database",
+            "paper.sqlite3",
+        ]
+    )
+    assert exit_code == 2
+    assert printed == [health]
+
+
+def test_supervisor_health_genuine_report_error_fails_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    _install_health_facts(monkeypatch, config)
+    calls = 0
+    sleeps: list[float] = []
+
+    def run(_arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        return _completed_report(returncode=2, stderr="genuine report integrity failure")
+
+    monkeypatch.setattr(paper_supervisor, "_run_hyperlab_process", run)
+    monkeypatch.setattr(paper_supervisor.time, "sleep", sleeps.append)
+
+    with pytest.raises(RuntimeError, match="reviewed HyperLab command refused"):
+        paper_supervisor.build_health(Path("config.json"), Path("paper.sqlite3"))
+
+    assert calls == 1
+    assert sleeps == []
+
+    def fail_health(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("reviewed HyperLab command refused")
+
+    printed: list[dict[str, object]] = []
+    monkeypatch.setattr(paper_supervisor, "build_health", fail_health)
+    monkeypatch.setattr(paper_supervisor, "_print", printed.append)
+    exit_code = paper_supervisor.main(
+        [
+            "health",
+            "--config",
+            "config.json",
+            "--database",
+            "paper.sqlite3",
+        ]
+    )
+    assert exit_code == 3
+    assert printed[0]["status"] == "REFUSED"
+    assert printed[0]["blockers"] == ["SUPERVISOR_ERROR_RUNTIMEERROR"]
 
 
 def test_supervisor_admits_only_safe_flat_stopped_run(tmp_path: Path) -> None:

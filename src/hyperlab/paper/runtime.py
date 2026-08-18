@@ -21,6 +21,7 @@ from hyperlab.paper.models import (
     PaperProjection,
     PaperRunConfig,
     PaperState,
+    PaperStrategyConfig,
     decimal_text,
     deterministic_id,
     parse_utc,
@@ -32,6 +33,7 @@ from hyperlab.paper.runner import (
     PaperRunner,
     PaperRunnerResult,
     PaperStrategyView,
+    PortfolioRunner,
 )
 from hyperlab.paper.store import PaperStore, RunNotFoundError
 
@@ -332,7 +334,7 @@ class PaperRuntime:
     def __init__(
         self,
         engine: PaperEngine,
-        strategy: FrozenPaperStrategy,
+        strategy: FrozenPaperStrategy | Iterable[FrozenPaperStrategy],
         source: NormalizedPublicMarketSource,
         *,
         config: PaperRuntimeConfig | None = None,
@@ -344,13 +346,38 @@ class PaperRuntime:
         if not isinstance(descriptor, PublicSourceDescriptor):
             raise TypeError("source descriptor must be a PublicSourceDescriptor")
         self.engine = engine
-        self._strategy = strategy
+        if engine.config.strategies:
+            strategy_adapters: tuple[FrozenPaperStrategy, ...]
+            if hasattr(strategy, "decide"):
+                strategy_adapters = (cast(FrozenPaperStrategy, strategy),)
+            else:
+                strategy_adapters = tuple(strategy)
+            try:
+                self._runner: PaperRunner | PortfolioRunner = PortfolioRunner(
+                    engine,
+                    strategy_adapters,
+                )
+            except ValueError as error:
+                raise PaperAdmissionError(
+                    "paper strategy differs from the frozen paper configuration"
+                ) from error
+            self._strategy = strategy_adapters[0]
+        else:
+            if not hasattr(strategy, "decide"):
+                raise TypeError("legacy paper runtime requires exactly one strategy adapter")
+            self._strategy = cast(FrozenPaperStrategy, strategy)
+            try:
+                self._runner = PaperRunner(engine, self._strategy)
+            except ValueError as error:
+                raise PaperAdmissionError(
+                    "paper strategy differs from the frozen paper configuration"
+                ) from error
         self._source = source
         self.config = config or PaperRuntimeConfig()
         self._clock = clock
         self._expected_config_hash = engine.config.config_hash
-        self._expected_strategy_name = strategy.strategy_name
-        self._expected_strategy_hash = strategy.strategy_hash
+        self._expected_strategy_name = self._strategy.strategy_name
+        self._expected_strategy_hash = self._strategy.strategy_hash
         self._expected_source = descriptor
         self._stop_requested = Event()
         self._stop_notified = False
@@ -377,7 +404,6 @@ class PaperRuntime:
         self._strategy_restore_commit_sequence = 0
         self._verify_release_code()
         self._verify_frozen_bindings()
-        self._runner = PaperRunner(engine, strategy)
 
     def __enter__(self) -> Self:
         return self
@@ -414,16 +440,26 @@ class PaperRuntime:
             != self.engine.config.runtime_source_poll_timeout_seconds
         ):
             raise PaperAdmissionError("paper runtime cadence differs from the frozen run configuration")
-        if (
-            self._strategy.strategy_name != self._expected_strategy_name
-            or self._strategy.strategy_hash != self._expected_strategy_hash
-        ):
-            raise PaperAdmissionError("frozen paper strategy identity changed during the run")
-        if (
-            self.engine.config.strategy_name != self._expected_strategy_name
-            or self.engine.config.strategy_hash != self._expected_strategy_hash
-        ):
-            raise PaperAdmissionError("paper strategy differs from the frozen paper configuration")
+        if isinstance(self._runner, PortfolioRunner):
+            for strategy_config, adapter in self._runner.strategies:
+                if (
+                    getattr(adapter, "strategy_id", None) != strategy_config.strategy_id
+                    or adapter.strategy_name != strategy_config.strategy_name
+                    or adapter.strategy_hash != strategy_config.strategy_hash
+                    or getattr(adapter, "strategy_config_hash", None) != strategy_config.strategy_config_hash
+                ):
+                    raise PaperAdmissionError("frozen portfolio strategy identity changed during the run")
+        else:
+            if (
+                self._strategy.strategy_name != self._expected_strategy_name
+                or self._strategy.strategy_hash != self._expected_strategy_hash
+            ):
+                raise PaperAdmissionError("frozen paper strategy identity changed during the run")
+            if (
+                self.engine.config.strategy_name != self._expected_strategy_name
+                or self.engine.config.strategy_hash != self._expected_strategy_hash
+            ):
+                raise PaperAdmissionError("paper strategy differs from the frozen paper configuration")
         descriptor = self._source.descriptor
         if not isinstance(descriptor, PublicSourceDescriptor) or descriptor != self._expected_source:
             raise PaperAdmissionError("normalized public source identity changed during the run")
@@ -443,6 +479,7 @@ class PaperRuntime:
             raise PaperAdmissionError("current paper release code digest could not be verified") from error
         if current != self.engine.config.release_code_sha256:
             raise PaperAdmissionError("paper release code differs from frozen run identity")
+
     def _verify_runtime_environment(self) -> None:
         try:
             from hyperlab.environment_authorization import (
@@ -455,9 +492,7 @@ class PaperRuntime:
                 "current paper runtime environment digest could not be verified"
             ) from error
         if current != self.engine.config.runtime_environment_sha256:
-            raise PaperAdmissionError(
-                "paper runtime environment differs from frozen run identity"
-            )
+            raise PaperAdmissionError("paper runtime environment differs from frozen run identity")
 
     def _now(self) -> datetime:
         current = _utc_clock_value(self._clock())
@@ -739,9 +774,7 @@ class PaperRuntime:
             )
         except InterruptedError as error:
             if self.stopped:
-                raise PaperStartupInterrupted(
-                    "paper startup interrupted by cooperative stop"
-                ) from error
+                raise PaperStartupInterrupted("paper startup interrupted by cooperative stop") from error
             raise
         started = preparation.started
         if started.projection.last_received_at is not None and as_of < started.projection.last_received_at:
@@ -759,9 +792,7 @@ class PaperRuntime:
             )
         except InterruptedError as error:
             if self.stopped:
-                raise PaperStartupInterrupted(
-                    "paper startup interrupted by cooperative stop"
-                ) from error
+                raise PaperStartupInterrupted("paper startup interrupted by cooperative stop") from error
             raise
         projection = reconciled.projection
         if not projection.reconciled or projection.state is PaperState.MANUAL_REVIEW:
@@ -870,36 +901,51 @@ class PaperRuntime:
         if not incremental:
             self._latest_markets.clear()
             self._bootstrap_connect_health.clear()
-        after_commit_sequence = self._strategy_restore_commit_sequence if incremental else 0
-        restore = (
-            getattr(self._strategy, "restore_incremental", None)
-            if incremental
-            else getattr(self._strategy, "restore", None)
-        )
-        if incremental and restore is None:
-            after_commit_sequence = 0
-            restore = getattr(self._strategy, "restore", None)
-        markets = self._durable_markets(
-            after_commit_sequence=after_commit_sequence,
-        )
-        try:
-            if restore is None:
-                for _market in markets:
-                    pass
-            else:
-                if not callable(restore):
-                    raise PaperAdmissionError(
-                        "paper strategy restore attribute must be callable"
+        bindings: Iterable[tuple[PaperStrategyConfig | None, FrozenPaperStrategy]]
+        if isinstance(self._runner, PortfolioRunner):
+            bindings = self._runner.strategies
+        else:
+            bindings = ((None, self._strategy),)
+        for strategy_config, adapter in bindings:
+            after_commit_sequence = self._strategy_restore_commit_sequence if incremental else 0
+            restore = (
+                getattr(adapter, "restore_incremental", None)
+                if incremental
+                else getattr(adapter, "restore", None)
+            )
+            if incremental and restore is None:
+                after_commit_sequence = 0
+                restore = getattr(adapter, "restore", None)
+            markets = self._durable_markets(
+                after_commit_sequence=after_commit_sequence,
+            )
+            try:
+                if restore is None:
+                    for _market in markets:
+                        pass
+                else:
+                    if not callable(restore):
+                        raise PaperAdmissionError("paper strategy restore attribute must be callable")
+                    restore(
+                        markets,
+                        PaperStrategyView.from_projection(
+                            projection,
+                            strategy_config,
+                        ),
                     )
-                restore(markets, PaperStrategyView.from_projection(projection))
-        except PaperStartupInterrupted:
-            raise
-        except (KeyError, TypeError, ValueError) as error:
-            raise PaperAdmissionError("paper strategy state restoration failed closed") from error
+            except PaperStartupInterrupted:
+                raise
+            except (KeyError, TypeError, ValueError) as error:
+                strategy_label = (
+                    strategy_config.strategy_id
+                    if strategy_config is not None
+                    else self._expected_strategy_name
+                )
+                raise PaperAdmissionError(
+                    f"paper strategy state restoration failed closed: {strategy_label}"
+                ) from error
         self._check_startup_interrupted()
-        self._strategy_restore_commit_sequence = self.engine.store.get_run(
-            self.engine.run_id
-        ).commit_sequence
+        self._strategy_restore_commit_sequence = self.engine.store.get_run(self.engine.run_id).commit_sequence
 
     def _bootstrap_complete(self, *, as_of: datetime) -> bool:
         if self._steady_state_armed:
@@ -1002,6 +1048,21 @@ class PaperRuntime:
             PaperState.HEDGE_PENDING,
             PaperState.EXIT_PENDING,
         }
+        if projection.strategy_projections:
+            deadlines = tuple(
+                strategy.state_since
+                + timedelta(
+                    seconds=self.engine.config.strategy_config(strategy_id).risk.unhedged_timeout_seconds
+                )
+                for strategy_id, strategy in projection.strategy_projections.items()
+                if strategy.positions
+                and strategy.state_since is not None
+                and (
+                    strategy.state in pending_states
+                    or (strategy.state is PaperState.PAUSED and strategy.suspended_from in pending_states)
+                )
+            )
+            return min(deadlines, default=None)
         state = projection.state
         if state is PaperState.PAUSED and projection.suspended_from in pending_states:
             state = projection.suspended_from
@@ -1035,6 +1096,32 @@ class PaperRuntime:
         self,
         projection: PaperProjection,
     ) -> bool:
+        if projection.strategy_projections:
+            decision_ids = tuple(
+                strategy.current_exit_decision_id
+                for strategy in projection.strategy_projections.values()
+                if strategy.current_exit_decision_id is not None
+            )
+            for strategy_decision_id in decision_ids:
+                record = self.engine.store.get_input(
+                    self.engine.run_id,
+                    strategy_decision_id,
+                )
+                if record is None:
+                    raise PaperAdmissionError(
+                        "current strategy emergency exit lacks a durable canonical input"
+                    )
+                raw_decision = record.payload.get("decision")
+                if not isinstance(raw_decision, Mapping):
+                    raise PaperAdmissionError("current strategy emergency exit input is malformed")
+                orders = tuple(
+                    order
+                    for order in projection.orders.values()
+                    if order.intent.decision_id == strategy_decision_id
+                )
+                if raw_decision.get("action") == "EXIT" and any(order.status.active for order in orders):
+                    return True
+            return False
         decision_id = projection.current_exit_decision_id
         if decision_id is None:
             return False
@@ -1063,7 +1150,16 @@ class PaperRuntime:
             raise PaperAdmissionError("automatic emergency flatten clock precedes durable state")
         markets: dict[str, MarketEvent] = {}
         stale_after = timedelta(seconds=self.engine.config.risk.stale_after_seconds)
-        for instrument in sorted(projection.positions):
+        instruments = (
+            {
+                instrument
+                for strategy in projection.strategy_projections.values()
+                for instrument in strategy.positions
+            }
+            if projection.strategy_projections
+            else set(projection.positions)
+        )
+        for instrument in sorted(instruments):
             market = self._latest_markets.get(instrument)
             if market is None:
                 return None
@@ -1087,13 +1183,18 @@ class PaperRuntime:
         *,
         as_of: datetime,
     ) -> PaperCommandResult | None:
+        has_attributed_position = (
+            any(strategy.positions for strategy in projection.strategy_projections.values())
+            if projection.strategy_projections
+            else bool(projection.positions)
+        )
         if (
             projection.state
             not in {
                 PaperState.EMERGENCY_FLATTEN,
                 PaperState.REDUCE_ONLY,
             }
-            or not projection.positions
+            or not has_attributed_position
             or self._runtime_emergency_exit_is_active(projection)
         ):
             return None

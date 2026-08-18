@@ -24,6 +24,8 @@ from hyperlab.paper.models import (
     PaperRiskLimits,
     PaperRunConfig,
     PaperState,
+    PaperStrategyConfig,
+    PaperStrategyProjection,
     StoredPaperEvent,
     TimeInForce,
     deterministic_id,
@@ -35,6 +37,7 @@ from hyperlab.paper.runner import (
     PaperRunner,
     PaperRunnerResult,
     PaperStrategyView,
+    PortfolioRunner,
 )
 from hyperlab.paper.store import (
     AppendResult,
@@ -81,7 +84,10 @@ __all__ = [
     "PaperRunnerResult",
     "PaperState",
     "PaperStore",
+    "PaperStrategyConfig",
+    "PaperStrategyProjection",
     "PaperStrategyView",
+    "PortfolioRunner",
     "RiskDecision",
     "RunConflictError",
     "RunNotFoundError",

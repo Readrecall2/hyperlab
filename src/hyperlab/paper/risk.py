@@ -48,8 +48,20 @@ def _price_for_order(order: OrderIntent, market: MarketEvent) -> Decimal:
     return market.ask_price if order.side is OrderSide.BUY else market.bid_price
 
 
-def is_risk_reducing(projection: PaperProjection, order: OrderIntent) -> bool:
-    current = projection.positions.get(order.instrument, Decimal(0))
+def is_risk_reducing(
+    projection: PaperProjection,
+    order: OrderIntent,
+    *,
+    strategy_id: str | None = None,
+) -> bool:
+    if strategy_id is None:
+        positions = projection.positions
+        active_orders = projection.active_orders
+    else:
+        strategy = projection.strategy_projection(strategy_id)
+        positions = strategy.positions
+        active_orders = projection.strategy_active_orders(strategy_id)
+    current = positions.get(order.instrument, Decimal(0))
     if current == 0:
         return False
     # Reserve already accepted reduce-only remainders before accepting another
@@ -58,7 +70,7 @@ def is_risk_reducing(projection: PaperProjection, order: OrderIntent) -> bool:
     reserved = sum(
         (
             cast(OrderSide, pending.intent.side).sign * pending.remaining_quantity
-            for pending in projection.active_orders
+            for pending in active_orders
             if pending.intent.instrument == order.instrument and pending.intent.reduce_only
         ),
         Decimal(0),
@@ -76,6 +88,8 @@ def evaluate_order_risk(
     order: OrderIntent,
     market: MarketEvent,
     limits: PaperRiskLimits,
+    *,
+    strategy_id: str | None = None,
 ) -> RiskDecision:
     """Fail-closed pre-acceptance check including worst-case open-order reservations."""
 
@@ -83,18 +97,42 @@ def evaluate_order_risk(
         raise ValueError("risk check order belongs to another run")
     if market.instrument != order.instrument:
         raise ValueError("risk check market event does not match the order instrument")
+    if strategy_id is not None and order.strategy_id != strategy_id:
+        raise ValueError("risk check scope differs from the order strategy_id")
     price = _price_for_order(order, market)
     order_notional = order.quantity * price
-    reducing = is_risk_reducing(projection, order)
+    reducing_scope = strategy_id
+    if strategy_id is None and projection.strategy_projections and order.strategy_id is not None:
+        reducing_scope = order.strategy_id
+    reducing = is_risk_reducing(
+        projection,
+        order,
+        strategy_id=reducing_scope,
+    )
     reasons: list[str] = []
-    projected_active_orders = len(projection.active_orders) + 1
+    if strategy_id is None:
+        state = projection.state
+        positions = projection.positions
+        active_orders = projection.active_orders
+        current_equity = projection.equity
+        session_start_equity = projection.session_start_equity
+        peak_equity = projection.peak_equity
+    else:
+        strategy = projection.strategy_projection(strategy_id)
+        state = strategy.state
+        positions = strategy.positions
+        active_orders = projection.strategy_active_orders(strategy_id)
+        current_equity = strategy.equity(projection.marks)
+        session_start_equity = strategy.session_start_equity
+        peak_equity = strategy.peak_equity
+    projected_active_orders = len(active_orders) + 1
 
-    if projection.state is PaperState.MANUAL_REVIEW:
+    if state is PaperState.MANUAL_REVIEW:
         reasons.append("manual review blocks every new simulated order")
     if order.reduce_only and not reducing:
         reasons.append("reduce_only order would not reduce the existing position")
     if (
-        projection.state
+        state
         in {
             PaperState.PAUSED,
             PaperState.REDUCE_ONLY,
@@ -102,7 +140,7 @@ def evaluate_order_risk(
         }
         and not reducing
     ):
-        reasons.append(f"state {projection.state.value} permits risk reduction only")
+        reasons.append(f"state {state.value} permits risk reduction only")
     if order.created_at - market.received_at > timedelta(seconds=limits.stale_after_seconds) and not reducing:
         reasons.append("public market observation is older than stale_after_seconds")
     if (market.stale or market.gap) and not reducing:
@@ -116,28 +154,38 @@ def evaluate_order_risk(
     if projected_active_orders > limits.max_concurrent_orders and not reducing:
         reasons.append("active orders exceed max_concurrent_orders")
 
-    current_equity = projection.equity
-    if projection.session_start_equity - current_equity >= limits.max_daily_loss and not reducing:
+    if session_start_equity - current_equity >= limits.max_daily_loss and not reducing:
         reasons.append("daily loss limit permits risk reduction only")
-    if projection.peak_equity - current_equity >= limits.max_drawdown and not reducing:
+    if peak_equity - current_equity >= limits.max_drawdown and not reducing:
         reasons.append("drawdown limit permits risk reduction only")
 
     current_gross = Decimal(0)
     current_net = Decimal(0)
-    for instrument, quantity in projection.positions.items():
+    if strategy_id is None and projection.strategy_projections:
+        gross_positions = tuple(
+            (instrument, quantity)
+            for strategy in projection.strategy_projections.values()
+            for instrument, quantity in strategy.positions.items()
+        )
+    else:
+        gross_positions = tuple(positions.items())
+    for instrument, quantity in gross_positions:
         mark = price if instrument == order.instrument else projection.marks.get(instrument)
         if mark is None:
             reasons.append(f"missing mark for existing position {instrument}")
             continue
         notional = quantity * mark
         current_gross += abs(notional)
-        current_net += notional
+    for instrument, quantity in positions.items():
+        mark = price if instrument == order.instrument else projection.marks.get(instrument)
+        if mark is not None:
+            current_net += quantity * mark
 
     reserved_gross = Decimal(0)
     reserved_net = Decimal(0)
     reserved_instrument = Decimal(0)
     reserved_instrument_quantity = Decimal(0)
-    for pending in projection.active_orders:
+    for pending in active_orders:
         pending_price = (
             price
             if pending.intent.instrument == order.instrument
@@ -153,8 +201,24 @@ def evaluate_order_risk(
             reserved_instrument += pending_notional
             reserved_instrument_quantity += pending.remaining_quantity
 
-    existing_instrument = abs(projection.positions.get(order.instrument, Decimal(0)) * price)
-    existing_quantity = abs(projection.positions.get(order.instrument, Decimal(0)))
+    if strategy_id is None and projection.strategy_projections:
+        existing_instrument = sum(
+            (
+                abs(strategy.positions.get(order.instrument, Decimal(0)) * price)
+                for strategy in projection.strategy_projections.values()
+            ),
+            Decimal(0),
+        )
+        existing_quantity = sum(
+            (
+                abs(strategy.positions.get(order.instrument, Decimal(0)))
+                for strategy in projection.strategy_projections.values()
+            ),
+            Decimal(0),
+        )
+    else:
+        existing_instrument = abs(positions.get(order.instrument, Decimal(0)) * price)
+        existing_quantity = abs(positions.get(order.instrument, Decimal(0)))
     projected_gross = current_gross + reserved_gross + order_notional
     projected_net = abs(current_net + reserved_net + cast(OrderSide, order.side).sign * order_notional)
     projected_instrument = existing_instrument + reserved_instrument + order_notional

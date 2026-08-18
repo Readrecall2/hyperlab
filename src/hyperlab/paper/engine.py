@@ -164,9 +164,7 @@ class PaperEngine:
                 damaged = self.projection()
                 self.reconcile(as_of=damaged.last_received_at or self.config.validation_started_at)
                 if isinstance(error, _LedgerReconciliationError):
-                    raise ValueError(
-                        "paper ledger does not reconcile: " + str(error)
-                    ) from error
+                    raise ValueError("paper ledger does not reconcile: " + str(error)) from error
                 raise
 
         input_id = deterministic_id("paper_input_run_started", self.run_id)
@@ -180,6 +178,22 @@ class PaperEngine:
             started = duplicate
         else:
             projection = self.projection()
+            run_payload: dict[str, object] = {
+                "config_hash": self.config.config_hash,
+                "run_kind": self.config.run_kind,
+                "strategy_hash": self.config.strategy_hash,
+            }
+            if self.config.strategies:
+                run_payload["portfolio_id"] = self.config.portfolio_id
+                run_payload["strategies"] = [
+                    {
+                        "strategy_config_hash": strategy.strategy_config_hash,
+                        "strategy_hash": strategy.strategy_hash,
+                        "strategy_id": strategy.strategy_id,
+                        "strategy_name": strategy.strategy_name,
+                    }
+                    for strategy in self.config.strategy_configs
+                ]
             event = PaperEvent.create(
                 run_id=self.run_id,
                 event_type=PaperEventType.RUN_STARTED,
@@ -187,11 +201,7 @@ class PaperEngine:
                 received_at=self.config.validation_started_at,
                 causation_id=None,
                 correlation_id=self.run_id,
-                payload={
-                    "config_hash": self.config.config_hash,
-                    "run_kind": self.config.run_kind,
-                    "strategy_hash": self.config.strategy_hash,
-                },
+                payload=run_payload,
             )
             transaction_id = deterministic_id("paper_initial_capital", self.run_id)
             entries = (
@@ -383,7 +393,21 @@ class PaperEngine:
     ) -> PaperCommandResult:
         if decision.run_id != self.run_id:
             raise ValueError("decision belongs to another paper run")
-        if decision.strategy_name != self.config.strategy_name:
+        strategy_config = None
+        if self.config.strategies:
+            if decision.strategy_id is None:
+                raise ValueError("multi-strategy decisions require explicit strategy identity")
+            try:
+                strategy_config = self.config.strategy_config(decision.strategy_id)
+            except KeyError as error:
+                raise ValueError("decision references an unknown strategy_id") from error
+            if (
+                decision.strategy_name != strategy_config.strategy_name
+                or decision.strategy_hash != strategy_config.strategy_hash
+                or decision.strategy_config_hash != strategy_config.strategy_config_hash
+            ):
+                raise ValueError("decision strategy differs from the frozen strategy configuration")
+        elif decision.strategy_id is not None or decision.strategy_name != self.config.strategy_name:
             raise ValueError("decision strategy differs from the frozen strategy")
         markets = {market.instrument: market} if isinstance(market, MarketEvent) else dict(market)
         if not markets or any(key != value.instrument for key, value in markets.items()):
@@ -416,9 +440,14 @@ class PaperEngine:
             raise ValueError("decision processing time cannot precede durable paper state")
         if projection.state is PaperState.MANUAL_REVIEW:
             raise IntegrityError(self.store.verify_integrity(self.run_id, raise_on_error=False))
-        if decision.action is DecisionAction.ENTRY and projection.state is not PaperState.FLAT:
+        decision_state = (
+            projection.strategy_projection(decision.strategy_id).state
+            if decision.strategy_id is not None
+            else projection.state
+        )
+        if decision.action is DecisionAction.ENTRY and decision_state is not PaperState.FLAT:
             raise ValueError("ENTRY decisions are accepted only from FLAT")
-        if decision.action is DecisionAction.EXIT and projection.state not in {
+        if decision.action is DecisionAction.EXIT and decision_state not in {
             PaperState.HEDGED,
             PaperState.PAUSED,
             PaperState.REDUCE_ONLY,
@@ -430,13 +459,16 @@ class PaperEngine:
         working = projection.clone()
 
         def emit(event_type: PaperEventType, payload: Mapping[str, object]) -> PaperEvent:
+            event_payload = dict(payload)
+            if decision.strategy_id is not None:
+                event_payload["strategy_id"] = decision.strategy_id
             event = self._event(
                 event_type,
                 at=processed,
                 received_at=processed,
                 causation_id=decision.decision_id,
                 correlation_id=decision.decision_id,
-                payload=payload,
+                payload=event_payload,
                 ordinal=len(events),
             )
             apply_event(working, event)
@@ -455,10 +487,15 @@ class PaperEngine:
         planning_state = (
             PaperState.ENTRY_PLANNED if decision.action is DecisionAction.ENTRY else PaperState.EXIT_PLANNED
         )
+        working_state = (
+            working.strategy_projection(decision.strategy_id).state
+            if decision.strategy_id is not None
+            else working.state
+        )
         protective_exit_state = (
-            working.state
+            working_state
             if decision.action is DecisionAction.EXIT
-            and working.state
+            and working_state
             in {
                 PaperState.PAUSED,
                 PaperState.REDUCE_ONLY,
@@ -469,7 +506,7 @@ class PaperEngine:
         if protective_exit_state is None:
             emit(
                 PaperEventType.STATE_TRANSITIONED,
-                self._transition_payload(working.state, planning_state, "strategy decision"),
+                self._transition_payload(working_state, planning_state, "strategy decision"),
             )
         accepted = 0
         for order in decision.orders:
@@ -480,7 +517,31 @@ class PaperEngine:
                 {"action": cast(DecisionAction, decision.action).value, "order": order.to_dict()},
             )
             order_market = markets[order.instrument]
-            risk = evaluate_order_risk(working, order, order_market, self.config.risk)
+            strategy_risk = (
+                evaluate_order_risk(
+                    working,
+                    order,
+                    order_market,
+                    strategy_config.risk,
+                    strategy_id=decision.strategy_id,
+                )
+                if strategy_config is not None
+                else None
+            )
+            portfolio_risk = evaluate_order_risk(
+                working,
+                order,
+                order_market,
+                self.config.risk,
+            )
+            risk = (
+                strategy_risk if strategy_risk is not None and not strategy_risk.accepted else portfolio_risk
+            )
+            rejection_scope = (
+                "STRATEGY"
+                if strategy_risk is not None and not strategy_risk.accepted
+                else ("PORTFOLIO" if not portfolio_risk.accepted else None)
+            )
             if risk.accepted and self.config.execution.cost_schedule is not None:
                 try:
                     self.config.execution.cost_schedule.lookup(
@@ -488,6 +549,7 @@ class PaperEngine:
                         order.instrument,
                     )
                 except ValueError as error:
+                    rejection_scope = "EXECUTION"
                     risk = type(risk)(
                         accepted=False,
                         reasons=(f"point-in-time cost schedule unavailable: {error}",),
@@ -499,10 +561,19 @@ class PaperEngine:
                         projected_active_orders=risk.projected_active_orders,
                         risk_reducing=risk.risk_reducing,
                     )
+            risk_payload = risk.to_dict()
+            if strategy_risk is not None:
+                risk_payload.update(
+                    {
+                        "portfolio": portfolio_risk.to_dict(),
+                        "rejection_scope": rejection_scope,
+                        "strategy": strategy_risk.to_dict(),
+                    }
+                )
             if not risk.accepted:
                 emit(
                     PaperEventType.RISK_REJECTED,
-                    {"order_id": order.order_id, "risk": risk.to_dict()},
+                    {"order_id": order.order_id, "risk": risk_payload},
                 )
                 emit(
                     PaperEventType.ALERT_RAISED,
@@ -527,7 +598,7 @@ class PaperEngine:
                 {
                     "ack_due_at": utc_text(ack_due),
                     "order_id": order.order_id,
-                    "risk": risk.to_dict(),
+                    "risk": risk_payload,
                 },
             )
             if ack_due <= processed:
@@ -551,10 +622,15 @@ class PaperEngine:
             target = PaperState.EXIT_PENDING if accepted else protective_exit_state
         else:
             target = PaperState.EXIT_PENDING if accepted else PaperState.HEDGED
-        if target is not working.state:
+        final_state = (
+            working.strategy_projection(decision.strategy_id).state
+            if decision.strategy_id is not None
+            else working.state
+        )
+        if target is not final_state:
             emit(
                 PaperEventType.STATE_TRANSITIONED,
-                self._transition_payload(working.state, target, "orders planned"),
+                self._transition_payload(final_state, target, "orders planned"),
             )
         return self._commit(
             input_id=decision.decision_id,
@@ -612,13 +688,20 @@ class PaperEngine:
             *,
             causation_id: str | None = None,
         ) -> PaperEvent:
+            event_payload = dict(payload)
+            raw_order_id = event_payload.get("order_id")
+            if isinstance(raw_order_id, str) and raw_order_id in working.orders:
+                event_payload = self._order_event_payload(
+                    working.orders[raw_order_id],
+                    event_payload,
+                )
             event = self._event(
                 event_type,
                 at=processed,
                 received_at=processed,
                 causation_id=causation_id or market.event_id,
                 correlation_id=causation_id or market.event_id,
-                payload=payload,
+                payload=event_payload,
                 ordinal=len(events),
             )
             apply_event(working, event)
@@ -889,7 +972,10 @@ class PaperEngine:
             received_at=requested_at,
             causation_id=command_id,
             correlation_id=order.intent.decision_id,
-            payload={"cancel_effective_at": utc_text(effective), "order_id": order_id},
+            payload=self._order_event_payload(
+                order,
+                {"cancel_effective_at": utc_text(effective), "order_id": order_id},
+            ),
         )
         return self._commit(
             input_id=command_id,
@@ -1069,6 +1155,7 @@ class PaperEngine:
         if projection.last_received_at is not None and processed < projection.last_received_at:
             raise ValueError("funding processing time cannot precede durable paper state")
         current_position = projection.positions.get(instrument, Decimal(0))
+        historical: PaperProjection | None = None
         if detailed:
             assert normalized_rate is not None
             assert normalized_position is not None
@@ -1123,6 +1210,43 @@ class PaperEngine:
                 raise ValueError("unsupported funding mark_source")
         elif current_position == 0 and normalized_amount != 0:
             raise ValueError("non-zero funding cannot be posted while flat")
+        if projection.strategy_projections:
+            if not detailed:
+                if any(
+                    strategy.positions.get(instrument, Decimal(0)) != 0
+                    for strategy in projection.strategy_projections.values()
+                ):
+                    raise ValueError("multi-strategy funding requires detailed deterministic attribution")
+                strategy_amounts = {
+                    strategy_id: Decimal(0) for strategy_id in projection.strategy_projections
+                }
+            else:
+                assert normalized_rate is not None
+                if normalized_mark is None and any(
+                    strategy.positions.get(instrument, Decimal(0)) != 0
+                    for strategy in projection.strategy_projections.values()
+                ):
+                    raise ValueError("offsetting strategy funding requires an explicit public mark")
+                strategy_amounts = {}
+                for strategy_id in sorted(projection.strategy_projections):
+                    historical_strategy = (
+                        historical.strategy_projections.get(strategy_id) if historical is not None else None
+                    )
+                    strategy_position = (
+                        historical_strategy.positions.get(instrument, Decimal(0))
+                        if historical_strategy is not None
+                        else Decimal(0)
+                    )
+                    strategy_amounts[strategy_id] = (
+                        Decimal(0)
+                        if normalized_applicability == "PRE_ACTIVATION_IGNORED" or strategy_position == 0
+                        else -(strategy_position * cast(Decimal, normalized_mark) * normalized_rate)
+                    )
+            if sum(strategy_amounts.values(), Decimal(0)) != normalized_amount:
+                raise ValueError("strategy funding attribution differs from account funding")
+            payload["strategy_amounts"] = {
+                strategy_id: decimal_text(amount) for strategy_id, amount in strategy_amounts.items()
+            }
 
         event_payload = dict(payload)
         event_payload.pop("input_type")
@@ -1311,6 +1435,8 @@ class PaperEngine:
         last_market = working.last_market_received_at
         required_instruments = set(self.config.required_instruments)
         required_instruments.update(working.positions)
+        for strategy in working.strategy_projections.values():
+            required_instruments.update(strategy.positions)
         required_instruments.update(order.intent.instrument for order in working.active_orders)
         stale_instruments = sorted(
             instrument
@@ -1335,14 +1461,42 @@ class PaperEngine:
             PaperState.HEDGE_PENDING,
             PaperState.EXIT_PENDING,
         }
-        unhedged = bool(working.positions) and (
-            working.state in pending_states
-            or (working.state is PaperState.PAUSED and working.suspended_from in pending_states)
-        )
-        state_since = working.state_since or self.config.validation_started_at
-        unhedged_timed_out = unhedged and as_of - state_since >= timedelta(
-            seconds=self.config.risk.unhedged_timeout_seconds
-        )
+        if working.strategy_projections:
+            unhedged_strategies = tuple(
+                strategy
+                for strategy in working.strategy_projections.values()
+                if strategy.positions
+                and (
+                    strategy.state in pending_states
+                    or (strategy.state is PaperState.PAUSED and strategy.suspended_from in pending_states)
+                )
+            )
+            unhedged = bool(unhedged_strategies)
+            state_since = min(
+                (
+                    strategy.state_since or self.config.validation_started_at
+                    for strategy in unhedged_strategies
+                ),
+                default=self.config.validation_started_at,
+            )
+        else:
+            unhedged = bool(working.positions) and (
+                working.state in pending_states
+                or (working.state is PaperState.PAUSED and working.suspended_from in pending_states)
+            )
+            state_since = working.state_since or self.config.validation_started_at
+        if working.strategy_projections:
+            unhedged_timed_out = any(
+                as_of - (strategy.state_since or self.config.validation_started_at)
+                >= timedelta(
+                    seconds=self.config.strategy_config(strategy.strategy_id).risk.unhedged_timeout_seconds
+                )
+                for strategy in unhedged_strategies
+            )
+        else:
+            unhedged_timed_out = unhedged and as_of - state_since >= timedelta(
+                seconds=self.config.risk.unhedged_timeout_seconds
+            )
         if feed_stale:
             stale_payload = self._alert_payload(
                 code="STALE_MARKET_DATA",
@@ -1424,6 +1578,125 @@ class PaperEngine:
             at=as_of,
             causation_id=input_id,
         )
+        return self._commit(
+            input_id=input_id,
+            input_payload=payload,
+            base=projection,
+            events=tuple(events),
+        )
+
+    def record_strategy_failure(
+        self,
+        *,
+        strategy_id: str,
+        as_of: datetime,
+        phase: str,
+        error_type: str,
+        market_event_ids: tuple[str, ...],
+    ) -> PaperCommandResult:
+        try:
+            strategy_config = self.config.strategy_config(strategy_id)
+        except KeyError as error:
+            raise ValueError("strategy failure references unknown strategy_id") from error
+        normalized_phase = phase.strip().upper()
+        normalized_error = error_type.strip()
+        if not normalized_phase or not normalized_error:
+            raise ValueError("strategy failure phase and error_type cannot be empty")
+        if not market_event_ids:
+            raise ValueError("strategy failure requires its observed market_event_ids")
+        projection = self.projection()
+        if projection.state is PaperState.MANUAL_REVIEW:
+            raise IntegrityError(self.store.verify_integrity(self.run_id, raise_on_error=False))
+        effective_at = parse_utc(utc_text(as_of))
+        if projection.last_received_at is not None and effective_at < projection.last_received_at:
+            effective_at = projection.last_received_at
+        failure_id = deterministic_id(
+            "paper_strategy_local_failure",
+            self.run_id,
+            strategy_config.strategy_id,
+            strategy_config.strategy_config_hash,
+            normalized_phase,
+            normalized_error,
+            tuple(sorted(market_event_ids)),
+        )
+        input_id = deterministic_id(
+            "paper_strategy_local_failure_input",
+            failure_id,
+        )
+        payload = {
+            "as_of": utc_text(effective_at),
+            "error_type": normalized_error,
+            "failure_id": failure_id,
+            "input_type": "STRATEGY_LOCAL_FAILURE",
+            "market_event_ids": list(sorted(market_event_ids)),
+            "phase": normalized_phase,
+            "strategy_config_hash": strategy_config.strategy_config_hash,
+            "strategy_id": strategy_config.strategy_id,
+        }
+        duplicate = self._deduplicate(input_id, payload)
+        if duplicate is not None:
+            return duplicate
+        events: list[PaperEvent] = []
+        working = projection.clone()
+        alert_payload = self._alert_payload(
+            code="STRATEGY_LOCAL_FAILURE",
+            severity=AlertSeverity.CRITICAL,
+            message=(f"strategy {strategy_id} paused after {normalized_phase}: {normalized_error}"),
+            causation_id=failure_id,
+            at=effective_at,
+        )
+        alert_payload["strategy_id"] = strategy_id
+        alert = self._event(
+            PaperEventType.ALERT_RAISED,
+            at=effective_at,
+            received_at=effective_at,
+            causation_id=failure_id,
+            correlation_id=input_id,
+            payload=alert_payload,
+            ordinal=0,
+        )
+        apply_event(working, alert)
+        events.append(alert)
+        strategy = working.strategy_projection(strategy_id)
+        if strategy.state is not PaperState.PAUSED:
+            transition = self._event(
+                PaperEventType.STATE_TRANSITIONED,
+                at=effective_at,
+                received_at=effective_at,
+                causation_id=failure_id,
+                correlation_id=input_id,
+                payload={
+                    **self._transition_payload(
+                        strategy.state,
+                        PaperState.PAUSED,
+                        "strategy-local failure isolation",
+                    ),
+                    "strategy_id": strategy_id,
+                },
+                ordinal=1,
+            )
+            apply_event(working, transition)
+            events.append(transition)
+        if strategy.positions and working.state not in {
+            PaperState.REDUCE_ONLY,
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.MANUAL_REVIEW,
+        }:
+            protective = self._event(
+                PaperEventType.STATE_TRANSITIONED,
+                at=effective_at,
+                received_at=effective_at,
+                causation_id=failure_id,
+                correlation_id=input_id,
+                payload=self._transition_payload(
+                    working.state,
+                    PaperState.REDUCE_ONLY,
+                    "strategy-local failure with attributed exposure",
+                ),
+                ordinal=len(events),
+            )
+            apply_event(working, protective)
+            events.append(protective)
         return self._commit(
             input_id=input_id,
             input_payload=payload,
@@ -1629,7 +1902,10 @@ class PaperEngine:
                     received_at=as_of,
                     causation_id=artifact,
                     correlation_id=order.intent.decision_id,
-                    payload={"order_id": order.intent.order_id},
+                    payload=self._order_event_payload(
+                        order,
+                        {"order_id": order.intent.order_id},
+                    ),
                     ordinal=len(events),
                 )
                 apply_event(working, cancelled)
@@ -1641,7 +1917,10 @@ class PaperEngine:
                     received_at=as_of,
                     causation_id=artifact,
                     correlation_id=order.intent.decision_id,
-                    payload={"order_id": order.intent.order_id},
+                    payload=self._order_event_payload(
+                        order,
+                        {"order_id": order.intent.order_id},
+                    ),
                     ordinal=len(events),
                 )
                 apply_event(working, cancelled)
@@ -1783,7 +2062,12 @@ class PaperEngine:
             for order in projection.orders.values()
         ):
             raise ValueError("resume_from_pause requires all entry orders to be terminal")
-        target = PaperState.REDUCE_ONLY if projection.positions else PaperState.FLAT
+        has_attributed_positions = any(
+            strategy.positions for strategy in projection.strategy_projections.values()
+        )
+        target = (
+            PaperState.REDUCE_ONLY if projection.positions or has_attributed_positions else PaperState.FLAT
+        )
         event = self._event(
             PaperEventType.STATE_TRANSITIONED,
             at=as_of,
@@ -1820,6 +2104,91 @@ class PaperEngine:
             PaperState.REDUCE_ONLY,
         }:
             raise ValueError("automatic flatten requires a protective paper state")
+        if projection.strategy_projections:
+            owned_positions = {
+                strategy_id: dict(strategy.positions)
+                for strategy_id, strategy in projection.strategy_projections.items()
+                if strategy.positions
+            }
+            if not owned_positions:
+                raise ValueError("emergency_flatten requires an attributed simulated position")
+            required_instruments = {
+                instrument for positions in owned_positions.values() for instrument in positions
+            }
+            if any(instrument not in markets for instrument in required_instruments):
+                raise ValueError("emergency_flatten requires a public market for every attributed position")
+            last_result: PaperCommandResult | None = None
+            for strategy_id in sorted(owned_positions):
+                strategy = self.config.strategy_config(strategy_id)
+                positions = owned_positions[strategy_id]
+                strategy_markets = {instrument: markets[instrument] for instrument in sorted(positions)}
+                latest_received = max(market.received_at for market in strategy_markets.values())
+                if decided_at < latest_received:
+                    raise ValueError("emergency flatten decision cannot precede its public observations")
+                primary = max(
+                    strategy_markets.values(),
+                    key=lambda item: (
+                        item.received_at,
+                        item.capture_ordinal,
+                        item.event_id,
+                    ),
+                )
+                reason_ordinal = int(
+                    deterministic_id(
+                        "paper_emergency_reason",
+                        strategy_id,
+                        reason,
+                    )[:8],
+                    16,
+                )
+                decision_id = DecisionIntent.identifier(
+                    run_id=self.run_id,
+                    strategy_id=strategy_id,
+                    market_event_id=primary.event_id,
+                    action=DecisionAction.EXIT,
+                    ordinal=reason_ordinal,
+                )
+                orders = tuple(
+                    OrderIntent.create(
+                        decision_id=decision_id,
+                        run_id=self.run_id,
+                        strategy_id=strategy_id,
+                        instrument=instrument,
+                        side=(OrderSide.SELL if quantity > 0 else OrderSide.BUY),
+                        quantity=abs(quantity),
+                        order_type=PaperOrderType.TAKER,
+                        time_in_force=TimeInForce.IOC,
+                        created_at=decided_at,
+                        ordinal=index,
+                        reduce_only=True,
+                        leg_number=index + 1,
+                    )
+                    for index, (instrument, quantity) in enumerate(sorted(positions.items()))
+                )
+                decision = DecisionIntent(
+                    decision_id=decision_id,
+                    run_id=self.run_id,
+                    strategy_id=strategy_id,
+                    strategy_name=strategy.strategy_name,
+                    strategy_hash=strategy.strategy_hash,
+                    strategy_config_hash=strategy.strategy_config_hash,
+                    action=DecisionAction.EXIT,
+                    decided_at=decided_at,
+                    received_at=latest_received,
+                    market_event_id=primary.event_id,
+                    observed_event_ids=tuple(
+                        strategy_markets[instrument].event_id for instrument in sorted(strategy_markets)
+                    ),
+                    orders=orders,
+                    ordinal=reason_ordinal,
+                )
+                last_result = self.submit_decision(
+                    decision,
+                    strategy_markets,
+                )
+            if last_result is None:
+                raise AssertionError("attributed emergency flatten produced no decisions")
+            return last_result
         if not projection.positions:
             raise ValueError("emergency_flatten requires an open simulated position")
         if any(instrument not in markets for instrument in projection.positions):
@@ -2107,6 +2476,19 @@ class PaperEngine:
                             "PAPER_RUNTIME_FAILURE": "PAPER_RUNTIME_FAILURE",
                         }[input_type],
                     )
+                elif input_type == "STRATEGY_LOCAL_FAILURE":
+                    raw_market_event_ids = payload.get("market_event_ids")
+                    if not isinstance(raw_market_event_ids, Sequence) or isinstance(
+                        raw_market_event_ids, (str, bytes)
+                    ):
+                        raise ValueError("strategy-local failure replay requires market_event_ids")
+                    replay_engine.record_strategy_failure(
+                        strategy_id=str(payload["strategy_id"]),
+                        as_of=parse_utc(str(payload["as_of"])),
+                        phase=str(payload["phase"]),
+                        error_type=str(payload["error_type"]),
+                        market_event_ids=tuple(str(item) for item in raw_market_event_ids),
+                    )
                 elif input_type == "PAPER_KILL":
                     replay_engine.kill(
                         as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00")),
@@ -2182,23 +2564,22 @@ class PaperEngine:
         current = self.store.get_run(self.run_id)
         projection = self.projection()
         if current.head_identity != verification.head_identity:
-            raise ConcurrentWriteError(
-                "paper durable head changed after startup verification"
-            )
+            raise ConcurrentWriteError("paper durable head changed after startup verification")
         if projection.to_dict() != verification.projection.to_dict():
-            raise ConcurrentWriteError(
-                "paper projection changed after startup verification"
-            )
+            raise ConcurrentWriteError("paper projection changed after startup verification")
         _raise_if_interrupted(should_stop)
-        has_durable_reconciliation = next(
-            iter(
-                self.store.iter_inputs(
-                    self.run_id,
-                    input_type="RECONCILE",
-                )
-            ),
-            None,
-        ) is not None
+        has_durable_reconciliation = (
+            next(
+                iter(
+                    self.store.iter_inputs(
+                        self.run_id,
+                        input_type="RECONCILE",
+                    )
+                ),
+                None,
+            )
+            is not None
+        )
         if (
             preparation.started.append.idempotent
             and has_durable_reconciliation
@@ -2233,13 +2614,9 @@ class PaperEngine:
             if verification is not None:
                 current = self.store.get_run(self.run_id)
                 if current.head_identity != verification.head_identity:
-                    raise ConcurrentWriteError(
-                        "paper durable head changed after startup verification"
-                    )
+                    raise ConcurrentWriteError("paper durable head changed after startup verification")
                 if projection.to_dict() != verification.projection.to_dict():
-                    raise ConcurrentWriteError(
-                        "paper projection changed after startup verification"
-                    )
+                    raise ConcurrentWriteError("paper projection changed after startup verification")
             report = verified.report
             _raise_if_interrupted(should_stop)
         except IntegrityError:
@@ -2387,6 +2764,36 @@ class PaperEngine:
             errors.append("ledger fees differ from the replayed projection")
         if ledger_realized_pnl != projection.realized_pnl:
             errors.append("ledger realized PnL differs from the replayed projection")
+        for strategy_id, strategy in sorted(projection.strategy_projections.items()):
+            prefix = f"strategy:{strategy_id}:"
+            if balances.get(prefix + "asset:cash", Decimal(0)) != strategy.cash:
+                errors.append(f"strategy ledger cash differs for {strategy_id}")
+            for instrument in strategy.positions:
+                expected_inventory = strategy.inventory_value[instrument]
+                if (
+                    balances.get(
+                        prefix + f"asset:inventory:{instrument}",
+                        Decimal(0),
+                    )
+                    != expected_inventory
+                ):
+                    errors.append(f"strategy ledger inventory differs for {strategy_id}:{instrument}")
+            durable_strategy_inventory = {
+                account.removeprefix(prefix + "asset:inventory:")
+                for account, balance in balances.items()
+                if account.startswith(prefix + "asset:inventory:") and balance != 0
+            }
+            if durable_strategy_inventory != set(strategy.positions):
+                errors.append(f"strategy ledger inventory accounts differ for {strategy_id}")
+            if balances.get(prefix + "expense:fees", Decimal(0)) != strategy.fees:
+                errors.append(f"strategy ledger fees differ for {strategy_id}")
+            strategy_realized = (
+                -balances.get(prefix + "income:realized_pnl", Decimal(0))
+                - balances.get(prefix + "expense:fees", Decimal(0))
+                - balances.get(prefix + "income:funding", Decimal(0))
+            )
+            if strategy_realized != strategy.realized_pnl:
+                errors.append(f"strategy ledger realized PnL differs for {strategy_id}")
         return tuple(errors)
 
     def _commit(
@@ -2476,6 +2883,17 @@ class PaperEngine:
         require_transition(source, target)
         return {"reason": reason, "source": source.value, "target": target.value}
 
+    @staticmethod
+    def _order_event_payload(
+        order: OrderIntent | PaperOrder,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        intent = order.intent if isinstance(order, PaperOrder) else order
+        result = dict(payload)
+        if intent.strategy_id is not None:
+            result["strategy_id"] = intent.strategy_id
+        return result
+
     def _alert_payload(
         self,
         *,
@@ -2502,6 +2920,7 @@ class PaperEngine:
             sorted(
                 projection.orders.values(),
                 key=lambda candidate: (
+                    candidate.intent.strategy_id or "",
                     candidate.intent.leg_number,
                     candidate.intent.decision_id,
                     candidate.intent.order_id,
@@ -2525,7 +2944,10 @@ class PaperEngine:
             received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=order.intent.decision_id,
-            payload={"order_id": order.intent.order_id, "reason": reason},
+            payload=self._order_event_payload(
+                order,
+                {"order_id": order.intent.order_id, "reason": reason},
+            ),
             ordinal=len(events),
         )
         apply_event(projection, event)
@@ -2539,7 +2961,12 @@ class PaperEngine:
         at: datetime,
         causation_id: str,
     ) -> bool:
-        if not projection.positions or projection.state in {
+        has_exposure = (
+            any(strategy.positions for strategy in projection.strategy_projections.values())
+            if projection.strategy_projections
+            else bool(projection.positions)
+        )
+        if not has_exposure or projection.state in {
             PaperState.REDUCE_ONLY,
             PaperState.EMERGENCY_FLATTEN,
             PaperState.MANUAL_REVIEW,
@@ -2550,15 +2977,31 @@ class PaperEngine:
         missing_marks: list[str] = []
         signed_net = Decimal(0)
         gross = Decimal(0)
-        for instrument, quantity in sorted(projection.positions.items()):
-            mark = projection.public_bbo_mids.get(instrument)
-            if mark is None:
-                missing_marks.append(instrument)
-                continue
-            notional = quantity * mark
-            notionals[instrument] = abs(notional)
-            gross += abs(notional)
-            signed_net += notional
+        if projection.strategy_projections:
+            for strategy in projection.strategy_projections.values():
+                for instrument, quantity in sorted(strategy.positions.items()):
+                    mark = projection.public_bbo_mids.get(instrument)
+                    if mark is None:
+                        missing_marks.append(instrument)
+                        continue
+                    notional = quantity * mark
+                    notionals[instrument] = notionals.get(instrument, Decimal(0)) + abs(notional)
+                    gross += abs(notional)
+            for instrument, quantity in projection.positions.items():
+                mark = projection.public_bbo_mids.get(instrument)
+                if mark is not None:
+                    signed_net += quantity * mark
+        else:
+            for instrument, quantity in sorted(projection.positions.items()):
+                mark = projection.public_bbo_mids.get(instrument)
+                if mark is None:
+                    missing_marks.append(instrument)
+                    continue
+                notional = quantity * mark
+                notionals[instrument] = abs(notional)
+                gross += abs(notional)
+                signed_net += notional
+        missing_marks = sorted(set(missing_marks))
         net = abs(signed_net)
 
         code: str | None = None
@@ -2698,10 +3141,13 @@ class PaperEngine:
                     received_at=at,
                     causation_id=causation_id,
                     correlation_id=order.intent.decision_id,
-                    payload={
-                        "order_id": order.intent.order_id,
-                        "reason": f"protective state before ack: {reason}",
-                    },
+                    payload=self._order_event_payload(
+                        order,
+                        {
+                            "order_id": order.intent.order_id,
+                            "reason": f"protective state before ack: {reason}",
+                        },
+                    ),
                     ordinal=len(events),
                 )
                 apply_event(projection, event)
@@ -2716,11 +3162,14 @@ class PaperEngine:
                 received_at=at,
                 causation_id=causation_id,
                 correlation_id=order.intent.decision_id,
-                payload={
-                    "cancel_effective_at": utc_text(effective),
-                    "order_id": order.intent.order_id,
-                    "reason": reason,
-                },
+                payload=self._order_event_payload(
+                    order,
+                    {
+                        "cancel_effective_at": utc_text(effective),
+                        "order_id": order.intent.order_id,
+                        "reason": reason,
+                    },
+                ),
                 ordinal=len(events),
             )
             apply_event(projection, requested)
@@ -2732,7 +3181,10 @@ class PaperEngine:
                     received_at=at,
                     causation_id=causation_id,
                     correlation_id=order.intent.decision_id,
-                    payload={"order_id": order.intent.order_id},
+                    payload=self._order_event_payload(
+                        order,
+                        {"order_id": order.intent.order_id},
+                    ),
                     ordinal=len(events),
                 )
                 apply_event(projection, cancelled)
@@ -2762,7 +3214,10 @@ class PaperEngine:
                 received_at=command_received_at,
                 causation_id=causation_id,
                 correlation_id=intent.decision_id,
-                payload={"order_id": intent.order_id, "reason": "post_only_would_cross"},
+                payload=self._order_event_payload(
+                    intent,
+                    {"order_id": intent.order_id, "reason": "post_only_would_cross"},
+                ),
                 ordinal=len(events),
             )
         else:
@@ -2777,11 +3232,14 @@ class PaperEngine:
                 received_at=command_received_at,
                 causation_id=causation_id,
                 correlation_id=intent.decision_id,
-                payload={
-                    "active_at": utc_text(at),
-                    "expires_at": utc_text(expires_at) if expires_at is not None else None,
-                    "order_id": intent.order_id,
-                },
+                payload=self._order_event_payload(
+                    intent,
+                    {
+                        "active_at": utc_text(at),
+                        "expires_at": (utc_text(expires_at) if expires_at is not None else None),
+                        "order_id": intent.order_id,
+                    },
+                ),
                 ordinal=len(events),
             )
         apply_event(projection, event)
@@ -2807,8 +3265,78 @@ class PaperEngine:
         if order_notional > limits.max_order_notional:
             reasons.append("actual fill notional exceeds max_order_notional")
 
-        positions = dict(projection.positions)
         signed_fill = cast(OrderSide, intent.side).sign * fill_quantity
+        if intent.strategy_id is not None:
+            strategy = projection.strategy_projection(intent.strategy_id)
+            strategy_limits = self.config.strategy_config(intent.strategy_id).risk
+            strategy_positions = dict(strategy.positions)
+            strategy_positions[intent.instrument] = (
+                strategy_positions.get(intent.instrument, Decimal(0)) + signed_fill
+            )
+            if strategy_positions[intent.instrument] == 0:
+                strategy_positions.pop(intent.instrument)
+            strategy_gross = Decimal(0)
+            strategy_net = Decimal(0)
+            for instrument, quantity in strategy_positions.items():
+                mark = (
+                    max(
+                        fill_price,
+                        projection.public_bbo_mids.get(instrument, fill_price),
+                    )
+                    if instrument == intent.instrument
+                    else projection.public_bbo_mids.get(instrument)
+                )
+                if mark is None:
+                    reasons.append(f"strategy missing public BBO mark for position {instrument}")
+                    continue
+                notional = quantity * mark
+                strategy_gross += abs(notional)
+                strategy_net += notional
+            strategy_reserved_gross = Decimal(0)
+            strategy_reserved_net = Decimal(0)
+            strategy_reserved_instrument = Decimal(0)
+            strategy_reserved_quantity = Decimal(0)
+            for pending in projection.strategy_active_orders(intent.strategy_id):
+                remaining = pending.remaining_quantity
+                if pending.intent.order_id == intent.order_id:
+                    remaining -= fill_quantity
+                if remaining <= 0:
+                    continue
+                pending_mark = pending.intent.limit_price or projection.public_bbo_mids.get(
+                    pending.intent.instrument
+                )
+                if pending.intent.instrument == intent.instrument:
+                    pending_mark = max(pending_mark or fill_price, fill_price)
+                if pending_mark is None:
+                    reasons.append(
+                        f"strategy missing public BBO mark for pending order {pending.intent.order_id}"
+                    )
+                    continue
+                pending_notional = remaining * pending_mark
+                strategy_reserved_gross += pending_notional
+                strategy_reserved_net += cast(OrderSide, pending.intent.side).sign * pending_notional
+                if pending.intent.instrument == intent.instrument:
+                    strategy_reserved_instrument += pending_notional
+                    strategy_reserved_quantity += remaining
+            strategy_instrument = (
+                abs(strategy_positions.get(intent.instrument, Decimal(0)) * fill_price)
+                + strategy_reserved_instrument
+            )
+            strategy_quantity = (
+                abs(strategy_positions.get(intent.instrument, Decimal(0))) + strategy_reserved_quantity
+            )
+            if order_notional > strategy_limits.max_order_notional:
+                reasons.append("strategy actual fill notional exceeds max_order_notional")
+            if strategy_gross + strategy_reserved_gross > strategy_limits.max_gross_notional:
+                reasons.append("strategy actual-fill gross notional exceeds max_gross_notional")
+            if abs(strategy_net + strategy_reserved_net) > strategy_limits.max_net_notional:
+                reasons.append("strategy actual-fill net notional exceeds max_net_notional")
+            if strategy_instrument > strategy_limits.max_instrument_notional:
+                reasons.append("strategy actual-fill instrument notional exceeds max_instrument_notional")
+            if strategy_quantity > strategy_limits.max_position_quantity:
+                reasons.append("strategy actual-fill quantity exceeds max_position_quantity")
+
+        positions = dict(projection.positions)
         positions[intent.instrument] = positions.get(intent.instrument, Decimal(0)) + signed_fill
         if positions[intent.instrument] == 0:
             positions.pop(intent.instrument)
@@ -2818,7 +3346,20 @@ class PaperEngine:
         current_gross = Decimal(0)
         current_net = Decimal(0)
         current_instrument = Decimal(0)
-        for instrument, quantity in positions.items():
+        if projection.strategy_projections and intent.strategy_id is not None:
+            gross_positions: list[tuple[str, Decimal]] = []
+            for strategy_id, strategy in projection.strategy_projections.items():
+                owned_positions = dict(strategy.positions)
+                if strategy_id == intent.strategy_id:
+                    owned_positions[intent.instrument] = (
+                        owned_positions.get(intent.instrument, Decimal(0)) + signed_fill
+                    )
+                    if owned_positions[intent.instrument] == 0:
+                        owned_positions.pop(intent.instrument)
+                gross_positions.extend(owned_positions.items())
+        else:
+            gross_positions = list(positions.items())
+        for instrument, quantity in gross_positions:
             mark = (
                 fill_valuation
                 if instrument == intent.instrument
@@ -2829,9 +3370,16 @@ class PaperEngine:
                 continue
             notional = quantity * mark
             current_gross += abs(notional)
-            current_net += notional
             if instrument == intent.instrument:
                 current_instrument += abs(notional)
+        for instrument, quantity in positions.items():
+            mark = (
+                fill_valuation
+                if instrument == intent.instrument
+                else projection.public_bbo_mids.get(instrument)
+            )
+            if mark is not None:
+                current_net += quantity * mark
 
         reserved_gross = Decimal(0)
         reserved_net = Decimal(0)
@@ -2861,7 +3409,18 @@ class PaperEngine:
         projected_gross = current_gross + reserved_gross
         projected_net = abs(current_net + reserved_net)
         projected_instrument = current_instrument + reserved_instrument
-        projected_quantity = abs(positions.get(intent.instrument, Decimal(0))) + reserved_instrument_quantity
+        if projection.strategy_projections:
+            current_quantity = sum(
+                (
+                    abs(quantity)
+                    for instrument, quantity in gross_positions
+                    if instrument == intent.instrument
+                ),
+                Decimal(0),
+            )
+        else:
+            current_quantity = abs(positions.get(intent.instrument, Decimal(0)))
+        projected_quantity = current_quantity + reserved_instrument_quantity
         if projected_gross > limits.max_gross_notional:
             reasons.append("actual-fill gross notional exceeds max_gross_notional")
         if projected_net > limits.max_net_notional:
@@ -2919,7 +3478,10 @@ class PaperEngine:
                         received_at=processed_at,
                         causation_id=market.event_id,
                         correlation_id=intent.decision_id,
-                        payload={"order_id": intent.order_id, "reason": reason},
+                        payload=self._order_event_payload(
+                            intent,
+                            {"order_id": intent.order_id, "reason": reason},
+                        ),
                         ordinal=len(events),
                     )
                     apply_event(projection, expiry)
@@ -2960,7 +3522,14 @@ class PaperEngine:
                 return
         quantity_cap = order.remaining_quantity
         if intent.reduce_only:
-            current = projection.positions.get(intent.instrument, Decimal(0))
+            current = (
+                projection.strategy_projection(intent.strategy_id).positions.get(
+                    intent.instrument,
+                    Decimal(0),
+                )
+                if intent.strategy_id is not None
+                else projection.positions.get(intent.instrument, Decimal(0))
+            )
             if current == 0 or (
                 (current > 0 and intent.side is not OrderSide.SELL)
                 or (current < 0 and intent.side is not OrderSide.BUY)
@@ -3111,7 +3680,10 @@ class PaperEngine:
                     received_at=processed_at,
                     causation_id=market.event_id,
                     correlation_id=intent.decision_id,
-                    payload={"order_id": intent.order_id, "reason": reason},
+                    payload=self._order_event_payload(
+                        intent,
+                        {"order_id": intent.order_id, "reason": reason},
+                    ),
                     ordinal=len(events),
                 )
                 apply_event(projection, terminal)
@@ -3175,16 +3747,19 @@ class PaperEngine:
             received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=intent.decision_id,
-            payload={
-                "fee": decimal_text(fee),
-                "fill_id": fill_id,
-                "fill_price": decimal_text(price),
-                "fill_quantity": decimal_text(quantity),
-                "liquidity": "MAKER" if is_maker else "TAKER",
-                "order_id": intent.order_id,
-                "slippage_bps": decimal_text(slippage_bps),
-                "source_market_received_at": utc_text(market.received_at),
-            },
+            payload=self._order_event_payload(
+                intent,
+                {
+                    "fee": decimal_text(fee),
+                    "fill_id": fill_id,
+                    "fill_price": decimal_text(price),
+                    "fill_quantity": decimal_text(quantity),
+                    "liquidity": "MAKER" if is_maker else "TAKER",
+                    "order_id": intent.order_id,
+                    "slippage_bps": decimal_text(slippage_bps),
+                    "source_market_received_at": utc_text(market.received_at),
+                },
+            ),
             ordinal=len(events),
         )
         apply_event(projection, event)
@@ -3211,7 +3786,10 @@ class PaperEngine:
             received_at=processed_at,
             causation_id=market.event_id,
             correlation_id=order.intent.decision_id,
-            payload={"order_id": order.intent.order_id, "reason": reason},
+            payload=self._order_event_payload(
+                order,
+                {"order_id": order.intent.order_id, "reason": reason},
+            ),
             ordinal=len(events),
         )
         apply_event(projection, event)
@@ -3253,6 +3831,43 @@ class PaperEngine:
         *,
         processed_at: datetime,
     ) -> None:
+        if projection.strategy_projections:
+            for strategy_id in sorted(projection.strategy_projections):
+                self._derive_strategy_lifecycle(
+                    projection,
+                    events,
+                    market,
+                    strategy_id=strategy_id,
+                    processed_at=processed_at,
+                )
+            has_attributed_positions = any(
+                strategy.positions for strategy in projection.strategy_projections.values()
+            )
+            has_active_exit = any(
+                order.action is DecisionAction.EXIT and order.status.active
+                for order in projection.orders.values()
+            )
+            if (
+                projection.state in {PaperState.REDUCE_ONLY, PaperState.EMERGENCY_FLATTEN}
+                and not has_attributed_positions
+                and not has_active_exit
+            ):
+                transition = self._event(
+                    PaperEventType.STATE_TRANSITIONED,
+                    at=processed_at,
+                    received_at=processed_at,
+                    causation_id=market.event_id,
+                    correlation_id=market.event_id,
+                    payload=self._transition_payload(
+                        projection.state,
+                        PaperState.FLAT,
+                        "portfolio protective flatten completed",
+                    ),
+                    ordinal=len(events),
+                )
+                apply_event(projection, transition)
+                events.append(transition)
+            return
         if projection.state in {PaperState.MANUAL_REVIEW, PaperState.PAUSED}:
             return
         entry_orders = [
@@ -3316,6 +3931,97 @@ class PaperEngine:
                 causation_id=market.event_id,
                 correlation_id=market.event_id,
                 payload={"completed_at": utc_text(processed_at)},
+                ordinal=len(events),
+            )
+            apply_event(projection, cycle)
+            events.append(cycle)
+
+    def _derive_strategy_lifecycle(
+        self,
+        projection: PaperProjection,
+        events: list[PaperEvent],
+        market: MarketEvent,
+        *,
+        strategy_id: str,
+        processed_at: datetime,
+    ) -> None:
+        strategy = projection.strategy_projection(strategy_id)
+        if projection.state in {PaperState.MANUAL_REVIEW, PaperState.PAUSED}:
+            return
+        if strategy.state in {PaperState.MANUAL_REVIEW, PaperState.PAUSED}:
+            return
+        entry_orders = [
+            order
+            for order in projection.orders.values()
+            if order.intent.strategy_id == strategy_id
+            and order.action is DecisionAction.ENTRY
+            and order.intent.decision_id == strategy.current_entry_decision_id
+        ]
+        exit_orders = [
+            order
+            for order in projection.orders.values()
+            if order.intent.strategy_id == strategy_id
+            and order.action is DecisionAction.EXIT
+            and order.intent.decision_id == strategy.current_exit_decision_id
+        ]
+        target: PaperState | None = None
+        complete_cycle = False
+        if strategy.state in {PaperState.LEG_1_PENDING, PaperState.HEDGE_PENDING}:
+            active = any(order.status.active for order in entry_orders)
+            fully_filled = bool(entry_orders) and all(
+                order.status is OrderStatus.FILLED for order in entry_orders
+            )
+            if fully_filled:
+                target = PaperState.HEDGED
+            elif strategy.positions:
+                target = PaperState.HEDGE_PENDING
+            elif not active:
+                target = PaperState.FLAT
+        elif strategy.state in {
+            PaperState.EXIT_PENDING,
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.REDUCE_ONLY,
+        }:
+            active = any(order.status.active for order in exit_orders)
+            if not strategy.positions and not active:
+                target = PaperState.FLAT
+                complete_cycle = True
+            elif exit_orders and not active and strategy.positions:
+                target = (
+                    strategy.state
+                    if strategy.state in {PaperState.REDUCE_ONLY, PaperState.EMERGENCY_FLATTEN}
+                    else PaperState.EMERGENCY_FLATTEN
+                )
+        if target is not None and target is not strategy.state:
+            transition = self._event(
+                PaperEventType.STATE_TRANSITIONED,
+                at=processed_at,
+                received_at=processed_at,
+                causation_id=market.event_id,
+                correlation_id=market.event_id,
+                payload={
+                    **self._transition_payload(
+                        strategy.state,
+                        target,
+                        "strategy order lifecycle update",
+                    ),
+                    "strategy_id": strategy_id,
+                },
+                ordinal=len(events),
+            )
+            apply_event(projection, transition)
+            events.append(transition)
+        if complete_cycle:
+            cycle = self._event(
+                PaperEventType.CYCLE_COMPLETED,
+                at=processed_at,
+                received_at=processed_at,
+                causation_id=market.event_id,
+                correlation_id=market.event_id,
+                payload={
+                    "completed_at": utc_text(processed_at),
+                    "strategy_id": strategy_id,
+                },
                 ordinal=len(events),
             )
             apply_event(projection, cycle)

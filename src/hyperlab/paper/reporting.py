@@ -5,8 +5,9 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import cast
 
+from hyperlab.backtest.protocol import canonical_sha256
 from hyperlab.paper.models import decimal_text, parse_utc, utc_text
-from hyperlab.paper.store import PaperStore, StoredEventRecord
+from hyperlab.paper.store import AlertRecord, PaperStore, StoredEventRecord
 
 MAX_TIMELINE_LIMIT = 500
 MAX_DAY_LIMIT = 366
@@ -242,6 +243,8 @@ def _timeline_item(
     }
     if input_payload is not None:
         item["input_type"] = input_payload.get("input_type")
+    if details.get("strategy_id") is not None:
+        item["strategy_id"] = details.get("strategy_id")
     if record.event_type == "DECISION_RECORDED":
         decision = details.get("decision")
         if isinstance(decision, Mapping):
@@ -249,6 +252,7 @@ def _timeline_item(
             item["decision_id"] = decision.get("decision_id")
             item["intent"] = dict(decision)
             item["signal"] = decision.get("signal")
+            item["strategy_id"] = decision.get("strategy_id")
             item["strategy_name"] = decision.get("strategy_name")
     elif record.event_type == "ORDER_PLANNED":
         item["intent"] = details.get("order")
@@ -378,6 +382,105 @@ def _source_health(
     }
 
 
+def _strategy_reports(
+    store: PaperStore,
+    run_id: str,
+    *,
+    projection: Mapping[str, object],
+    config: Mapping[str, object],
+    alerts: Sequence[AlertRecord],
+) -> dict[str, object]:
+    raw_projections = projection.get("strategy_projections")
+    if not isinstance(raw_projections, Mapping):
+        return {}
+    raw_orders = projection.get("orders")
+    all_orders = raw_orders if isinstance(raw_orders, Mapping) else {}
+    marks = projection.get("marks")
+    raw_strategies = config.get("strategies")
+    config_by_id: dict[str, Mapping[str, object]] = {}
+    if isinstance(raw_strategies, Sequence) and not isinstance(raw_strategies, (str, bytes)):
+        for item in raw_strategies:
+            if isinstance(item, Mapping) and item.get("strategy_id") is not None:
+                config_by_id[str(item["strategy_id"])] = item
+
+    result: dict[str, object] = {}
+    for raw_strategy_id, raw_local in sorted(raw_projections.items(), key=lambda item: str(item[0])):
+        strategy_id = str(raw_strategy_id)
+        if not isinstance(raw_local, Mapping):
+            raise ValueError("strategy projection must be an object")
+        strategy_config = config_by_id.get(strategy_id)
+        if strategy_config is None:
+            raise ValueError("strategy projection lacks immutable run configuration")
+        raw_strategy_risk = strategy_config.get("risk")
+        local_orders = {
+            str(order_id): order
+            for order_id, order in all_orders.items()
+            if isinstance(order, Mapping) and order.get("strategy_id") == strategy_id
+        }
+        metric_projection = {
+            **dict(raw_local),
+            "archived_order_count": 0,
+            "initial_cash": "0",
+            "marks": marks if isinstance(marks, Mapping) else {},
+            "orders": local_orders,
+        }
+        metrics = _account_metrics(metric_projection)
+        funding_net = -store.get_ledger_account_total(
+            run_id,
+            account=f"strategy:{strategy_id}:income:funding",
+        )
+        metrics["funding_net"] = decimal_text(funding_net)
+        metrics["trading_realized_pnl_after_fees"] = decimal_text(
+            _decimal(raw_local.get("realized_pnl")) - funding_net
+        )
+        incident_count = raw_local.get("critical_incident_count", 0)
+        if isinstance(incident_count, bool) or not isinstance(incident_count, int) or incident_count < 0:
+            raise ValueError("strategy critical_incident_count must be non-negative")
+        raw_last_incident = raw_local.get("last_critical_incident_at")
+        last_incident = utc_text(parse_utc(str(raw_last_incident))) if raw_last_incident is not None else None
+        if (incident_count == 0) != (last_incident is None):
+            raise ValueError("strategy critical incident summary is inconsistent")
+        strategy_alerts = [
+            {
+                "alert": alert.alert,
+                "alert_id": alert.alert_id,
+                "code": alert.code,
+                "created_at": alert.created_at,
+                "event_sequence": alert.event_sequence,
+                "severity": alert.severity,
+            }
+            for alert in alerts
+            if isinstance(alert.alert, Mapping) and alert.alert.get("strategy_id") == strategy_id
+        ]
+        result[strategy_id] = {
+            "accounting": metrics,
+            "decisions": raw_local.get("decisions", 0),
+            "identity": {
+                "strategy_config_hash": canonical_sha256(strategy_config),
+                "strategy_hash": strategy_config.get("strategy_hash"),
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_config.get("strategy_name"),
+            },
+            "incidents": {
+                "critical_incident_count": incident_count,
+                "last_critical_incident_at": last_incident,
+                "recent_alerts": strategy_alerts,
+            },
+            "risk": {
+                "current": {
+                    "active_order_count": metrics["active_order_count"],
+                    "daily_loss": decimal_text(max(Decimal(0), -_decimal(metrics["daily_pnl"]))),
+                    "drawdown": metrics["drawdown"],
+                    "gross_notional": metrics["gross_notional"],
+                    "net_notional": metrics["net_notional"],
+                },
+                "limits": dict(raw_strategy_risk) if isinstance(raw_strategy_risk, Mapping) else {},
+            },
+            "state": raw_local.get("state"),
+        }
+    return result
+
+
 def _build_paper_report_once(
     store: PaperStore,
     run_id: str,
@@ -505,6 +608,27 @@ def _build_paper_report_once(
         for alert in alerts
         if alert.code == "PAPER_RUNTIME_FAILURE"
     ]
+    strategies = _strategy_reports(
+        store,
+        run_id,
+        projection=projection,
+        config=config,
+        alerts=alerts,
+    )
+    portfolio = dict(account)
+    if strategies:
+        attributed_gross = Decimal(0)
+        attributed_realized = Decimal(0)
+        for strategy_report in strategies.values():
+            if not isinstance(strategy_report, Mapping):
+                raise ValueError("strategy report must be an object")
+            strategy_accounting = strategy_report.get("accounting")
+            if not isinstance(strategy_accounting, Mapping):
+                raise ValueError("strategy report accounting must be an object")
+            attributed_gross += _decimal(strategy_accounting.get("gross_notional"))
+            attributed_realized += _decimal(strategy_accounting.get("realized_pnl"))
+        portfolio["attributed_realized_pnl"] = decimal_text(attributed_realized)
+        portfolio["gross_notional"] = decimal_text(attributed_gross)
     report: dict[str, object] = {
         "account": account,
         "classification": {
@@ -533,6 +657,14 @@ def _build_paper_report_once(
             "run_id": run.run_id,
             "strategy_hash": config.get("strategy_hash"),
             "strategy_name": config.get("strategy_name"),
+            **(
+                {
+                    "portfolio_id": config.get("portfolio_id"),
+                    "strategy_count": len(strategies),
+                }
+                if strategies
+                else {}
+            ),
         },
         "integrity": "HEAD_ANCHORS_VERIFIED_READONLY",
         "integrity_scope": {
@@ -556,6 +688,7 @@ def _build_paper_report_once(
         },
         "mode": "paper-simulation-only",
         "orders_enabled": False,
+        **({"portfolio": portfolio, "strategies": strategies} if strategies else {}),
         "risk": {
             "critical_incident_count": incident_count,
             "last_critical_incident_at": last_incident,
@@ -563,7 +696,7 @@ def _build_paper_report_once(
                 "active_order_count": account["active_order_count"],
                 "daily_loss": decimal_text(max(Decimal(0), -_decimal(account["daily_pnl"]))),
                 "drawdown": account["drawdown"],
-                "gross_notional": account["gross_notional"],
+                "gross_notional": portfolio["gross_notional"],
                 "net_notional": account["net_notional"],
             },
             "limits": risk_limits,
@@ -580,7 +713,7 @@ def _build_paper_report_once(
             "source": source,
             "state": projection.get("state"),
         },
-        "schema_version": 1,
+        "schema_version": 2 if strategies else 1,
         "status": run.status,
         "timeline": {
             "after_sequence": after_sequence,
@@ -647,28 +780,19 @@ def paper_runtime_session_health(projection: Mapping[str, object]) -> dict[str, 
     raw_session_id = projection.get("runtime_session_id")
     session_id = str(raw_session_id) if raw_session_id is not None else None
     if session_id is not None and (
-        len(session_id) != 64
-        or any(character not in "0123456789abcdef" for character in session_id)
+        len(session_id) != 64 or any(character not in "0123456789abcdef" for character in session_id)
     ):
         raise ValueError("projection runtime_session_id must be a lowercase SHA-256")
     raw_started_at = projection.get("runtime_session_started_at")
-    started_at = (
-        utc_text(parse_utc(str(raw_started_at))) if raw_started_at is not None else None
-    )
+    started_at = utc_text(parse_utc(str(raw_started_at))) if raw_started_at is not None else None
     raw_stopped_at = projection.get("runtime_session_stopped_at")
-    stopped_at = (
-        utc_text(parse_utc(str(raw_stopped_at))) if raw_stopped_at is not None else None
-    )
+    stopped_at = utc_text(parse_utc(str(raw_stopped_at))) if raw_stopped_at is not None else None
     if generation == 0:
         if session_id is not None or started_at is not None or stopped_at is not None:
             raise ValueError("zero runtime session generation requires empty session facts")
     elif session_id is None or started_at is None:
         raise ValueError("positive runtime session generation requires identity and start time")
-    if (
-        stopped_at is not None
-        and started_at is not None
-        and parse_utc(stopped_at) < parse_utc(started_at)
-    ):
+    if stopped_at is not None and started_at is not None and parse_utc(stopped_at) < parse_utc(started_at):
         raise ValueError("runtime session stop cannot precede its start")
     active = generation > 0 and session_id is not None and stopped_at is None
     return {

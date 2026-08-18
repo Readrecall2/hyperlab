@@ -17,9 +17,7 @@ from hyperlab.backtest.protocol import JsonValue, canonical_json, canonical_sha2
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CALIBRATION_STATUSES = frozenset({"CALIBRATED", "UNCALIBRATED", "SYNTHETIC", "TOY"})
-_ACTIVE_ORDER_STATUSES = frozenset(
-    {"RISK_ACCEPTED", "ACKED", "CANCEL_PENDING", "PARTIALLY_FILLED"}
-)
+_ACTIVE_ORDER_STATUSES = frozenset({"RISK_ACCEPTED", "ACKED", "CANCEL_PENDING", "PARTIALLY_FILLED"})
 _PAPER_ENGINE_BUILD_HASH_V2 = canonical_sha256(
     {
         "component": "hyperlab.paper",
@@ -34,17 +32,25 @@ PAPER_ENGINE_BUILD_HASH = canonical_sha256(
         "schema_version": 3,
     }
 )
+MULTI_STRATEGY_PAPER_ENGINE_BUILD_HASH = canonical_sha256(
+    {
+        "component": "hyperlab.paper",
+        "execution_semantics": "phase12-paper-multistrategy-foundation-v1",
+        "schema_version": 4,
+    }
+)
 
 
 def _current_release_code_sha256() -> str:
     from hyperlab.environment_authorization import current_paper_release_code_sha256
 
     return current_paper_release_code_sha256()
+
+
 def _current_runtime_environment_sha256() -> str:
     from hyperlab.environment_authorization import current_paper_runtime_environment_sha256
 
     return current_paper_runtime_environment_sha256()
-
 
 
 def _utc(value: datetime, *, label: str) -> datetime:
@@ -204,9 +210,7 @@ class PaperState(StrEnum):
 
 
 _TRANSITIONS: Mapping[PaperState, frozenset[PaperState]] = {
-    PaperState.FLAT: frozenset(
-        {PaperState.ENTRY_PLANNED, PaperState.PAUSED, PaperState.MANUAL_REVIEW}
-    ),
+    PaperState.FLAT: frozenset({PaperState.ENTRY_PLANNED, PaperState.PAUSED, PaperState.MANUAL_REVIEW}),
     PaperState.ENTRY_PLANNED: frozenset(
         {
             PaperState.LEG_1_PENDING,
@@ -288,9 +292,7 @@ _TRANSITIONS: Mapping[PaperState, frozenset[PaperState]] = {
         }
     ),
     PaperState.MANUAL_REVIEW: frozenset(),
-    PaperState.EMERGENCY_FLATTEN: frozenset(
-        {PaperState.FLAT, PaperState.PAUSED, PaperState.MANUAL_REVIEW}
-    ),
+    PaperState.EMERGENCY_FLATTEN: frozenset({PaperState.FLAT, PaperState.PAUSED, PaperState.MANUAL_REVIEW}),
 }
 
 
@@ -466,12 +468,8 @@ class PaperRiskLimits:
                 label="max_order_quantity",
             ),
             max_concurrent_orders=int(str(value.get("max_concurrent_orders", 1000))),
-            max_daily_loss=decimal_value(
-                str(value.get("max_daily_loss", "5000")), label="max_daily_loss"
-            ),
-            max_drawdown=decimal_value(
-                str(value.get("max_drawdown", "10000")), label="max_drawdown"
-            ),
+            max_daily_loss=decimal_value(str(value.get("max_daily_loss", "5000")), label="max_daily_loss"),
+            max_drawdown=decimal_value(str(value.get("max_drawdown", "10000")), label="max_drawdown"),
             stale_after_seconds=int(str(value.get("stale_after_seconds", 30))),
             unhedged_timeout_seconds=int(str(value.get("unhedged_timeout_seconds", 60))),
         )
@@ -570,14 +568,10 @@ class PaperExecutionConfig:
                     "rules": [
                         {
                             "effective_from": (
-                                str(rule.effective_from)
-                                if rule.effective_from is not None
-                                else None
+                                str(rule.effective_from) if rule.effective_from is not None else None
                             ),
                             "effective_to": (
-                                str(rule.effective_to)
-                                if rule.effective_to is not None
-                                else None
+                                str(rule.effective_to) if rule.effective_to is not None else None
                             ),
                             "instrument": rule.instrument,
                             "maker_fee_bps": rule.maker_fee_bps,
@@ -664,13 +658,9 @@ class PaperExecutionConfig:
                         taker_fee_bps=float(raw_rule["taker_fee_bps"]),
                         slippage=SlippageModel(
                             base_bps=float(raw_rule_slippage["base_bps"]),
-                            impact_coefficient_bps=float(
-                                raw_rule_slippage["impact_coefficient_bps"]
-                            ),
+                            impact_coefficient_bps=float(raw_rule_slippage["impact_coefficient_bps"]),
                             exponent=float(raw_rule_slippage["exponent"]),
-                            max_participation=float(
-                                raw_rule_slippage["max_participation"]
-                            ),
+                            max_participation=float(raw_rule_slippage["max_participation"]),
                         ),
                         effective_from=(
                             str(raw_rule["effective_from"])
@@ -687,9 +677,7 @@ class PaperExecutionConfig:
                 )
             cost_schedule = CostSchedule(
                 rules=tuple(cost_rules),
-                calibration_status=str(
-                    raw_cost_schedule.get("calibration_status", "UNCALIBRATED")
-                ),
+                calibration_status=str(raw_cost_schedule.get("calibration_status", "UNCALIBRATED")),
                 calibration_evidence_hash=(
                     str(raw_cost_schedule["calibration_evidence_hash"])
                     if raw_cost_schedule.get("calibration_evidence_hash") is not None
@@ -699,15 +687,9 @@ class PaperExecutionConfig:
         return cls(
             maker_fill=maker,
             slippage=slippage,
-            maker_fee_bps=decimal_value(
-                str(value.get("maker_fee_bps", "0")), label="maker_fee_bps"
-            ),
-            taker_fee_bps=decimal_value(
-                str(value.get("taker_fee_bps", "0")), label="taker_fee_bps"
-            ),
-            cost_multiplier=decimal_value(
-                str(value.get("cost_multiplier", "1")), label="cost_multiplier"
-            ),
+            maker_fee_bps=decimal_value(str(value.get("maker_fee_bps", "0")), label="maker_fee_bps"),
+            taker_fee_bps=decimal_value(str(value.get("taker_fee_bps", "0")), label="taker_fee_bps"),
+            cost_multiplier=decimal_value(str(value.get("cost_multiplier", "1")), label="cost_multiplier"),
             ioc_fill_probability=decimal_value(
                 str(value.get("ioc_fill_probability", "1")), label="ioc_fill_probability"
             ),
@@ -728,6 +710,95 @@ class PaperExecutionConfig:
             ),
             source=str(value.get("source", "research-placeholder")),
             cost_schedule=cost_schedule,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PaperStrategyConfig:
+    """Immutable identity, parameters, and local risk budget for one strategy."""
+
+    strategy_id: str
+    strategy_name: str
+    strategy_hash: str
+    parameters: Mapping[str, object]
+    risk: PaperRiskLimits
+    required_instruments: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "strategy_id",
+            _identifier(self.strategy_id, label="strategy_id"),
+        )
+        object.__setattr__(
+            self,
+            "strategy_name",
+            _identifier(self.strategy_name, label="strategy_name"),
+        )
+        object.__setattr__(
+            self,
+            "strategy_hash",
+            _digest(self.strategy_hash, label="strategy_hash"),
+        )
+        if not isinstance(self.parameters, Mapping):
+            raise TypeError("strategy parameters must be a mapping")
+        object.__setattr__(
+            self,
+            "parameters",
+            frozen_json_mapping(self.parameters, label="strategy parameters"),
+        )
+        if not isinstance(self.risk, PaperRiskLimits):
+            raise TypeError("strategy risk must be PaperRiskLimits")
+        if not isinstance(self.required_instruments, tuple):
+            raise TypeError("strategy required_instruments must be a frozen tuple")
+        for instrument in self.required_instruments:
+            parse_instrument(instrument)
+        if len(set(self.required_instruments)) != len(self.required_instruments):
+            raise ValueError("strategy required_instruments must not contain duplicates")
+        object.__setattr__(
+            self,
+            "required_instruments",
+            tuple(sorted(self.required_instruments)),
+        )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "parameters": cast(
+                dict[str, JsonValue],
+                json.loads(canonical_json(self.parameters)),
+            ),
+            "required_instruments": list(self.required_instruments),
+            "risk": self.risk.to_dict(),
+            "strategy_hash": self.strategy_hash,
+            "strategy_id": self.strategy_id,
+            "strategy_name": self.strategy_name,
+        }
+
+    @property
+    def strategy_config_hash(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PaperStrategyConfig:
+        parameters = value.get("parameters")
+        risk = value.get("risk")
+        raw_instruments = value.get("required_instruments", ())
+        if not isinstance(parameters, Mapping):
+            raise ValueError("strategy parameters must be an object")
+        if not isinstance(risk, Mapping):
+            raise ValueError("strategy risk must be an object")
+        if not isinstance(raw_instruments, Sequence) or isinstance(
+            raw_instruments,
+            (str, bytes),
+        ):
+            raise ValueError("strategy required_instruments must be an array")
+        return cls(
+            strategy_id=str(value["strategy_id"]),
+            strategy_name=str(value["strategy_name"]),
+            strategy_hash=str(value["strategy_hash"]),
+            parameters=cast(Mapping[str, object], parameters),
+            risk=PaperRiskLimits.from_dict(risk),
+            required_instruments=tuple(str(item) for item in raw_instruments),
         )
 
 
@@ -756,15 +827,16 @@ class PaperRunConfig:
     runtime_source_poll_timeout_seconds: float = 0.25
     minimum_validation_cycles: int = 30
     schema_version: int = 2
+    strategies: tuple[PaperStrategyConfig, ...] = ()
     environment: str = "PAPER"
 
     def __post_init__(self) -> None:
         if (
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
-            or self.schema_version not in {1, 2}
+            or self.schema_version not in {1, 2, 3}
         ):
-            raise ValueError("paper configuration schema_version must be 1 or 2")
+            raise ValueError("paper configuration schema_version must be 1, 2, or 3")
         if self.environment != "PAPER":
             raise ValueError("paper configuration environment must be PAPER")
         object.__setattr__(self, "strategy_name", _identifier(self.strategy_name, label="strategy_name"))
@@ -822,6 +894,32 @@ class PaperRunConfig:
             "required_instruments",
             tuple(sorted(self.required_instruments)),
         )
+        if not isinstance(self.strategies, tuple):
+            raise TypeError("strategies must be a frozen tuple")
+        if self.schema_version < 3 and self.strategies:
+            raise ValueError("legacy paper configurations cannot contain strategies")
+        if self.schema_version == 3:
+            if not self.strategies:
+                raise ValueError("schema v3 paper configurations require strategies")
+            if any(not isinstance(item, PaperStrategyConfig) for item in self.strategies):
+                raise TypeError("every strategy must be a PaperStrategyConfig")
+            strategy_ids = [item.strategy_id for item in self.strategies]
+            if len(set(strategy_ids)) != len(strategy_ids):
+                raise ValueError("strategy_id must be unique within a paper portfolio")
+            ordered_strategies = tuple(sorted(self.strategies, key=lambda item: item.strategy_id))
+            object.__setattr__(self, "strategies", ordered_strategies)
+            primary = ordered_strategies[0]
+            if (
+                self.strategy_name != primary.strategy_name
+                or self.strategy_hash != primary.strategy_hash
+                or canonical_json(self.parameters) != canonical_json(primary.parameters)
+            ):
+                raise ValueError("schema v3 legacy strategy aliases must match the first strategy_id")
+            required = {
+                instrument for strategy in ordered_strategies for instrument in strategy.required_instruments
+            }
+            if not required.issubset(self.required_instruments):
+                raise ValueError("portfolio required_instruments must cover every strategy instrument")
         if self.economic_prerequisites_evidence_hash is not None:
             object.__setattr__(
                 self,
@@ -831,13 +929,8 @@ class PaperRunConfig:
                     label="economic prerequisites evidence hash",
                 ),
             )
-        if (
-            self.economic_prerequisites_satisfied
-            and self.economic_prerequisites_evidence_hash is None
-        ):
-            raise ValueError(
-                "satisfied economic prerequisites require a Gate B/C evidence hash"
-            )
+        if self.economic_prerequisites_satisfied and self.economic_prerequisites_evidence_hash is None:
+            raise ValueError("satisfied economic prerequisites require a Gate B/C evidence hash")
         if status == "CALIBRATED":
             if self.data_calibration_evidence_hash is None:
                 raise ValueError("CALIBRATED paper data requires a calibration evidence hash")
@@ -851,10 +944,16 @@ class PaperRunConfig:
         expected_build_hash = (
             _PAPER_ENGINE_BUILD_HASH_V2
             if self.schema_version == 1
-            else PAPER_ENGINE_BUILD_HASH
+            else (
+                MULTI_STRATEGY_PAPER_ENGINE_BUILD_HASH
+                if self.schema_version == 3
+                else PAPER_ENGINE_BUILD_HASH
+            )
         )
         if self.schema_version == 1 and normalized_build_hash == PAPER_ENGINE_BUILD_HASH:
             normalized_build_hash = _PAPER_ENGINE_BUILD_HASH_V2
+        if self.schema_version == 3 and normalized_build_hash == PAPER_ENGINE_BUILD_HASH:
+            normalized_build_hash = MULTI_STRATEGY_PAPER_ENGINE_BUILD_HASH
         object.__setattr__(self, "engine_build_hash", normalized_build_hash)
         if self.engine_build_hash != expected_build_hash:
             raise ValueError("paper configuration targets a different execution-engine build")
@@ -921,9 +1020,7 @@ class PaperRunConfig:
             "data_hash": self.data_hash,
             "data_source": self.data_source,
             "economic_prerequisites_satisfied": self.economic_prerequisites_satisfied,
-            "economic_prerequisites_evidence_hash": (
-                self.economic_prerequisites_evidence_hash
-            ),
+            "economic_prerequisites_evidence_hash": (self.economic_prerequisites_evidence_hash),
             "engine_build_hash": self.engine_build_hash,
             "execution": self.execution.to_dict(),
             "initial_cash": decimal_text(self.initial_cash),
@@ -942,11 +1039,41 @@ class PaperRunConfig:
             payload["environment"] = self.environment
             payload["release_code_sha256"] = self.release_code_sha256
             payload["runtime_environment_sha256"] = self.runtime_environment_sha256
-            payload["runtime_source_poll_timeout_seconds"] = (
-                self.runtime_source_poll_timeout_seconds
-            )
+            payload["runtime_source_poll_timeout_seconds"] = self.runtime_source_poll_timeout_seconds
             payload["runtime_timer_interval_seconds"] = self.runtime_timer_interval_seconds
+        if self.schema_version >= 3:
+            payload["portfolio_id"] = self.portfolio_id
+            payload["strategies"] = [item.to_dict() for item in self.strategies]
         return payload
+
+    @property
+    def strategy_configs(self) -> tuple[PaperStrategyConfig, ...]:
+        if self.strategies:
+            return self.strategies
+        return (
+            PaperStrategyConfig(
+                strategy_id=self.strategy_name,
+                strategy_name=self.strategy_name,
+                strategy_hash=self.strategy_hash,
+                parameters=self.parameters,
+                risk=self.risk,
+                required_instruments=self.required_instruments,
+            ),
+        )
+
+    def strategy_config(self, strategy_id: str) -> PaperStrategyConfig:
+        normalized = _identifier(strategy_id, label="strategy_id")
+        for strategy in self.strategy_configs:
+            if strategy.strategy_id == normalized:
+                return strategy
+        raise KeyError(normalized)
+
+    @property
+    def portfolio_id(self) -> str:
+        return deterministic_id(
+            "paper_portfolio",
+            tuple((item.strategy_id, item.strategy_config_hash) for item in self.strategy_configs),
+        )
 
     @property
     def config_hash(self) -> str:
@@ -967,13 +1094,13 @@ class PaperRunConfig:
             raise ValueError("paper run config parameters must be an object")
         raw_schema_version = value.get("schema_version", 1)
         if isinstance(raw_schema_version, bool):
-            raise ValueError("paper configuration schema_version must be 1 or 2")
+            raise ValueError("paper configuration schema_version must be 1, 2, or 3")
         schema_version = int(str(raw_schema_version))
-        if schema_version not in {1, 2}:
-            raise ValueError("paper configuration schema_version must be 1 or 2")
-        if schema_version == 2 and "environment" not in value:
-            raise ValueError("schema v2 paper configuration requires explicit environment PAPER")
-        if schema_version == 2:
+        if schema_version not in {1, 2, 3}:
+            raise ValueError("paper configuration schema_version must be 1, 2, or 3")
+        if schema_version >= 2 and "environment" not in value:
+            raise ValueError("schema v2/v3 paper configuration requires explicit environment PAPER")
+        if schema_version >= 2:
             missing_snapshot_fields = tuple(
                 field_name
                 for field_name in (
@@ -999,13 +1126,24 @@ class PaperRunConfig:
             if "runtime_environment_sha256" in value
             else _current_runtime_environment_sha256()
         )
-        runtime_timer_interval_seconds = float(
-            str(value.get("runtime_timer_interval_seconds", 1.0))
-        )
+        runtime_timer_interval_seconds = float(str(value.get("runtime_timer_interval_seconds", 1.0)))
         runtime_source_poll_timeout_seconds = float(
             str(value.get("runtime_source_poll_timeout_seconds", 0.25))
         )
-        return cls(
+        raw_strategies = value.get("strategies", ())
+        if not isinstance(raw_strategies, Sequence) or isinstance(
+            raw_strategies,
+            (str, bytes),
+        ):
+            raise ValueError("paper strategies must be an array")
+        strategies = tuple(
+            PaperStrategyConfig.from_dict(cast(Mapping[str, object], item))
+            for item in raw_strategies
+            if isinstance(item, Mapping)
+        )
+        if len(strategies) != len(raw_strategies):
+            raise ValueError("every paper strategy must be an object")
+        config = cls(
             strategy_name=str(value["strategy_name"]),
             strategy_hash=str(value["strategy_hash"]),
             parameters=cast(Mapping[str, object], parameters),
@@ -1025,9 +1163,7 @@ class PaperRunConfig:
                 else None
             ),
             data_source=str(value.get("data_source", "research-placeholder")),
-            economic_prerequisites_satisfied=bool(
-                value.get("economic_prerequisites_satisfied", False)
-            ),
+            economic_prerequisites_satisfied=bool(value.get("economic_prerequisites_satisfied", False)),
             economic_prerequisites_evidence_hash=(
                 str(value["economic_prerequisites_evidence_hash"])
                 if value.get("economic_prerequisites_evidence_hash") is not None
@@ -1035,9 +1171,7 @@ class PaperRunConfig:
             ),
             required_instruments=tuple(
                 str(instrument)
-                for instrument in cast(
-                    Sequence[object], value.get("required_instruments", ())
-                )
+                for instrument in cast(Sequence[object], value.get("required_instruments", ()))
             ),
             engine_build_hash=str(
                 value.get(
@@ -1045,7 +1179,11 @@ class PaperRunConfig:
                     (
                         _PAPER_ENGINE_BUILD_HASH_V2
                         if schema_version == 1
-                        else PAPER_ENGINE_BUILD_HASH
+                        else (
+                            MULTI_STRATEGY_PAPER_ENGINE_BUILD_HASH
+                            if schema_version == 3
+                            else PAPER_ENGINE_BUILD_HASH
+                        )
                     ),
                 )
             ),
@@ -1054,7 +1192,15 @@ class PaperRunConfig:
             runtime_source_poll_timeout_seconds=runtime_source_poll_timeout_seconds,
             runtime_environment_sha256=runtime_environment_sha256,
             minimum_validation_cycles=int(str(value.get("minimum_validation_cycles", 30))),
+            strategies=strategies,
         )
+        if schema_version == 3:
+            raw_portfolio_id = value.get("portfolio_id")
+            if raw_portfolio_id is None:
+                raise ValueError("schema v3 paper configuration requires portfolio_id")
+            if str(raw_portfolio_id) != config.portfolio_id:
+                raise ValueError("paper portfolio_id differs from immutable strategy membership")
+        return config
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,11 +1219,18 @@ class OrderIntent:
     reduce_only: bool = False
     hedge_group_id: str | None = None
     leg_number: int = 1
+    strategy_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_id", _digest(self.order_id, label="order_id"))
         object.__setattr__(self, "decision_id", _digest(self.decision_id, label="decision_id"))
         object.__setattr__(self, "run_id", _digest(self.run_id, label="run_id"))
+        if self.strategy_id is not None:
+            object.__setattr__(
+                self,
+                "strategy_id",
+                _identifier(self.strategy_id, label="strategy_id"),
+            )
         parse_instrument(self.instrument)
         object.__setattr__(self, "side", OrderSide(self.side))
         object.__setattr__(
@@ -1106,8 +1259,7 @@ class OrderIntent:
                 "hedge_group_id",
                 _identifier(self.hedge_group_id, label="hedge_group_id"),
             )
-        expected_id = deterministic_id(
-            "paper_order",
+        components = (
             self.run_id,
             self.decision_id,
             self.ordinal,
@@ -1120,6 +1272,11 @@ class OrderIntent:
             self.reduce_only,
             self.hedge_group_id,
             self.leg_number,
+        )
+        expected_id = (
+            deterministic_id("paper_order", self.strategy_id, *components)
+            if self.strategy_id is not None
+            else deterministic_id("paper_order", *components)
         )
         if self.order_id != expected_id:
             raise ValueError("order_id does not match the deterministic order payload")
@@ -1141,9 +1298,9 @@ class OrderIntent:
         reduce_only: bool = False,
         hedge_group_id: str | None = None,
         leg_number: int = 1,
+        strategy_id: str | None = None,
     ) -> OrderIntent:
-        order_id = deterministic_id(
-            "paper_order",
+        components = (
             run_id,
             decision_id,
             ordinal,
@@ -1156,6 +1313,11 @@ class OrderIntent:
             reduce_only,
             hedge_group_id,
             leg_number,
+        )
+        order_id = (
+            deterministic_id("paper_order", strategy_id, *components)
+            if strategy_id is not None
+            else deterministic_id("paper_order", *components)
         )
         return cls(
             order_id=order_id,
@@ -1172,10 +1334,11 @@ class OrderIntent:
             reduce_only=reduce_only,
             hedge_group_id=hedge_group_id,
             leg_number=leg_number,
+            strategy_id=strategy_id,
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "created_at": utc_text(self.created_at),
             "decision_id": self.decision_id,
             "hedge_group_id": self.hedge_group_id,
@@ -1191,6 +1354,9 @@ class OrderIntent:
             "side": cast(OrderSide, self.side).value,
             "time_in_force": cast(TimeInForce, self.time_in_force).value,
         }
+        if self.strategy_id is not None:
+            payload["strategy_id"] = self.strategy_id
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> OrderIntent:
@@ -1215,6 +1381,7 @@ class OrderIntent:
                 str(value["hedge_group_id"]) if value.get("hedge_group_id") is not None else None
             ),
             leg_number=int(str(value.get("leg_number", 1))),
+            strategy_id=(str(value["strategy_id"]) if value.get("strategy_id") is not None else None),
         )
 
 
@@ -1231,11 +1398,42 @@ class DecisionIntent:
     orders: tuple[OrderIntent, ...]
     ordinal: int = 0
     signal: Mapping[str, object] = field(default_factory=dict)
+    strategy_id: str | None = None
+    strategy_hash: str | None = None
+    strategy_config_hash: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "decision_id", _digest(self.decision_id, label="decision_id"))
         object.__setattr__(self, "run_id", _digest(self.run_id, label="run_id"))
         object.__setattr__(self, "strategy_name", _identifier(self.strategy_name, label="strategy_name"))
+        identities = (
+            self.strategy_id,
+            self.strategy_hash,
+            self.strategy_config_hash,
+        )
+        if any(item is not None for item in identities):
+            if any(item is None for item in identities):
+                raise ValueError(
+                    "multi-strategy decisions require strategy_id, strategy_hash, and strategy_config_hash"
+                )
+            object.__setattr__(
+                self,
+                "strategy_id",
+                _identifier(cast(str, self.strategy_id), label="strategy_id"),
+            )
+            object.__setattr__(
+                self,
+                "strategy_hash",
+                _digest(cast(str, self.strategy_hash), label="strategy_hash"),
+            )
+            object.__setattr__(
+                self,
+                "strategy_config_hash",
+                _digest(
+                    cast(str, self.strategy_config_hash),
+                    label="strategy_config_hash",
+                ),
+            )
         object.__setattr__(self, "action", DecisionAction(self.action))
         object.__setattr__(self, "decided_at", _utc(self.decided_at, label="decided_at"))
         object.__setattr__(self, "received_at", _utc(self.received_at, label="received_at"))
@@ -1255,6 +1453,8 @@ class DecisionIntent:
         for order in self.orders:
             if order.run_id != self.run_id or order.decision_id != self.decision_id:
                 raise ValueError("every order must be bound to the same run and decision")
+            if order.strategy_id != self.strategy_id:
+                raise ValueError("every order must be bound to the same strategy")
             if order.created_at != self.decided_at:
                 raise ValueError("order created_at must equal decision decided_at")
         order_ids = [order.order_id for order in self.orders]
@@ -1279,6 +1479,7 @@ class DecisionIntent:
             action=cast(DecisionAction, self.action),
             ordinal=self.ordinal,
             signal=self.signal,
+            strategy_id=self.strategy_id,
         )
         if self.decision_id != expected_id:
             raise ValueError("decision_id does not match the deterministic decision payload")
@@ -1292,15 +1493,24 @@ class DecisionIntent:
         action: DecisionAction | str,
         ordinal: int,
         signal: Mapping[str, object] | None = None,
+        strategy_id: str | None = None,
     ) -> str:
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
             raise ValueError("decision ordinal must be a non-negative integer")
+        components: tuple[object, ...] = (
+            run_id,
+            market_event_id,
+            str(action),
+            ordinal,
+        )
+        if strategy_id is not None:
+            components = (run_id, strategy_id, market_event_id, str(action), ordinal)
         if signal:
-            return deterministic_id("paper_decision", run_id, market_event_id, str(action), ordinal, signal)
-        return deterministic_id("paper_decision", run_id, market_event_id, str(action), ordinal)
+            return deterministic_id("paper_decision", *components, signal)
+        return deterministic_id("paper_decision", *components)
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "action": cast(DecisionAction, self.action).value,
             "decided_at": utc_text(self.decided_at),
             "decision_id": self.decision_id,
@@ -1313,9 +1523,15 @@ class DecisionIntent:
             "strategy_name": self.strategy_name,
             **(
                 {"signal": cast(dict[str, JsonValue], json.loads(canonical_json(self.signal)))}
-                if self.signal else {}
+                if self.signal
+                else {}
             ),
         }
+        if self.strategy_id is not None:
+            payload["strategy_config_hash"] = self.strategy_config_hash
+            payload["strategy_hash"] = self.strategy_hash
+            payload["strategy_id"] = self.strategy_id
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> DecisionIntent:
@@ -1324,9 +1540,7 @@ class DecisionIntent:
         raw_signal = value.get("signal", {})
         if not isinstance(raw_orders, Sequence) or isinstance(raw_orders, (str, bytes)):
             raise ValueError("decision orders must be an array")
-        if not isinstance(raw_observed, Sequence) or isinstance(
-            raw_observed, (str, bytes)
-        ):
+        if not isinstance(raw_observed, Sequence) or isinstance(raw_observed, (str, bytes)):
             raise ValueError("decision observed_event_ids must be an array")
         if not isinstance(raw_signal, Mapping):
             raise ValueError("decision signal must be an object")
@@ -1347,6 +1561,11 @@ class DecisionIntent:
             ),
             ordinal=int(str(value.get("ordinal", 0))),
             signal=cast(Mapping[str, object], raw_signal),
+            strategy_id=(str(value["strategy_id"]) if value.get("strategy_id") is not None else None),
+            strategy_hash=(str(value["strategy_hash"]) if value.get("strategy_hash") is not None else None),
+            strategy_config_hash=(
+                str(value["strategy_config_hash"]) if value.get("strategy_config_hash") is not None else None
+            ),
         )
 
 
@@ -1452,9 +1671,7 @@ class MarketEvent:
         capture_ordinal: int,
     ) -> str:
         if source_sequence is None and capture_ordinal == 0:
-            raise ValueError(
-                "market identity requires source_sequence or a positive capture_ordinal"
-            )
+            raise ValueError("market identity requires source_sequence or a positive capture_ordinal")
         return deterministic_id(
             "paper_market_event",
             instrument,
@@ -1513,9 +1730,7 @@ class MarketEvent:
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
-            "aggressor_side": (
-                cast(OrderSide, self.aggressor_side).value if self.aggressor_side else None
-            ),
+            "aggressor_side": (cast(OrderSide, self.aggressor_side).value if self.aggressor_side else None),
             "ask_depth": decimal_text(self.ask_depth),
             "ask_price": decimal_text(self.ask_price),
             "bid_depth": decimal_text(self.bid_depth),
@@ -1528,14 +1743,16 @@ class MarketEvent:
             "source_sequence": self.source_sequence,
             **({"source_event_kind": self.source_event_kind} if self.source_event_kind else {}),
             **({"source_connection_id": self.source_connection_id} if self.source_connection_id else {}),
-            **({"source_connection_epoch": self.source_connection_epoch} if self.source_connection_epoch is not None else {}),
+            **(
+                {"source_connection_epoch": self.source_connection_epoch}
+                if self.source_connection_epoch is not None
+                else {}
+            ),
             "stale": self.stale,
             "tradable": self.tradable,
             "trade_price": decimal_text(self.trade_price) if self.trade_price is not None else None,
             "trade_quantity": (
-                decimal_text(self.trade_quantity)
-                if self.trade_quantity is not None
-                else None
+                decimal_text(self.trade_quantity) if self.trade_quantity is not None else None
             ),
         }
 
@@ -1550,9 +1767,7 @@ class MarketEvent:
             bid_depth=decimal_value(str(value["bid_depth"]), label="bid_depth"),
             ask_depth=decimal_value(str(value["ask_depth"]), label="ask_depth"),
             source_sequence=(
-                int(str(value["source_sequence"]))
-                if value.get("source_sequence") is not None
-                else None
+                int(str(value["source_sequence"])) if value.get("source_sequence") is not None else None
             ),
             capture_ordinal=int(str(value.get("capture_ordinal", 0))),
             trade_price=(
@@ -1566,19 +1781,13 @@ class MarketEvent:
                 else None
             ),
             aggressor_side=(
-                str(value["aggressor_side"])
-                if value.get("aggressor_side") is not None
-                else None
+                str(value["aggressor_side"]) if value.get("aggressor_side") is not None else None
             ),
             source_event_kind=(
-                str(value["source_event_kind"])
-                if value.get("source_event_kind") is not None
-                else None
+                str(value["source_event_kind"]) if value.get("source_event_kind") is not None else None
             ),
             source_connection_id=(
-                str(value["source_connection_id"])
-                if value.get("source_connection_id") is not None
-                else None
+                str(value["source_connection_id"]) if value.get("source_connection_id") is not None else None
             ),
             source_connection_epoch=(
                 int(str(value["source_connection_epoch"]))
@@ -1678,9 +1887,7 @@ class PaperEvent:
             event_type=str(value["event_type"]),
             occurred_at=parse_utc(str(value["occurred_at"]), label="occurred_at"),
             received_at=parse_utc(str(value["received_at"]), label="received_at"),
-            causation_id=(
-                str(value["causation_id"]) if value.get("causation_id") is not None else None
-            ),
+            causation_id=(str(value["causation_id"]) if value.get("causation_id") is not None else None),
             correlation_id=str(value["correlation_id"]),
             payload=cast(Mapping[str, object], payload),
         )
@@ -1792,9 +1999,7 @@ class PaperOrder:
             raise TypeError("paper order intent must be an OrderIntent")
         self.action = DecisionAction(self.action)
         self.status = OrderStatus(self.status)
-        self.filled_quantity = decimal_value(
-            self.filled_quantity, label="filled_quantity", non_negative=True
-        )
+        self.filled_quantity = decimal_value(self.filled_quantity, label="filled_quantity", non_negative=True)
         if self.filled_quantity > self.intent.quantity:
             raise ValueError("filled_quantity cannot exceed requested quantity")
         if self.average_fill_price is not None:
@@ -1856,11 +2061,205 @@ class PaperOrder:
             active_at=parse_utc(str(value["active_at"])) if value.get("active_at") else None,
             expires_at=parse_utc(str(value["expires_at"])) if value.get("expires_at") else None,
             cancel_effective_at=(
-                parse_utc(str(value["cancel_effective_at"]))
-                if value.get("cancel_effective_at")
-                else None
+                parse_utc(str(value["cancel_effective_at"])) if value.get("cancel_effective_at") else None
             ),
             fill_attempts=int(str(value.get("fill_attempts", 0))),
+        )
+
+
+@dataclass(slots=True)
+class PaperStrategyProjection:
+    """Durable strategy-owned state; shared marks and orders remain portfolio-owned."""
+
+    strategy_id: str
+    strategy_name: str
+    strategy_hash: str
+    strategy_config_hash: str
+    state: PaperState = PaperState.FLAT
+    state_since: datetime | None = None
+    suspended_from: PaperState | None = None
+    cash: Decimal = Decimal(0)
+    fees: Decimal = Decimal(0)
+    realized_pnl: Decimal = Decimal(0)
+    positions: dict[str, Decimal] = field(default_factory=dict)
+    cost_basis: dict[str, Decimal] = field(default_factory=dict)
+    inventory_value: dict[str, Decimal] = field(default_factory=dict)
+    decisions: int = 0
+    completed_cycles: int = 0
+    current_entry_decision_id: str | None = None
+    current_exit_decision_id: str | None = None
+    peak_equity: Decimal = Decimal(0)
+    session_start_equity: Decimal = Decimal(0)
+    session_date: str | None = None
+    critical_incident_count: int = 0
+    last_critical_incident_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        self.strategy_id = _identifier(self.strategy_id, label="strategy_id")
+        self.strategy_name = _identifier(self.strategy_name, label="strategy_name")
+        self.strategy_hash = _digest(self.strategy_hash, label="strategy_hash")
+        self.strategy_config_hash = _digest(
+            self.strategy_config_hash,
+            label="strategy_config_hash",
+        )
+        self.state = PaperState(self.state)
+        if self.suspended_from is not None:
+            self.suspended_from = PaperState(self.suspended_from)
+        if self.state_since is not None:
+            self.state_since = _utc(self.state_since, label="strategy state_since")
+        for name in (
+            "cash",
+            "fees",
+            "realized_pnl",
+            "peak_equity",
+            "session_start_equity",
+        ):
+            setattr(self, name, decimal_value(getattr(self, name), label=name))
+        for name in ("positions", "cost_basis", "inventory_value"):
+            values = getattr(self, name)
+            if not isinstance(values, dict):
+                raise TypeError(f"strategy {name} must be a dict")
+            normalized = {
+                instrument: decimal_value(
+                    value,
+                    label=f"strategy {name}.{instrument}",
+                    positive=name == "cost_basis",
+                )
+                for instrument, value in values.items()
+            }
+            if name == "positions":
+                normalized = {instrument: value for instrument, value in normalized.items() if value != 0}
+            setattr(self, name, normalized)
+        if set(self.cost_basis) != set(self.positions):
+            raise ValueError("strategy cost_basis keys must equal positions")
+        if set(self.inventory_value) != set(self.positions):
+            raise ValueError("strategy inventory_value keys must equal positions")
+        for instrument, quantity in self.positions.items():
+            if (self.inventory_value[instrument] > 0) != (quantity > 0):
+                raise ValueError(f"strategy inventory_value sign differs from position for {instrument}")
+        for name in (
+            "decisions",
+            "completed_cycles",
+            "critical_incident_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"strategy {name} must be a non-negative integer")
+        if self.current_entry_decision_id is not None:
+            self.current_entry_decision_id = _digest(
+                self.current_entry_decision_id,
+                label="strategy current_entry_decision_id",
+            )
+        if self.current_exit_decision_id is not None:
+            self.current_exit_decision_id = _digest(
+                self.current_exit_decision_id,
+                label="strategy current_exit_decision_id",
+            )
+        if self.last_critical_incident_at is not None:
+            self.last_critical_incident_at = _utc(
+                self.last_critical_incident_at,
+                label="strategy last_critical_incident_at",
+            )
+        if (self.critical_incident_count == 0) != (self.last_critical_incident_at is None):
+            raise ValueError("strategy last critical incident must match the incident count")
+
+    def equity(self, marks: Mapping[str, Decimal]) -> Decimal:
+        return self.cash + sum(
+            (quantity * marks.get(instrument, Decimal(0)) for instrument, quantity in self.positions.items()),
+            Decimal(0),
+        )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "cash": decimal_text(self.cash),
+            "completed_cycles": self.completed_cycles,
+            "cost_basis": {key: decimal_text(value) for key, value in sorted(self.cost_basis.items())},
+            "critical_incident_count": self.critical_incident_count,
+            "current_entry_decision_id": self.current_entry_decision_id,
+            "current_exit_decision_id": self.current_exit_decision_id,
+            "decisions": self.decisions,
+            "fees": decimal_text(self.fees),
+            "inventory_value": {
+                key: decimal_text(value) for key, value in sorted(self.inventory_value.items())
+            },
+            "last_critical_incident_at": (
+                utc_text(self.last_critical_incident_at)
+                if self.last_critical_incident_at is not None
+                else None
+            ),
+            "peak_equity": decimal_text(self.peak_equity),
+            "positions": {key: decimal_text(value) for key, value in sorted(self.positions.items())},
+            "realized_pnl": decimal_text(self.realized_pnl),
+            "session_date": self.session_date,
+            "session_start_equity": decimal_text(self.session_start_equity),
+            "state": self.state.value,
+            "state_since": (utc_text(self.state_since) if self.state_since is not None else None),
+            "strategy_config_hash": self.strategy_config_hash,
+            "strategy_hash": self.strategy_hash,
+            "strategy_id": self.strategy_id,
+            "strategy_name": self.strategy_name,
+            "suspended_from": (self.suspended_from.value if self.suspended_from is not None else None),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> PaperStrategyProjection:
+        def decimal_map(name: str) -> dict[str, Decimal]:
+            raw = value.get(name, {})
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"strategy projection {name} must be an object")
+            return {
+                str(key): decimal_value(str(item), label=f"strategy {name}.{key}")
+                for key, item in raw.items()
+            }
+
+        return cls(
+            strategy_id=str(value["strategy_id"]),
+            strategy_name=str(value["strategy_name"]),
+            strategy_hash=str(value["strategy_hash"]),
+            strategy_config_hash=str(value["strategy_config_hash"]),
+            state=PaperState(str(value.get("state", "FLAT"))),
+            state_since=(
+                parse_utc(str(value["state_since"])) if value.get("state_since") is not None else None
+            ),
+            suspended_from=(
+                PaperState(str(value["suspended_from"])) if value.get("suspended_from") is not None else None
+            ),
+            cash=decimal_value(str(value.get("cash", "0")), label="strategy cash"),
+            fees=decimal_value(str(value.get("fees", "0")), label="strategy fees"),
+            realized_pnl=decimal_value(
+                str(value.get("realized_pnl", "0")),
+                label="strategy realized_pnl",
+            ),
+            positions=decimal_map("positions"),
+            cost_basis=decimal_map("cost_basis"),
+            inventory_value=decimal_map("inventory_value"),
+            decisions=int(str(value.get("decisions", 0))),
+            completed_cycles=int(str(value.get("completed_cycles", 0))),
+            current_entry_decision_id=(
+                str(value["current_entry_decision_id"])
+                if value.get("current_entry_decision_id") is not None
+                else None
+            ),
+            current_exit_decision_id=(
+                str(value["current_exit_decision_id"])
+                if value.get("current_exit_decision_id") is not None
+                else None
+            ),
+            peak_equity=decimal_value(
+                str(value.get("peak_equity", "0")),
+                label="strategy peak_equity",
+            ),
+            session_start_equity=decimal_value(
+                str(value.get("session_start_equity", "0")),
+                label="strategy session_start_equity",
+            ),
+            session_date=(str(value["session_date"]) if value.get("session_date") is not None else None),
+            critical_incident_count=int(str(value.get("critical_incident_count", 0))),
+            last_critical_incident_at=(
+                parse_utc(str(value["last_critical_incident_at"]))
+                if value.get("last_critical_incident_at") is not None
+                else None
+            ),
         )
 
 
@@ -1883,10 +2282,9 @@ class PaperProjection:
     inventory_value: dict[str, Decimal] = field(default_factory=dict)
     marks: dict[str, Decimal] = field(default_factory=dict)
     public_bbo_mids: dict[str, Decimal] = field(default_factory=dict)
-    public_bbo_received_at_by_instrument: dict[str, datetime] = field(
-        default_factory=dict
-    )
+    public_bbo_received_at_by_instrument: dict[str, datetime] = field(default_factory=dict)
     orders: dict[str, PaperOrder] = field(default_factory=dict)
+    strategy_projections: dict[str, PaperStrategyProjection] = field(default_factory=dict)
     archived_order_count: int = 0
     decisions: int = 0
     completed_cycles: int = 0
@@ -1904,9 +2302,7 @@ class PaperProjection:
     last_received_at: datetime | None = None
     last_public_source_received_at: datetime | None = None
     last_market_received_at: datetime | None = None
-    last_market_received_at_by_instrument: dict[str, datetime] = field(
-        default_factory=dict
-    )
+    last_market_received_at_by_instrument: dict[str, datetime] = field(default_factory=dict)
     last_sequence: int = 0
     last_event_hash: str | None = None
     reconciled: bool = True
@@ -1927,15 +2323,10 @@ class PaperProjection:
         self.realized_pnl = decimal_value(self.realized_pnl, label="realized_pnl")
         if isinstance(self.peak_equity, Decimal) and self.peak_equity.is_nan():
             self.peak_equity = self.initial_cash
-        if (
-            isinstance(self.session_start_equity, Decimal)
-            and self.session_start_equity.is_nan()
-        ):
+        if isinstance(self.session_start_equity, Decimal) and self.session_start_equity.is_nan():
             self.session_start_equity = self.initial_cash
         self.peak_equity = decimal_value(self.peak_equity, label="peak_equity")
-        self.session_start_equity = decimal_value(
-            self.session_start_equity, label="session_start_equity"
-        )
+        self.session_start_equity = decimal_value(self.session_start_equity, label="session_start_equity")
         if self.session_date is not None:
             try:
                 datetime.fromisoformat(f"{self.session_date}T00:00:00+00:00")
@@ -1983,14 +2374,49 @@ class PaperProjection:
             instrument: _utc(received_at, label=f"public BBO {instrument}")
             for instrument, received_at in self.public_bbo_received_at_by_instrument.items()
         }
-        if set(self.public_bbo_mids) != set(
-            self.public_bbo_received_at_by_instrument
-        ):
-            raise ValueError(
-                "public BBO mid and source-received timestamp keys must match"
-            )
+        if set(self.public_bbo_mids) != set(self.public_bbo_received_at_by_instrument):
+            raise ValueError("public BBO mid and source-received timestamp keys must match")
         if any(key != order.intent.order_id for key, order in self.orders.items()):
             raise ValueError("paper order projection keys must equal their deterministic order IDs")
+        if any(key != strategy.strategy_id for key, strategy in self.strategy_projections.items()):
+            raise ValueError("strategy projection keys must equal their immutable strategy_id")
+        if self.strategy_projections:
+            for order in self.orders.values():
+                strategy_id = order.intent.strategy_id
+                if strategy_id is None or strategy_id not in self.strategy_projections:
+                    raise ValueError("multi-strategy orders require a known explicit strategy_id")
+            instruments = {
+                instrument
+                for strategy in self.strategy_projections.values()
+                for instrument in strategy.positions
+            }
+            attributed_positions = {
+                instrument: sum(
+                    (
+                        strategy.positions.get(instrument, Decimal(0))
+                        for strategy in self.strategy_projections.values()
+                    ),
+                    Decimal(0),
+                )
+                for instrument in instruments
+            }
+            attributed_positions = {
+                instrument: quantity for instrument, quantity in attributed_positions.items() if quantity != 0
+            }
+            if attributed_positions != self.positions:
+                raise ValueError("aggregate positions differ from durable strategy attribution")
+            attributed_cash = self.initial_cash + sum(
+                (strategy.cash for strategy in self.strategy_projections.values()),
+                Decimal(0),
+            )
+            if attributed_cash != self.cash:
+                raise ValueError("aggregate cash differs from durable strategy attribution")
+            attributed_fees = sum(
+                (strategy.fees for strategy in self.strategy_projections.values()),
+                Decimal(0),
+            )
+            if attributed_fees != self.fees:
+                raise ValueError("aggregate fees differ from durable strategy attribution")
         if (
             isinstance(self.archived_order_count, bool)
             or not isinstance(self.archived_order_count, int)
@@ -2018,21 +2444,16 @@ class PaperProjection:
                 self.last_critical_incident_at,
                 label="last_critical_incident_at",
             )
-        if (self.critical_incident_count == 0) != (
-            self.last_critical_incident_at is None
-        ):
+        if (self.critical_incident_count == 0) != (self.last_critical_incident_at is None):
             raise ValueError(
-                "last_critical_incident_at must be present exactly when "
-                "critical_incident_count is positive"
+                "last_critical_incident_at must be present exactly when critical_incident_count is positive"
             )
         if (
             isinstance(self.runtime_session_generation, bool)
             or not isinstance(self.runtime_session_generation, int)
             or self.runtime_session_generation < 0
         ):
-            raise ValueError(
-                "runtime_session_generation must be a non-negative integer"
-            )
+            raise ValueError("runtime_session_generation must be a non-negative integer")
         if self.runtime_session_id is not None:
             self.runtime_session_id = _digest(
                 self.runtime_session_id,
@@ -2057,13 +2478,9 @@ class PaperProjection:
                     self.runtime_session_stopped_at,
                 )
             ):
-                raise ValueError(
-                    "runtime session fields require a positive generation"
-                )
+                raise ValueError("runtime session fields require a positive generation")
         elif self.runtime_session_id is None or self.runtime_session_started_at is None:
-            raise ValueError(
-                "positive runtime session generation requires identity and start time"
-            )
+            raise ValueError("positive runtime session generation requires identity and start time")
         if (
             self.runtime_session_stopped_at is not None
             and self.runtime_session_started_at is not None
@@ -2091,21 +2508,15 @@ class PaperProjection:
             if self.last_market_received_at is None:
                 self.last_market_received_at = latest_market
             elif self.last_market_received_at != latest_market:
-                raise ValueError(
-                    "last_market_received_at must equal the latest per-instrument market time"
-                )
+                raise ValueError("last_market_received_at must equal the latest per-instrument market time")
         if (
             self.last_public_source_received_at is not None
             and self.last_received_at is not None
             and self.last_public_source_received_at > self.last_received_at
         ):
-            raise ValueError(
-                "public source receipt time cannot exceed durable processing time"
-            )
+            raise ValueError("public source receipt time cannot exceed durable processing time")
         if self.public_bbo_received_at_by_instrument:
-            latest_public_bbo = max(
-                self.public_bbo_received_at_by_instrument.values()
-            )
+            latest_public_bbo = max(self.public_bbo_received_at_by_instrument.values())
             if (
                 self.last_public_source_received_at is not None
                 and latest_public_bbo > self.last_public_source_received_at
@@ -2138,6 +2549,17 @@ class PaperProjection:
     def active_orders(self) -> tuple[PaperOrder, ...]:
         return tuple(order for order in self.orders.values() if order.status.active)
 
+    def strategy_projection(self, strategy_id: str) -> PaperStrategyProjection:
+        normalized = _identifier(strategy_id, label="strategy_id")
+        try:
+            return self.strategy_projections[normalized]
+        except KeyError as error:
+            raise ValueError(f"unknown strategy_id {normalized}") from error
+
+    def strategy_active_orders(self, strategy_id: str) -> tuple[PaperOrder, ...]:
+        normalized = _identifier(strategy_id, label="strategy_id")
+        return tuple(order for order in self.active_orders if order.intent.strategy_id == normalized)
+
     @property
     def runtime_session_active(self) -> bool:
         return (
@@ -2152,9 +2574,7 @@ class PaperProjection:
             "cash": decimal_text(self.cash),
             "completed_cycles": self.completed_cycles,
             "config_hash": self.config_hash,
-            "cost_basis": {
-                key: decimal_text(value) for key, value in sorted(self.cost_basis.items())
-            },
+            "cost_basis": {key: decimal_text(value) for key, value in sorted(self.cost_basis.items())},
             "critical_incident_count": self.critical_incident_count,
             "current_entry_decision_id": self.current_entry_decision_id,
             "current_exit_decision_id": self.current_exit_decision_id,
@@ -2176,15 +2596,11 @@ class PaperProjection:
                 else None
             ),
             "last_market_received_at": (
-                utc_text(self.last_market_received_at)
-                if self.last_market_received_at is not None
-                else None
+                utc_text(self.last_market_received_at) if self.last_market_received_at is not None else None
             ),
             "last_market_received_at_by_instrument": {
                 instrument: utc_text(received_at)
-                for instrument, received_at in sorted(
-                    self.last_market_received_at_by_instrument.items()
-                )
+                for instrument, received_at in sorted(self.last_market_received_at_by_instrument.items())
             },
             "last_received_at": (
                 utc_text(self.last_received_at) if self.last_received_at is not None else None
@@ -2192,20 +2608,15 @@ class PaperProjection:
             "last_sequence": self.last_sequence,
             "marks": {key: decimal_text(value) for key, value in sorted(self.marks.items())},
             "public_bbo_mids": {
-                key: decimal_text(value)
-                for key, value in sorted(self.public_bbo_mids.items())
+                key: decimal_text(value) for key, value in sorted(self.public_bbo_mids.items())
             },
             "public_bbo_received_at_by_instrument": {
                 instrument: utc_text(received_at)
-                for instrument, received_at in sorted(
-                    self.public_bbo_received_at_by_instrument.items()
-                )
+                for instrument, received_at in sorted(self.public_bbo_received_at_by_instrument.items())
             },
             "orders": {key: value.to_dict() for key, value in sorted(self.orders.items())},
             "peak_equity": decimal_text(self.peak_equity),
-            "positions": {
-                key: decimal_text(value) for key, value in sorted(self.positions.items())
-            },
+            "positions": {key: decimal_text(value) for key, value in sorted(self.positions.items())},
             "realized_pnl": decimal_text(self.realized_pnl),
             "reconciled": self.reconciled,
             "run_id": self.run_id,
@@ -2221,11 +2632,20 @@ class PaperProjection:
                 if self.runtime_session_stopped_at is not None
                 else None
             ),
-            "schema_version": 3,
+            "schema_version": 4 if self.strategy_projections else 3,
             "session_start_equity": decimal_text(self.session_start_equity),
             "session_date": self.session_date,
             "state": self.state.value,
             "state_since": utc_text(self.state_since) if self.state_since is not None else None,
+            **(
+                {
+                    "strategy_projections": {
+                        key: value.to_dict() for key, value in sorted(self.strategy_projections.items())
+                    }
+                }
+                if self.strategy_projections
+                else {}
+            ),
             "suspended_from": self.suspended_from.value if self.suspended_from else None,
         }
 
@@ -2251,26 +2671,22 @@ class PaperProjection:
             try:
                 parsed = int(str(raw))
             except ValueError as error:
-                raise ValueError(
-                    f"projection {name} must be a non-negative integer"
-                ) from error
+                raise ValueError(f"projection {name} must be a non-negative integer") from error
             if parsed < 0:
                 raise ValueError(f"projection {name} must be a non-negative integer")
             return parsed
 
         raw_schema_version = value.get("schema_version", 1)
         if isinstance(raw_schema_version, bool):
-            raise ValueError("projection schema_version must be 1, 2, or 3")
+            raise ValueError("projection schema_version must be 1, 2, 3, or 4")
         schema_version = int(str(raw_schema_version))
-        if schema_version not in {1, 2, 3}:
-            raise ValueError("projection schema_version must be 1, 2, or 3")
+        if schema_version not in {1, 2, 3, 4}:
+            raise ValueError("projection schema_version must be 1, 2, 3, or 4")
 
         legacy_incidents: list[datetime] = []
         if schema_version == 1:
             raw_incidents = value.get("critical_incidents", [])
-            if not isinstance(raw_incidents, Sequence) or isinstance(
-                raw_incidents, (str, bytes)
-            ):
+            if not isinstance(raw_incidents, Sequence) or isinstance(raw_incidents, (str, bytes)):
                 raise ValueError("projection critical_incidents must be an array")
             legacy_incidents = [parse_utc(str(item)) for item in raw_incidents]
         elif "critical_incidents" in value:
@@ -2282,9 +2698,7 @@ class PaperProjection:
             "runtime_session_stopped_at",
         }
         if schema_version < 3 and runtime_session_fields.intersection(value):
-            raise ValueError(
-                "projection schema v1/v2 cannot contain runtime session fields"
-            )
+            raise ValueError("projection schema v1/v2 cannot contain runtime session fields")
 
         derived_incident_count = len(legacy_incidents)
         derived_last_incident = max(legacy_incidents, default=None)
@@ -2294,50 +2708,43 @@ class PaperProjection:
         )
         raw_last_incident = value.get("last_critical_incident_at")
         last_critical_incident_at = (
-            parse_utc(str(raw_last_incident))
-            if raw_last_incident is not None
-            else derived_last_incident
+            parse_utc(str(raw_last_incident)) if raw_last_incident is not None else derived_last_incident
         )
         if (
             schema_version == 1
             and "critical_incident_count" in value
             and critical_incident_count != derived_incident_count
         ):
-            raise ValueError(
-                "legacy critical_incidents differ from critical_incident_count"
-            )
+            raise ValueError("legacy critical_incidents differ from critical_incident_count")
         if (
             schema_version == 1
             and "last_critical_incident_at" in value
             and last_critical_incident_at != derived_last_incident
         ):
-            raise ValueError(
-                "legacy critical_incidents differ from last_critical_incident_at"
-            )
+            raise ValueError("legacy critical_incidents differ from last_critical_incident_at")
 
         raw_orders = value.get("orders", {})
         if not isinstance(raw_orders, Mapping):
             raise ValueError("projection orders must be an object")
+        raw_strategies = value.get("strategy_projections", {})
+        if not isinstance(raw_strategies, Mapping):
+            raise ValueError("projection strategy_projections must be an object")
+        if schema_version < 4 and raw_strategies:
+            raise ValueError("projection schema v1/v2/v3 cannot contain strategy_projections")
         return cls(
             run_id=str(value["run_id"]),
             config_hash=str(value["config_hash"]),
             initial_cash=decimal_value(str(value["initial_cash"]), label="initial_cash"),
             state=PaperState(str(value.get("state", "FLAT"))),
             state_since=(
-                parse_utc(str(value["state_since"]))
-                if value.get("state_since") is not None
-                else None
+                parse_utc(str(value["state_since"])) if value.get("state_since") is not None else None
             ),
             suspended_from=(
-                PaperState(str(value["suspended_from"]))
-                if value.get("suspended_from") is not None
-                else None
+                PaperState(str(value["suspended_from"])) if value.get("suspended_from") is not None else None
             ),
             cash=decimal_value(str(value.get("cash", value["initial_cash"])), label="cash"),
             fees=decimal_value(str(value.get("fees", "0")), label="fees"),
-            realized_pnl=decimal_value(
-                str(value.get("realized_pnl", "0")), label="realized_pnl"
-            ),
+            realized_pnl=decimal_value(str(value.get("realized_pnl", "0")), label="realized_pnl"),
             positions=decimal_map("positions"),
             cost_basis=decimal_map("cost_basis"),
             inventory_value=decimal_map("inventory_value"),
@@ -2346,6 +2753,11 @@ class PaperProjection:
             orders={
                 str(key): PaperOrder.from_dict(cast(Mapping[str, object], item))
                 for key, item in raw_orders.items()
+                if isinstance(item, Mapping)
+            },
+            strategy_projections={
+                str(key): PaperStrategyProjection.from_dict(cast(Mapping[str, object], item))
+                for key, item in raw_strategies.items()
                 if isinstance(item, Mapping)
             },
             archived_order_count=non_negative_count("archived_order_count", 0),
@@ -2376,9 +2788,7 @@ class PaperProjection:
                 0,
             ),
             runtime_session_id=(
-                str(value["runtime_session_id"])
-                if value.get("runtime_session_id") is not None
-                else None
+                str(value["runtime_session_id"]) if value.get("runtime_session_id") is not None else None
             ),
             runtime_session_started_at=(
                 parse_utc(str(value["runtime_session_started_at"]))
@@ -2456,6 +2866,8 @@ __all__ = [
     "PaperRiskLimits",
     "PaperRunConfig",
     "PaperState",
+    "PaperStrategyConfig",
+    "PaperStrategyProjection",
     "StoredPaperEvent",
     "TimeInForce",
     "decimal_text",

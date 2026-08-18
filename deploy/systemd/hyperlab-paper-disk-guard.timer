@@ -1,0 +1,12 @@
+[Unit]
+Description=Check HyperLab Phase 12 Paper free space every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=yes
+Unit=hyperlab-paper-disk-guard.service
+
+[Install]
+WantedBy=timers.target

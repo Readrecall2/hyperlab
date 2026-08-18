@@ -1,0 +1,7 @@
+[Unit]
+Description=Stop HyperLab Paper safely after disk guard refusal
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl stop hyperlab-paper.service
+ExecStart=/usr/bin/systemctl stop hyperlab-paper-disk-guard.timer

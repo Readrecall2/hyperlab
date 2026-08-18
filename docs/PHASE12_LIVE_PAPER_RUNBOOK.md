@@ -1,9 +1,13 @@
 # Phase 12 live-public-data Paper runbook
 
-> **UNEXECUTED MANUAL PROCEDURE.** The commands in this document connect to live public
-> Hyperliquid data only when a human operator runs them. They were not executed while this
-> change was prepared. The frozen run is `TECHNICAL`, `UNCALIBRATED`, Paper-only, and never
-> Gate D or profitability evidence.
+> **VALIDATION BOUNDARY.** The Paper runtime/recovery sequence was validated on the Linux VPS
+> at commit `ba84444240af6cdbfc3df4f0170866a2a0c15c1f`: clean stop, exact replay,
+> reconciliation, same-database generation-2 restart, post-restart `REPLAY_EXACT`, final
+> `FLAT`, `active=false`, and `unclosed=false`. The systemd supervision added below is a new
+> deployment procedure and is not represented as VPS-validated until the operator executes it
+> from its final reviewed commit. All commands use live **public** Hyperliquid data only. The
+> frozen run remains `TECHNICAL`, `UNCALIBRATED`, Paper-only, and never Gate D or profitability
+> evidence.
 
 ## Frozen first runtime
 
@@ -492,6 +496,239 @@ A future validation campaign must begin prospectively with independently satisfi
 calibration prerequisites, a separately frozen `VALIDATION` config/hash/run ID, and its own start
 time. No technical event, fill, day, or PnL may be relabelled or retroactively converted into
 validation/Gate-D evidence.
+
+## Linux systemd supervision for the 48-72 hour technical soak
+
+The supervisor is deliberately outside the frozen Paper release-code manifest. It starts the
+already reviewed `paper run` command with the already reviewed Linux operator bundle and the
+same persistent SQLite database/run ID. It does not regenerate artifacts, create a run, copy or
+move the database, or implement accounting/reconciliation in shell. The exact Paper replay,
+runtime lease, engine pause, readiness, and runtime startup paths remain authoritative.
+
+### Restart policy and exact unit behavior
+
+`hyperlab-paper.service` has these semantics:
+
+- one systemd service and the existing nonblocking `PaperRuntimeLease` enforce one writer for the
+  exact database/run;
+- `ExecCondition` runs offline Paper preflight, release/runtime identity checks, disk thresholds,
+  the OS lease check, durable config/run matching, and full exact replay before every start;
+- automatic admission is intentionally narrower than normal interactive recovery: only a
+  reconciled `FLAT` run with no active position/order and no unresolved critical incident is
+  admitted;
+- a reviewed offline unclosed-session recovery may retain the old durable session as active until
+  the runtime creates its replacement generation; the exact reviewed recovery input is required;
+- an unreviewed unclosed session is atomically latched through the existing Paper engine as a
+  sanitized `UNCLOSED_RUNTIME_SESSION` critical failure, then refused;
+- `MANUAL_REVIEW`, `PAUSED`, non-`FLAT`, killed, unreconciled, identity-drifted, replay-failed,
+  active-writer, active-position/order, low-disk, and ambiguous runs are refused;
+- an `ExecCondition` refusal exits nonzero without running `ExecStart`; systemd records a skipped
+  condition and does not loop the runtime;
+- `Restart=on-failure` is bounded by three starts per 15 minutes. A cleanly closed transient exit
+  can restart after 30 seconds; a durable unsafe state makes the next condition refuse;
+- reboot startup is enabled through `multi-user.target`. A planned reboot sends `SIGTERM`, waits up
+  to 90 seconds for cooperative close, and can start automatically after boot. A hard power loss
+  leaves an unclosed session and therefore requires the reviewed manual path below;
+- systemd runs the process as `hyperlab-paper`, with no capabilities, no-new-privileges, a
+  read-only checkout, a single writable persistent root, and only `AF_UNIX/AF_INET/AF_INET6`;
+- the system service environment does not inherit an SSH shell. Testnet/wallet/key variables are
+  explicitly unset, and the environment file is restricted to paths and disk thresholds.
+
+The service still exposes only `PAPER`, `PAPER_RUNTIME`, `credential_scope=NONE`,
+`execution_network=NONE`, `authorizes_real_money=false`, and `orders_enabled=false`.
+
+### One-time install on the reviewed VPS
+
+Keep the existing validated operator bundle and database. Do not generate a different run ID.
+Set `FINAL_SUPERVISOR_COMMIT` to the final commit delivered by this change; the operator bundle
+path below intentionally remains the already validated `ba844442...` bundle because none of the
+files in its frozen `release-code-manifest.json` changed.
+
+```bash
+cd /opt/hyperlab-multistrategy
+FINAL_SUPERVISOR_COMMIT="<FINAL_COMMIT_FROM_CHANGE_REPORT>"
+CONFIG="/var/lib/hyperlab/phase12-live-paper/authorization-ba84444240af6cdbfc3df4f0170866a2a0c15c1f-linux-cpython-3.12.13/paper-config.json"
+DB="/var/lib/hyperlab/phase12-live-paper/paper/paper.sqlite3"
+
+test "$(git branch --show-current)" = "phase-12-live-paper"
+test "$(git rev-parse HEAD)" = "$FINAL_SUPERVISOR_COMMIT"
+test -z "$(git status --porcelain)"
+test -f "$CONFIG"
+test -f "$DB"
+RUN_ID="$(.venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$CONFIG")"
+test "${#RUN_ID}" -eq 64
+.venv/bin/python -m hyperlab paper status --database "$DB" --run-id "$RUN_ID"
+
+id -u hyperlab-paper >/dev/null 2>&1 || \
+  sudo useradd --system --home-dir /var/lib/hyperlab/phase12-live-paper \
+    --shell /usr/sbin/nologin hyperlab-paper
+sudo chown -R hyperlab-paper:hyperlab-paper /var/lib/hyperlab/phase12-live-paper
+sudo -u hyperlab-paper test -x /opt/hyperlab-multistrategy/.venv/bin/python
+sudo -u hyperlab-paper test -r "$CONFIG"
+sudo -u hyperlab-paper test -r "$DB"
+
+sudo install -d -m 0755 /etc/hyperlab /etc/systemd/system
+sudo install -m 0600 deploy/systemd/paper-supervisor.env.example \
+  /etc/hyperlab/paper-supervisor.env
+sudo install -m 0644 deploy/systemd/hyperlab-paper.service \
+  /etc/systemd/system/hyperlab-paper.service
+sudo install -m 0644 deploy/systemd/hyperlab-paper-disk-guard.service \
+  /etc/systemd/system/hyperlab-paper-disk-guard.service
+sudo install -m 0644 deploy/systemd/hyperlab-paper-disk-guard.timer \
+  /etc/systemd/system/hyperlab-paper-disk-guard.timer
+sudo install -m 0644 deploy/systemd/hyperlab-paper-disk-stop.service \
+  /etc/systemd/system/hyperlab-paper-disk-stop.service
+
+sudo systemd-analyze verify \
+  /etc/systemd/system/hyperlab-paper.service \
+  /etc/systemd/system/hyperlab-paper-disk-guard.service \
+  /etc/systemd/system/hyperlab-paper-disk-guard.timer \
+  /etc/systemd/system/hyperlab-paper-disk-stop.service
+sudo systemctl daemon-reload
+```
+
+Review `/etc/hyperlab/paper-supervisor.env` before enabling. It must contain only the exact
+`CONFIG`, exact `DB`, `HYPERLAB_PAPER_MIN_FREE_BYTES=5368709120` (5 GiB), and
+`HYPERLAB_PAPER_MIN_FREE_PERCENT=10`. It must contain no key, wallet, credential, hostname, or
+new run ID.
+
+Run the guard once explicitly, as the service user, before systemd start:
+
+```bash
+sudo -u hyperlab-paper env -i \
+  PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  /opt/hyperlab-multistrategy/.venv/bin/python \
+  /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py guard \
+  --config "$CONFIG" --database "$DB" \
+  --minimum-free-bytes 5368709120 --minimum-free-percent 10
+```
+
+Expected: JSON `status=READY`, `paper_state=FLAT`, `reconciled=true`,
+`full_replay=REPLAY_EXACT`, and every paper-only boundary false/none as appropriate. Any refusal
+is a stop condition.
+
+### Enable, start, stop, and restart
+
+```bash
+sudo systemctl enable --now hyperlab-paper-disk-guard.timer
+sudo systemctl enable --now hyperlab-paper.service
+```
+
+Stop cleanly and wait for the bounded cooperative shutdown:
+
+```bash
+sudo systemctl stop hyperlab-paper.service
+sudo systemctl show hyperlab-paper.service \
+  -p ActiveState -p SubState -p Result -p ExecMainStatus
+```
+
+A reviewed restart always re-runs `ExecCondition` against the same database/run:
+
+```bash
+sudo systemctl restart hyperlab-paper.service
+```
+
+Never use `systemctl kill -s SIGKILL`, delete a lock file, copy the live SQLite database, change
+the config, or point the service at a fresh database to make a refusal disappear.
+
+### Status, health, and logs
+
+Service and timer status:
+
+```bash
+sudo systemctl status hyperlab-paper.service --no-pager
+sudo systemctl status hyperlab-paper-disk-guard.timer --no-pager
+sudo systemctl list-timers hyperlab-paper-disk-guard.timer --no-pager
+```
+
+The read-only health command combines the bounded same-head Paper report with systemd, `/proc`,
+filesystem, and recent journald facts. It reports run ID, Paper state, active/generation/unclosed
+session, integrity/readiness, BTC/ETH public timestamps and wall-clock staleness, reconnects,
+gaps, critical incidents, active positions/orders, database size, free bytes/percent, process
+uptime/average CPU/RSS when available, service status, and the last 30 message-only journal lines:
+
+```bash
+sudo env -i \
+  PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  /opt/hyperlab-multistrategy/.venv/bin/python \
+  /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py health \
+  --config "$CONFIG" --database "$DB" \
+  --service-name hyperlab-paper.service \
+  --minimum-free-bytes 5368709120 --minimum-free-percent 10
+```
+
+Recent and follow-mode logs use journald; no separate mutable log file or credential is needed:
+
+```bash
+sudo journalctl -u hyperlab-paper.service -n 200 --no-pager -o short-iso
+sudo journalctl -u hyperlab-paper.service -f -o short-iso
+sudo journalctl -u hyperlab-paper-disk-guard.service -n 100 --no-pager -o short-iso
+```
+
+Do not paste full host logs into reports. Preserve only the relevant sanitized Paper messages,
+timestamps, exit/result codes, and hashes needed for review.
+
+### Disk guard and recovery
+
+The one-minute timer checks the filesystem containing the exact DB. Both 5 GiB free and 10% free
+must remain available. These are initial stop thresholds for a 48-72 hour technical soak, not a
+capacity claim. The monitor does not delete, rotate, vacuum, copy, archive, or truncate SQLite.
+
+If either threshold fails, `hyperlab-paper-disk-guard.service` fails and triggers
+`hyperlab-paper-disk-stop.service`. The latter stops the runtime with its normal SIGTERM/90-second
+path and stops the disk timer to avoid an alert loop. Free space only by reviewing unrelated
+files outside the Paper journal; never mutate the DB or its rollback journal. Then:
+
+```bash
+sudo systemctl reset-failed hyperlab-paper-disk-guard.service \
+  hyperlab-paper-disk-stop.service
+sudo systemctl start hyperlab-paper-disk-guard.timer
+sudo systemctl start hyperlab-paper-disk-guard.service
+sudo systemctl start hyperlab-paper.service
+```
+
+If the DB grows faster than available space can safely support for the remaining soak, stop and
+report the measured growth. Do not invent retention or lower the thresholds for a pass.
+
+### Reboot and manual recovery when automatic start is refused
+
+After a planned reboot, confirm the same run and generation increment:
+
+```bash
+sudo reboot
+# reconnect after boot
+sudo systemctl status hyperlab-paper.service --no-pager
+sudo journalctl -b -u hyperlab-paper.service --no-pager -o short-iso
+```
+
+If `ExecCondition` refuses, keep the service stopped and inspect health/status. For an unclosed
+hard-crash session, the guard has already latched the exact deterministic critical incident
+through `PaperEngine.pause`; use the existing explicit offline recovery only after review:
+
+```bash
+sudo systemctl stop hyperlab-paper.service
+sudo -u hyperlab-paper env -i PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  /opt/hyperlab-multistrategy/.venv/bin/python -m hyperlab paper status \
+  --database "$DB" --run-id "$RUN_ID"
+sudo -u hyperlab-paper env -i PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  /opt/hyperlab-multistrategy/.venv/bin/python -m hyperlab paper replay \
+  "$RUN_ID" --database "$DB"
+sudo -u hyperlab-paper env -i PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  /opt/hyperlab-multistrategy/.venv/bin/python -m hyperlab paper resume \
+  "$RUN_ID" --database "$DB" \
+  --review-reason "Unclosed systemd runtime session and durable incident reviewed" \
+  --offline-unclosed-recovery
+sudo systemctl start hyperlab-paper.service
+```
+
+For a cleanly stopped `PAUSED` run, follow the existing reviewed standard resume procedure: exact
+replay/reconciliation, one manual Paper run while still paused to obtain fresh bilateral BBO,
+clean stop, then `paper resume` with a specific review reason. Do not automate resume.
+
+`MANUAL_REVIEW`, a killed run, config/release/runtime mismatch, replay failure, reconciliation
+failure, unexplained position/order, or unresolved critical incident has no automatic recovery.
+Preserve the DB and journal, leave the unit stopped, and perform a human code/data review. Never
+create another run ID or database to conceal the refusal.
 
 ## Known limitations to retain visibly
 

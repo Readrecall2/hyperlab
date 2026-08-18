@@ -1,0 +1,23 @@
+[Unit]
+Description=HyperLab Phase 12 Paper disk-space guard
+OnFailure=hyperlab-paper-disk-stop.service
+
+[Service]
+Type=oneshot
+User=hyperlab-paper
+Group=hyperlab-paper
+WorkingDirectory=/opt/hyperlab-multistrategy
+Environment=HYPERLAB_MODE=readonly
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/hyperlab/paper-supervisor.env
+UnsetEnvironment=HYPERLAB_TESTNET_PRIVATE_KEY HYPERLAB_TESTNET_ACCOUNT_ADDRESS HYPERLAB_TESTNET_API_WALLET_ADDRESS PRIVATE_KEY SEED_PHRASE MNEMONIC WALLET_KEY API_KEY
+ExecStart=/opt/hyperlab-multistrategy/.venv/bin/python /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py disk-check --database ${HYPERLAB_PAPER_DB} --minimum-free-bytes ${HYPERLAB_PAPER_MIN_FREE_BYTES} --minimum-free-percent ${HYPERLAB_PAPER_MIN_FREE_PERCENT}
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/hyperlab-multistrategy /var/lib/hyperlab/phase12-live-paper
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=

@@ -1,0 +1,47 @@
+[Unit]
+Description=HyperLab Phase 08 Paper runtime (public data, simulated orders only)
+Documentation=file:/opt/hyperlab-multistrategy/docs/PHASE12_LIVE_PAPER_RUNBOOK.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=hyperlab-paper
+Group=hyperlab-paper
+WorkingDirectory=/opt/hyperlab-multistrategy
+Environment=HYPERLAB_MODE=readonly
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/hyperlab/paper-supervisor.env
+UnsetEnvironment=HYPERLAB_TESTNET_PRIVATE_KEY HYPERLAB_TESTNET_ACCOUNT_ADDRESS HYPERLAB_TESTNET_API_WALLET_ADDRESS PRIVATE_KEY SEED_PHRASE MNEMONIC WALLET_KEY API_KEY
+ExecCondition=/opt/hyperlab-multistrategy/.venv/bin/python /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py guard --config ${HYPERLAB_PAPER_CONFIG} --database ${HYPERLAB_PAPER_DB} --minimum-free-bytes ${HYPERLAB_PAPER_MIN_FREE_BYTES} --minimum-free-percent ${HYPERLAB_PAPER_MIN_FREE_PERCENT}
+ExecStart=/opt/hyperlab-multistrategy/.venv/bin/python -m hyperlab paper run ${HYPERLAB_PAPER_CONFIG} --database ${HYPERLAB_PAPER_DB}
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=15min
+TimeoutStopSec=90
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=yes
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/hyperlab-multistrategy
+ReadWritePaths=/var/lib/hyperlab/phase12-live-paper
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

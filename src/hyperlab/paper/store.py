@@ -3654,14 +3654,19 @@ class PaperStore:
         return totals
 
     def iter_ledger_entries(self, run_id: str) -> Iterable[LedgerRecord]:
-        """Stream ledger entries in deterministic transaction order."""
+        """Stream ledger entries in reducer event and transaction order."""
 
         normalized_run_id = _identifier(run_id, label="run_id")
         with self._read_connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT * FROM paper_ledger_entries
-                WHERE run_id=? ORDER BY transaction_id, entry_index
+                SELECT ledger.*
+                FROM paper_ledger_entries AS ledger
+                JOIN paper_events AS event
+                  ON event.run_id = ledger.run_id
+                 AND event.event_id = ledger.event_id
+                WHERE ledger.run_id=?
+                ORDER BY event.sequence, ledger.transaction_id, ledger.entry_index
                 """,
                 (normalized_run_id,),
             )

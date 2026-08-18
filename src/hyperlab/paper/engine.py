@@ -2186,8 +2186,34 @@ class PaperEngine:
 
     def _ledger_reconciliation_errors(self, projection: PaperProjection) -> tuple[str, ...]:
         balances: dict[str, Decimal] = {}
+        # Decimal arithmetic is exact only within the active finite precision.
+        # The reducer applies one economic event net at a time, so reconciliation
+        # must preserve those chronological transaction boundaries instead of
+        # summing individual postings in arbitrary transaction-hash order.
+        ledger_realized_pnl = Decimal(0)
+        transaction_id: str | None = None
+        transaction_balances: dict[str, Decimal] = {}
+
+        def apply_transaction(amounts: Mapping[str, Decimal]) -> Decimal:
+            for account, amount in amounts.items():
+                balances[account] = balances.get(account, Decimal(0)) + amount
+            return (
+                -amounts.get("income:realized_pnl", Decimal(0))
+                - amounts.get("expense:fees", Decimal(0))
+                - amounts.get("income:funding", Decimal(0))
+            )
+
         for entry in self.store.iter_ledger_entries(self.run_id):
-            balances[entry.account] = balances.get(entry.account, Decimal(0)) + entry.amount
+            if transaction_id is not None and entry.transaction_id != transaction_id:
+                ledger_realized_pnl += apply_transaction(transaction_balances)
+                transaction_balances = {}
+            transaction_id = entry.transaction_id
+            transaction_balances[entry.account] = (
+                transaction_balances.get(entry.account, Decimal(0)) + entry.amount
+            )
+        if transaction_id is not None:
+            ledger_realized_pnl += apply_transaction(transaction_balances)
+
         errors: list[str] = []
         if balances.get("asset:cash", Decimal(0)) != projection.cash:
             errors.append("ledger cash differs from the replayed projection")
@@ -2204,10 +2230,7 @@ class PaperEngine:
             errors.append("ledger inventory accounts differ from open positions")
         if balances.get("expense:fees", Decimal(0)) != projection.fees:
             errors.append("ledger fees differ from the replayed projection")
-        expected_realized = -balances.get("income:realized_pnl", Decimal(0))
-        expected_realized -= balances.get("expense:fees", Decimal(0))
-        expected_realized -= balances.get("income:funding", Decimal(0))
-        if expected_realized != projection.realized_pnl:
+        if ledger_realized_pnl != projection.realized_pnl:
             errors.append("ledger realized PnL differs from the replayed projection")
         return tuple(errors)
 

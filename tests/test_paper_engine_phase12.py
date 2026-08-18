@@ -1908,8 +1908,10 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
     entry_market = _market(
         "partial-entry-decision",
         _START + timedelta(seconds=1),
+        bid="4107",
+        ask="4107.748393756197",
         bid_depth="2",
-        ask_depth="2",
+        ask_depth="3.1472266337672912",
     )
     entry = _decision(
         config,
@@ -1924,16 +1926,20 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
         _market(
             "partial-entry-fill",
             _START + timedelta(seconds=2),
+            bid="4107",
+            ask="4107.748393756197",
             bid_depth="2",
-            ask_depth="2",
+            ask_depth="3.1472266337672912",
         )
     )
 
     entry_order = partial.projection.orders[entry.orders[0].order_id]
     assert partial.projection.state is PaperState.HEDGE_PENDING
     assert entry_order.status is OrderStatus.EXPIRED
-    assert entry_order.filled_quantity == Decimal("0.5")
-    assert partial.projection.positions == {_INSTRUMENT: Decimal("0.5")}
+    assert entry_order.filled_quantity == Decimal("0.7868066584418228425088130494")
+    assert partial.projection.positions == {
+        _INSTRUMENT: Decimal("0.7868066584418228425088130494")
+    }
 
     paused = engine.process_market(
         _market(
@@ -1961,6 +1967,8 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
     emergency_market = _market(
         "emergency-decision",
         _START + timedelta(seconds=6, milliseconds=200),
+        bid="4173.120778349457",
+        ask="4174",
         bid_depth="10",
         ask_depth="10",
     )
@@ -1978,8 +1986,10 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
 
     flattened = engine.process_market(
         _market(
-            "emergency-fill",
+            "emergency-fill-14",
             _START + timedelta(seconds=7),
+            bid="4173.120778349457",
+            ask="4174",
             bid_depth="10",
             ask_depth="10",
         )
@@ -1990,6 +2000,49 @@ def test_partial_ioc_times_out_unhedged_then_emergency_flattens(tmp_path: Path) 
     types = _event_types(store, config.run_id)
     assert PaperEventType.ORDER_PARTIALLY_FILLED in types
     assert PaperEventType.ORDER_EXPIRED in types
+    assert engine._ledger_reconciliation_errors(flattened.projection) == ()
+    reconciled = engine.reconcile(as_of=_START + timedelta(seconds=8))
+    assert reconciled.projection.reconciled is True
+    assert engine.replay().to_dict() == reconciled.projection.to_dict()
+    assert engine.verify_input_replay().to_dict() == reconciled.projection.to_dict()
+
+
+def test_startup_reconciliation_failure_audit_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    store, _engine = _started_engine(tmp_path / "paper.sqlite3", config)
+    reason = "ledger cash differs from the replayed projection"
+
+    monkeypatch.setattr(
+        PaperEngine,
+        "_ledger_reconciliation_errors",
+        lambda _self, _projection: (reason,),
+    )
+
+    with pytest.raises(ValueError, match="paper ledger does not reconcile"):
+        PaperEngine(store, config).start()
+
+    failure_events = [
+        stored.event
+        for stored in store.get_events(config.run_id)
+        if stored.event.event_type is PaperEventType.RECONCILIATION_FAILED
+    ]
+    assert len(failure_events) == 1
+    assert failure_events[0].payload["reason"] == reason
+    assert len(tuple(store.iter_inputs(config.run_id, input_type="RECONCILE"))) == 1
+    event_count_after_first_failure = store.get_run(config.run_id).event_sequence
+
+    with pytest.raises(ValueError, match="paper ledger does not reconcile"):
+        PaperEngine(store, config).start()
+
+    assert store.get_run(config.run_id).event_sequence == event_count_after_first_failure
+    assert len(tuple(store.iter_inputs(config.run_id, input_type="RECONCILE"))) == 1
+    assert (
+        _event_types(store, config.run_id).count(PaperEventType.RECONCILIATION_FAILED)
+        == 1
+    )
 
 
 def test_duplicate_inputs_are_noops_but_divergent_reuse_fails_closed(tmp_path: Path) -> None:

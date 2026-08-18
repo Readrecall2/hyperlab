@@ -20,6 +20,16 @@ from ops.phase12.paper_supervisor import inspect_durable_start
 
 _ROOT = Path(__file__).resolve().parents[1]
 _START = datetime(2026, 8, 18, 12, tzinfo=UTC)
+_CAPTURED_HEAD_CHANGED_RUN_ID = "9aa7213ef08ddc07d700128cf8fdf90e75a764f0867201075074e0c5fbe64436"
+_CAPTURED_HEAD_CHANGED_STDERR = (
+    "Usage: python -m hyperlab paper report [OPTIONS] {run_id}\n"
+    "Try 'python -m hyperlab paper report --help' for help.\n"
+    "╭─ Error ──────────────────────────────────────────────────────────────────────╮\n"
+    "│ Invalid value: Rapport paper bloqué: paper report retry required for         │\n"
+    "│ 9aa7213ef08ddc07d700128cf8fdf90e75a764f0867201075074e0c5fbe64436: durable    │\n"
+    "│ head changed during assembly                                                 │\n"
+    "╰──────────────────────────────────────────────────────────────────────────────╯\n"
+)
 
 
 def _config(*, parameters: dict[str, object] | None = None) -> PaperRunConfig:
@@ -94,6 +104,58 @@ def _head_changed_result(run_id: str) -> subprocess.CompletedProcess[str]:
             "durable head changed during assembly"
         ),
     )
+
+
+def test_paper_report_head_changed_classifier_accepts_exact_rich_wrapped_stderr() -> None:
+    arguments = ["paper", "report", _CAPTURED_HEAD_CHANGED_RUN_ID, "--database", "paper.sqlite3"]
+    completed = _completed_report(returncode=2, stderr=_CAPTURED_HEAD_CHANGED_STDERR)
+
+    assert paper_supervisor._is_paper_report_head_changed(arguments, completed) is True
+
+
+def test_paper_report_head_changed_classifier_accepts_ansi_literal() -> None:
+    arguments = ["paper", "report", _CAPTURED_HEAD_CHANGED_RUN_ID, "--database", "paper.sqlite3"]
+    completed = _completed_report(returncode=2, stderr="\x1b[31m│ HEAD_CHANGED_RETRY │\x1b[0m")
+
+    assert paper_supervisor._is_paper_report_head_changed(arguments, completed) is True
+
+
+def test_paper_report_diagnostic_normalization_strips_ansi_rich_frames_and_wraps() -> None:
+    diagnostic = "\x1b[31m│ durable │\x1b[0m\n│ head changed during assembly │"
+
+    assert paper_supervisor._normalize_diagnostic_text(diagnostic) == "durable head changed during assembly"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "returncode"),
+    [
+        (["paper", "status", "--run-id", _CAPTURED_HEAD_CHANGED_RUN_ID], 2),
+        (["paper", "report", _CAPTURED_HEAD_CHANGED_RUN_ID], 1),
+    ],
+)
+def test_paper_report_head_changed_classifier_requires_exact_command_and_exit_code(
+    arguments: list[str],
+    returncode: int,
+) -> None:
+    completed = _completed_report(returncode=returncode, stderr="HEAD_CHANGED_RETRY")
+
+    assert paper_supervisor._is_paper_report_head_changed(arguments, completed) is False
+
+
+def test_paper_report_head_changed_classifier_rejects_unrelated_rich_typer_exit_2() -> None:
+    arguments = ["paper", "report", _CAPTURED_HEAD_CHANGED_RUN_ID, "--database", "paper.sqlite3"]
+    completed = _completed_report(
+        returncode=2,
+        stderr=(
+            "Usage: python -m hyperlab paper report [OPTIONS] {run_id}\n"
+            "Try 'python -m hyperlab paper report --help' for help.\n"
+            "╭─ Error ──────────────────────────────────────────────────────────────────────╮\n"
+            "│ No such option: --not-a-real-option                                         │\n"
+            "╰──────────────────────────────────────────────────────────────────────────────╯\n"
+        ),
+    )
+
+    assert paper_supervisor._is_paper_report_head_changed(arguments, completed) is False
 
 
 def _install_health_facts(

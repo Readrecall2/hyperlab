@@ -33,6 +33,18 @@ DEFAULT_SERVICE_NAME = "hyperlab-paper.service"
 MAX_LOG_LINES = 30
 PAPER_REPORT_HEALTH_MAX_ATTEMPTS = 3
 PAPER_REPORT_HEALTH_RETRY_DELAY_SECONDS = 0.1
+_ANSI_ESCAPE_SEQUENCE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x1b\x07]*(?:\x07|\x1b\\)"
+    r"|[PX^_][^\x1b]*\x1b\\"
+    r"|[@-Z\\-_]"
+    r")"
+)
+_RICH_BOX_DRAWING = re.compile(r"[\u2500-\u257f]")
+_HEAD_CHANGED_RETRY_LITERAL = re.compile(
+    r"(?<![A-Z0-9_])HEAD_CHANGED_RETRY(?![A-Z0-9_])", re.IGNORECASE
+)
 _CREDENTIAL_ENV_MARKERS = (
     "PRIVATE_KEY",
     "SEED_PHRASE",
@@ -155,23 +167,28 @@ def _decode_hyperlab_json(completed: subprocess.CompletedProcess[str]) -> dict[s
     return payload
 
 
+def _normalize_diagnostic_text(text: str) -> str:
+    without_ansi = _ANSI_ESCAPE_SEQUENCE.sub("", text)
+    without_rich_framing = _RICH_BOX_DRAWING.sub(" ", without_ansi)
+    return " ".join(without_rich_framing.split())
+
+
 def _is_paper_report_head_changed(
     arguments: list[str],
     completed: subprocess.CompletedProcess[str],
 ) -> bool:
     if arguments[:2] != ["paper", "report"] or completed.returncode != 2:
         return False
-    output = f"{completed.stdout}\n{completed.stderr}"
-    if "head_changed_retry" in output.casefold():
+    diagnostic = _normalize_diagnostic_text(f"{completed.stdout}\n{completed.stderr}")
+    if _HEAD_CHANGED_RETRY_LITERAL.search(diagnostic) is not None:
         return True
-    return bool(
-        re.search(
-            r"paper\s+report\s+retry\s+required\s+for\b.*"
-            r"durable\s+head\s+changed\s+during\s+assembly",
-            output,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+    if len(arguments) < 3:
+        return False
+    expected_message = (
+        f"paper report retry required for {arguments[2]}: "
+        "durable head changed during assembly"
     )
+    return expected_message.casefold() in diagnostic.casefold()
 
 
 def _run_paper_report_json(arguments: list[str]) -> PaperReportRead:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -325,3 +326,30 @@ def test_restart_reconstruction_is_streamable_exact_and_memory_bounded() -> None
     assert restarted.diagnostic_snapshot["bars_retained"] == _config().retained_bars
 
     assert int(restarted.diagnostic_snapshot["bars_retained"]) <= _config().retained_bars
+
+
+def test_restart_reconstruction_evaluates_only_final_bounded_window_at_22k_scale(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    strategy = FrozenRobustPairsPaperStrategy(_config())
+    evaluations = 0
+    original = strategy._evaluate_reviewed_strategy
+
+    def counted_evaluation() -> None:
+        nonlocal evaluations
+        evaluations += 1
+        original()
+
+    monkeypatch.setattr(strategy, "_evaluate_reviewed_strategy", counted_evaluation)
+    markets = (
+        market
+        for index in range(11_094)
+        for market in _frame(index, _baseline_spread(index)).values()
+    )
+    started_at = time.perf_counter()
+    strategy.restore(markets, _view(PaperState.FLAT))
+    elapsed = time.perf_counter() - started_at
+    assert evaluations == 1
+    assert elapsed < 10.0
+    assert strategy.diagnostic_snapshot["status"] == "RESTORED"
+    assert strategy.diagnostic_snapshot["bars_retained"] == _config().retained_bars

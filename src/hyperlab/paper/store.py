@@ -25,8 +25,14 @@ from hyperlab.paper.models import (
 from hyperlab.paper.reducer import apply_event, transaction_ledger_amounts
 
 SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
 GENESIS_SEQUENCE = 0
 ZERO_HASH = "0" * 64
+
+
+def _raise_if_interrupted(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise InterruptedError("paper startup interrupted")
 
 FAULT_STAGES = frozenset(
     {
@@ -509,7 +515,7 @@ CREATE TABLE paper_commits (
     FOREIGN KEY (run_id, input_id) REFERENCES paper_inbox(run_id, input_id)
 );
 
-CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id);
+CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id, sequence);
 CREATE INDEX paper_ledger_event_idx ON paper_ledger_entries(run_id, event_id);
 CREATE INDEX paper_alerts_sequence_idx ON paper_alerts(run_id, event_sequence, alert_id);
 CREATE INDEX paper_alerts_run_severity_sequence_idx
@@ -869,13 +875,15 @@ class PaperStore:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                 )
             }
-            if version > SCHEMA_VERSION:
+            if version > STORE_SCHEMA_VERSION:
                 raise SchemaVersionError(
-                    f"paper store schema {version} is newer than supported schema {SCHEMA_VERSION}"
+                    "paper store schema "
+                    f"{version} is newer than supported schema {STORE_SCHEMA_VERSION}"
                 )
-            if version not in {0, SCHEMA_VERSION}:
+            if version not in {0, 1, STORE_SCHEMA_VERSION}:
                 raise SchemaVersionError(
-                    f"paper store schema {version} has no forward migration to {SCHEMA_VERSION}"
+                    "paper store schema "
+                    f"{version} has no forward migration to {STORE_SCHEMA_VERSION}"
                 )
             if version == 0:
                 if tables:
@@ -886,23 +894,62 @@ class PaperStore:
                 connection.executescript(
                     "BEGIN IMMEDIATE;\n"
                     + _SCHEMA_SQL
-                    + f"\nINSERT INTO paper_schema VALUES (1, {SCHEMA_VERSION}, '{created_at}');\n"
-                    + f"PRAGMA user_version={SCHEMA_VERSION};\nCOMMIT;"
+                    + f"\nINSERT INTO paper_schema VALUES (1, {STORE_SCHEMA_VERSION}, "
+                    + f"'{created_at}');\n"
+                    + f"PRAGMA user_version={STORE_SCHEMA_VERSION};\nCOMMIT;"
                 )
+            elif version == 1:
+                self._migrate_v1_to_v2(connection)
             self._verify_schema(connection)
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        metadata = connection.execute(
+            "SELECT version FROM paper_schema WHERE singleton=1"
+        ).fetchone()
+        legacy_columns = tuple(
+            str(row[2])
+            for row in connection.execute("PRAGMA index_info('paper_events_input_idx')")
+        )
+        if metadata is None or int(metadata[0]) != 1:
+            raise SchemaVersionError("paper store v1 metadata is inconsistent")
+        if legacy_columns != ("run_id", "input_id"):
+            raise SchemaVersionError(
+                "paper store v1 event-input index differs from the recognized schema"
+            )
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            "DROP INDEX paper_events_input_idx;\n"
+            "CREATE INDEX paper_events_input_idx "
+            "ON paper_events(run_id, input_id, sequence);\n"
+            "UPDATE paper_schema SET version=2 WHERE singleton=1;\n"
+            "PRAGMA user_version=2;\n"
+            "COMMIT;"
+        )
 
     def _verify_schema(self, connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version != SCHEMA_VERSION:
+        if version != STORE_SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"paper store schema {version} is not supported by schema {SCHEMA_VERSION} code"
+                "paper store schema "
+                f"{version} is not supported by schema {STORE_SCHEMA_VERSION} code"
             )
         try:
             row = connection.execute("SELECT version FROM paper_schema WHERE singleton=1").fetchone()
         except sqlite3.DatabaseError as error:
             raise SchemaVersionError("paper store schema metadata is missing") from error
-        if row is None or int(row[0]) != SCHEMA_VERSION:
+        if row is None or int(row[0]) != STORE_SCHEMA_VERSION:
             raise SchemaVersionError("paper store schema metadata disagrees with PRAGMA user_version")
+        event_input_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                "PRAGMA index_info('paper_events_input_idx')"
+            )
+        )
+        if event_input_columns != ("run_id", "input_id", "sequence"):
+            raise SchemaVersionError(
+                "paper event-input index does not bind input order to event sequence"
+            )
         foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
         if foreign_keys != 1 or synchronous < 2:
@@ -1894,6 +1941,7 @@ class PaperStore:
         run_id: str,
         *,
         raise_on_error: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> IntegrityReport:
         normalized_run_id = _identifier(run_id, label="run_id")
         with self._connect() as connection:
@@ -1908,7 +1956,11 @@ class PaperStore:
                     is None
                 ):
                     raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
-                issues = self._collect_integrity_issues(connection, normalized_run_id)
+                issues = self._collect_integrity_issues(
+                    connection,
+                    normalized_run_id,
+                    should_stop=should_stop,
+                )
                 if issues:
                     self._persist_guard_alert(
                         connection,
@@ -2527,7 +2579,10 @@ class PaperStore:
         self,
         connection: sqlite3.Connection,
         run_id: str,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> tuple[IntegrityIssue, ...]:
+        _raise_if_interrupted(should_stop)
         issues = _IntegrityIssueCollector()
 
         def issue(code: str, detail: str) -> None:
@@ -2565,6 +2620,7 @@ class PaperStore:
         for row in event_rows:
             event_count += 1
             self._observe_integrity_buffer("event_row", 1)
+            _raise_if_interrupted(should_stop)
             sequence = int(row["sequence"])
             expected_sequence += 1
             if sequence != expected_sequence:
@@ -2650,6 +2706,7 @@ class PaperStore:
         )
         for transaction in transaction_rows:
             self._observe_integrity_buffer("ledger_transaction_row", 1)
+            _raise_if_interrupted(should_stop)
             transaction_id = str(transaction["transaction_id"])
             rows = connection.execute(
                 """
@@ -2666,6 +2723,7 @@ class PaperStore:
             for index, row in enumerate(rows):
                 entry_count += 1
                 self._observe_integrity_buffer("ledger_entry_row", 1)
+                _raise_if_interrupted(should_stop)
                 if int(row["entry_index"]) != index:
                     issue(
                         "LEDGER_ENTRY_GAP",
@@ -2803,6 +2861,7 @@ class PaperStore:
         has_safety_alert = False
         for row in alert_rows:
             self._observe_integrity_buffer("alert_row", 1)
+            _raise_if_interrupted(should_stop)
             alert_id = str(row["alert_id"])
             alert_code = str(row["code"])
             if alert_code.endswith("INTEGRITY_FAILURE") or alert_code.endswith("CONFLICT"):
@@ -2869,6 +2928,7 @@ class PaperStore:
         for row in inbox_rows:
             inbox_count += 1
             self._observe_integrity_buffer("inbox_row", 1)
+            _raise_if_interrupted(should_stop)
             try:
                 payload = _json_object(str(row["payload_json"]), label=f"input {row['input_id']}")
                 if canonical_json(payload) != str(row["payload_json"]):
@@ -2902,6 +2962,7 @@ class PaperStore:
         for expected_commit_sequence, row in enumerate(commit_rows, start=1):
             commit_count += 1
             self._observe_integrity_buffer("commit_row", 1)
+            _raise_if_interrupted(should_stop)
             commit_sequence = int(row["commit_sequence"])
             if commit_sequence != expected_commit_sequence:
                 issue(
@@ -3067,6 +3128,7 @@ class PaperStore:
         for expected_revision, row in enumerate(history_rows):
             history_count += 1
             self._observe_integrity_buffer("projection_history_row", 1)
+            _raise_if_interrupted(should_stop)
             revision = int(row["revision"])
             if revision != expected_revision:
                 issue("PROJECTION_HISTORY_GAP", f"expected projection revision {expected_revision}")
@@ -4006,13 +4068,20 @@ class PaperStore:
         run_id: str,
         *,
         input_type: str | None = None,
+        after_commit_sequence: int = 0,
     ) -> Iterable[InputRecord]:
         """Stream the canonical inbox in commit order with bounded memory."""
 
         normalized_run_id = _identifier(run_id, label="run_id")
         normalized_type = _identifier(input_type, label="input_type") if input_type is not None else None
-        sql = "SELECT * FROM paper_inbox WHERE run_id=?"
-        parameters: list[object] = [normalized_run_id]
+        if (
+            isinstance(after_commit_sequence, bool)
+            or not isinstance(after_commit_sequence, int)
+            or after_commit_sequence < 0
+        ):
+            raise ValueError("after_commit_sequence must be a non-negative integer")
+        sql = "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence>?"
+        parameters: list[object] = [normalized_run_id, after_commit_sequence]
         if normalized_type is not None:
             sql += " AND json_extract(payload_json, '$.input_type')=?"
             parameters.append(normalized_type)
@@ -4060,6 +4129,7 @@ __all__ = [
     "FAULT_STAGES",
     "PAPER_STATES",
     "SCHEMA_VERSION",
+    "STORE_SCHEMA_VERSION",
     "AlertRecord",
     "AppendConflictError",
     "AppendResult",

@@ -171,8 +171,8 @@ _PHASE12_PAPER_READINESS_MANIFEST = _PHASE12_PAPER_ARTIFACT_ROOT / "readiness-ma
 _PHASE12_PAPER_EVIDENCE_ROOT = _PHASE12_PAPER_ARTIFACT_ROOT
 _PHASE12_PAPER_RUNTIME_TIMER_INTERVAL_SECONDS = 1.0
 _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
-_PHASE12_PAPER_CONFIG_HASH = "b36676fe5481d8fb13387de1ae83638446f97c96105d2adffd29ec6cbc5c4635"
-_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "4044f99fc0b6182c0af41094fd2f3aa327a49abed4a3cbf52aae1b053dcb6216"
+_PHASE12_PAPER_CONFIG_HASH = "40149fcdc9f927dbf6511f4c0191cc5cc2b3beb1afce05ec7c25b9562c09aef5"
+_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "b53551b5902c7fcf5f91e5cb86b4f73d84421c56076717216d13e146fa4901a5"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -2904,7 +2904,11 @@ def paper_run(
 ) -> None:
     """Exécute exclusivement une liaison paper pré-approuvée et compilée dans ce checkout."""
     from hyperlab.paper.engine import PaperEngine
-    from hyperlab.paper.runtime import PaperRuntime, PaperRuntimeConfig
+    from hyperlab.paper.runtime import (
+        PaperRuntime,
+        PaperRuntimeConfig,
+        PaperStartupInterrupted,
+    )
     from hyperlab.paper.store import PaperStore
 
     settings = _settings()
@@ -2948,7 +2952,7 @@ def paper_run(
         )
         with _cooperative_signal_handlers(runtime.stop):
             projection = runtime.run_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, PaperStartupInterrupted):
         if runtime is not None:
             runtime.stop()
         console.print("Arrêt demandé; fermeture propre du runtime paper-only.")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import signal
 import sqlite3
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -11,6 +13,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import hyperlab.cli as cli_module
 from hyperlab.backtest.protocol import canonical_json, canonical_sha256
 from hyperlab.cli import app
 from hyperlab.paper.engine import PaperEngine
@@ -33,6 +36,7 @@ from hyperlab.paper.runtime import (
     PaperRuntimeConfig,
     PaperRuntimeLease,
     PaperRuntimeStepKind,
+    PaperStartupInterrupted,
     PublicSourceDescriptor,
     replay_paper_run,
 )
@@ -426,6 +430,136 @@ def test_restart_streams_durable_markets_into_strategy_before_new_poll(
     assert strategy.restore_calls == 1
     assert strategy.restored_event_ids == [first_market.event_id]
     assert strategy.calls == 1
+
+
+def test_restart_reuses_one_integrity_scan_and_one_event_replay_before_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "single-verified-restart.sqlite3"
+    first = _runtime(
+        database,
+        QueuePublicSource([{_INSTRUMENT: _market("single-pass", _START + timedelta(seconds=1))}]),
+        HoldStrategy(),
+        MutableClock(_START + timedelta(seconds=1)),
+    )
+    first.run_once()
+    first.close()
+    restarted = _runtime(
+        database,
+        QueuePublicSource([None]),
+        RestoreHoldStrategy(),
+        MutableClock(_START + timedelta(seconds=2)),
+    )
+    integrity_calls = 0
+    replay_calls = 0
+    original_integrity = restarted.engine.store.verify_integrity
+    original_replay = restarted.engine.replay
+
+    def counted_integrity(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal integrity_calls
+        integrity_calls += 1
+        return original_integrity(*args, **kwargs)
+
+    def counted_replay(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal replay_calls
+        replay_calls += 1
+        return original_replay(*args, **kwargs)
+
+    monkeypatch.setattr(restarted.engine.store, "verify_integrity", counted_integrity)
+    monkeypatch.setattr(restarted.engine, "replay", counted_replay)
+    startup = restarted.start()
+    assert integrity_calls == 1
+    assert replay_calls == 1
+    assert startup.projection.runtime_session_generation == 2
+    restarted.close()
+
+
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM"])
+@pytest.mark.parametrize("interrupt_phase", ["integrity", "strategy_restore"])
+def test_signal_interrupts_startup_without_new_durable_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_name: str,
+    interrupt_phase: str,
+) -> None:
+    database = tmp_path / f"interrupt-{signal_name.casefold()}.sqlite3"
+    first = _runtime(
+        database,
+        QueuePublicSource([{_INSTRUMENT: _market("interrupt-history", _START + timedelta(seconds=1))}]),
+        HoldStrategy(),
+        MutableClock(_START + timedelta(seconds=1)),
+    )
+    first.run_once()
+    first.close()
+    before_store = PaperStore(database, initialize=False)
+    before = before_store.get_run(_config().run_id)
+    before_projection = before_store.get_projection(_config().run_id)
+    before_store.close()
+    source = QueuePublicSource([None])
+    strategy = RestoreHoldStrategy()
+    restarted = _runtime(
+        database,
+        source,
+        strategy,
+        MutableClock(_START + timedelta(seconds=2)),
+    )
+    requested = False
+    original_observer = restarted.engine.store._observe_integrity_buffer
+    original_restore = strategy.restore
+
+    def raise_requested_signal() -> None:
+        nonlocal requested
+        requested = True
+        handler = signal.getsignal(getattr(signal, signal_name))
+        assert callable(handler)
+        signal.raise_signal(getattr(signal, signal_name))
+
+    def request_signal(name: str, size: int) -> None:
+        original_observer(name, size)
+        if not requested and name == "event_row":
+            raise_requested_signal()
+
+    def interrupting_restore(
+        markets: Iterable[MarketEvent],
+        view: PaperStrategyView,
+    ) -> None:
+        def interrupting_markets() -> Iterable[MarketEvent]:
+            for market in markets:
+                if not requested:
+                    raise_requested_signal()
+                yield market
+
+        original_restore(interrupting_markets(), view)
+
+    if interrupt_phase == "integrity":
+        monkeypatch.setattr(
+            restarted.engine.store,
+            "_observe_integrity_buffer",
+            request_signal,
+        )
+    else:
+        monkeypatch.setattr(strategy, "restore", interrupting_restore)
+    interrupted_at = time.perf_counter()
+    with (
+        cli_module._cooperative_signal_handlers(restarted.stop),
+        pytest.raises(PaperStartupInterrupted, match="startup interrupted"),
+    ):
+        restarted.start()
+    interruption_seconds = time.perf_counter() - interrupted_at
+    after_store = PaperStore(database, initialize=False)
+    after = after_store.get_run(_config().run_id)
+    after_projection = after_store.get_projection(_config().run_id)
+    after_store.close()
+    assert requested is True
+    assert interruption_seconds < 1.0
+    assert after.head_identity == before.head_identity
+    assert after_projection.to_dict() == before_projection.to_dict()
+    assert after_projection.runtime_session_generation == 1
+    assert after_projection.runtime_session_active is False
+    assert source.start_calls == 0
+    with PaperRuntimeLease(database, _config().run_id):
+        pass
 
 
 def test_public_funding_is_durable_idempotent_and_conflicts_fail_closed(

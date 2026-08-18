@@ -219,17 +219,32 @@ class FrozenRobustPairsPaperStrategy:
         ``decide`` call and are never inferred from public prices.
         """
 
-        del view
         self._reset_rolling_state()
-        for market in markets:
-            completed = self._ingest(market)
-            if completed:
-                self._evaluate_reviewed_strategy()
-        self._pending_signal_bar_ended_at = None
+        self.restore_incremental(markets, view)
         self._diagnostic = {
             **self._diagnostic,
             "bars_retained": len(self._bars),
             "status": "RESTORED",
+        }
+
+    def restore_incremental(
+        self,
+        markets: Iterable[MarketEvent],
+        view: PaperStrategyView | None = None,
+    ) -> None:
+        """Apply a durable suffix and evaluate only its final bounded window."""
+
+        del view
+        completed = False
+        for market in markets:
+            completed = self._ingest(market) or completed
+        if completed and self._bars:
+            self._evaluate_reviewed_strategy()
+        self._pending_signal_bar_ended_at = None
+        self._diagnostic = {
+            **self._diagnostic,
+            "bars_retained": len(self._bars),
+            "status": "RESTORED_INCREMENTAL",
         }
 
     def decide(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import gc
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -50,7 +50,9 @@ from hyperlab.paper.reducer import (
 from hyperlab.paper.risk import evaluate_order_risk
 from hyperlab.paper.store import (
     AppendResult,
+    ConcurrentWriteError,
     IntegrityError,
+    IntegrityReport,
     PaperStore,
     RunConflictError,
     RunNotFoundError,
@@ -61,6 +63,28 @@ from hyperlab.paper.store import (
 class PaperCommandResult:
     append: AppendResult
     projection: PaperProjection
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedPaperState:
+    head_identity: tuple[str, str, str, int, str, int, str, int, str]
+    report: IntegrityReport
+    projection: PaperProjection
+
+
+class _LedgerReconciliationError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PaperStartupPreparation:
+    started: PaperCommandResult
+    verification: _VerifiedPaperState
+
+
+def _raise_if_interrupted(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise InterruptedError("paper startup interrupted")
 
 
 @dataclass(slots=True)
@@ -105,7 +129,21 @@ class PaperEngine:
     def run_id(self) -> str:
         return self.config.run_id
 
-    def start(self) -> PaperCommandResult:
+    def start(
+        self,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PaperCommandResult:
+        return self.prepare_startup(should_stop=should_stop).started
+
+    def prepare_startup(
+        self,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PaperStartupPreparation:
+        """Verify one exact durable head once before startup reconciliation."""
+
+        _raise_if_interrupted(should_stop)
         initial = PaperProjection(
             run_id=self.run_id,
             config_hash=self.config.config_hash,
@@ -117,18 +155,19 @@ class PaperEngine:
             durable = self.store.create_run(self.config, initial)
         if durable.config_hash != self.config.config_hash:
             raise RunConflictError("paper run configuration drift is forbidden")
+
+        verification: _VerifiedPaperState | None = None
         if durable.event_sequence:
-            self.store.verify_integrity(self.run_id)
             try:
-                restored = self.replay()
-            except ValueError:
+                verification = self._verify_durable_state(should_stop=should_stop)
+            except ValueError as error:
                 damaged = self.projection()
                 self.reconcile(as_of=damaged.last_received_at or self.config.validation_started_at)
+                if isinstance(error, _LedgerReconciliationError):
+                    raise ValueError(
+                        "paper ledger does not reconcile: " + str(error)
+                    ) from error
                 raise
-            errors = self._ledger_reconciliation_errors(restored)
-            if errors:
-                self.reconcile(as_of=restored.last_received_at or self.config.validation_started_at)
-                raise ValueError("paper ledger does not reconcile: " + "; ".join(errors))
 
         input_id = deterministic_id("paper_input_run_started", self.run_id)
         input_payload = {
@@ -138,47 +177,79 @@ class PaperEngine:
         }
         duplicate = self._deduplicate(input_id, input_payload)
         if duplicate is not None:
-            return duplicate
+            started = duplicate
+        else:
+            projection = self.projection()
+            event = PaperEvent.create(
+                run_id=self.run_id,
+                event_type=PaperEventType.RUN_STARTED,
+                occurred_at=self.config.validation_started_at,
+                received_at=self.config.validation_started_at,
+                causation_id=None,
+                correlation_id=self.run_id,
+                payload={
+                    "config_hash": self.config.config_hash,
+                    "run_kind": self.config.run_kind,
+                    "strategy_hash": self.config.strategy_hash,
+                },
+            )
+            transaction_id = deterministic_id("paper_initial_capital", self.run_id)
+            entries = (
+                LedgerEntry.create(
+                    run_id=self.run_id,
+                    event_id=event.event_id,
+                    transaction_id=transaction_id,
+                    account="asset:cash",
+                    amount=self.config.initial_cash,
+                    ordinal=0,
+                ),
+                LedgerEntry.create(
+                    run_id=self.run_id,
+                    event_id=event.event_id,
+                    transaction_id=transaction_id,
+                    account="equity:initial_capital",
+                    amount=-self.config.initial_cash,
+                    ordinal=1,
+                ),
+            )
+            started = self._commit(
+                input_id=input_id,
+                input_payload=input_payload,
+                base=projection,
+                events=(event,),
+                explicit_ledger=entries,
+            )
+        if verification is None:
+            verification = self._verify_durable_state(should_stop=should_stop)
+        _raise_if_interrupted(should_stop)
+        return PaperStartupPreparation(started=started, verification=verification)
 
-        projection = self.projection()
-        event = PaperEvent.create(
-            run_id=self.run_id,
-            event_type=PaperEventType.RUN_STARTED,
-            occurred_at=self.config.validation_started_at,
-            received_at=self.config.validation_started_at,
-            causation_id=None,
-            correlation_id=self.run_id,
-            payload={
-                "config_hash": self.config.config_hash,
-                "run_kind": self.config.run_kind,
-                "strategy_hash": self.config.strategy_hash,
-            },
+    def _verify_durable_state(
+        self,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> _VerifiedPaperState:
+        before = self.store.get_run(self.run_id)
+        report = self.store.verify_integrity(self.run_id, should_stop=should_stop)
+        replayed = self.replay(should_stop=should_stop)
+        errors = (
+            self._ledger_reconciliation_errors(replayed)
+            if should_stop is None
+            else self._ledger_reconciliation_errors(
+                replayed,
+                should_stop=should_stop,
+            )
         )
-        transaction_id = deterministic_id("paper_initial_capital", self.run_id)
-        entries = (
-            LedgerEntry.create(
-                run_id=self.run_id,
-                event_id=event.event_id,
-                transaction_id=transaction_id,
-                account="asset:cash",
-                amount=self.config.initial_cash,
-                ordinal=0,
-            ),
-            LedgerEntry.create(
-                run_id=self.run_id,
-                event_id=event.event_id,
-                transaction_id=transaction_id,
-                account="equity:initial_capital",
-                amount=-self.config.initial_cash,
-                ordinal=1,
-            ),
-        )
-        return self._commit(
-            input_id=input_id,
-            input_payload=input_payload,
-            base=projection,
-            events=(event,),
-            explicit_ledger=entries,
+        if errors:
+            raise _LedgerReconciliationError("; ".join(errors))
+        after = self.store.get_run(self.run_id)
+        if after.head_identity != before.head_identity:
+            raise ConcurrentWriteError("paper durable head changed during startup verification")
+        _raise_if_interrupted(should_stop)
+        return _VerifiedPaperState(
+            head_identity=after.head_identity,
+            report=report,
+            projection=replayed,
         )
 
     def projection(self) -> PaperProjection:
@@ -1799,14 +1870,23 @@ class PaperEngine:
         )
         return self.submit_decision(decision, markets)
 
-    def replay(self) -> PaperProjection:
+    def replay(
+        self,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PaperProjection:
         run = self.store.get_run(self.run_id)
-        events = self.store.iter_events(self.run_id)
+
+        def interruptible_events():  # type: ignore[no-untyped-def]
+            for stored in self.store.iter_events(self.run_id):
+                _raise_if_interrupted(should_stop)
+                yield stored
+
         replayed = replay_projection(
             run_id=self.run_id,
             config_hash=self.config.config_hash,
             initial_cash=self.config.initial_cash,
-            events=events,
+            events=interruptible_events(),
         )
         durable = self.projection()
         if replayed.to_dict() != durable.to_dict():
@@ -2081,7 +2161,67 @@ class PaperEngine:
             gc.collect()
             return replayed
 
-    def reconcile(self, *, as_of: datetime) -> PaperCommandResult:
+    def reconcile(
+        self,
+        *,
+        as_of: datetime,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PaperCommandResult:
+        return self._reconcile(as_of=as_of, should_stop=should_stop)
+
+    def reconcile_prepared(
+        self,
+        preparation: PaperStartupPreparation,
+        *,
+        as_of: datetime,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PaperCommandResult:
+        if not isinstance(preparation, PaperStartupPreparation):
+            raise TypeError("preparation must be a PaperStartupPreparation")
+        verification = preparation.verification
+        current = self.store.get_run(self.run_id)
+        projection = self.projection()
+        if current.head_identity != verification.head_identity:
+            raise ConcurrentWriteError(
+                "paper durable head changed after startup verification"
+            )
+        if projection.to_dict() != verification.projection.to_dict():
+            raise ConcurrentWriteError(
+                "paper projection changed after startup verification"
+            )
+        _raise_if_interrupted(should_stop)
+        has_durable_reconciliation = next(
+            iter(
+                self.store.iter_inputs(
+                    self.run_id,
+                    input_type="RECONCILE",
+                )
+            ),
+            None,
+        ) is not None
+        if (
+            preparation.started.append.idempotent
+            and has_durable_reconciliation
+            and projection.reconciled
+            and projection.state is not PaperState.MANUAL_REVIEW
+        ):
+            return PaperCommandResult(
+                append=preparation.started.append,
+                projection=projection,
+            )
+        return self._reconcile(
+            as_of=as_of,
+            should_stop=should_stop,
+            verification=verification,
+        )
+
+    def _reconcile(
+        self,
+        *,
+        as_of: datetime,
+        should_stop: Callable[[], bool] | None = None,
+        verification: _VerifiedPaperState | None = None,
+    ) -> PaperCommandResult:
         input_id = deterministic_id("paper_reconcile", self.run_id, utc_text(as_of))
         payload = {"as_of": utc_text(as_of), "input_type": "RECONCILE"}
         duplicate = self._deduplicate(input_id, payload)
@@ -2089,11 +2229,19 @@ class PaperEngine:
             return duplicate
         projection = self.projection()
         try:
-            report = self.store.verify_integrity(self.run_id)
-            replayed = self.replay()
-            ledger_errors = self._ledger_reconciliation_errors(replayed)
-            if ledger_errors:
-                raise ValueError("; ".join(ledger_errors))
+            verified = verification or self._verify_durable_state(should_stop=should_stop)
+            if verification is not None:
+                current = self.store.get_run(self.run_id)
+                if current.head_identity != verification.head_identity:
+                    raise ConcurrentWriteError(
+                        "paper durable head changed after startup verification"
+                    )
+                if projection.to_dict() != verification.projection.to_dict():
+                    raise ConcurrentWriteError(
+                        "paper projection changed after startup verification"
+                    )
+            report = verified.report
+            _raise_if_interrupted(should_stop)
         except IntegrityError:
             raise
         except ValueError as error:
@@ -2146,6 +2294,7 @@ class PaperEngine:
                 base=projection,
                 events=tuple(events),
             )
+        _raise_if_interrupted(should_stop)
         event = self._event(
             PaperEventType.RECONCILIATION_SUCCEEDED,
             at=as_of,
@@ -2184,7 +2333,12 @@ class PaperEngine:
         )
         return PaperCommandResult(append=append, projection=self.projection())
 
-    def _ledger_reconciliation_errors(self, projection: PaperProjection) -> tuple[str, ...]:
+    def _ledger_reconciliation_errors(
+        self,
+        projection: PaperProjection,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> tuple[str, ...]:
         balances: dict[str, Decimal] = {}
         # Decimal arithmetic is exact only within the active finite precision.
         # The reducer applies one economic event net at a time, so reconciliation
@@ -2204,6 +2358,7 @@ class PaperEngine:
             )
 
         for entry in self.store.iter_ledger_entries(self.run_id):
+            _raise_if_interrupted(should_stop)
             if transaction_id is not None and entry.transaction_id != transaction_id:
                 ledger_realized_pnl += apply_transaction(transaction_balances)
                 transaction_balances = {}

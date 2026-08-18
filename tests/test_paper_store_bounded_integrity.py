@@ -202,6 +202,51 @@ def test_large_journal_integrity_scan_has_bounded_python_side_cardinality(
     assert len(corrupt_report.issues) < 16
 
 
+def test_v1_store_migrates_to_covering_event_input_index_without_head_drift(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper-v1-index-migration.sqlite3"
+    store, config = _build_journal(database, market_count=32)
+    before = store.get_run(config.run_id)
+    before_projection = store.get_projection(config.run_id).to_dict()
+    store.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX paper_events_input_idx")
+        connection.execute(
+            "CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id)"
+        )
+        connection.execute("UPDATE paper_schema SET version=1 WHERE singleton=1")
+        connection.execute("PRAGMA user_version=1")
+
+    migrated = PaperStore(database)
+    after = migrated.get_run(config.run_id)
+    assert after.head_identity == before.head_identity
+    assert migrated.get_projection(config.run_id).to_dict() == before_projection
+    assert migrated.inspect_integrity_readonly(config.run_id).ok is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        columns = tuple(
+            str(row[2])
+            for row in connection.execute(
+                "PRAGMA index_info('paper_events_input_idx')"
+            )
+        )
+        input_id = connection.execute(
+            "SELECT input_id FROM paper_commits WHERE run_id=? AND commit_sequence=2",
+            (config.run_id,),
+        ).fetchone()[0]
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT event_hash FROM paper_events
+            WHERE run_id=? AND input_id=? ORDER BY sequence
+            """,
+            (config.run_id, input_id),
+        ).fetchall()
+    assert columns == ("run_id", "input_id", "sequence")
+    assert any("paper_events_input_idx" in str(row[3]) for row in plan)
+
+
 @pytest.mark.parametrize(
     ("setup_sql", "tamper_sql", "expected_issue"),
     [

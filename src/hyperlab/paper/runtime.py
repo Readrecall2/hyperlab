@@ -212,6 +212,10 @@ class PaperAdmissionError(PaperRuntimeError):
     """A frozen binding, clock, source, or reconciliation gate failed."""
 
 
+class PaperStartupInterrupted(PaperRuntimeError):
+    """A cooperative stop interrupted restoration before session admission."""
+
+
 class PaperRuntimeStepKind(StrEnum):
     MARKET = "MARKET"
     FUNDING = "FUNDING"
@@ -370,6 +374,7 @@ class PaperRuntime:
         self._bootstrap_deadline_at: datetime | None = None
         self._steady_state_armed = False
         self._strategy_restored = False
+        self._strategy_restore_commit_sequence = 0
         self._verify_release_code()
         self._verify_frozen_bindings()
         self._runner = PaperRunner(engine, strategy)
@@ -702,6 +707,10 @@ class PaperRuntime:
                 )
             raise
 
+    def _check_startup_interrupted(self) -> None:
+        if self.stopped:
+            raise PaperStartupInterrupted("paper startup interrupted by cooperative stop")
+
     def _start_with_lease(self) -> PaperRuntimeStartup:
         if self._closed:
             raise PaperRuntimeError("closed paper runtime cannot be restarted")
@@ -711,26 +720,54 @@ class PaperRuntime:
         as_of = self._now()
         if as_of < self.engine.config.validation_started_at:
             raise PaperAdmissionError("paper runtime clock precedes validation_started_at")
+        runtime_restart = False
         try:
             durable_before_start = self.engine.store.get_run(self.engine.run_id)
         except RunNotFoundError:
             durable_before_start = None
         if durable_before_start is not None:
             durable_projection = self.engine.store.get_projection(self.engine.run_id)
+            runtime_restart = durable_projection.runtime_session_generation > 0
             if (
                 durable_projection.last_received_at is not None
                 and as_of < durable_projection.last_received_at
             ):
                 raise PaperAdmissionError("paper runtime clock precedes durable paper state")
-        started = self.engine.start()
+        try:
+            preparation = self.engine.prepare_startup(
+                should_stop=self._stop_requested.is_set,
+            )
+        except InterruptedError as error:
+            if self.stopped:
+                raise PaperStartupInterrupted(
+                    "paper startup interrupted by cooperative stop"
+                ) from error
+            raise
+        started = preparation.started
         if started.projection.last_received_at is not None and as_of < started.projection.last_received_at:
             raise PaperAdmissionError("paper runtime clock precedes durable paper state")
-        reconciled = self.engine.reconcile(as_of=as_of)
+        self._verify_frozen_bindings()
+        if runtime_restart or not self.engine.config.required_instruments:
+            self._restore_strategy(self.engine.projection())
+            self._strategy_restored = True
+        self._check_startup_interrupted()
+        try:
+            reconciled = self.engine.reconcile_prepared(
+                preparation,
+                as_of=as_of,
+                should_stop=self._stop_requested.is_set,
+            )
+        except InterruptedError as error:
+            if self.stopped:
+                raise PaperStartupInterrupted(
+                    "paper startup interrupted by cooperative stop"
+                ) from error
+            raise
         projection = reconciled.projection
         if not projection.reconciled or projection.state is PaperState.MANUAL_REVIEW:
             raise PaperAdmissionError("paper run did not reconcile cleanly before admission")
         self._source_activation_cutoff = self._load_source_activation_cutoff()
-        self._verify_frozen_bindings()
+        self._check_startup_interrupted()
         runtime_session_started = self._start_runtime_session(projection, as_of=as_of)
         projection = runtime_session_started.projection
         restart_exercise: PaperCommandResult | None = None
@@ -747,18 +784,6 @@ class PaperRuntime:
                 artifact_hash=artifact_hash,
                 exercised_at=as_of,
             )
-        if not self.engine.config.required_instruments:
-            try:
-                self._restore_strategy(self.engine.projection())
-            except Exception as error:
-                self._persist_runtime_failure(
-                    as_of=as_of,
-                    phase="STRATEGY_RESTORE",
-                    error_type=type(error).__name__,
-                    failure_key=cast(str, self._runtime_session_id),
-                )
-                raise
-            self._strategy_restored = True
         self._verify_runtime_environment()
         source_start = getattr(self._source, "start", None)
         if source_start is not None:
@@ -813,11 +838,17 @@ class PaperRuntime:
             if market.source_event_kind == "connect":
                 self._bootstrap_connect_health[market.instrument] = market
 
-    def _durable_markets(self) -> Iterable[MarketEvent]:
+    def _durable_markets(
+        self,
+        *,
+        after_commit_sequence: int = 0,
+    ) -> Iterable[MarketEvent]:
         for record in self.engine.store.iter_inputs(
             self.engine.run_id,
             input_type="PUBLIC_MARKET_EVENT",
+            after_commit_sequence=after_commit_sequence,
         ):
+            self._check_startup_interrupted()
             raw_market = record.payload.get("market")
             if not isinstance(raw_market, Mapping):
                 raise PaperAdmissionError("durable public market input is malformed")
@@ -829,21 +860,46 @@ class PaperRuntime:
             self._observe_connection_health((market,))
             yield market
 
-    def _restore_strategy(self, projection: PaperProjection) -> None:
-        self._latest_markets.clear()
-        self._bootstrap_connect_health.clear()
-        markets = self._durable_markets()
-        restore = getattr(self._strategy, "restore", None)
-        if restore is None:
-            for _market in markets:
-                pass
-            return
-        if not callable(restore):
-            raise PaperAdmissionError("paper strategy restore attribute must be callable")
+    def _restore_strategy(
+        self,
+        projection: PaperProjection,
+        *,
+        incremental: bool = False,
+    ) -> None:
+        self._check_startup_interrupted()
+        if not incremental:
+            self._latest_markets.clear()
+            self._bootstrap_connect_health.clear()
+        after_commit_sequence = self._strategy_restore_commit_sequence if incremental else 0
+        restore = (
+            getattr(self._strategy, "restore_incremental", None)
+            if incremental
+            else getattr(self._strategy, "restore", None)
+        )
+        if incremental and restore is None:
+            after_commit_sequence = 0
+            restore = getattr(self._strategy, "restore", None)
+        markets = self._durable_markets(
+            after_commit_sequence=after_commit_sequence,
+        )
         try:
-            restore(markets, PaperStrategyView.from_projection(projection))
+            if restore is None:
+                for _market in markets:
+                    pass
+            else:
+                if not callable(restore):
+                    raise PaperAdmissionError(
+                        "paper strategy restore attribute must be callable"
+                    )
+                restore(markets, PaperStrategyView.from_projection(projection))
+        except PaperStartupInterrupted:
+            raise
         except (KeyError, TypeError, ValueError) as error:
             raise PaperAdmissionError("paper strategy state restoration failed closed") from error
+        self._check_startup_interrupted()
+        self._strategy_restore_commit_sequence = self.engine.store.get_run(
+            self.engine.run_id
+        ).commit_sequence
 
     def _bootstrap_complete(self, *, as_of: datetime) -> bool:
         if self._steady_state_armed:
@@ -1489,7 +1545,7 @@ class PaperRuntime:
             self._observe_connection_health(fresh.values())
             if not self._steady_state_armed:
                 if self._bootstrap_complete(as_of=observed_at):
-                    self._restore_strategy(result.projection)
+                    self._restore_strategy(result.projection, incremental=True)
                     self._strategy_restored = True
                     self._arm_steady_state(as_of=observed_at)
                 elif deadline is not None and observed_at >= deadline:
@@ -1600,6 +1656,7 @@ __all__ = [
     "PaperRuntimeStartup",
     "PaperRuntimeStep",
     "PaperRuntimeStepKind",
+    "PaperStartupInterrupted",
     "PublicSourceDescriptor",
     "replay_paper_run",
 ]

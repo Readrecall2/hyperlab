@@ -12,6 +12,8 @@ User=hyperlab-paper
 Group=hyperlab-paper
 WorkingDirectory=/opt/hyperlab-multistrategy
 Environment=HYPERLAB_MODE=readonly
+Environment=HYPERLAB_DATA_DIR=/var/lib/hyperlab/phase12-live-paper
+Environment=HYPERLAB_PAPER_DIR=/var/lib/hyperlab/phase12-live-paper/paper
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/hyperlab/paper-supervisor.env

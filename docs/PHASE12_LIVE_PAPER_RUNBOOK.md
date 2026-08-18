@@ -529,13 +529,26 @@ runtime lease, engine pause, readiness, and runtime startup paths remain authori
 - reboot startup is enabled through `multi-user.target`. A planned reboot sends `SIGTERM`, waits up
   to 90 seconds for cooperative close, and can start automatically after boot. A hard power loss
   leaves an unclosed session and therefore requires the reviewed manual path below;
-- systemd runs the process as `hyperlab-paper`, with no capabilities, no-new-privileges, a
-  read-only checkout, a single writable persistent root, and only `AF_UNIX/AF_INET/AF_INET6`;
+- systemd runs the process as `hyperlab-paper`, with no capabilities, no-new-privileges,
+  `ProtectSystem=strict`, an explicit read-only `/opt/hyperlab-multistrategy`, the single writable
+  `/var/lib/hyperlab/phase12-live-paper` root, and only `AF_UNIX/AF_INET/AF_INET6`;
+- the unit pins `HYPERLAB_DATA_DIR=/var/lib/hyperlab/phase12-live-paper` and
+  `HYPERLAB_PAPER_DIR=/var/lib/hyperlab/phase12-live-paper/paper`. The public collector therefore
+  writes `paper/phase12-public-source-status.json` under that persistent root. Its atomic
+  `phase12-public-source-status.tmp` write, rename, and cleanup remain in the same writable
+  directory and filesystem;
 - the system service environment does not inherit an SSH shell. Testnet/wallet/key variables are
   explicitly unset, and the environment file is restricted to paths and disk thresholds.
 
 The service still exposes only `PAPER`, `PAPER_RUNTIME`, `credential_scope=NONE`,
 `execution_network=NONE`, `authorizes_real_money=false`, and `orders_enabled=false`.
+
+The narrowly scoped mutable-path inventory for the supervised runtime is the explicitly selected
+SQLite database and its rollback journal in the persistent `paper` directory, the existing
+runtime lease file beside that database, and the collector status JSON/temp pair above. No other
+repo-relative mutable runtime path was found in the Paper startup/steady-state call graph;
+`PYTHONDONTWRITEBYTECODE=1` also prevents bytecode writes in the checkout. Journald and systemd's
+private temporary directory are managed outside the checkout.
 
 ### One-time install on the reviewed VPS
 
@@ -548,7 +561,7 @@ files in its frozen `release-code-manifest.json` changed.
 cd /opt/hyperlab-multistrategy
 FINAL_SUPERVISOR_COMMIT="<FINAL_COMMIT_FROM_CHANGE_REPORT>"
 CONFIG="/var/lib/hyperlab/phase12-live-paper/authorization-ba84444240af6cdbfc3df4f0170866a2a0c15c1f-linux-cpython-3.12.13/paper-config.json"
-DB="/var/lib/hyperlab/phase12-live-paper/paper/paper.sqlite3"
+DB="/var/lib/hyperlab/phase12-live-paper/paper/paper-ba84444.sqlite3"
 
 test "$(git branch --show-current)" = "phase-12-live-paper"
 test "$(git rev-parse HEAD)" = "$FINAL_SUPERVISOR_COMMIT"
@@ -590,13 +603,16 @@ sudo systemctl daemon-reload
 Review `/etc/hyperlab/paper-supervisor.env` before enabling. It must contain only the exact
 `CONFIG`, exact `DB`, `HYPERLAB_PAPER_MIN_FREE_BYTES=5368709120` (5 GiB), and
 `HYPERLAB_PAPER_MIN_FREE_PERCENT=10`. It must contain no key, wallet, credential, hostname, or
-new run ID.
+new run ID, and must not override the unit's exact `HYPERLAB_DATA_DIR` or
+`HYPERLAB_PAPER_DIR`.
 
 Run the guard once explicitly, as the service user, before systemd start:
 
 ```bash
 sudo -u hyperlab-paper env -i \
   PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  HYPERLAB_DATA_DIR=/var/lib/hyperlab/phase12-live-paper \
+  HYPERLAB_PAPER_DIR=/var/lib/hyperlab/phase12-live-paper/paper \
   /opt/hyperlab-multistrategy/.venv/bin/python \
   /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py guard \
   --config "$CONFIG" --database "$DB" \
@@ -650,6 +666,8 @@ uptime/average CPU/RSS when available, service status, and the last 30 message-o
 ```bash
 sudo env -i \
   PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+  HYPERLAB_DATA_DIR=/var/lib/hyperlab/phase12-live-paper \
+  HYPERLAB_PAPER_DIR=/var/lib/hyperlab/phase12-live-paper/paper \
   /opt/hyperlab-multistrategy/.venv/bin/python \
   /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py health \
   --config "$CONFIG" --database "$DB" \
@@ -720,6 +738,73 @@ sudo -u hyperlab-paper env -i PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
   --offline-unclosed-recovery
 sudo systemctl start hyperlab-paper.service
 ```
+
+#### Recovery of the reproduced generation-3 status-path failure
+
+The reproduced failure is an unclosed-session recovery, not a standard fresh-BBO resume. After
+installing the corrected unit/environment from the final reviewed commit and running
+`systemctl daemon-reload`, keep the service stopped and bind the exact existing identities:
+
+```bash
+cd /opt/hyperlab-multistrategy
+CONFIG="/var/lib/hyperlab/phase12-live-paper/authorization-ba84444240af6cdbfc3df4f0170866a2a0c15c1f-linux-cpython-3.12.13/paper-config.json"
+DB="/var/lib/hyperlab/phase12-live-paper/paper/paper-ba84444.sqlite3"
+RUN_ID="9aa7213ef08ddc07d700128cf8fdf90e75a764f0867201075074e0c5fbe64436"
+
+test -f "$CONFIG"
+test -f "$DB"
+test "$(.venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$CONFIG")" = "$RUN_ID"
+sudo systemctl stop hyperlab-paper.service
+sudo systemctl show hyperlab-paper.service -p ActiveState -p SubState -p Result
+
+paper_python() {
+  sudo -u hyperlab-paper env -i \
+    PATH=/usr/bin:/bin HYPERLAB_MODE=readonly \
+    HYPERLAB_DATA_DIR=/var/lib/hyperlab/phase12-live-paper \
+    HYPERLAB_PAPER_DIR=/var/lib/hyperlab/phase12-live-paper/paper \
+    /opt/hyperlab-multistrategy/.venv/bin/python "$@"
+}
+```
+
+The initial `PUBLIC_SOURCE_FAILURE` may still be the only/latest critical incident. Existing
+offline recovery accepts only the deterministic `UNCLOSED_RUNTIME_SESSION` incident. Run the
+existing guard once while stopped so it atomically latches that incident through
+`PaperEngine.pause`:
+
+```bash
+paper_python /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py guard \
+  --config "$CONFIG" --database "$DB" \
+  --minimum-free-bytes 5368709120 --minimum-free-percent 10
+```
+
+Expected: nonzero exit with `status=REFUSED` and
+`UNCLOSED_RUNTIME_SESSION_REQUIRES_REVIEW`. This latch is idempotent. Review the status/latest
+critical incident, then use the existing explicit offline recovery on the same DB/run:
+
+```bash
+paper_python -m hyperlab paper status --database "$DB" --run-id "$RUN_ID"
+paper_python -m hyperlab paper replay "$RUN_ID" --database "$DB"
+paper_python -m hyperlab paper resume "$RUN_ID" --database "$DB" \
+  --review-reason "Generation 3 status-path failure and unclosed runtime incident reviewed" \
+  --offline-unclosed-recovery
+```
+
+The resume command reconciles internally under the same runtime lease. Require `state=FLAT`, no
+position/order, the same DB/run ID, and the old durable session still active pending replacement.
+If it returns `REDUCE_ONLY`, or any identity/replay/reconciliation check fails, do not start the
+unit. Otherwise rerun the guard and start only after `status=READY`, `paper_state=FLAT`, and
+`full_replay=REPLAY_EXACT`:
+
+```bash
+paper_python /opt/hyperlab-multistrategy/ops/phase12/paper_supervisor.py guard \
+  --config "$CONFIG" --database "$DB" \
+  --minimum-free-bytes 5368709120 --minimum-free-percent 10
+sudo systemctl start hyperlab-paper.service
+```
+
+The next runtime replaces durable generation 3 with generation 4 and requires a new bilateral
+public-source bootstrap before strategy execution. Nothing here auto-resumes, recreates the DB,
+or changes the run ID.
 
 For a cleanly stopped `PAUSED` run, follow the existing reviewed standard resume procedure: exact
 replay/reconciliation, one manual Paper run while still paused to obtain fresh bilateral BBO,

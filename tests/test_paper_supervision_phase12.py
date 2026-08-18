@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+import pytest
+
+from hyperlab.cli import _phase12_paper_source_factory
+from hyperlab.paper.collector_source import HyperliquidPaperPublicSource
 from hyperlab.paper.engine import PaperEngine
 from hyperlab.paper.models import PaperExecutionConfig, PaperRiskLimits, PaperRunConfig, PaperState
-from hyperlab.paper.runtime import PaperRuntimeLease
+from hyperlab.paper.runtime import PaperRuntimeLease, PublicSourceDescriptor
 from hyperlab.paper.store import PaperStore
 from ops.phase12.paper_supervisor import inspect_durable_start
 
@@ -197,6 +202,12 @@ def test_supervisor_rejects_config_or_runtime_identity_mismatch(tmp_path: Path) 
 
 def test_systemd_supervision_remains_paper_only_and_fail_closed() -> None:
     service = (_ROOT / "deploy/systemd/hyperlab-paper.service").read_text(encoding="utf-8")
+    environment = (
+        _ROOT / "deploy/systemd/paper-supervisor.env.example"
+    ).read_text(encoding="utf-8")
+    runbook = (
+        _ROOT / "docs/PHASE12_LIVE_PAPER_RUNBOOK.md"
+    ).read_text(encoding="utf-8")
     disk_service = (
         _ROOT / "deploy/systemd/hyperlab-paper-disk-guard.service"
     ).read_text(encoding="utf-8")
@@ -215,6 +226,10 @@ def test_systemd_supervision_remains_paper_only_and_fail_closed() -> None:
     assert "KillSignal=SIGTERM" in service
     assert "TimeoutStopSec=90" in service
     assert "HYPERLAB_MODE=readonly" in service
+    assert "ProtectSystem=strict" in service
+    assert "ReadOnlyPaths=/opt/hyperlab-multistrategy" in service
+    assert "ReadWritePaths=/var/lib/hyperlab/phase12-live-paper" in service
+    assert "ReadWritePaths=/opt/hyperlab-multistrategy" not in service
     assert "UnsetEnvironment=" in service
     assert "hyperlab-testnet" not in service.casefold()
     assert "-m hyperlab testnet" not in service.casefold()
@@ -224,3 +239,85 @@ def test_systemd_supervision_remains_paper_only_and_fail_closed() -> None:
     assert "systemctl stop hyperlab-paper-disk-guard.timer" in disk_stop
     assert "RemainAfterExit" not in disk_stop
     assert "OnUnitActiveSec=1min" in timer
+
+    checkout = PurePosixPath("/opt/hyperlab-multistrategy")
+    writable_root = PurePosixPath("/var/lib/hyperlab/phase12-live-paper")
+    data_root = PurePosixPath(
+        next(
+            line.split("=", 2)[2]
+            for line in service.splitlines()
+            if line.startswith("Environment=HYPERLAB_DATA_DIR=")
+        )
+    )
+    paper_root = PurePosixPath(
+        next(
+            line.split("=", 2)[2]
+            for line in service.splitlines()
+            if line.startswith("Environment=HYPERLAB_PAPER_DIR=")
+        )
+    )
+    status_path = data_root / "paper/phase12-public-source-status.json"
+    assert data_root == writable_root
+    assert paper_root == writable_root / "paper"
+    assert status_path.is_relative_to(writable_root)
+    assert not status_path.is_relative_to(checkout)
+    assert "Do not override them here" in environment
+    assert (
+        "HYPERLAB_PAPER_DB=/var/lib/hyperlab/phase12-live-paper/paper/"
+        "paper-ba84444.sqlite3"
+    ) in environment
+    assert "--offline-unclosed-recovery" in runbook
+    assert "UNCLOSED_RUNTIME_SESSION_REQUIRES_REVIEW" in runbook
+    assert (
+        "/var/lib/hyperlab/phase12-live-paper/paper/paper-ba84444.sqlite3"
+    ) in runbook
+    assert (
+        "9aa7213ef08ddc07d700128cf8fdf90e75a764f0867201075074e0c5fbe64436"
+    ) in runbook
+    assert "generation 3 with generation 4" in runbook
+
+
+def test_supervised_source_factory_uses_configured_persistent_data_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "var/lib/hyperlab/phase12-live-paper"
+    checkout = tmp_path / "opt/hyperlab-multistrategy"
+    monkeypatch.setenv("HYPERLAB_DATA_DIR", str(data_root))
+    monkeypatch.chdir(_ROOT)
+    config_payload = json.loads(
+        (
+            _ROOT
+            / "config/paper/phase08-robust-pairs-btc-eth-paper-v1/paper-config.json"
+        ).read_text(encoding="utf-8")
+    )
+    config = PaperRunConfig.from_dict(config_payload)
+    captured: dict[str, Path] = {}
+
+    class _CapturedSource:
+        descriptor = PublicSourceDescriptor(
+            source=config.data_source,
+            data_hash=config.data_hash,
+        )
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    def capture_create_mainnet(*, runtime_status_path: Path) -> _CapturedSource:
+        captured["runtime_status_path"] = runtime_status_path
+        return _CapturedSource()
+
+    monkeypatch.setattr(
+        HyperliquidPaperPublicSource,
+        "create_mainnet",
+        staticmethod(capture_create_mainnet),
+    )
+
+    source = _phase12_paper_source_factory(config)
+    source.close()
+
+    status_path = captured["runtime_status_path"]
+    assert status_path == data_root / "paper/phase12-public-source-status.json"
+    assert status_path.is_relative_to(data_root)
+    assert not status_path.is_relative_to(checkout)

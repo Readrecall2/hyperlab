@@ -339,6 +339,32 @@ def test_create_mainnet_is_transport_lazy_and_binds_exact_public_identity(
     assert not (tmp_path / "paper-public-status.json").exists()
 
 
+def test_collector_status_atomic_write_stays_in_persistent_paper_directory(
+    tmp_path: Path,
+) -> None:
+    persistent_root = tmp_path / "var/lib/hyperlab/phase12-live-paper"
+    status_path = persistent_root / "paper/phase12-public-source-status.json"
+    collector = PublicCollector(
+        phase12_public_collector_config(),
+        rest=_FixtureRest(),
+        socket_factory=_NoSocketFactory(),
+        sink=_NullSink(),
+        runtime_status_path=status_path,
+        clock=lambda: NOW,
+    )
+    try:
+        collector._publish_status()
+    finally:
+        collector.close()
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "readonly"
+    assert payload["orders_enabled"] is False
+    assert payload["network"] == "mainnet"
+    assert status_path.is_relative_to(persistent_root)
+    assert not status_path.with_suffix(".tmp").exists()
+
+
 def test_create_mainnet_rejects_invalid_transport_bounds_without_start(
     tmp_path: Path,
 ) -> None:

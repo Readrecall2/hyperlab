@@ -274,7 +274,7 @@ def test_opt_in_shared_source_attaches_normalized_context_with_spot_alias() -> N
     context_row.update(
         {
             "instrument_kind": "spot",
-            "instrument_id": "HL:HYPE:spot",
+            "instrument_id": "HYPERLIQUID:@107:spot",
             "mark_price": Decimal("100"),
             "mid_price": Decimal("100"),
             "notional_volume_24h": Decimal("100000000"),
@@ -282,7 +282,7 @@ def test_opt_in_shared_source_attaches_normalized_context_with_spot_alias() -> N
         }
     )
     alias_identity = dict(context_row)
-    alias_identity["instrument_id"] = "HL:@107:spot"
+    alias_identity["instrument_id"] = "HL:HYPE:spot"
     with pytest.raises(
         PublicRecordAdapterError,
         match="instrument_id differs from the frozen source route",
@@ -290,7 +290,7 @@ def test_opt_in_shared_source_attaches_normalized_context_with_spot_alias() -> N
         adapter.adapt(ParsedRecord(RecordType.MARKET_CONTEXT, "@107", alias_identity))
 
     mismatched = dict(context_row)
-    mismatched["instrument_id"] = "HL:OTHER:spot"
+    mismatched["instrument_id"] = "HYPERLIQUID:OTHER:spot"
     with pytest.raises(
         PublicRecordAdapterError,
         match="instrument_id differs from the frozen source route",
@@ -312,6 +312,7 @@ def test_opt_in_shared_source_attaches_normalized_context_with_spot_alias() -> N
 
     assert frame is not None
     event = frame["HL:HYPE:spot"]
+    assert event.context["instrument_id"] == "HL:HYPE:spot"
     assert event.context["source_asset"] == "@107"
     assert event.context["instrument_kind"] == "spot"
     assert event.context["product_identity_sha256"] == _SPOT_IDENTITY

@@ -14,7 +14,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from hyperlab.collector.models import ParsedRecord
-from hyperlab.data.schema import RecordType, latest_schema_for, parse_instrument
+from hyperlab.data.schema import RecordType, instrument, latest_schema_for, parse_instrument
 from hyperlab.paper.models import MarketEvent
 from hyperlab.paper.runtime import PUBLIC_MARKET_SCHEMA_VERSION, PublicSourceDescriptor
 
@@ -594,8 +594,8 @@ class PublicRecordMarketEventAdapter:
             row.get("instrument_id"),
             label="instrument_id",
         )
-        expected_instrument_id = self._instruments[key]
-        if observed_instrument_id != expected_instrument_id:
+        expected_source_instrument_id = instrument(key[0], key[1], expected_kind)
+        if observed_instrument_id != expected_source_instrument_id:
             raise PublicRecordAdapterError(
                 "market context instrument_id differs from the frozen source route"
             )
@@ -603,7 +603,7 @@ class PublicRecordMarketEventAdapter:
             "base_volume_24h": row.get("base_volume_24h"),
             "circulating_supply": row.get("circulating_supply"),
             "current_funding_rate": row.get("current_funding_rate"),
-            "instrument_id": observed_instrument_id,
+            "instrument_id": self._instruments[key],
             "instrument_kind": observed_kind,
             "mark_price": row.get("mark_price"),
             "mid_price": row.get("mid_price"),

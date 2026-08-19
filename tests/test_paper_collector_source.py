@@ -151,6 +151,16 @@ class _NullSink:
         return None
 
 
+class _CapturingSink(_NullSink):
+    def __init__(self) -> None:
+        self.records: list[ParsedRecord] = []
+
+    def add_many(self, records: Any) -> int:
+        batch = tuple(records)
+        self.records.extend(batch)
+        return len(batch)
+
+
 class _BlockingCollector:
     def __init__(self) -> None:
         self.run_started = threading.Event()
@@ -287,6 +297,36 @@ def test_restricted_rest_materialization_emits_bbo_and_funding_but_not_l2_or_can
     assert RecordType.L2_SNAPSHOT not in record_types
     assert RecordType.L2_DELTA not in record_types
     assert RecordType.CANDLE not in record_types
+
+
+def test_v10_rest_bootstrap_uses_a_producer_scoped_connection_domain(tmp_path: Path) -> None:
+    sink = _CapturingSink()
+    collector = PublicCollector(
+        phase12_public_collector_config(),
+        rest=_FixtureRest(),
+        socket_factory=_NoSocketFactory(),
+        sink=sink,
+        runtime_status_path=tmp_path / "paper-public-status.json",
+        clock=lambda: NOW,
+        producer_scoped_rest_connection_ids=True,
+    )
+    try:
+        collector._collect_rest(
+            connection_id="ws-1-live-fixture",
+            connection_epoch=1,
+        )
+    finally:
+        collector.close()
+
+    causal_records = tuple(
+        record
+        for record in sink.records
+        if record.record_type in {RecordType.BBO, RecordType.MARKET_CONTEXT}
+    )
+    assert causal_records
+    assert {record.row["connection_id"] for record in causal_records} == {
+        "rest-bootstrap-1-ws-1-live-fixture"
+    }
 
 
 def test_create_mainnet_is_transport_lazy_and_binds_exact_public_identity(

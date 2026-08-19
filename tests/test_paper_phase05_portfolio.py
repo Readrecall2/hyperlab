@@ -376,6 +376,10 @@ def test_foundation_is_lazy_public_only_uncalibrated_and_budget_bound(
         assert identity["product_identity_hashes"] == dict(
             PHASE12_PHASE05_PRODUCT_IDENTITY_HASHES
         )
+        assert identity["normalized_order_policy"].endswith("CONNECTION_EPOCH_V2")
+        assert identity["transport"]["rest_connection_id_policy"] == (
+            "SYNCHRONOUS_BOOTSTRAP_RESYNC_PRODUCER_SCOPED_V1"
+        )
         assert identity["transport"]["credential_scope"] == "NONE"
         assert identity["transport"]["orders_enabled"] is False
         assert identity["transport"]["execution_routes_present"] is False

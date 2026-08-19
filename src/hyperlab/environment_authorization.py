@@ -2095,8 +2095,8 @@ def _fixed_paper_facts(
                     'funding_time_policy': 'HYPERLIQUID_FUNDING_HISTORY_FIRST_60_SECONDS_CANONICAL_EXACT_UTC_HOUR_V1',
                     'instrument_route_policy': 'EXPLICIT_MAPPING_PRODUCT_IDENTITY_BOUND_V2',
                     'normalized_order_policy': (
-                        'COLLECTOR_FIFO_PER_CONNECTION_ARRIVAL_SEQUENCE_'
-                        'PER_ROUTE_CONNECTION_EPOCH_V1'
+                        'COLLECTOR_FIFO_PRODUCER_SCOPED_CONNECTION_ID_'
+                        'PER_CONNECTION_ARRIVAL_SEQUENCE_PER_ROUTE_CONNECTION_EPOCH_V2'
                     ),
                     'market_context_policy': 'LATEST_CAUSAL_CONTEXT_ATTACHED_TO_BBO_V1',
                     'normalized_record_schema_versions': {

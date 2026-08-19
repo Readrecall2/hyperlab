@@ -293,7 +293,9 @@ class PublicRecordMarketEventAdapter:
             key: None for key in normalized
         }
         self._last_received_at: datetime | None = None
-        self._last_arrival_sequence_by_connection: dict[tuple[str, int], int] = {}
+        self._last_arrival_sequence_by_connection: dict[
+            tuple[str, int], tuple[int, str, str, str]
+        ] = {}
         self._last_connection_epoch_by_route: dict[_SourceKey, int] = {}
         self._funding_signatures: OrderedDict[
             str,
@@ -354,8 +356,8 @@ class PublicRecordMarketEventAdapter:
                     "instrument_route_policy": "EXPLICIT_MAPPING_PRODUCT_IDENTITY_BOUND_V2",
                     "market_context_policy": "LATEST_CAUSAL_CONTEXT_ATTACHED_TO_BBO_V1",
                     "normalized_order_policy": (
-                        "COLLECTOR_FIFO_PER_CONNECTION_ARRIVAL_SEQUENCE_"
-                        "PER_ROUTE_CONNECTION_EPOCH_V1"
+                        "COLLECTOR_FIFO_PRODUCER_SCOPED_CONNECTION_ID_"
+                        "PER_CONNECTION_ARRIVAL_SEQUENCE_PER_ROUTE_CONNECTION_EPOCH_V2"
                     ),
                     "product_identity_hashes": dict(sorted(product_identities.items())),
                 }
@@ -574,7 +576,12 @@ class PublicRecordMarketEventAdapter:
         if not isinstance(identity, str):
             return None
         parts = identity.rsplit(":", 2)
-        if len(parts) != 3 or (parts[0] != suffix_prefix and not parts[0].endswith(suffix_prefix)):
+        if len(parts) != 3:
+            return None
+        if record.record_type is RecordType.BBO:
+            if not parts[0].endswith(suffix_prefix):
+                return None
+        elif parts[0] != suffix_prefix:
             return None
         epoch_text, arrival_text = parts[1:]
         if not epoch_text.isdecimal() or not arrival_text.isdecimal():
@@ -618,12 +625,21 @@ class PublicRecordMarketEventAdapter:
                     raise PublicRecordAdapterError(
                         "normalized records regress per-route connection_epoch"
                     )
-        if lineage is not None:
+        current_arrival = (
+            lineage[2],
+            record.record_type.value,
+            venue,
+            asset,
+        ) if lineage is not None else None
+        if lineage is not None and current_arrival is not None:
             connection_key = lineage[:2]
             previous_arrival = self._last_arrival_sequence_by_connection.get(connection_key)
-            if previous_arrival is not None and lineage[2] < previous_arrival:
+            if previous_arrival is not None and current_arrival[0] < previous_arrival[0]:
+                previous_lineage = (*connection_key, *previous_arrival)
+                current_lineage = (*connection_key, *current_arrival)
                 raise PublicRecordAdapterError(
-                    "normalized records regress per-connection arrival_sequence"
+                    "normalized records regress per-producer connection arrival_sequence; "
+                    f"previous={previous_lineage!r}; current={current_lineage!r}"
                 )
         elif epoch is None:
             self._observe_order(received_at)
@@ -631,8 +647,8 @@ class PublicRecordMarketEventAdapter:
         if epoch is not None:
             for route in routes:
                 self._last_connection_epoch_by_route[route] = epoch
-        if lineage is not None:
-            self._last_arrival_sequence_by_connection[lineage[:2]] = lineage[2]
+        if lineage is not None and current_arrival is not None:
+            self._last_arrival_sequence_by_connection[lineage[:2]] = current_arrival
 
     def _observe_order(self, received_at: datetime) -> None:
         if self._last_received_at is not None and received_at < self._last_received_at:

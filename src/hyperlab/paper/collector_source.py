@@ -339,6 +339,10 @@ class HyperliquidPaperPublicSource:
             "websocket_required_http_status": PUBLIC_WEBSOCKET_REQUIRED_HTTP_STATUS,
             "wire_queue_capacity_messages": wire_queue_capacity,
         }
+        if include_phase05_cash_and_carry:
+            transport_identity["rest_connection_id_policy"] = (
+                "SYNCHRONOUS_BOOTSTRAP_RESYNC_PRODUCER_SCOPED_V1"
+            )
         adapter = PublicRecordMarketEventAdapter(
             instruments=(
                 PHASE12_PHASE05_PUBLIC_INSTRUMENTS
@@ -386,6 +390,7 @@ class HyperliquidPaperPublicSource:
                 socket_factory=resolved_socket_factory,
                 sink=_PaperCollectorSink(source),
                 runtime_status_path=runtime_status_path,
+                producer_scoped_rest_connection_ids=include_phase05_cash_and_carry,
             )
 
         return cls(

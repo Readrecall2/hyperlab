@@ -139,7 +139,10 @@ class PublicCollector:
         sleeper: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
         connection_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
+        producer_scoped_rest_connection_ids: bool = False,
     ) -> None:
+        if not isinstance(producer_scoped_rest_connection_ids, bool):
+            raise TypeError("producer_scoped_rest_connection_ids must be a boolean")
         self.config = config
         subscriptions = config.subscriptions()
         critical_channels = {"activeAssetCtx", "l2Book"}
@@ -170,6 +173,7 @@ class PublicCollector:
         self.monotonic = monotonic
         self.sleeper = sleeper
         self.connection_id_factory = connection_id_factory
+        self._producer_scoped_rest_connection_ids = producer_scoped_rest_connection_ids
         self.metrics = CollectorMetrics()
         self._stop_requested = False
         self._runtime_telemetry = ProcessRuntimeTelemetry(
@@ -1182,10 +1186,15 @@ class PublicCollector:
         connection_epoch: int,
     ) -> None:
         materialization_started = self.monotonic()
+        rest_connection_id = (
+            f"rest-bootstrap-{connection_epoch}-{connection_id}"
+            if self._producer_scoped_rest_connection_ids
+            else connection_id
+        )
         try:
             records = tuple(
                 self._iter_rest_records(
-                    connection_id=connection_id,
+                    connection_id=rest_connection_id,
                     connection_epoch=connection_epoch,
                     history_hours=self.config.history_lookback_hours,
                     include_l2=True,

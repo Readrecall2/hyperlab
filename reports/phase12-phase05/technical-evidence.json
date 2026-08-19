@@ -22,18 +22,18 @@
   },
   "evidence_contract": "PHASE12_PHASE05_MULTISTRATEGY_TECHNICAL_EVIDENCE_V1",
   "identity": {
-    "config_hash": "e111e877633bd7df311e36a6e8cec41384fd1d107f15ecc1307a4ec7b7c3c5f0",
+    "config_hash": "6529e0bfdb0d26bcac5d24b81fc0e69c44e657743b68a122e34e7b31244cae4e",
     "engine_build_hash": "a443b7723fd96fad8ef116b8fc061ad53ede0c49d228a514fbd4375bbd5cc1ef",
     "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
-    "release_code_sha256": "783cef42b421c925103d7fef3a159ba60f7ae4e9331f211681b3e9d94b2c5753",
-    "run_id": "57a7d8d45e5b918fbe8be8ef3a90f86ce4e6c5566a167a8c41ba20f62c045296",
+    "release_code_sha256": "4bb70cbc140a39054735a2c943e3d85b84cc58e002732dca09af53b63805c724",
+    "run_id": "0a42e4b0796c4723d30ac6d47e4bd6de69d5ddeab0753376d3faf23b04847302",
     "runtime_environment_sha256": "f51df86b54d5505159841d6c8320b1b06a3d6c902f0460334d42953bb1884183",
-    "source_data_hash": "a67c542083b919683b3bf1a5d2f0ff861af2ca7f6800ea270c234d9d63fc2d38"
+    "source_data_hash": "049abe7dfcf4e0562413f4002d47010ecb99a1b5c05c3a566ddacc283cc2303d"
   },
   "paper_configuration": {
     "data_calibration_evidence_hash": null,
     "data_calibration_status": "UNCALIBRATED",
-    "data_hash": "a67c542083b919683b3bf1a5d2f0ff861af2ca7f6800ea270c234d9d63fc2d38",
+    "data_hash": "049abe7dfcf4e0562413f4002d47010ecb99a1b5c05c3a566ddacc283cc2303d",
     "data_source": "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1",
     "economic_prerequisites_evidence_hash": null,
     "economic_prerequisites_satisfied": false,
@@ -116,7 +116,7 @@
       "source_contract": "ONE_SHARED_PUBLIC_NORMALIZED_FEED_NO_PRIVATE_API"
     },
     "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
-    "release_code_sha256": "783cef42b421c925103d7fef3a159ba60f7ae4e9331f211681b3e9d94b2c5753",
+    "release_code_sha256": "4bb70cbc140a39054735a2c943e3d85b84cc58e002732dca09af53b63805c724",
     "required_instruments": [
       "HL:BTC:perp",
       "HL:ETH:perp",
@@ -349,7 +349,7 @@
       ],
       "ws_connect_timeout_seconds": 15.0
     },
-    "data_hash": "a67c542083b919683b3bf1a5d2f0ff861af2ca7f6800ea270c234d9d63fc2d38",
+    "data_hash": "049abe7dfcf4e0562413f4002d47010ecb99a1b5c05c3a566ddacc283cc2303d",
     "identity_artifact": {
       "adapter_schema_version": 10,
       "bbo_tradability_policy": "REST_BOOTSTRAP_NONTRADABLE_POST_CONNECT_EXACT_WEBSOCKET_LINEAGE_REQUIRED_MALFORMED_TERMINAL_V2",
@@ -382,7 +382,7 @@
       ],
       "malformed_bbo_policy": "TERMINAL_SOURCE_FAILURE_RESTART_AND_RESYNC_REQUIRED_NO_SILENT_DROP_V1",
       "market_context_policy": "LATEST_CAUSAL_CONTEXT_ATTACHED_TO_BBO_V1",
-      "normalized_order_policy": "COLLECTOR_FIFO_PER_CONNECTION_ARRIVAL_SEQUENCE_PER_ROUTE_CONNECTION_EPOCH_V1",
+      "normalized_order_policy": "COLLECTOR_FIFO_PRODUCER_SCOPED_CONNECTION_ID_PER_CONNECTION_ARRIVAL_SEQUENCE_PER_ROUTE_CONNECTION_EPOCH_V2",
       "normalized_record_schema_versions": {
         "bbo": 2,
         "connection_event": 2,
@@ -462,6 +462,7 @@
         ],
         "redirects_allowed": false,
         "request_timeout_seconds": 10.0,
+        "rest_connection_id_policy": "SYNCHRONOUS_BOOTSTRAP_RESYNC_PRODUCER_SCOPED_V1",
         "rest_l2_book_projection": "BBO_BOOTSTRAP_AND_RESYNC_ONLY",
         "subscription_payloads": [
           {
@@ -505,7 +506,7 @@
         "wire_queue_capacity_messages": 10000
       }
     },
-    "identity_artifact_sha256": "a67c542083b919683b3bf1a5d2f0ff861af2ca7f6800ea270c234d9d63fc2d38",
+    "identity_artifact_sha256": "049abe7dfcf4e0562413f4002d47010ecb99a1b5c05c3a566ddacc283cc2303d",
     "name": "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1",
     "one_shared_collector": true,
     "public_read_only": true,

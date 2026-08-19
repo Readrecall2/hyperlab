@@ -81,6 +81,7 @@ def _bbo(
     *,
     update_id: str,
     asset: str = "BTC",
+    connection_id: str = "public-connection-1",
     bid_price: object = Decimal("100"),
     ask_price: object = Decimal("101"),
     bid_quantity: object = Decimal("2"),
@@ -89,6 +90,7 @@ def _bbo(
     row = _common_row(RecordType.BBO, received_at, asset=asset)
     row.update(
         {
+            "connection_id": connection_id,
             "update_id": update_id,
             "bid_price": bid_price,
             "ask_price": ask_price,
@@ -888,40 +890,59 @@ def test_received_time_regression_is_rejected() -> None:
 def test_v10_accepts_overlapping_received_times_in_authoritative_causal_order() -> None:
     adapter = _v10_adapter()
     source = _source(adapter)
-
-    assert source.feed(
-        _bbo(
-            START,
-            update_id="1723809600000:BTC:public-connection-1:1:10",
-        )
+    rest_connection_id = "rest-bootstrap-1-ws-1-live-fixture"
+    websocket_connection_id = "ws-1-live-fixture"
+    rest_bbo = _bbo(
+        START,
+        asset="@107",
+        connection_id=rest_connection_id,
+        update_id=f"rest:1723809600000:@107:{rest_connection_id}:1:8",
     )
+
+    assert source.feed(rest_bbo)
     assert source.feed(
         _market_context(
             START - timedelta(milliseconds=2),
-            observation_id="public-connection-1:1:11",
+            asset="BTC",
+            connection_id=websocket_connection_id,
+            observation_id=f"{websocket_connection_id}:1:1",
         )
     ) is False
-    assert _event(source.poll(timeout_seconds=0)).instrument == "HL:BTC:perp"
+    assert PublicRecordMarketEventAdapter._causal_arrival_lineage(rest_bbo) == (
+        rest_connection_id,
+        1,
+        8,
+    )
+    assert _event(source.poll(timeout_seconds=0)).instrument == "HL:HYPE:spot"
 
 
 def test_v10_rejects_genuine_per_connection_causal_regression() -> None:
     adapter = _v10_adapter()
+    connection_id = "ws-1-live-fixture"
     _event(
         adapter.adapt(
             _bbo(
                 START,
-                update_id="1723809600000:BTC:public-connection-1:1:10",
+                connection_id=connection_id,
+                update_id=f"1723809600000:BTC:{connection_id}:1:10",
             )
         )
     )
 
-    with pytest.raises(PublicRecordAdapterError, match="arrival_sequence"):
+    with pytest.raises(PublicRecordAdapterError, match="arrival_sequence") as failure:
         adapter.adapt(
             _market_context(
                 START + timedelta(milliseconds=2),
-                observation_id="public-connection-1:1:9",
+                connection_id=connection_id,
+                observation_id=f"{connection_id}:1:9",
             )
         )
+    message = str(failure.value)
+    assert "previous=('ws-1-live-fixture', 1, 10, 'bbo', 'hyperliquid', 'BTC')" in message
+    assert (
+        "current=('ws-1-live-fixture', 1, 9, 'market_context', 'hyperliquid', '@107')"
+        in message
+    )
 
 
 def test_bounded_source_coalesces_pending_bbo_within_one_utc_minute() -> None:

@@ -482,7 +482,7 @@ def _synthetic_hyperliquid_one_hour_history() -> tuple[ParsedRecord, ...]:
                         "coin": asset,
                         "fundingRate": "0",
                         "premium": "0",
-                        "time": int((BASE - timedelta(minutes=30)).timestamp() * 1_000),
+                        "time": int((BASE - timedelta(hours=1)).timestamp() * 1_000),
                     }
                 ],
                 funding_envelope,

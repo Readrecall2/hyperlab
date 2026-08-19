@@ -8,8 +8,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from hyperlab.backtest.execution import MakerFillModel
 from hyperlab.backtest.protocol import canonical_sha256
+from hyperlab.collector.bootstrap import parse_funding_history
+from hyperlab.collector.models import WireEnvelope
 from hyperlab.environment_authorization import (
     current_paper_release_code_sha256,
     current_paper_runtime_environment_sha256,
@@ -22,6 +26,7 @@ from hyperlab.paper.carry_strategy import (
 from hyperlab.paper.collector_source import (
     PHASE12_PHASE05_PRODUCT_IDENTITY_HASHES,
     PHASE12_PHASE05_PUBLIC_ASSETS,
+    PHASE12_PHASE05_PUBLIC_INSTRUMENTS,
     PHASE12_PHASE05_PUBLIC_SOURCE_NAME,
 )
 from hyperlab.paper.engine import PaperEngine
@@ -31,6 +36,7 @@ from hyperlab.paper.models import (
     PaperExecutionConfig,
     PaperState,
     decimal_text,
+    utc_text,
 )
 from hyperlab.paper.pairs_strategy import (
     PHASE08_PAIRS_STRATEGY_ID,
@@ -41,10 +47,14 @@ from hyperlab.paper.phase05_portfolio import (
     build_phase05_phase08_paper_foundation,
     default_phase05_phase08_risk_allocation,
 )
-from hyperlab.paper.public_source import PublicFundingSettlement
+from hyperlab.paper.public_source import (
+    PublicFundingSettlement,
+    PublicRecordMarketEventAdapter,
+)
 from hyperlab.paper.reporting import build_paper_report
 from hyperlab.paper.runner import PaperStrategyView, PortfolioRunner
 from hyperlab.paper.runtime import (
+    PaperAdmissionError,
     PaperRuntime,
     PaperRuntimeConfig,
     PublicSourceDescriptor,
@@ -208,6 +218,46 @@ def _funding(hour: int) -> PublicFundingSettlement:
     )
 
 
+def _realistic_hype_funding_settlement(
+    *,
+    offset_ms: int = 30,
+) -> tuple[datetime, PublicFundingSettlement]:
+    funding_hour = _START + timedelta(hours=1)
+    received_at = funding_hour + timedelta(seconds=2)
+    raw_time_ms = int(funding_hour.timestamp() * 1_000) + offset_ms
+    envelope = WireEnvelope(
+        raw_message=(
+            '[{"coin":"HYPE","fundingRate":"0.0000125",'
+            f'"premium":"-0.0002319741","time":{raw_time_ms}}}]'
+        ),
+        received_time=received_at,
+        connection_id="rest-refresh-7-fixture",
+        connection_epoch=7,
+        arrival_sequence=42,
+    )
+    records = parse_funding_history(
+        [
+            {
+                "coin": "HYPE",
+                "fundingRate": "0.0000125",
+                "premium": "-0.0002319741",
+                "time": raw_time_ms,
+            }
+        ],
+        envelope,
+    )
+    assert len(records) == 1
+    adapter = PublicRecordMarketEventAdapter(
+        instruments=PHASE12_PHASE05_PUBLIC_INSTRUMENTS,
+        queue_capacity=16,
+        include_market_context=True,
+        product_identity_hashes=PHASE12_PHASE05_PRODUCT_IDENTITY_HASHES,
+    )
+    settlement = adapter.adapt(records[0])
+    assert isinstance(settlement, PublicFundingSettlement)
+    return funding_hour, settlement
+
+
 def _post_flat_funding(
     engine: PaperEngine,
     strategy: FrozenCashAndCarryPaperStrategy,
@@ -332,6 +382,187 @@ def test_foundation_is_lazy_public_only_uncalibrated_and_budget_bound(
         assert identity["transport"]["wallet_or_signer_present"] is False
     finally:
         foundation.source.close()
+
+
+def test_real_hyperliquid_funding_history_restores_at_exact_hour(
+    tmp_path: Path,
+) -> None:
+    funding_hour, settlement = _realistic_hype_funding_settlement()
+    assert settlement.funding_time == funding_hour
+    assert settlement.received_at == funding_hour + timedelta(seconds=2)
+
+    foundation = _foundation(tmp_path)
+    database = tmp_path / "real-funding-restore.sqlite3"
+    engine = PaperEngine(PaperStore(database), foundation.config)
+    engine.start()
+    initial_source = _OfflinePublicSource(foundation.source.descriptor)
+    initial_runtime = PaperRuntime(
+        engine,
+        foundation.strategies,
+        initial_source,
+        config=PaperRuntimeConfig(
+            timer_interval_seconds=foundation.config.runtime_timer_interval_seconds,
+            source_poll_timeout_seconds=foundation.config.runtime_source_poll_timeout_seconds,
+        ),
+        clock=lambda: _START,
+    )
+    initial_runtime.start()
+    initial_runtime.close()
+
+    engine.post_funding(
+        instrument=settlement.instrument,
+        amount=Decimal(0),
+        occurred_at=settlement.funding_time,
+        source_event_id=settlement.event_id,
+        funding_rate=settlement.funding_rate,
+        funding_interval_seconds=settlement.funding_interval_seconds,
+        rate_kind=settlement.rate_kind,
+        mark_price=None,
+        source_mark_price=settlement.mark_price,
+        oracle_price=settlement.oracle_price,
+        position_quantity=Decimal(0),
+        mark_source="FLAT_NO_MARK",
+        source_observation_id=settlement.source_observation_id,
+        received_at=settlement.received_at,
+        processed_at=settlement.received_at,
+        source_activation_cutoff=_START,
+    )
+    durable = next(
+        record
+        for record in engine.store.iter_inputs(
+            engine.run_id,
+            input_type="PUBLIC_FUNDING_SETTLEMENT",
+        )
+    )
+    assert durable.payload["occurred_at"] == utc_text(funding_hour)
+    foundation.source.close()
+
+    restarted_foundation = _foundation(tmp_path)
+    restarted_source = _OfflinePublicSource(restarted_foundation.source.descriptor)
+    restarted = PaperRuntime(
+        PaperEngine(PaperStore(database), restarted_foundation.config),
+        restarted_foundation.strategies,
+        restarted_source,
+        config=PaperRuntimeConfig(
+            timer_interval_seconds=restarted_foundation.config.runtime_timer_interval_seconds,
+            source_poll_timeout_seconds=(restarted_foundation.config.runtime_source_poll_timeout_seconds),
+        ),
+        clock=lambda: settlement.received_at + timedelta(seconds=1),
+    )
+    try:
+        recovered = next(
+            item for item in restarted._durable_public_inputs() if isinstance(item, PublicFundingSettlement)
+        )
+        assert recovered.funding_time == funding_hour
+        startup = restarted.start()
+        assert startup.projection.reconciled
+        restarted_carry, _restarted_pairs = _real_adapters(restarted_foundation)
+        assert restarted_carry.diagnostic_snapshot["status"] == "RESTORED"
+    finally:
+        restarted.close()
+        restarted_foundation.source.close()
+
+
+def test_malformed_finalized_funding_time_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="first 60 seconds of its UTC hour"):
+        _realistic_hype_funding_settlement(offset_ms=120_000)
+
+    foundation = _foundation(tmp_path)
+    carry, _pairs = _real_adapters(foundation)
+    malformed_time = _START + timedelta(hours=1, milliseconds=30)
+    malformed = PublicFundingSettlement(
+        event_id=canonical_sha256({"funding_time": malformed_time.isoformat(), "instrument": _HYPE_PERP}),
+        instrument=_HYPE_PERP,
+        funding_time=malformed_time,
+        received_at=malformed_time + timedelta(seconds=2),
+        funding_rate=Decimal("0.0000125"),
+        funding_interval_seconds=3600,
+        rate_kind="hyperliquid-hourly-settlement",
+        mark_price=None,
+        oracle_price=None,
+        source_observation_id="malformed-finalized-funding",
+    )
+    try:
+        with pytest.raises(ValueError, match="exact UTC hour"):
+            carry.restore_incremental_public_inputs((malformed,))
+    finally:
+        foundation.source.close()
+
+
+def test_incremental_restore_failure_releases_cursor_before_failure_persistence(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    database = tmp_path / "restore-failure-lock.sqlite3"
+    engine = PaperEngine(PaperStore(database, timeout_seconds=0.05), foundation.config)
+    engine.start()
+    initial_runtime = PaperRuntime(
+        engine,
+        foundation.strategies,
+        _OfflinePublicSource(foundation.source.descriptor),
+        config=PaperRuntimeConfig(
+            timer_interval_seconds=foundation.config.runtime_timer_interval_seconds,
+            source_poll_timeout_seconds=foundation.config.runtime_source_poll_timeout_seconds,
+        ),
+        clock=lambda: _START,
+    )
+    initial_runtime.start()
+    initial_runtime.close()
+
+    malformed_time = _START + timedelta(hours=1, milliseconds=30)
+    received_at = malformed_time + timedelta(seconds=2)
+    engine.post_funding(
+        instrument=_HYPE_PERP,
+        amount=Decimal(0),
+        occurred_at=malformed_time,
+        source_event_id=canonical_sha256({"malformed-funding": malformed_time.isoformat()}),
+        funding_rate=Decimal("0.0000125"),
+        funding_interval_seconds=3600,
+        rate_kind="hyperliquid-hourly-settlement",
+        mark_price=None,
+        source_mark_price=None,
+        oracle_price=None,
+        position_quantity=Decimal(0),
+        mark_source="FLAT_NO_MARK",
+        source_observation_id="malformed-durable-funding",
+        received_at=received_at,
+        processed_at=received_at,
+        source_activation_cutoff=_START,
+    )
+    engine.reconcile(as_of=received_at + timedelta(seconds=1))
+    foundation.source.close()
+
+    restarted_foundation = _foundation(tmp_path)
+    runtime = PaperRuntime(
+        PaperEngine(
+            PaperStore(database, timeout_seconds=0.05),
+            restarted_foundation.config,
+        ),
+        restarted_foundation.strategies,
+        _OfflinePublicSource(restarted_foundation.source.descriptor),
+        config=PaperRuntimeConfig(
+            timer_interval_seconds=restarted_foundation.config.runtime_timer_interval_seconds,
+            source_poll_timeout_seconds=(restarted_foundation.config.runtime_source_poll_timeout_seconds),
+        ),
+        clock=lambda: received_at + timedelta(seconds=2),
+    )
+    try:
+        with pytest.raises(PaperAdmissionError, match="phase05_cash_and_carry") as failure:
+            runtime._restore_strategy(runtime.engine.projection(), incremental=True)
+        assert "exact UTC hour" in str(failure.value.__cause__)
+        persisted = runtime._persist_runtime_failure(
+            as_of=received_at + timedelta(seconds=2),
+            phase="MARKET_EVALUATION",
+            error_type=type(failure.value).__name__,
+            failure_key="incremental-restore-fixture",
+        )
+        assert persisted is not None
+        assert persisted.projection.state is PaperState.PAUSED
+    finally:
+        runtime.close()
+        restarted_foundation.source.close()
 
 
 def test_real_phase05_phase08_same_observation_funding_restart_and_replay(

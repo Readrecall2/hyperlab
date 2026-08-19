@@ -105,7 +105,7 @@ class FakeRest:
                 "coin": asset,
                 "fundingRate": "0.00001",
                 "premium": "0",
-                "time": end_ms - 3_600_000,
+                "time": (end_ms // 3_600_000 - 1) * 3_600_000,
             }
         ]
 

@@ -1025,6 +1025,10 @@ class PaperRuntime:
                 raise PaperAdmissionError(
                     f"paper strategy state restoration failed closed: {strategy_label}"
                 ) from error
+            finally:
+                close_inputs = getattr(durable_inputs, "close", None)
+                if callable(close_inputs):
+                    close_inputs()
         self._check_startup_interrupted()
         self._strategy_restore_commit_sequence = self.engine.store.get_run(self.engine.run_id).commit_sequence
 

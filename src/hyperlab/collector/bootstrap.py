@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from hyperlab.api.public import PublicBootstrap, hyperliquid_spot_coin
@@ -243,6 +243,17 @@ def historical_envelope(
     )
 
 
+def _finalized_hourly_funding_time(value: object) -> datetime:
+    observed_time = _datetime_ms(value)
+    funding_hour = observed_time.replace(minute=0, second=0, microsecond=0)
+    if observed_time - funding_hour >= timedelta(seconds=60):
+        raise ValueError(
+            "finalized Hyperliquid funding time must lie within the first 60 seconds "
+            "of its UTC hour"
+        )
+    return funding_hour
+
+
 def parse_funding_history(
     payload: object,
     envelope: WireEnvelope,
@@ -251,7 +262,7 @@ def parse_funding_history(
     for raw_item in _sequence(payload, label="funding history"):
         item = _mapping(raw_item, label="funding record")
         coin = str(item["coin"])
-        funding_time = _datetime_ms(item["time"])
+        funding_time = _finalized_hourly_funding_time(item["time"])
         row = _common(
             RecordType.FUNDING,
             coin,

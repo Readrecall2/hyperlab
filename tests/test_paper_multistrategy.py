@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from hyperlab.environment_authorization import (
+    current_paper_release_code_sha256,
+    current_paper_runtime_environment_sha256,
+    paper_release_identity_candidate,
+)
 from hyperlab.paper.engine import PaperEngine
 from hyperlab.paper.models import (
     DecisionAction,
@@ -62,6 +67,9 @@ def _portfolio_config(
     *,
     portfolio_risk: PaperRiskLimits | None = None,
 ) -> PaperRunConfig:
+    candidate_id = paper_release_identity_candidate(
+        config_schema_version=3,
+    )
     primary = sorted(strategies, key=lambda item: item.strategy_id)[0]
     return PaperRunConfig(
         strategy_name=primary.strategy_name,
@@ -85,6 +93,12 @@ def _portfolio_config(
         ),
         schema_version=3,
         strategies=strategies,
+        release_code_sha256=current_paper_release_code_sha256(
+            candidate_id=candidate_id,
+        ),
+        runtime_environment_sha256=current_paper_runtime_environment_sha256(
+            candidate_id=candidate_id,
+        ),
     )
 
 

@@ -469,6 +469,39 @@ _PAPER_SUPPORTED_CANDIDATE_SOURCES: Mapping[str, str] = MappingProxyType(
         _PAPER_MULTISTRATEGY_CANDIDATE_ID: _PAPER_MULTISTRATEGY_SOURCE_IDENTITY,
     }
 )
+
+
+def paper_release_identity_candidate(
+    candidate_id: str | None = None,
+    *,
+    config_schema_version: int | None = None,
+) -> str:
+    """Resolve one exact compiled Paper candidate for release identity checks."""
+
+    if (candidate_id is None) == (config_schema_version is None):
+        raise ValueError(
+            "PAPER release identity requires exactly one candidate or config schema"
+        )
+    if candidate_id is not None:
+        if candidate_id not in _PAPER_SUPPORTED_CANDIDATE_SOURCES:
+            raise ValueError("unsupported PAPER candidate identity")
+        return candidate_id
+    if (
+        isinstance(config_schema_version, bool)
+        or not isinstance(config_schema_version, int)
+        or config_schema_version not in {1, 2, 3}
+    ):
+        raise ValueError("unsupported PAPER config schema identity")
+    resolved = (
+        _PAPER_MULTISTRATEGY_CANDIDATE_ID
+        if config_schema_version == 3
+        else _PAPER_CANDIDATE_ID
+    )
+    if resolved not in _PAPER_SUPPORTED_CANDIDATE_SOURCES:
+        raise ValueError("unsupported PAPER candidate identity")
+    return resolved
+
+
 _PAPER_HTTP_ENDPOINT = 'https://api.hyperliquid.xyz'
 _PAPER_WEBSOCKET_ENDPOINT = 'wss://api.hyperliquid.xyz/ws'
 _PAPER_RELEASE_CODE_MANIFEST_ARTIFACT = 'release-code-manifest.json'
@@ -4042,6 +4075,7 @@ __all__ = [
     "current_paper_runtime_environment_sha256",
     "issue_environment_receipt",
     "paper_evidence_payload",
+    "paper_release_identity_candidate",
     "paper_runtime_environment_attestation_bytes",
     "profile_for",
     "receipt_scope_blockers",

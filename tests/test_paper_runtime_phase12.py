@@ -1519,8 +1519,9 @@ def test_runtime_environment_drift_at_pre_source_recheck_fails_closed_and_releas
     )
     calls = 0
 
-    def drifting_environment_digest() -> str:
+    def drifting_environment_digest(*, candidate_id: str) -> str:
         nonlocal calls
+        assert candidate_id == "phase08-robust-pairs-btc-eth-paper-v1"
         calls += 1
         return config.runtime_environment_sha256 if calls == 1 else "0" * 64
 

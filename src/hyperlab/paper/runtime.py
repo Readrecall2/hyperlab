@@ -472,9 +472,15 @@ class PaperRuntime:
         try:
             from hyperlab.environment_authorization import (
                 current_paper_release_code_sha256,
+                paper_release_identity_candidate,
             )
 
-            current = current_paper_release_code_sha256()
+            candidate_id = paper_release_identity_candidate(
+                config_schema_version=self.engine.config.schema_version,
+            )
+            current = current_paper_release_code_sha256(
+                candidate_id=candidate_id,
+            )
         except Exception as error:
             raise PaperAdmissionError("current paper release code digest could not be verified") from error
         if current != self.engine.config.release_code_sha256:
@@ -484,9 +490,15 @@ class PaperRuntime:
         try:
             from hyperlab.environment_authorization import (
                 current_paper_runtime_environment_sha256,
+                paper_release_identity_candidate,
             )
 
-            current = current_paper_runtime_environment_sha256()
+            candidate_id = paper_release_identity_candidate(
+                config_schema_version=self.engine.config.schema_version,
+            )
+            current = current_paper_runtime_environment_sha256(
+                candidate_id=candidate_id,
+            )
         except Exception as error:
             raise PaperAdmissionError(
                 "current paper runtime environment digest could not be verified"

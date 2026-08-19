@@ -30,6 +30,7 @@ from hyperlab.paper.models import PaperExecutionConfig, PaperRiskLimits, PaperRu
 _START = datetime(2026, 8, 16, tzinfo=UTC)
 _INSTRUMENT = "HYPERLIQUID:BTC:perp"
 _SOURCE_IDENTITY = "hyperliquid-public-normalized-v2"
+_PAPER_CANDIDATE_ID = "phase08-robust-pairs-btc-eth-paper-v1"
 
 
 def _semantic_payload(context: EvidenceVerificationContext) -> dict[str, object]:
@@ -174,7 +175,7 @@ def _readiness_fixture(
                 credential_scope=profile.credential_scope,
                 order_capability=profile.order_capability,
                 subject=ReadinessSubject(
-                    candidate_id="cash_and_carry",
+                    candidate_id=_PAPER_CANDIDATE_ID,
                     config_hash=config.config_hash,
                     strategy_hash=config.strategy_hash,
                     build_hash=config.engine_build_hash,
@@ -198,7 +199,7 @@ def _readiness_fixture(
         credential_scope=profile.credential_scope,
         order_capability=profile.order_capability,
         subject=ReadinessSubject(
-            candidate_id="cash_and_carry",
+            candidate_id=_PAPER_CANDIDATE_ID,
             config_hash=config.config_hash,
             strategy_hash=config.strategy_hash,
             build_hash=config.engine_build_hash,
@@ -234,7 +235,7 @@ def test_registered_runtime_rechecks_technical_readiness_before_factories_or_sto
         raise AssertionError("source factory must not run")
 
     approval = cli_module._ApprovedPaperRuntimeFactories(
-        candidate_id="cash_and_carry",
+        candidate_id=_PAPER_CANDIDATE_ID,
         config_hash=config.config_hash,
         config_artifact_path=config_artifact,
         readiness_manifest_path=tmp_path / "missing-readiness.json",
@@ -315,7 +316,7 @@ def test_valid_technical_readiness_reaches_store_and_factory_without_gate_b_c_d(
             calls.append("close")
 
     approval = cli_module._ApprovedPaperRuntimeFactories(
-        candidate_id="cash_and_carry",
+        candidate_id=_PAPER_CANDIDATE_ID,
         config_hash=config.config_hash,
         config_artifact_path=config_artifact,
         readiness_manifest_path=manifest_path,
@@ -395,7 +396,7 @@ def test_swapped_frozen_cadence_blocks_before_store_or_factories(
             raise AssertionError("store must not open")
 
     approval = cli_module._ApprovedPaperRuntimeFactories(
-        candidate_id="cash_and_carry",
+        candidate_id=_PAPER_CANDIDATE_ID,
         config_hash=config.config_hash,
         config_artifact_path=config_artifact,
         readiness_manifest_path=manifest_path,
@@ -454,7 +455,7 @@ def test_stale_approved_readiness_profile_blocks_before_store_or_factories(
             raise AssertionError("store must not open")
 
     approval = cli_module._ApprovedPaperRuntimeFactories(
-        candidate_id="cash_and_carry",
+        candidate_id=_PAPER_CANDIDATE_ID,
         config_hash=config.config_hash,
         config_artifact_path=config_artifact,
         readiness_manifest_path=manifest_path,

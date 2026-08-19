@@ -10,6 +10,11 @@ from pathlib import Path
 
 from hyperlab.backtest.execution import MakerFillModel
 from hyperlab.backtest.protocol import canonical_sha256
+from hyperlab.environment_authorization import (
+    current_paper_release_code_sha256,
+    current_paper_runtime_environment_sha256,
+    paper_release_identity_candidate,
+)
 from hyperlab.paper.carry_strategy import (
     PHASE05_CARRY_STRATEGY_ID,
     FrozenCashAndCarryPaperStrategy,
@@ -72,10 +77,19 @@ def _execution() -> PaperExecutionConfig:
 
 
 def _foundation(tmp_path: Path) -> Phase05Phase08PaperFoundation:
+    candidate_id = paper_release_identity_candidate(
+        config_schema_version=3,
+    )
     return build_phase05_phase08_paper_foundation(
         runtime_status_path=tmp_path / "collector-status.json",
         validation_started_at=_START,
         execution=_execution(),
+        release_code_sha256=current_paper_release_code_sha256(
+            candidate_id=candidate_id,
+        ),
+        runtime_environment_sha256=current_paper_runtime_environment_sha256(
+            candidate_id=candidate_id,
+        ),
     )
 
 

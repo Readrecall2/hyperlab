@@ -78,6 +78,9 @@ from hyperlab.environment_authorization import (
     receipt_scope_blockers,
     verify_environment_readiness,
 )
+from hyperlab.environment_authorization import (
+    paper_release_identity_candidate as _paper_release_identity_candidate,
+)
 from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
 from hyperlab.strategies.funding_basket import FundingBasketStrategy
@@ -178,15 +181,9 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "cc04ebcb3ec434f019021e79b1d0fd6280bca13420566c8469fe3c408989f37a"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "d53c88bd073ce17aa958bb0da20fe7dd28e4d5e405840eaa0d28dc3e6248a580"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "ac751e875d72ac6186842a7599551864657c3f9cd185b004d4437028927a8f80"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "cea33fc20bff00c00a61ad16610ee480f5d242af53af53212a5755e2160cedd0"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-
-
-def _paper_release_identity_candidate(candidate_id: str) -> str:
-    if candidate_id == _PHASE12_MULTISTRATEGY_CANDIDATE_ID:
-        return candidate_id
-    return _PHASE12_PAPER_CANDIDATE_ID
 
 
 def _phase12_paper_strategy_factory(

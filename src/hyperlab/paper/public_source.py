@@ -594,7 +594,7 @@ class PublicRecordMarketEventAdapter:
             row.get("instrument_id"),
             label="instrument_id",
         )
-        expected_instrument_id = f"{_SOURCE_VENUE_TO_PAPER_EXCHANGE[key[0]]}:{key[1]}:{expected_kind}"
+        expected_instrument_id = self._instruments[key]
         if observed_instrument_id != expected_instrument_id:
             raise PublicRecordAdapterError(
                 "market context instrument_id differs from the frozen source route"

@@ -21,6 +21,14 @@ from hyperlab.paper.public_source import (
 from hyperlab.paper.runtime import PublicSourceDescriptor
 
 INSTRUMENTS = {("hyperliquid", "BTC"): "HL:BTC:perp"}
+V10_INSTRUMENTS = {
+    ("hyperliquid", "@107"): "HL:HYPE:spot",
+    ("hyperliquid", "BTC"): "HL:BTC:perp",
+}
+V10_PRODUCT_IDENTITIES = {
+    "HL:HYPE:spot": "1" * 64,
+    "HL:BTC:perp": "2" * 64,
+}
 START = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
 
 
@@ -33,6 +41,15 @@ def _adapter(
         instruments=INSTRUMENTS,
         queue_capacity=queue_capacity,
         funding_dedupe_capacity=funding_dedupe_capacity,
+    )
+
+
+def _v10_adapter() -> PublicRecordMarketEventAdapter:
+    return PublicRecordMarketEventAdapter(
+        instruments=V10_INSTRUMENTS,
+        queue_capacity=4,
+        include_market_context=True,
+        product_identity_hashes=V10_PRODUCT_IDENTITIES,
     )
 
 
@@ -80,6 +97,28 @@ def _bbo(
         }
     )
     return ParsedRecord(record_type=RecordType.BBO, asset=asset, row=row)
+
+
+def _market_context(
+    received_at: datetime,
+    *,
+    observation_id: str,
+    asset: str = "@107",
+    connection_id: str = "public-connection-1",
+) -> ParsedRecord:
+    row = _common_row(RecordType.MARKET_CONTEXT, received_at, asset=asset)
+    kind = "spot" if asset.startswith("@") else "perp"
+    row.update(
+        {
+            "connection_id": connection_id,
+            "instrument_kind": kind,
+            "instrument_id": f"HYPERLIQUID:{asset}:{kind}",
+            "mark_price": Decimal("100"),
+            "mid_price": Decimal("100"),
+            "observation_id": observation_id,
+        }
+    )
+    return ParsedRecord(record_type=RecordType.MARKET_CONTEXT, asset=asset, row=row)
 
 
 def _trade(received_at: datetime, *, trade_id: str) -> ParsedRecord:
@@ -842,6 +881,45 @@ def test_received_time_regression_is_rejected() -> None:
             _bbo(
                 START - timedelta(microseconds=1),
                 update_id="book-2",
+            )
+        )
+
+
+def test_v10_accepts_overlapping_received_times_in_authoritative_causal_order() -> None:
+    adapter = _v10_adapter()
+    source = _source(adapter)
+
+    assert source.feed(
+        _bbo(
+            START,
+            update_id="1723809600000:BTC:public-connection-1:1:10",
+        )
+    )
+    assert source.feed(
+        _market_context(
+            START - timedelta(milliseconds=2),
+            observation_id="public-connection-1:1:11",
+        )
+    ) is False
+    assert _event(source.poll(timeout_seconds=0)).instrument == "HL:BTC:perp"
+
+
+def test_v10_rejects_genuine_per_connection_causal_regression() -> None:
+    adapter = _v10_adapter()
+    _event(
+        adapter.adapt(
+            _bbo(
+                START,
+                update_id="1723809600000:BTC:public-connection-1:1:10",
+            )
+        )
+    )
+
+    with pytest.raises(PublicRecordAdapterError, match="arrival_sequence"):
+        adapter.adapt(
+            _market_context(
+                START + timedelta(milliseconds=2),
+                observation_id="public-connection-1:1:9",
             )
         )
 

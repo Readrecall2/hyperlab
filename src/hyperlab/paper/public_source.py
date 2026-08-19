@@ -293,6 +293,8 @@ class PublicRecordMarketEventAdapter:
             key: None for key in normalized
         }
         self._last_received_at: datetime | None = None
+        self._last_arrival_sequence_by_connection: dict[tuple[str, int], int] = {}
+        self._last_connection_epoch_by_route: dict[_SourceKey, int] = {}
         self._funding_signatures: OrderedDict[
             str,
             tuple[Decimal, int, Decimal | None, Decimal | None],
@@ -351,6 +353,10 @@ class PublicRecordMarketEventAdapter:
                     "funding_time_policy": "HYPERLIQUID_FUNDING_HISTORY_FIRST_60_SECONDS_CANONICAL_EXACT_UTC_HOUR_V1",
                     "instrument_route_policy": "EXPLICIT_MAPPING_PRODUCT_IDENTITY_BOUND_V2",
                     "market_context_policy": "LATEST_CAUSAL_CONTEXT_ATTACHED_TO_BBO_V1",
+                    "normalized_order_policy": (
+                        "COLLECTOR_FIFO_PER_CONNECTION_ARRIVAL_SEQUENCE_"
+                        "PER_ROUTE_CONNECTION_EPOCH_V1"
+                    ),
                     "product_identity_hashes": dict(sorted(product_identities.items())),
                 }
             )
@@ -403,7 +409,15 @@ class PublicRecordMarketEventAdapter:
         venue, asset = self._record_identity(record)
         received_at = _utc(record.row.get("received_time"), label="received_time")
         if record.record_type is not RecordType.FUNDING:
-            self._observe_order(received_at)
+            if self._include_market_context:
+                self._observe_v10_order(
+                    record,
+                    venue=venue,
+                    asset=asset,
+                    received_at=received_at,
+                )
+            else:
+                self._observe_order(received_at)
 
         if record.record_type is RecordType.CONNECTION_EVENT:
             return self._adapt_connection(record, venue=venue, asset=asset, received_at=received_at)
@@ -542,6 +556,83 @@ class PublicRecordMarketEventAdapter:
         if row_asset != record_asset:
             raise PublicRecordAdapterError("ParsedRecord.asset does not match row asset")
         return venue, row_asset
+
+    @staticmethod
+    def _causal_arrival_lineage(record: ParsedRecord) -> tuple[str, int, int] | None:
+        row = record.row
+        connection_id = row.get("connection_id")
+        if not isinstance(connection_id, str) or not connection_id:
+            return None
+        if record.record_type is RecordType.BBO:
+            identity = row.get("update_id")
+            suffix_prefix = f":{connection_id}"
+        elif record.record_type is RecordType.MARKET_CONTEXT:
+            identity = row.get("observation_id")
+            suffix_prefix = connection_id
+        else:
+            return None
+        if not isinstance(identity, str):
+            return None
+        parts = identity.rsplit(":", 2)
+        if len(parts) != 3 or (parts[0] != suffix_prefix and not parts[0].endswith(suffix_prefix)):
+            return None
+        epoch_text, arrival_text = parts[1:]
+        if not epoch_text.isdecimal() or not arrival_text.isdecimal():
+            return None
+        epoch = int(epoch_text)
+        arrival_sequence = int(arrival_text)
+        if not 1 <= epoch <= _UINT64_MAX or not 1 <= arrival_sequence <= _UINT64_MAX:
+            return None
+        return connection_id, epoch, arrival_sequence
+
+    def _observe_v10_order(
+        self,
+        record: ParsedRecord,
+        *,
+        venue: str,
+        asset: str,
+        received_at: datetime,
+    ) -> None:
+        lineage = self._causal_arrival_lineage(record)
+        raw_epoch = record.row.get("connection_epoch")
+        epoch = (
+            lineage[1]
+            if lineage is not None
+            else raw_epoch
+            if isinstance(raw_epoch, int)
+            and not isinstance(raw_epoch, bool)
+            and 1 <= raw_epoch <= _UINT64_MAX
+            else None
+        )
+        routes = (
+            tuple(key for key in self._instruments if key[0] == venue)
+            if asset == "GLOBAL"
+            else ((venue, asset),)
+            if (venue, asset) in self._instruments
+            else ()
+        )
+        if epoch is not None:
+            for route in routes:
+                previous_epoch = self._last_connection_epoch_by_route.get(route)
+                if previous_epoch is not None and epoch < previous_epoch:
+                    raise PublicRecordAdapterError(
+                        "normalized records regress per-route connection_epoch"
+                    )
+        if lineage is not None:
+            connection_key = lineage[:2]
+            previous_arrival = self._last_arrival_sequence_by_connection.get(connection_key)
+            if previous_arrival is not None and lineage[2] < previous_arrival:
+                raise PublicRecordAdapterError(
+                    "normalized records regress per-connection arrival_sequence"
+                )
+        elif epoch is None:
+            self._observe_order(received_at)
+
+        if epoch is not None:
+            for route in routes:
+                self._last_connection_epoch_by_route[route] = epoch
+        if lineage is not None:
+            self._last_arrival_sequence_by_connection[lineage[:2]] = lineage[2]
 
     def _observe_order(self, received_at: datetime) -> None:
         if self._last_received_at is not None and received_at < self._last_received_at:

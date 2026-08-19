@@ -23,6 +23,7 @@ from hyperlab.environment_authorization import (
 from hyperlab.paper.collector_source import (
     HYPERLIQUID_MAINNET_PUBLIC_HTTP_URL,
     HYPERLIQUID_MAINNET_PUBLIC_WEBSOCKET_URL,
+    PHASE12_PHASE05_PUBLIC_SOURCE_NAME,
     PHASE12_PUBLIC_SOURCE_NAME,
     HyperliquidPaperPublicSource,
 )
@@ -35,20 +36,28 @@ from scripts.generate_phase12_live_paper_artifacts import (
     ARTIFACT_INDEX,
     CANDIDATE_ID,
     CONFIG_ARTIFACT,
+    DEPLOYMENT_GATE_ARTIFACT,
+    MULTISTRATEGY_CANDIDATE_DIRECTORY,
+    MULTISTRATEGY_CANDIDATE_ID,
     READINESS_MANIFEST_ARTIFACT,
     RELEASE_CODE_MANIFEST_ARTIFACT,
     RUNTIME_ENVIRONMENT_ARTIFACT,
     SOURCE_IDENTITY_ARTIFACT,
+    TECHNICAL_EVIDENCE_ARTIFACT,
     ArtifactDriftError,
-    build_phase12_artifacts,
+    build_phase12_multistrategy_artifacts,
     build_release_code_manifest_bytes,
     build_source_identity_artifact_bytes,
     check_artifacts,
+    check_multistrategy_artifacts,
     write_artifacts,
+    write_multistrategy_artifacts,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_ROOT = ROOT / "config/paper" / CANDIDATE_ID
+MULTISTRATEGY_ROOT = ROOT / MULTISTRATEGY_CANDIDATE_DIRECTORY
+HISTORICAL_ATTESTATION = ROOT / "config/paper/phase08-v9-historical-attestation.json"
 
 
 def test_windows_bootstrap_uses_hash_locked_dependencies_and_no_deps_editable() -> None:
@@ -71,31 +80,62 @@ def _config(root: Path = CANDIDATE_ROOT) -> PaperRunConfig:
     return PaperRunConfig.from_dict(payload)
 
 
-def test_checked_in_phase12_artifacts_regenerate_byte_for_byte(tmp_path: Path) -> None:
-    expected = build_phase12_artifacts(repository_root=ROOT)
+def test_historical_phase08_v9_artifacts_remain_byte_for_byte_immutable() -> None:
+    attestation_bytes = HISTORICAL_ATTESTATION.read_bytes()
+    attestation = json.loads(attestation_bytes)
+    assert canonical_json(attestation).encode("utf-8") + b"\n" == attestation_bytes
+    assert attestation["candidate_id"] == CANDIDATE_ID
+    assert attestation["status"] == "HISTORICAL_IMMUTABLE_NON_CURRENT"
+    expected_hashes = attestation["artifacts"]
+    assert isinstance(expected_hashes, dict)
 
-    assert len(expected) == 22
+    actual_paths = {
+        path.relative_to(CANDIDATE_ROOT).as_posix()
+        for path in CANDIDATE_ROOT.rglob("*")
+        if path.is_file()
+    }
+    assert actual_paths == set(expected_hashes)
+    for relative_path, expected_sha256 in expected_hashes.items():
+        assert hashlib.sha256((CANDIDATE_ROOT / relative_path).read_bytes()).hexdigest() == expected_sha256
+
+    config = _config()
+    source = json.loads((CANDIDATE_ROOT / SOURCE_IDENTITY_ARTIFACT).read_bytes())
+    release = json.loads((CANDIDATE_ROOT / RELEASE_CODE_MANIFEST_ARTIFACT).read_bytes())
+    assert config.config_hash == attestation["identity"]["config_hash"]
+    assert config.run_id == attestation["identity"]["run_id"]
+    assert source["adapter_schema_version"] == 9
+    assert source["feed_contract"].endswith("LATEST_VALUE_V9")
+    assert release["candidate_id"] == CANDIDATE_ID
+    assert release["release_code_sha256"] == config.release_code_sha256
+
+
+def test_checked_in_multistrategy_artifacts_regenerate_byte_for_byte(tmp_path: Path) -> None:
+    expected = build_phase12_multistrategy_artifacts(repository_root=ROOT)
+
+    assert len(expected) == 24
     assert sum(path.startswith("evidence/") for path in expected) == 16
     assert {
         ARTIFACT_INDEX,
         CONFIG_ARTIFACT,
+        DEPLOYMENT_GATE_ARTIFACT,
         READINESS_MANIFEST_ARTIFACT,
         RELEASE_CODE_MANIFEST_ARTIFACT,
         RUNTIME_ENVIRONMENT_ARTIFACT,
         SOURCE_IDENTITY_ARTIFACT,
+        TECHNICAL_EVIDENCE_ARTIFACT,
     } < set(expected)
     for relative_path, payload in expected.items():
-        assert (CANDIDATE_ROOT / relative_path).read_bytes() == payload
+        assert (MULTISTRATEGY_ROOT / relative_path).read_bytes() == payload
         decoded = json.loads(payload)
         assert canonical_json(decoded).encode("utf-8") == payload
 
     regenerated_root = tmp_path / "candidate"
-    regenerated = write_artifacts(regenerated_root, repository_root=ROOT)
+    regenerated = write_multistrategy_artifacts(regenerated_root, repository_root=ROOT)
     assert regenerated == expected
-    assert check_artifacts(regenerated_root, repository_root=ROOT) == expected
+    assert check_multistrategy_artifacts(regenerated_root, repository_root=ROOT) == expected
 
 
-def test_phase12_readiness_manifest_is_exact_semantic_paper_runtime() -> None:
+def test_historical_phase12_readiness_is_valid_evidence_but_not_current_authorization() -> None:
     manifest = EnvironmentReadinessManifest.from_json_bytes(
         (CANDIDATE_ROOT / READINESS_MANIFEST_ARTIFACT).read_bytes(),
         require_canonical=True,
@@ -103,8 +143,10 @@ def test_phase12_readiness_manifest_is_exact_semantic_paper_runtime() -> None:
     decision = verify_environment_readiness(manifest, evidence_root=CANDIDATE_ROOT)
     profile = profile_for(EnvironmentClass.PAPER)
 
-    assert decision.ready
-    assert decision.blockers == ()
+    assert not decision.ready
+    assert [(item.code, item.location) for item in decision.blockers] == [
+        ("EVIDENCE_SEMANTIC_VERIFICATION_FAILED", "evidence.RUNTIME_SOURCE_ATTESTATION")
+    ]
     assert manifest.environment is EnvironmentClass.PAPER
     assert manifest.purpose is profile.purpose
     assert manifest.subject.candidate_id == CANDIDATE_ID
@@ -116,6 +158,77 @@ def test_phase12_readiness_manifest_is_exact_semantic_paper_runtime() -> None:
         not in {CONFIG_ARTIFACT, SOURCE_IDENTITY_ARTIFACT}
         for binding in manifest.evidence.values()
     )
+
+
+def test_multistrategy_readiness_manifest_is_exact_semantic_paper_runtime() -> None:
+    manifest = EnvironmentReadinessManifest.from_json_bytes(
+        (MULTISTRATEGY_ROOT / READINESS_MANIFEST_ARTIFACT).read_bytes(),
+        require_canonical=True,
+    )
+    decision = verify_environment_readiness(manifest, evidence_root=MULTISTRATEGY_ROOT)
+    profile = profile_for(EnvironmentClass.PAPER)
+
+    assert decision.ready
+    assert decision.blockers == ()
+    assert manifest.subject.candidate_id == MULTISTRATEGY_CANDIDATE_ID
+    assert manifest.subject.source_identity == PHASE12_PHASE05_PUBLIC_SOURCE_NAME
+    assert set(manifest.evidence) == set(profile.required_checks)
+    config = _config(MULTISTRATEGY_ROOT)
+    assert config.schema_version == 3
+    assert config.portfolio_id == "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb"
+    assert [item.strategy_id for item in config.strategy_configs] == [
+        "phase05_cash_and_carry",
+        "phase08_robust_pairs",
+    ]
+
+
+def test_multistrategy_technical_evidence_binds_scope_identities_reporting_and_smoke_gate() -> None:
+    config = _config(MULTISTRATEGY_ROOT)
+    evidence = json.loads((MULTISTRATEGY_ROOT / TECHNICAL_EVIDENCE_ARTIFACT).read_bytes())
+    gate = json.loads((MULTISTRATEGY_ROOT / DEPLOYMENT_GATE_ARTIFACT).read_bytes())
+    index = json.loads((MULTISTRATEGY_ROOT / ARTIFACT_INDEX).read_bytes())
+
+    assert evidence["economic_status"] == "TECHNICAL_ONLY_UNCALIBRATED"
+    assert evidence["authorization"] == {
+        "authorizes_real_money": False,
+        "credential_scope": "NONE",
+        "environment": "PAPER",
+        "execution_network": "NONE",
+        "mode": "PAPER_ONLY",
+        "orders_enabled": False,
+    }
+    assert evidence["identities"]["portfolio_id"] == config.portfolio_id
+    assert evidence["identities"]["config_hash"] == config.config_hash
+    assert evidence["identities"]["run_id"] == config.run_id
+    assert evidence["identities"]["source_data_hash"] == config.data_hash
+    assert [item["strategy_id"] for item in evidence["strategies"]] == [
+        "phase05_cash_and_carry",
+        "phase08_robust_pairs",
+    ]
+    assert evidence["reporting_contract"] == {
+        "aggregate_views": ["account", "portfolio"],
+        "strategy_views": ["phase05_cash_and_carry", "phase08_robust_pairs"],
+    }
+    assert evidence["source_contract"] == {
+        "adapter_schema_version": 10,
+        "feed_contract": (
+            "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_MARKET_CONTEXT_"
+            "BOUNDED_PENDING_BBO_LATEST_VALUE_V10"
+        ),
+    }
+    assert gate["status"] == "REQUIRES_FUTURE_LOCAL_OR_LINUX_SMOKE"
+    assert gate["economic_profitability_requirement"] is None
+    assert set(gate["future_smoke_requirements"]) == {
+        "bbo_freshness",
+        "coalescing",
+        "cpu_ram",
+        "reconnect_resync",
+        "source_queue",
+        "sqlite_growth",
+        "unhedged_incidents",
+    }
+    assert index["status"] == "TECHNICAL_ONLY_UNCALIBRATED"
+    assert index["authorizes_real_money"] is False
 
 
 
@@ -322,9 +435,19 @@ def test_generated_evidence_matches_implemented_store_and_transport_facts() -> N
     assert "duplicate_input_reprocessing_allowed" not in restart
 
 
-def test_release_code_manifest_binds_the_exact_reviewed_checkout() -> None:
+def test_historical_release_code_manifest_remains_frozen() -> None:
     release_bytes = (CANDIDATE_ROOT / RELEASE_CODE_MANIFEST_ARTIFACT).read_bytes()
-    assert release_bytes == build_release_code_manifest_bytes(repository_root=ROOT)
+    release = json.loads(release_bytes)
+    assert release["candidate_id"] == CANDIDATE_ID
+    assert release["release_code_sha256"] == _config().release_code_sha256
+    assert hashlib.sha256(release_bytes).hexdigest() == (
+        json.loads(HISTORICAL_ATTESTATION.read_bytes())["artifacts"][RELEASE_CODE_MANIFEST_ARTIFACT]
+    )
+    assert release_bytes != build_release_code_manifest_bytes(repository_root=ROOT)
+
+
+def test_multistrategy_release_code_manifest_binds_the_exact_reviewed_checkout() -> None:
+    release_bytes = (MULTISTRATEGY_ROOT / RELEASE_CODE_MANIFEST_ARTIFACT).read_bytes()
     release = json.loads(release_bytes)
     assert isinstance(release, dict)
     assert canonical_json(release).encode("utf-8") == release_bytes
@@ -364,7 +487,7 @@ def test_release_code_manifest_binds_the_exact_reviewed_checkout() -> None:
 
     runtime_evidence = json.loads(
         (
-            CANDIDATE_ROOT
+            MULTISTRATEGY_ROOT
             / "evidence"
             / f"{EvidenceCheck.RUNTIME_SOURCE_ATTESTATION.value.casefold()}.json"
         ).read_bytes()
@@ -377,9 +500,9 @@ def test_release_code_manifest_binds_the_exact_reviewed_checkout() -> None:
         "release_code_sha256": release["release_code_sha256"],
         "sha256": hashlib.sha256(release_bytes).hexdigest(),
     }
-    assert _config().release_code_sha256 == release["release_code_sha256"]
+    assert _config(MULTISTRATEGY_ROOT).release_code_sha256 == release["release_code_sha256"]
     assert runtime_evidence["facts"]["engine_semantic_build_hash"] == (
-        _config().engine_build_hash
+        _config(MULTISTRATEGY_ROOT).engine_build_hash
     )
 
 
@@ -635,6 +758,9 @@ def test_generator_rejects_an_early_release_file_changed_after_its_read(
                 '_PHASE12_PAPER_CONFIG_HASH = "' + "0" * 64 + '"',
                 '_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "' + "1" * 64 + '"',
                 '_PHASE12_PAPER_READINESS_PROFILE_SHA256 = "' + "2" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_CONFIG_HASH = "' + "3" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "' + "4" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "' + "5" * 64 + '"',
                 "",
             )
         ),

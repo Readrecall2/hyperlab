@@ -33,7 +33,8 @@ from hyperlab.paper.runtime import PaperRuntimeLease, PublicSourceDescriptor
 from hyperlab.paper.store import PaperStore
 from scripts.generate_phase12_live_paper_artifacts import (
     CONFIG_ARTIFACT,
-    build_phase12_artifacts,
+    MULTISTRATEGY_CANDIDATE_ID,
+    build_phase12_multistrategy_artifacts,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -135,7 +136,11 @@ def _runtime_attestation_for(
     platform_system: str,
     python_micro: int,
 ) -> bytes:
-    artifact = json.loads(authorization_module.paper_runtime_environment_attestation_bytes())
+    artifact = json.loads(
+        authorization_module.paper_runtime_environment_attestation_bytes(
+            candidate_id=MULTISTRATEGY_CANDIDATE_ID,
+        )
+    )
     interpreter = artifact["interpreter"]
     version = {
         "major": 3,
@@ -291,18 +296,18 @@ def _invoke_operator(
     )
 
 
-def test_default_registry_contains_exactly_one_compiled_phase08_candidate() -> None:
+def test_default_registry_contains_exactly_one_compiled_multistrategy_candidate() -> None:
     assert len(cli_module._APPROVED_PAPER_RUNTIMES) == 1
     approval = next(iter(cli_module._APPROVED_PAPER_RUNTIMES.values()))
 
-    assert approval.candidate_id == "phase08-robust-pairs-btc-eth-paper-v1"
+    assert approval.candidate_id == MULTISTRATEGY_CANDIDATE_ID
     assert approval.config_artifact_path == (
-        Path("config/paper/phase08-robust-pairs-btc-eth-paper-v1") / "paper-config.json"
+        Path("config/paper/phase08-phase05-multistrategy-paper-v1") / "paper-config.json"
     )
     assert approval.readiness_manifest_path == (
-        Path("config/paper/phase08-robust-pairs-btc-eth-paper-v1") / "readiness-manifest.json"
+        Path("config/paper/phase08-phase05-multistrategy-paper-v1") / "readiness-manifest.json"
     )
-    assert approval.readiness_evidence_root == Path("config/paper/phase08-robust-pairs-btc-eth-paper-v1")
+    assert approval.readiness_evidence_root == Path("config/paper/phase08-phase05-multistrategy-paper-v1")
     assert len(approval.config_hash) == 64
     assert set(approval.config_hash) <= set("0123456789abcdef")
     assert len(approval.readiness_manifest_sha256) == 64
@@ -324,14 +329,14 @@ def test_default_preflight_accepts_exact_compiled_candidate_without_transport_or
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["candidate_id"] == ("phase08-robust-pairs-btc-eth-paper-v1")
-    assert payload["config_hash"] == cli_module._PHASE12_PAPER_CONFIG_HASH
+    assert payload["candidate_id"] == MULTISTRATEGY_CANDIDATE_ID
+    assert payload["config_hash"] == cli_module._PHASE12_MULTISTRATEGY_CONFIG_HASH
     assert payload["public_source"] == {
         "bootstrap_timeout_seconds": 120.0,
-        "data_hash": "da9784ec2c794340c482c389dda6d278373a24429baca48d4e363adf2a872525",
+        "data_hash": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671",
         "public_only": True,
         "schema_version": 1,
-        "source": "hyperliquid-mainnet-public-bbo-funding-v1",
+        "source": "hyperliquid-mainnet-public-bbo-funding-context-phase05-v1",
         "source_kind": "PUBLIC_NORMALIZED",
     }
     assert payload["public_transport_started"] is False
@@ -362,7 +367,7 @@ def test_operator_environment_bundles_are_exact_and_cross_platform_fail_closed(
         ("linux", linux_attestation),
     ):
         root = tmp_path / name
-        artifacts = build_phase12_artifacts(
+        artifacts = build_phase12_multistrategy_artifacts(
             repository_root=_ROOT,
             operator_runtime_environment_attestation_bytes=attestation,
         )
@@ -397,7 +402,7 @@ def test_operator_environment_bundles_are_exact_and_cross_platform_fail_closed(
         monkeypatch.setattr(
             authorization_module,
             "paper_runtime_environment_attestation_bytes",
-            lambda _root=None, payload=attestation: payload,
+            lambda _root=None, *, candidate_id=MULTISTRATEGY_CANDIDATE_ID, payload=attestation: payload,
         )
         accepted = CliRunner().invoke(
             app,
@@ -1266,7 +1271,11 @@ def test_real_registry_gate_and_report_load_the_raw_frozen_config(
     tmp_path: Path,
 ) -> None:
     config_artifact = (
-        _ROOT / "config" / "paper" / "phase08-robust-pairs-btc-eth-paper-v1" / "paper-config.json"
+        _ROOT
+        / "config"
+        / "paper"
+        / "phase08-phase05-multistrategy-paper-v1"
+        / "paper-config.json"
     )
     raw_config = json.loads(config_artifact.read_text(encoding="utf-8"))
     config = PaperRunConfig.from_dict(raw_config)

@@ -143,7 +143,10 @@ class _ApprovedPaperRuntimeFactories:
     readiness_manifest_sha256: str
     readiness_profile_sha256: str
     readiness_evidence_root: Path
-    strategy_factory: Callable[[PaperRunConfig], FrozenPaperStrategy]
+    strategy_factory: Callable[
+        [PaperRunConfig],
+        FrozenPaperStrategy | tuple[FrozenPaperStrategy, ...],
+    ]
     source_factory: Callable[[PaperRunConfig], NormalizedPublicMarketSource]
 
     def __post_init__(self) -> None:
@@ -165,7 +168,8 @@ class _ApprovedPaperRuntimeFactories:
 
 
 _PHASE12_PAPER_CANDIDATE_ID = "phase08-robust-pairs-btc-eth-paper-v1"
-_PHASE12_PAPER_ARTIFACT_ROOT = Path("config/paper/phase08-robust-pairs-btc-eth-paper-v1")
+_PHASE12_MULTISTRATEGY_CANDIDATE_ID = "phase08-phase05-multistrategy-paper-v1"
+_PHASE12_PAPER_ARTIFACT_ROOT = Path("config/paper/phase08-phase05-multistrategy-paper-v1")
 _PHASE12_PAPER_CONFIG_ARTIFACT = _PHASE12_PAPER_ARTIFACT_ROOT / "paper-config.json"
 _PHASE12_PAPER_READINESS_MANIFEST = _PHASE12_PAPER_ARTIFACT_ROOT / "readiness-manifest.json"
 _PHASE12_PAPER_EVIDENCE_ROOT = _PHASE12_PAPER_ARTIFACT_ROOT
@@ -174,27 +178,62 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "cc04ebcb3ec434f019021e79b1d0fd6280bca13420566c8469fe3c408989f37a"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "d53c88bd073ce17aa958bb0da20fe7dd28e4d5e405840eaa0d28dc3e6248a580"
+_PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
+
+
+def _paper_release_identity_candidate(candidate_id: str) -> str:
+    if candidate_id == _PHASE12_MULTISTRATEGY_CANDIDATE_ID:
+        return candidate_id
+    return _PHASE12_PAPER_CANDIDATE_ID
 
 
 def _phase12_paper_strategy_factory(
     config: PaperRunConfig,
-) -> FrozenPaperStrategy:
-    from hyperlab.paper.pairs_strategy import FrozenRobustPairsPaperStrategy
+) -> tuple[FrozenPaperStrategy, ...]:
+    from hyperlab.paper.phase05_portfolio import build_phase05_phase08_paper_foundation
 
-    strategy = FrozenRobustPairsPaperStrategy()
-    if config.strategy_name != strategy.strategy_name or config.strategy_hash != strategy.strategy_hash:
-        raise ValueError("frozen Phase 08 strategy differs from PaperRunConfig")
-    return strategy
+    foundation = build_phase05_phase08_paper_foundation(
+        runtime_status_path=(
+            _settings().app.data_dir / "paper" / "phase12-multistrategy-source-status.json"
+        ),
+        validation_started_at=config.validation_started_at,
+        release_code_sha256=config.release_code_sha256,
+        runtime_environment_sha256=config.runtime_environment_sha256,
+    )
+    try:
+        expected = tuple(item.strategy_config_hash for item in config.strategy_configs)
+        actual = tuple(
+            str(getattr(item, "strategy_config_hash", "")) for item in foundation.strategies
+        )
+        if config.schema_version != 3 or actual != expected:
+            raise ValueError("frozen Phase 05 + Phase 08 strategies differ from PaperRunConfig")
+        return foundation.strategies
+    finally:
+        foundation.source.close()
 
 
 def _phase12_paper_source_factory(
     config: PaperRunConfig,
 ) -> NormalizedPublicMarketSource:
-    from hyperlab.paper.collector_source import HyperliquidPaperPublicSource
-
-    source = HyperliquidPaperPublicSource.create_mainnet(
-        runtime_status_path=(_settings().app.data_dir / "paper" / "phase12-public-source-status.json")
+    from hyperlab.paper.collector_source import (
+        PHASE12_PHASE05_PUBLIC_SOURCE_NAME,
+        HyperliquidPaperPublicSource,
     )
+
+    if config.data_source == PHASE12_PHASE05_PUBLIC_SOURCE_NAME:
+        source = HyperliquidPaperPublicSource.create_mainnet_portfolio(
+            runtime_status_path=(
+                _settings().app.data_dir / "paper" / "phase12-multistrategy-source-status.json"
+            )
+        )
+    else:
+        source = HyperliquidPaperPublicSource.create_mainnet(
+            runtime_status_path=(
+                _settings().app.data_dir / "paper" / "phase12-public-source-status.json"
+            )
+        )
     descriptor = source.descriptor
     if config.data_source != descriptor.source or config.data_hash != descriptor.data_hash:
         source.close()
@@ -202,17 +241,17 @@ def _phase12_paper_source_factory(
     return source
 
 
-# One exact compiled candidate only, bound to separately versioned canonical artifacts.
+# One exact current candidate only, separate from the frozen historical V9 evidence.
 # The CLI never imports a user-supplied module or resolves an arbitrary strategy.
 _APPROVED_PAPER_RUNTIMES: Mapping[str, _ApprovedPaperRuntimeFactories] = MappingProxyType(
     {
-        _PHASE12_PAPER_CONFIG_HASH: _ApprovedPaperRuntimeFactories(
-            candidate_id=_PHASE12_PAPER_CANDIDATE_ID,
-            config_hash=_PHASE12_PAPER_CONFIG_HASH,
+        _PHASE12_MULTISTRATEGY_CONFIG_HASH: _ApprovedPaperRuntimeFactories(
+            candidate_id=_PHASE12_MULTISTRATEGY_CANDIDATE_ID,
+            config_hash=_PHASE12_MULTISTRATEGY_CONFIG_HASH,
             config_artifact_path=_PHASE12_PAPER_CONFIG_ARTIFACT,
             readiness_manifest_path=_PHASE12_PAPER_READINESS_MANIFEST,
-            readiness_manifest_sha256=_PHASE12_PAPER_READINESS_MANIFEST_SHA256,
-            readiness_profile_sha256=_PHASE12_PAPER_READINESS_PROFILE_SHA256,
+            readiness_manifest_sha256=_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256,
+            readiness_profile_sha256=_PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256,
             readiness_evidence_root=_PHASE12_PAPER_EVIDENCE_ROOT,
             strategy_factory=_phase12_paper_strategy_factory,
             source_factory=_phase12_paper_source_factory,
@@ -1839,12 +1878,16 @@ def _verify_approved_paper_readiness(
 
     blockers: list[str] = []
     try:
-        release_code_sha256 = current_paper_release_code_sha256()
+        release_code_sha256 = current_paper_release_code_sha256(
+            candidate_id=_paper_release_identity_candidate(approval.candidate_id),
+        )
     except (OSError, TypeError, ValueError) as error:
         release_code_sha256 = None
         blockers.append(f"current release-code digest unavailable: {error}")
     try:
-        runtime_environment_sha256 = current_paper_runtime_environment_sha256()
+        runtime_environment_sha256 = current_paper_runtime_environment_sha256(
+            candidate_id=_paper_release_identity_candidate(approval.candidate_id),
+        )
     except (OSError, TypeError, ValueError) as error:
         runtime_environment_sha256 = None
         blockers.append(
@@ -1873,8 +1916,17 @@ def _verify_approved_paper_readiness(
             blockers.append(f"readiness subject {label} differs from the frozen paper config")
     if approval.config_hash != frozen.config_hash:
         blockers.append("approved registration config_hash differs from the frozen paper config")
-    if frozen.schema_version != 2 or frozen.environment != "PAPER":
-        blockers.append("paper runtime requires schema v2 with explicit PAPER environment")
+    if frozen.schema_version not in {2, 3} or frozen.environment != "PAPER":
+        blockers.append("paper runtime requires schema v2/v3 with explicit PAPER environment")
+    if frozen.schema_version == 3 and (
+        len(frozen.strategy_configs) < 2
+        or frozen.data_calibration_status != "UNCALIBRATED"
+        or frozen.execution.calibration_status != "UNCALIBRATED"
+        or frozen.economically_eligible
+    ):
+        blockers.append(
+            "multi-strategy technical Paper must remain explicitly uncalibrated and non-economic"
+        )
     if frozen.run_kind not in {"TECHNICAL", "VALIDATION"}:
         blockers.append("paper runtime requires a TECHNICAL or VALIDATION run_kind")
     if not frozen.required_instruments:
@@ -1891,9 +1943,9 @@ def _verify_approved_paper_readiness(
         blockers.append("compiled PUBLIC_MARKET_SOURCE evidence is missing")
 
     cost_schedule = frozen.execution.cost_schedule
-    if cost_schedule is None:
+    if cost_schedule is None and frozen.schema_version == 2:
         blockers.append("paper runtime requires a point-in-time cost schedule")
-    else:
+    elif cost_schedule is not None:
         for instrument in frozen.required_instruments:
             try:
                 cost_schedule.lookup(pd.Timestamp(frozen.validation_started_at), instrument)
@@ -1917,8 +1969,12 @@ def _verify_approved_paper_readiness(
             final_manifest_bytes,
             require_canonical=True,
         )
-        final_release_code_sha256 = current_paper_release_code_sha256()
-        final_runtime_environment_sha256 = current_paper_runtime_environment_sha256()
+        final_release_code_sha256 = current_paper_release_code_sha256(
+            candidate_id=_paper_release_identity_candidate(approval.candidate_id),
+        )
+        final_runtime_environment_sha256 = current_paper_runtime_environment_sha256(
+            candidate_id=_paper_release_identity_candidate(approval.candidate_id),
+        )
         final_decision = verify_environment_readiness(
             final_manifest,
             evidence_root=approval.readiness_evidence_root,
@@ -2020,15 +2076,21 @@ def _paper_runtime_settings() -> Settings:
 
 
 def _require_current_paper_release(config: PaperRunConfig) -> None:
+    approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
+    candidate_id = _paper_release_identity_candidate(
+        approval.candidate_id if approval is not None else _PHASE12_PAPER_CANDIDATE_ID
+    )
     try:
-        current_release_code_sha256 = current_paper_release_code_sha256()
+        current_release_code_sha256 = current_paper_release_code_sha256(
+            candidate_id=candidate_id,
+        )
     except (OSError, TypeError, ValueError) as error:
         raise typer.BadParameter(f"Le digest release-code paper courant est invérifiable: {error}") from None
     if current_release_code_sha256 != config.release_code_sha256:
         raise typer.BadParameter("Le code Paper courant diffère du release_code_sha256 durable")
     try:
         current_runtime_environment_sha256 = (
-            current_paper_runtime_environment_sha256()
+            current_paper_runtime_environment_sha256(candidate_id=candidate_id)
         )
     except (OSError, TypeError, ValueError) as error:
         raise typer.BadParameter(
@@ -2052,7 +2114,7 @@ def _approved_paper_runtime_for(
     if approval is not None and approval.config_hash == config.config_hash:
         return approval
 
-    canonical_approval = _APPROVED_PAPER_RUNTIMES.get(_PHASE12_PAPER_CONFIG_HASH)
+    canonical_approval = _APPROVED_PAPER_RUNTIMES.get(_PHASE12_MULTISTRATEGY_CONFIG_HASH)
     if canonical_approval is None or config_artifact is None:
         raise typer.BadParameter(
             "Aucune liaison figee strategie + source publique n'est approuvee pour ce config_hash"
@@ -2063,8 +2125,8 @@ def _approved_paper_runtime_for(
         canonical_approval.config_artifact_path
     )
     if (
-        canonical_config.config_hash != _PHASE12_PAPER_CONFIG_HASH
-        or canonical_approval.config_hash != _PHASE12_PAPER_CONFIG_HASH
+        canonical_config.config_hash != _PHASE12_MULTISTRATEGY_CONFIG_HASH
+        or canonical_approval.config_hash != _PHASE12_MULTISTRATEGY_CONFIG_HASH
     ):
         raise typer.BadParameter(
             "La configuration Paper compilee de reference a derive"
@@ -2197,9 +2259,26 @@ def paper_preflight(
 
     source: NormalizedPublicMarketSource | None = None
     try:
-        strategy = approval.strategy_factory(frozen)
-        if strategy.strategy_name != frozen.strategy_name or strategy.strategy_hash != frozen.strategy_hash:
-            raise typer.BadParameter("La strategie compilee differe de la configuration Paper")
+        strategy_binding = approval.strategy_factory(frozen)
+        strategies = strategy_binding if isinstance(strategy_binding, tuple) else (strategy_binding,)
+        actual_identities = [
+            {
+                "strategy_hash": strategy.strategy_hash,
+                "strategy_id": getattr(strategy, "strategy_id", None),
+                "strategy_name": strategy.strategy_name,
+            }
+            for strategy in strategies
+        ]
+        expected_identities = [
+            {
+                "strategy_hash": item.strategy_hash,
+                "strategy_id": item.strategy_id if frozen.schema_version == 3 else None,
+                "strategy_name": item.strategy_name,
+            }
+            for item in frozen.strategy_configs
+        ]
+        if actual_identities != expected_identities:
+            raise typer.BadParameter("Les strategies compilees different de la configuration Paper")
         source = approval.source_factory(frozen)
         descriptor = source.descriptor
         if descriptor.source != frozen.data_source or descriptor.data_hash != frozen.data_hash:
@@ -2222,8 +2301,9 @@ def paper_preflight(
             "readiness_profile_sha256": approval.readiness_profile_sha256,
             "run_id": frozen.run_id,
             "status": "READY",
-            "strategy_hash": strategy.strategy_hash,
-            "strategy_name": strategy.strategy_name,
+            "strategies": actual_identities,
+            "strategy_hash": frozen.strategy_hash,
+            "strategy_name": frozen.strategy_name,
             "wallet_or_signer_required": False,
         }
     except typer.BadParameter:

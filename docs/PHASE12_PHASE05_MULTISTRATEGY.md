@@ -48,17 +48,21 @@ The production technical mapping is:
 - perpetual: `HL:HYPE:perp`, public source asset `HYPE`;
 - Phase 08: `HL:ETH:perp` and `HL:BTC:perp`.
 
-The generated technical evidence records:
+The dedicated successor release evidence records:
 
 - portfolio ID `964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb`;
-- config hash `79049391ac63ca089900787b239b26ef80826877a924f23b3ccaf01789d3c75c`;
-- run ID `213e9597702c8331892788c7b2841e283c14868e88987ef5d61765200b6b7601`;
+- config hash `cc04ebcb3ec434f019021e79b1d0fd6280bca13420566c8469fe3c408989f37a`;
+- run ID `88b7800ad58ef0605ac6c345b23ecf7cdb55bd3d2cca442c0675e1f0a6c49f9c`;
 - Phase 05 strategy hash `76e4b4ab6c1af42bb408a2f22163affbb88b0e717d49f2e88696c5abd0063f0f`;
 - Phase 05 strategy-config hash `d5d0c18e77a3e1a5ba1a11f9fda646ce9bd8d4a68c476d4d620a62886bc4af24`;
 - Phase 08 strategy hash `239ca1f27b9563a8fcacb5faa756364b6fc70240246dc086ac0be1633d8abb0d`;
-- Phase 08 strategy-config hash `3c41aff21544b83e03bf53a991b268a3e3c9e97c448ec353e47bfd470eadd75d`.
+- Phase 08 strategy-config hash `3c41aff21544b83e03bf53a991b268a3e3c9e97c448ec353e47bfd470eadd75d`;
+- source data hash `8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671`;
+- release-code hash `719359294c825dbdaf3c5286bf5a09b000ee498dbd4f637f9d1c00fdef049525`;
+- readiness manifest hash `d53c88bd073ce17aa958bb0da20fe7dd28e4d5e405840eaa0d28dc3e6248a580`;
+- readiness profile hash `e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a`.
 
-Runtime-environment and release-code hashes are intentionally recorded in `technical-evidence.json` rather than copied here; they must fail closed when the environment or source changes.
+The Windows runtime-environment hash remains recorded in `technical-evidence.json`; a future Linux bundle must generate and bind its own host-specific value.
 
 ## Shared public source
 
@@ -124,6 +128,8 @@ Generated artifacts:
 
 - `reports/phase12-phase05/benchmark.json`;
 - `reports/phase12-phase05/technical-evidence.json`.
+- `config/paper/phase08-phase05-multistrategy-paper-v1/`: the 24-file current release bundle.
+- `config/paper/phase08-v9-historical-attestation.json`: the immutable V9 file-hash attestation.
 
 Reproduce them with:
 
@@ -132,6 +138,7 @@ $env:PYTHONPATH = "src"
 python scripts/benchmark_paper_phase05_portfolio.py --frames 200 --repetitions 3 --output reports/phase12-phase05/benchmark.json
 python scripts/generate_phase05_paper_evidence.py
 python scripts/generate_phase05_paper_evidence.py --check
+python scripts/generate_phase12_live_paper_artifacts.py --check
 ```
 
 The evidence explicitly fixes:
@@ -149,7 +156,7 @@ The evidence explicitly fixes:
 
 Focused Phase 05, real Phase 05+08, generic multi-strategy, reporting, store, replay, reconciliation, runtime, source, and Phase 08 compatibility tests are the acceptance surface.
 
-The checked-in deployed Phase 08 V9 candidate is deliberately not regenerated in this task. Because this branch changes Paper source code, its frozen release-code attestation must fail closed. A failing V9 artifact/preflight verification is therefore a deployment blocker and positive integrity evidence, not permission to update or bypass the deployed artifact. Promotion requires a separate reviewed deployment phase with newly generated candidate artifacts.
+The deployed Phase 08 V9 namespace is deliberately not regenerated. Its new external attestation verifies every historical byte, while semantic re-authorization against the current source tree remains expected to fail closed on runtime-source identity. The V10 successor independently regenerates byte-for-byte and reaches technical PAPER/PAPER_RUNTIME readiness. Neither result permits rewriting V9 or treating technical readiness as economic evidence.
 
 ## Remaining deployment blockers
 
@@ -157,8 +164,9 @@ Before any real two-strategy VPS Paper deployment:
 
 1. independently review this diff and its technical evidence;
 2. calibrate execution, costs, and data or retain non-economic technical status;
-3. perform a dedicated candidate-artifact generation and authorization review;
-4. re-run the complete release, manifest, runtime-environment, and artifact gates;
-5. explicitly authorize deployment without adding private or real-money execution capability.
+3. generate and independently review the host-specific Linux bundle described in `PHASE12_PHASE05_RELEASE.md`;
+4. re-run the complete release, manifest, runtime-environment, artifact, gate-model, and offline preflight gates;
+5. declare resource limits and perform the supervised new-database technical smoke;
+6. explicitly authorize any systemd deployment without adding private or real-money execution capability.
 
 This task does not access the VPS, a live Paper database, or `phase-12-live-paper`, and it does not modify real-money capability.

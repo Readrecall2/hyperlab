@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,7 @@ from hyperlab.environment_authorization import (  # noqa: E402
     verify_environment_readiness,
 )
 from hyperlab.paper.collector_source import (  # noqa: E402
+    PHASE12_PHASE05_PUBLIC_SOURCE_NAME,
     PHASE12_PUBLIC_SOURCE_NAME,
     HyperliquidPaperPublicSource,
 )
@@ -40,10 +42,15 @@ from hyperlab.paper.pairs_strategy import (  # noqa: E402
     FrozenRobustPairsPaperConfig,
     FrozenRobustPairsPaperStrategy,
 )
+from hyperlab.paper.phase05_portfolio import (  # noqa: E402
+    build_phase05_phase08_paper_foundation,
+)
 
 CANDIDATE_ID = "phase08-robust-pairs-btc-eth-paper-v1"
 CANDIDATE_DIRECTORY = Path("config/paper") / CANDIDATE_ID
-DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / CANDIDATE_DIRECTORY
+MULTISTRATEGY_CANDIDATE_ID = "phase08-phase05-multistrategy-paper-v1"
+MULTISTRATEGY_CANDIDATE_DIRECTORY = Path("config/paper") / MULTISTRATEGY_CANDIDATE_ID
+DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / MULTISTRATEGY_CANDIDATE_DIRECTORY
 FEE_ARTIFACT_PATH = Path("config/paper/hyperliquid-tier0-fees-2026-08-16.json")
 
 CONFIG_ARTIFACT = "paper-config.json"
@@ -52,6 +59,8 @@ READINESS_MANIFEST_ARTIFACT = "readiness-manifest.json"
 RELEASE_CODE_MANIFEST_ARTIFACT = "release-code-manifest.json"
 RUNTIME_ENVIRONMENT_ARTIFACT = "runtime-environment-attestation.json"
 ARTIFACT_INDEX = "artifact-index.json"
+DEPLOYMENT_GATE_ARTIFACT = "technical-deployment-gate.json"
+TECHNICAL_EVIDENCE_ARTIFACT = "technical-evidence.json"
 
 _RELEASE_CODE_SCHEMA_VERSION = 1
 _RELEASE_CODE_CANONICALIZATION = (
@@ -66,12 +75,16 @@ _CLI_DERIVED_BINDING_NAMES = (
     "_PHASE12_PAPER_CONFIG_HASH",
     "_PHASE12_PAPER_READINESS_MANIFEST_SHA256",
     "_PHASE12_PAPER_READINESS_PROFILE_SHA256",
+    "_PHASE12_MULTISTRATEGY_CONFIG_HASH",
+    "_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256",
+    "_PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256",
 )
 _MAX_RELEASE_FILE_BYTES = 1024 * 1024
 RUNTIME_TIMER_INTERVAL_SECONDS = 1.0
 RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 
 VALIDATION_STARTED_AT = datetime(2026, 8, 17, tzinfo=UTC)
+MULTISTRATEGY_VALIDATION_STARTED_AT = datetime(2026, 8, 18, 12, tzinfo=UTC)
 FEE_OBSERVED_AT = "2026-08-16T21:06:42Z"
 
 
@@ -197,22 +210,33 @@ def _release_path_identities(
     }
 
 
-def _release_code_core(files: Mapping[str, str]) -> dict[str, object]:
+def _release_code_core(
+    files: Mapping[str, str],
+    *,
+    candidate_id: str = CANDIDATE_ID,
+) -> dict[str, object]:
+    if candidate_id not in {CANDIDATE_ID, MULTISTRATEGY_CANDIDATE_ID}:
+        raise ValueError("unsupported Phase 12 Paper candidate")
     return {
         "artifact_schema_version": _RELEASE_CODE_SCHEMA_VERSION,
-        "candidate_id": CANDIDATE_ID,
+        "candidate_id": candidate_id,
         "canonicalization": _RELEASE_CODE_CANONICALIZATION,
         "files": dict(files),
     }
 
 
-def _release_code_sha256(files: Mapping[str, str]) -> str:
-    return _sha256(_canonical_bytes(_release_code_core(files)))
+def _release_code_sha256(
+    files: Mapping[str, str],
+    *,
+    candidate_id: str = CANDIDATE_ID,
+) -> str:
+    return _sha256(_canonical_bytes(_release_code_core(files, candidate_id=candidate_id)))
 
 
 def build_release_code_manifest_bytes(
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    candidate_id: str = CANDIDATE_ID,
 ) -> bytes:
     """Build the release digest independently from the compiled verifier."""
 
@@ -235,8 +259,11 @@ def build_release_code_manifest_bytes(
         )
     return _canonical_bytes(
         {
-            **_release_code_core(files),
-            "release_code_sha256": _release_code_sha256(files),
+            **_release_code_core(files, candidate_id=candidate_id),
+            "release_code_sha256": _release_code_sha256(
+                files,
+                candidate_id=candidate_id,
+            ),
         }
     )
 
@@ -257,7 +284,11 @@ def _release_code_manifest_metadata(payload: bytes) -> tuple[int, str]:
     return len(files), release_code_sha256
 
 
-def _runtime_environment_metadata(payload: bytes) -> tuple[int, str]:
+def _runtime_environment_metadata(
+    payload: bytes,
+    *,
+    candidate_id: str = CANDIDATE_ID,
+) -> tuple[int, str]:
     decoded = json.loads(payload.decode("utf-8"))
     expected_keys = {
         "artifact_schema_version",
@@ -275,7 +306,7 @@ def _runtime_environment_metadata(payload: bytes) -> tuple[int, str]:
         or payload != _canonical_bytes(dict(decoded))
         or set(decoded) != expected_keys
         or decoded.get("artifact_schema_version") != 1
-        or decoded.get("candidate_id") != CANDIDATE_ID
+        or decoded.get("candidate_id") != candidate_id
         or decoded.get("extras_allowed") is not True
         or type(decoded.get("distribution_count")) is not int
         or int(decoded["distribution_count"]) <= 0
@@ -350,18 +381,24 @@ def _validate_fee_artifact(payload: bytes) -> None:
         raise ValueError("fee artifact may not use private account data or fee discounts")
 
 
-def build_source_identity_artifact_bytes() -> bytes:
+def build_source_identity_artifact_bytes(*, multistrategy: bool = False) -> bytes:
     """Read canonical identity from the transport-lazy production factory."""
 
     source = HyperliquidPaperPublicSource.create_mainnet(
         runtime_status_path=(
             REPOSITORY_ROOT / ".tmp" / "phase12-artifact-generator-status.json"
-        )
+        ),
+        include_phase05_cash_and_carry=multistrategy,
     )
     try:
         identity_bytes = source.identity_artifact_bytes
         descriptor = source.descriptor
-        if descriptor.source != PHASE12_PUBLIC_SOURCE_NAME:
+        expected_source = (
+            PHASE12_PHASE05_PUBLIC_SOURCE_NAME
+            if multistrategy
+            else PHASE12_PUBLIC_SOURCE_NAME
+        )
+        if descriptor.source != expected_source:
             raise RuntimeError("lazy production source returned an unexpected identity")
         if descriptor.data_hash != _sha256(identity_bytes):
             raise RuntimeError("lazy production source descriptor hash is inconsistent")
@@ -531,9 +568,41 @@ def build_paper_config(
     )
 
 
+def build_multistrategy_paper_config(
+    *,
+    release_code_sha256: str,
+    runtime_environment_sha256: str,
+) -> tuple[PaperRunConfig, bytes]:
+    foundation = build_phase05_phase08_paper_foundation(
+        runtime_status_path=(
+            REPOSITORY_ROOT / ".tmp" / "phase12-multistrategy-artifact-generator-status.json"
+        ),
+        validation_started_at=MULTISTRATEGY_VALIDATION_STARTED_AT,
+        release_code_sha256=release_code_sha256,
+        runtime_environment_sha256=runtime_environment_sha256,
+    )
+    try:
+        source_bytes = foundation.source.identity_artifact_bytes
+        config = replace(
+            foundation.config,
+            release_code_sha256=release_code_sha256,
+            runtime_environment_sha256=runtime_environment_sha256,
+            runtime_timer_interval_seconds=RUNTIME_TIMER_INTERVAL_SECONDS,
+            runtime_source_poll_timeout_seconds=RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS,
+        )
+        if config.data_source != PHASE12_PHASE05_PUBLIC_SOURCE_NAME:
+            raise RuntimeError("multi-strategy source identity is not the reviewed V10 successor")
+        if config.data_hash != _sha256(source_bytes):
+            raise RuntimeError("multi-strategy source bytes differ from PaperRunConfig")
+        return config, source_bytes
+    finally:
+        foundation.source.close()
+
+
 def _readiness_artifacts(
     config: PaperRunConfig,
     *,
+    candidate_id: str = CANDIDATE_ID,
     release_code_manifest_bytes: bytes,
     runtime_environment_attestation_bytes: bytes,
 ) -> tuple[dict[str, bytes], EnvironmentReadinessManifest]:
@@ -541,7 +610,7 @@ def _readiness_artifacts(
     if profile.purpose is not AuthorizationPurpose.PAPER_RUNTIME:
         raise RuntimeError("compiled PAPER profile is not PAPER_RUNTIME")
     subject = ReadinessSubject(
-        candidate_id=CANDIDATE_ID,
+        candidate_id=candidate_id,
         config_hash=config.config_hash,
         strategy_hash=config.strategy_hash,
         build_hash=config.engine_build_hash,
@@ -591,39 +660,179 @@ def _readiness_artifacts(
     return evidence_files, manifest
 
 
+def _technical_deployment_gate_bytes(config: PaperRunConfig) -> bytes:
+    return _canonical_bytes(
+        {
+            "artifact_schema_version": 1,
+            "candidate_id": MULTISTRATEGY_CANDIDATE_ID,
+            "economic_profitability_requirement": None,
+            "environment": "PAPER",
+            "future_smoke_requirements": {
+                "bbo_freshness": {
+                    "maximum_seconds": config.risk.stale_after_seconds,
+                    "requirement": "ALL_REQUIRED_INSTRUMENTS_BELOW_STALE_THRESHOLD",
+                },
+                "coalescing": "EFFECTIVE_WITH_NONZERO_BURST_REPLACEMENTS_AND_BOUNDED_HIGH_WATER",
+                "cpu_ram": {
+                    "operator_limits_required_before_smoke": True,
+                    "pass_condition": (
+                        "OBSERVED_PEAK_RSS_AND_CPU_REMAIN_WITHIN_PREDECLARED_OPERATOR_LIMITS"
+                    ),
+                    "requirement": "MEASURE_AND_RECORD_PEAK_RSS_AND_CPU",
+                },
+                "reconnect_resync": "NO_REPEATED_PATHOLOGY_OR_UNEXPLAINED_GAP_LOOP",
+                "source_queue": "NO_PERSISTENT_ACCUMULATION_AND_DRAINS_TO_ZERO",
+                "sqlite_growth": "MEASURE_BYTES_AND_COMMITS_OVER_SMOKE_WINDOW",
+                "unhedged_incidents": "NO_REPEATED_UNHEDGED_INCIDENT_OR_PROTECTIVE_LOOP",
+            },
+            "mode": "PAPER_ONLY",
+            "orders_enabled": False,
+            "status": "REQUIRES_FUTURE_LOCAL_OR_LINUX_SMOKE",
+        }
+    )
+
+
+def _technical_evidence_bytes(
+    config: PaperRunConfig,
+    *,
+    deployment_gate_bytes: bytes,
+    manifest: EnvironmentReadinessManifest,
+    profile_sha256: str,
+    release_code_sha256: str,
+    runtime_environment_sha256: str,
+) -> bytes:
+    strategies = [
+        {
+            **strategy.to_dict(),
+            "strategy_config_hash": strategy.strategy_config_hash,
+        }
+        for strategy in config.strategy_configs
+    ]
+    return _canonical_bytes(
+        {
+            "artifact_schema_version": 1,
+            "authorization": {
+                "authorizes_real_money": False,
+                "credential_scope": "NONE",
+                "environment": "PAPER",
+                "execution_network": "NONE",
+                "mode": "PAPER_ONLY",
+                "orders_enabled": False,
+            },
+            "benchmark_reference": {
+                "phase08_commits": 400,
+                "phase08_frames_per_second": 34.83,
+                "phase08_phase05_commits": 800,
+                "phase08_phase05_frames_per_second": 14.96,
+                "queue_bbo_admitted": 800,
+                "queue_bbo_coalesced": 796,
+                "queue_high_water": 4,
+                "queue_pending_after_drain": 0,
+                "status": "SYNTHETIC_TECHNICAL_ONLY",
+            },
+            "candidate_foundation_commit": "ca3c3bb3804b002aabd8132d002c55a4447fb582",
+            "candidate_id": MULTISTRATEGY_CANDIDATE_ID,
+            "deployment_gate": {
+                "path": DEPLOYMENT_GATE_ARTIFACT,
+                "sha256": _sha256(deployment_gate_bytes),
+            },
+            "economic_status": "TECHNICAL_ONLY_UNCALIBRATED",
+            "identities": {
+                "config_hash": config.config_hash,
+                "engine_build_hash": config.engine_build_hash,
+                "portfolio_id": config.portfolio_id,
+                "readiness_manifest_sha256": manifest.manifest_sha256,
+                "readiness_profile_sha256": profile_sha256,
+                "release_code_sha256": release_code_sha256,
+                "run_id": config.run_id,
+                "runtime_environment_sha256": runtime_environment_sha256,
+                "source_data_hash": config.data_hash,
+                "source_identity": config.data_source,
+            },
+            "linux_bundle_pattern": (
+                "authorization-<candidate-commit>-linux-cpython-<major.minor.micro>/"
+            ),
+            "reporting_contract": {
+                "aggregate_views": ["account", "portfolio"],
+                "strategy_views": [item.strategy_id for item in config.strategy_configs],
+            },
+            "source_contract": {
+                "adapter_schema_version": 10,
+                "feed_contract": (
+                    "SOLE_COLLECTOR_NORMALIZED_BBO_CONNECTION_FUNDING_MARKET_CONTEXT_"
+                    "BOUNDED_PENDING_BBO_LATEST_VALUE_V10"
+                ),
+            },
+            "strategies": strategies,
+        }
+    )
+
+
 def build_phase12_artifacts(
     *,
     repository_root: Path = REPOSITORY_ROOT,
     operator_runtime_environment_attestation_bytes: bytes | None = None,
+    candidate_id: str = CANDIDATE_ID,
 ) -> dict[str, bytes]:
     fee_bytes = (repository_root / FEE_ARTIFACT_PATH).read_bytes()
-    source_bytes = build_source_identity_artifact_bytes()
     release_code_manifest_bytes = build_release_code_manifest_bytes(
-        repository_root=repository_root
+        repository_root=repository_root,
+        candidate_id=candidate_id,
     )
     runtime_environment_bytes = (
-        paper_runtime_environment_attestation_bytes(repository_root)
+        paper_runtime_environment_attestation_bytes(
+            repository_root,
+            candidate_id=candidate_id,
+        )
         if operator_runtime_environment_attestation_bytes is None
         else operator_runtime_environment_attestation_bytes
     )
-    distribution_count, runtime_environment_sha256 = _runtime_environment_metadata(runtime_environment_bytes)
+    distribution_count, runtime_environment_sha256 = _runtime_environment_metadata(
+        runtime_environment_bytes,
+        candidate_id=candidate_id,
+    )
     release_file_count, release_code_sha256 = _release_code_manifest_metadata(
         release_code_manifest_bytes
     )
-    config = build_paper_config(
-        source_identity_bytes=source_bytes,
-        fee_artifact_bytes=fee_bytes,
-        release_code_sha256=release_code_sha256,
-        runtime_environment_sha256=runtime_environment_sha256,
-    )
+    if candidate_id == MULTISTRATEGY_CANDIDATE_ID:
+        config, source_bytes = build_multistrategy_paper_config(
+            release_code_sha256=release_code_sha256,
+            runtime_environment_sha256=runtime_environment_sha256,
+        )
+    elif candidate_id == CANDIDATE_ID:
+        source_bytes = build_source_identity_artifact_bytes()
+        config = build_paper_config(
+            source_identity_bytes=source_bytes,
+            fee_artifact_bytes=fee_bytes,
+            release_code_sha256=release_code_sha256,
+            runtime_environment_sha256=runtime_environment_sha256,
+        )
+    else:
+        raise ValueError("unsupported Phase 12 Paper candidate")
     config_bytes = _canonical_bytes(config.to_dict())
     evidence_files, manifest = _readiness_artifacts(
         config,
+        candidate_id=candidate_id,
         release_code_manifest_bytes=release_code_manifest_bytes,
         runtime_environment_attestation_bytes=runtime_environment_bytes,
     )
     manifest_bytes = manifest.canonical_json_bytes()
     profile = profile_for(EnvironmentClass.PAPER)
+    extra_artifacts: dict[str, bytes] = {}
+    if candidate_id == MULTISTRATEGY_CANDIDATE_ID:
+        deployment_gate_bytes = _technical_deployment_gate_bytes(config)
+        technical_evidence_bytes = _technical_evidence_bytes(
+            config,
+            deployment_gate_bytes=deployment_gate_bytes,
+            manifest=manifest,
+            profile_sha256=profile.profile_sha256,
+            release_code_sha256=release_code_sha256,
+            runtime_environment_sha256=runtime_environment_sha256,
+        )
+        extra_artifacts = {
+            DEPLOYMENT_GATE_ARTIFACT: deployment_gate_bytes,
+            TECHNICAL_EVIDENCE_ARTIFACT: technical_evidence_bytes,
+        }
     index_bytes = _canonical_bytes(
         {
             "artifact_schema_version": 1,
@@ -656,11 +865,25 @@ def build_phase12_artifacts(
                 "source_identity": {
                     "path": SOURCE_IDENTITY_ARTIFACT,
                     "sha256": _sha256(source_bytes),
-                    "source": PHASE12_PUBLIC_SOURCE_NAME,
+                    "source": config.data_source,
                 },
+                **(
+                    {
+                        "technical_deployment_gate": {
+                            "path": DEPLOYMENT_GATE_ARTIFACT,
+                            "sha256": _sha256(extra_artifacts[DEPLOYMENT_GATE_ARTIFACT]),
+                        },
+                        "technical_evidence": {
+                            "path": TECHNICAL_EVIDENCE_ARTIFACT,
+                            "sha256": _sha256(extra_artifacts[TECHNICAL_EVIDENCE_ARTIFACT]),
+                        },
+                    }
+                    if extra_artifacts
+                    else {}
+                ),
             },
             "authorizes_real_money": False,
-            "candidate_id": CANDIDATE_ID,
+            "candidate_id": candidate_id,
             "environment": "PAPER",
             "purpose": "PAPER_RUNTIME",
             "run_id": config.run_id,
@@ -674,9 +897,24 @@ def build_phase12_artifacts(
         RELEASE_CODE_MANIFEST_ARTIFACT: release_code_manifest_bytes,
         RUNTIME_ENVIRONMENT_ARTIFACT: runtime_environment_bytes,
         SOURCE_IDENTITY_ARTIFACT: source_bytes,
+        **extra_artifacts,
         **evidence_files,
         READINESS_MANIFEST_ARTIFACT: manifest_bytes,
     }
+
+
+def build_phase12_multistrategy_artifacts(
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+    operator_runtime_environment_attestation_bytes: bytes | None = None,
+) -> dict[str, bytes]:
+    return build_phase12_artifacts(
+        repository_root=repository_root,
+        operator_runtime_environment_attestation_bytes=(
+            operator_runtime_environment_attestation_bytes
+        ),
+        candidate_id=MULTISTRATEGY_CANDIDATE_ID,
+    )
 
 
 def _verify_written_readiness(output_root: Path) -> None:
@@ -717,8 +955,12 @@ def check_artifacts(
     output_root: Path,
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    candidate_id: str = CANDIDATE_ID,
 ) -> dict[str, bytes]:
-    expected = build_phase12_artifacts(repository_root=repository_root)
+    expected = build_phase12_artifacts(
+        repository_root=repository_root,
+        candidate_id=candidate_id,
+    )
     drift: list[str] = []
     for relative_path, payload in sorted(expected.items()):
         target = output_root / relative_path
@@ -739,8 +981,12 @@ def write_artifacts(
     output_root: Path,
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    candidate_id: str = CANDIDATE_ID,
 ) -> dict[str, bytes]:
-    artifacts = build_phase12_artifacts(repository_root=repository_root)
+    artifacts = build_phase12_artifacts(
+        repository_root=repository_root,
+        candidate_id=candidate_id,
+    )
     unexpected = _unexpected_artifact_paths(output_root, artifacts)
     if unexpected:
         raise ArtifactDriftError(
@@ -754,7 +1000,36 @@ def write_artifacts(
     return artifacts
 
 
-def _summary(artifacts: Mapping[str, bytes], *, action: str) -> dict[str, object]:
+def check_multistrategy_artifacts(
+    output_root: Path,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> dict[str, bytes]:
+    return check_artifacts(
+        output_root,
+        repository_root=repository_root,
+        candidate_id=MULTISTRATEGY_CANDIDATE_ID,
+    )
+
+
+def write_multistrategy_artifacts(
+    output_root: Path,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> dict[str, bytes]:
+    return write_artifacts(
+        output_root,
+        repository_root=repository_root,
+        candidate_id=MULTISTRATEGY_CANDIDATE_ID,
+    )
+
+
+def _summary(
+    artifacts: Mapping[str, bytes],
+    *,
+    action: str,
+    candidate_id: str = MULTISTRATEGY_CANDIDATE_ID,
+) -> dict[str, object]:
     config = PaperRunConfig.from_dict(
         json.loads(artifacts[CONFIG_ARTIFACT].decode("utf-8"))
     )
@@ -768,7 +1043,7 @@ def _summary(artifacts: Mapping[str, bytes], *, action: str) -> dict[str, object
     return {
         "action": action,
         "authorizes_real_money": False,
-        "candidate_id": CANDIDATE_ID,
+        "candidate_id": candidate_id,
         "config_hash": config.config_hash,
         "file_count": len(artifacts),
         "manifest_sha256": manifest.manifest_sha256,
@@ -785,7 +1060,7 @@ def _summary(artifacts: Mapping[str, bytes], *, action: str) -> dict[str, object
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Regenerate the offline, deterministic Phase 12 TECHNICAL Paper artifact set."
+            "Regenerate the offline deterministic Phase 08 + Phase 05 TECHNICAL Paper bundle."
         )
     )
     parser.add_argument(
@@ -806,10 +1081,10 @@ def main() -> int:
     args = parse_args()
     try:
         if args.check:
-            artifacts = check_artifacts(args.output_root)
+            artifacts = check_multistrategy_artifacts(args.output_root)
             action = "CHECKED_NO_WRITE"
         else:
-            artifacts = write_artifacts(args.output_root)
+            artifacts = write_multistrategy_artifacts(args.output_root)
             action = "REGENERATED"
     except (ArtifactDriftError, OSError, TypeError, ValueError) as error:
         print(json.dumps({"error": str(error), "status": "BLOCKED"}, sort_keys=True))

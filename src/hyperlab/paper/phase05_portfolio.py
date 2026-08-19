@@ -5,6 +5,10 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+from hyperlab.environment_authorization import (
+    current_paper_release_code_sha256,
+    current_paper_runtime_environment_sha256,
+)
 from hyperlab.paper.carry_strategy import (
     FrozenCashAndCarryPaperConfig,
     FrozenCashAndCarryPaperStrategy,
@@ -95,6 +99,8 @@ def build_phase05_phase08_paper_foundation(
     seed: int = 12_508,
     execution: PaperExecutionConfig | None = None,
     risk_allocation: Phase05Phase08RiskAllocation | None = None,
+    release_code_sha256: str | None = None,
+    runtime_environment_sha256: str | None = None,
 ) -> Phase05Phase08PaperFoundation:
     """Build the first real two-strategy candidate without starting its collector."""
 
@@ -159,6 +165,16 @@ def build_phase05_phase08_paper_foundation(
         ),
         schema_version=3,
         strategies=identities,
+        release_code_sha256=(
+            current_paper_release_code_sha256()
+            if release_code_sha256 is None
+            else release_code_sha256
+        ),
+        runtime_environment_sha256=(
+            current_paper_runtime_environment_sha256()
+            if runtime_environment_sha256 is None
+            else runtime_environment_sha256
+        ),
     )
     strategies: tuple[FrozenPaperStrategy, ...] = (
         FrozenCashAndCarryPaperStrategy(

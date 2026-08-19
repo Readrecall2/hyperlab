@@ -22,11 +22,11 @@
   },
   "evidence_contract": "PHASE12_PHASE05_MULTISTRATEGY_TECHNICAL_EVIDENCE_V1",
   "identity": {
-    "config_hash": "79049391ac63ca089900787b239b26ef80826877a924f23b3ccaf01789d3c75c",
+    "config_hash": "1e69921aed5752062bd16e51a882b9a9dd361b881202d008c1289b0d2ad1cec4",
     "engine_build_hash": "a443b7723fd96fad8ef116b8fc061ad53ede0c49d228a514fbd4375bbd5cc1ef",
     "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
-    "release_code_sha256": "ec0f5408aa2a1b0a888723add65babf4452874b0fff9a389f1d2030760724339",
-    "run_id": "213e9597702c8331892788c7b2841e283c14868e88987ef5d61765200b6b7601",
+    "release_code_sha256": "8de632c0e43a38ebde0a104890930209846f76af140434ac3c6ee9a4909472ec",
+    "run_id": "d9142949149819394b42704fc9caadaa1c9102471efc86e34aa36804e984ad05",
     "runtime_environment_sha256": "f51df86b54d5505159841d6c8320b1b06a3d6c902f0460334d42953bb1884183",
     "source_data_hash": "8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671"
   },
@@ -116,7 +116,7 @@
       "source_contract": "ONE_SHARED_PUBLIC_NORMALIZED_FEED_NO_PRIVATE_API"
     },
     "portfolio_id": "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb",
-    "release_code_sha256": "ec0f5408aa2a1b0a888723add65babf4452874b0fff9a389f1d2030760724339",
+    "release_code_sha256": "8de632c0e43a38ebde0a104890930209846f76af140434ac3c6ee9a4909472ec",
     "required_instruments": [
       "HL:BTC:perp",
       "HL:ETH:perp",

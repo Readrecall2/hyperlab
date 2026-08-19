@@ -1029,6 +1029,9 @@ def test_authorization_manifest_rejects_early_file_changed_after_its_read(
                 '_PHASE12_PAPER_CONFIG_HASH = "' + "0" * 64 + '"',
                 '_PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "' + "1" * 64 + '"',
                 '_PHASE12_PAPER_READINESS_PROFILE_SHA256 = "' + "2" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_CONFIG_HASH = "' + "3" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "' + "4" * 64 + '"',
+                '_PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "' + "5" * 64 + '"',
                 "",
             )
         ),
@@ -1053,6 +1056,8 @@ def test_authorization_manifest_rejects_early_file_changed_after_its_read(
 
     with pytest.raises(ValueError, match="release code changed while"):
         authorization_module._build_paper_release_code_manifest_bytes(repository)
+
+
 def _rebuild_release_manifest(
     release_manifest: dict[str, object],
 ) -> bytes:
@@ -1476,12 +1481,12 @@ def test_paper_builder_rejects_risk_values_above_compiled_ceilings(
 
 
 def test_paper_builder_rejects_uncompiled_candidate_and_source() -> None:
-    with pytest.raises(ValueError, match="compiled Phase 08"):
+    with pytest.raises(ValueError, match="compiled Phase 12"):
         paper_evidence_payload(
             EvidenceCheck.PUBLIC_MARKET_SOURCE,
             _subject(candidate_id="phase05-cash-and-carry"),
         )
-    with pytest.raises(ValueError, match="compiled Phase 08"):
+    with pytest.raises(ValueError, match="compiled Phase 12"):
         paper_evidence_payload(
             EvidenceCheck.PUBLIC_MARKET_SOURCE,
             _subject(source_identity="research-placeholder"),

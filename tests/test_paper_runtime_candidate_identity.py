@@ -195,3 +195,21 @@ def test_ready_preflight_then_v10_runtime_construction_uses_same_candidate(
     finally:
         foundation.source.close()
         store.close()
+
+
+def test_offline_release_candidate_accepts_runtime_environment_specific_v10_config() -> None:
+    from dataclasses import replace
+
+    frozen = cli_module._load_frozen_paper_config(
+        cli_module._PHASE12_PAPER_CONFIG_ARTIFACT
+    )
+    environment_specific = replace(
+        frozen,
+        runtime_environment_sha256="0" * 64,
+    )
+
+    assert environment_specific.config_hash != frozen.config_hash
+    assert (
+        cli_module._paper_release_candidate_for_config(environment_specific)
+        == cli_module._PHASE12_MULTISTRATEGY_CANDIDATE_ID
+    )

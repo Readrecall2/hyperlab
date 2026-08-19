@@ -181,8 +181,8 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "7621801239f9a6c38f12af0fd6e1436a015760e1e9bc9947b98ce2702e8a82f4"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "f1344dac18d3dd399818da2b459c1beb70af9d5bc8c7ed39369378c991db9ff4"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "6c98b8137afc163a90c369ffcfc043ac02a64e7bf10aff92b4e6503d7af12ccc"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "8caae765769473ebfa9f0ea78c5d0a8ced2c7a75080f688bb4f9882b8185b606"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -2072,10 +2072,31 @@ def _paper_runtime_settings() -> Settings:
     return settings
 
 
-def _require_current_paper_release(config: PaperRunConfig) -> None:
+def _paper_release_candidate_for_config(config: PaperRunConfig) -> str:
     approval = _APPROVED_PAPER_RUNTIMES.get(config.config_hash)
+    if approval is not None and approval.config_hash == config.config_hash:
+        return approval.candidate_id
+
+    canonical_approval = _APPROVED_PAPER_RUNTIMES.get(
+        _PHASE12_MULTISTRATEGY_CONFIG_HASH
+    )
+    if canonical_approval is not None:
+        canonical_config = _load_frozen_paper_config(
+            canonical_approval.config_artifact_path
+        )
+        canonical_payload = canonical_config.to_dict()
+        operator_payload = config.to_dict()
+        canonical_payload.pop("runtime_environment_sha256")
+        operator_payload.pop("runtime_environment_sha256")
+        if operator_payload == canonical_payload:
+            return canonical_approval.candidate_id
+
+    return _PHASE12_PAPER_CANDIDATE_ID
+
+
+def _require_current_paper_release(config: PaperRunConfig) -> None:
     candidate_id = _paper_release_identity_candidate(
-        approval.candidate_id if approval is not None else _PHASE12_PAPER_CANDIDATE_ID
+        _paper_release_candidate_for_config(config)
     )
     try:
         current_release_code_sha256 = current_paper_release_code_sha256(

@@ -10,7 +10,7 @@
   "benchmark": {
     "contract": "REAL_PHASE08_VS_REAL_PHASE08_PLUS_PHASE05_DURABLE_V1",
     "path": "reports/phase12-phase05/benchmark.json",
-    "sha256": "2633cf75410dfc7af194825837d51d20b13200d76c063ee344757807a4dd1c34",
+    "sha256": "c42b11557e437306f549a26d778657faa183bd0d1dfc870fb68dbf591a86dfff",
     "synthetic_warning": "SYNTHETIC TECHNICAL THROUGHPUT ONLY; NOT ECONOMIC OR DEPLOYMENT EVIDENCE"
   },
   "economic_status": {

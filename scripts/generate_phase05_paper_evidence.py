@@ -12,12 +12,18 @@ from hyperlab.paper.phase05_portfolio import build_phase05_phase08_paper_foundat
 _EVIDENCE_TIME = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 
 
+def canonical_lf_text_bytes(payload: bytes) -> bytes:
+    """Return strict UTF-8 text with checkout-independent LF endings."""
+
+    return payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
 def build_evidence(repository_root: Path) -> dict[str, object]:
     report_root = repository_root / "reports" / "phase12-phase05"
     benchmark_path = report_root / "benchmark.json"
     if not benchmark_path.is_file():
         raise FileNotFoundError("run benchmark_paper_phase05_portfolio.py before evidence generation")
-    benchmark_bytes = benchmark_path.read_bytes()
+    benchmark_bytes = canonical_lf_text_bytes(benchmark_path.read_bytes())
     benchmark = json.loads(benchmark_bytes)
     warning = benchmark.get("synthetic_warning")
     if not isinstance(warning, str) or "NOT ECONOMIC" not in warning:
@@ -113,14 +119,16 @@ def main() -> int:
     args = parser.parse_args()
     repository_root = args.repository_root.resolve()
     output = args.output or (repository_root / "reports" / "phase12-phase05" / "technical-evidence.json")
-    rendered = json.dumps(build_evidence(repository_root), indent=2, sort_keys=True) + "\n"
+    rendered = (json.dumps(build_evidence(repository_root), indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     if args.check:
-        if not output.is_file() or output.read_text(encoding="utf-8") != rendered:
+        if not output.is_file() or output.read_bytes() != rendered:
             raise SystemExit("Phase 05 technical evidence differs from current source/runtime")
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rendered, encoding="utf-8")
-    print(rendered, end="")
+        output.write_bytes(rendered)
+    print(rendered.decode("utf-8"), end="")
     return 0
 
 

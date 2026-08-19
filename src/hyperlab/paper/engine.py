@@ -3895,6 +3895,19 @@ class PaperEngine:
             min(order.remaining_quantity, allowed_total - order.filled_quantity),
         )
 
+    @staticmethod
+    def _entry_group_is_proportionally_filled(orders: list[PaperOrder]) -> bool:
+        """Return whether a terminal partial entry preserves every requested leg ratio."""
+
+        if len(orders) < 2 or any(order.status.active or order.filled_quantity <= 0 for order in orders):
+            return False
+        anchor = orders[0]
+        return all(
+            order.filled_quantity * anchor.intent.quantity
+            == anchor.filled_quantity * order.intent.quantity
+            for order in orders[1:]
+        )
+
     def _derive_lifecycle(
         self,
         projection: PaperProjection,
@@ -3961,7 +3974,7 @@ class PaperEngine:
             fully_filled = bool(entry_orders) and all(
                 order.status is OrderStatus.FILLED for order in entry_orders
             )
-            if fully_filled:
+            if fully_filled or self._entry_group_is_proportionally_filled(entry_orders):
                 target = PaperState.HEDGED
             elif projection.positions:
                 target = PaperState.HEDGE_PENDING
@@ -4043,7 +4056,7 @@ class PaperEngine:
             fully_filled = bool(entry_orders) and all(
                 order.status is OrderStatus.FILLED for order in entry_orders
             )
-            if fully_filled:
+            if fully_filled or self._entry_group_is_proportionally_filled(entry_orders):
                 target = PaperState.HEDGED
             elif strategy.positions:
                 target = PaperState.HEDGE_PENDING

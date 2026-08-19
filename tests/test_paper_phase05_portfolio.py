@@ -31,10 +31,15 @@ from hyperlab.paper.collector_source import (
 )
 from hyperlab.paper.engine import PaperEngine
 from hyperlab.paper.models import (
+    DecisionAction,
+    DecisionIntent,
     MarketEvent,
+    OrderIntent,
     OrderSide,
     PaperExecutionConfig,
+    PaperOrderType,
     PaperState,
+    TimeInForce,
     decimal_text,
     utc_text,
 )
@@ -771,3 +776,113 @@ def test_real_phase05_phase08_same_observation_funding_restart_and_replay(
     replay = replay_paper_run(store, foundation.config.run_id)
     assert replay.projection_hash == projection.canonical_hash
     assert replay.to_dict()["status"] == "REPLAY_EXACT"
+
+
+def test_phase08_proportional_terminal_partial_iocs_are_hedged_without_timeout(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    engine = PaperEngine(PaperStore(tmp_path / "proportional-partials.sqlite3"), foundation.config)
+    engine.start()
+    strategy = foundation.config.strategy_config(PHASE08_PAIRS_STRATEGY_ID)
+    decided_at = _START + timedelta(seconds=1)
+
+    def market(instrument: str, ordinal: int) -> MarketEvent:
+        return MarketEvent.create(
+            received_at=decided_at,
+            instrument=instrument,
+            bid_price=Decimal("1"),
+            ask_price=Decimal("1"),
+            bid_depth=Decimal("1"),
+            ask_depth=Decimal("1"),
+            source_sequence=800_000 + ordinal,
+            capture_ordinal=ordinal,
+        )
+
+    markets = {_ETH: market(_ETH, 1), _BTC: market(_BTC, 2)}
+    anchor = markets[_BTC]
+    signal = {"fixture": "proportional-terminal-partial-iocs"}
+    decision_id = DecisionIntent.identifier(
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        market_event_id=anchor.event_id,
+        action=DecisionAction.ENTRY,
+        ordinal=0,
+        signal=signal,
+    )
+    orders = (
+        OrderIntent.create(
+            decision_id=decision_id,
+            run_id=foundation.config.run_id,
+            strategy_id=strategy.strategy_id,
+            instrument=_ETH,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.2"),
+            order_type=PaperOrderType.TAKER,
+            time_in_force=TimeInForce.IOC,
+            created_at=decided_at,
+            ordinal=0,
+            hedge_group_id="phase08-proportional-partial-fixture",
+            leg_number=1,
+        ),
+        OrderIntent.create(
+            decision_id=decision_id,
+            run_id=foundation.config.run_id,
+            strategy_id=strategy.strategy_id,
+            instrument=_BTC,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.01"),
+            order_type=PaperOrderType.TAKER,
+            time_in_force=TimeInForce.IOC,
+            created_at=decided_at,
+            ordinal=1,
+            hedge_group_id="phase08-proportional-partial-fixture",
+            leg_number=2,
+        ),
+    )
+    decision = DecisionIntent(
+        decision_id=decision_id,
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        strategy_name=strategy.strategy_name,
+        strategy_hash=strategy.strategy_hash,
+        strategy_config_hash=strategy.strategy_config_hash,
+        action=DecisionAction.ENTRY,
+        decided_at=decided_at,
+        received_at=decided_at,
+        market_event_id=anchor.event_id,
+        observed_event_ids=tuple(item.event_id for item in markets.values()),
+        orders=orders,
+        ordinal=0,
+        signal=signal,
+    )
+    engine.process_market(markets[_ETH])
+    engine.process_market(markets[_BTC])
+    engine.submit_decision(decision, markets)
+
+    def fill_market(instrument: str, ordinal: int, offset_seconds: int) -> MarketEvent:
+        return MarketEvent.create(
+            received_at=decided_at + timedelta(seconds=offset_seconds),
+            instrument=instrument,
+            bid_price=Decimal("1"),
+            ask_price=Decimal("1"),
+            bid_depth=Decimal("1"),
+            ask_depth=Decimal("1"),
+            source_sequence=800_000 + ordinal,
+            capture_ordinal=ordinal,
+        )
+
+    engine.process_market(fill_market(_ETH, 3, 1))
+    filled = engine.process_market(fill_market(_BTC, 4, 2)).projection
+    owned = filled.strategy_projection(PHASE08_PAIRS_STRATEGY_ID)
+
+    assert [filled.orders[order.order_id].filled_quantity for order in orders] == [
+        Decimal("0.1"),
+        Decimal("0.005"),
+    ]
+    assert owned.state is PaperState.HEDGED
+    after_timeout = engine.process_timer(as_of=decided_at + timedelta(seconds=30)).projection
+    assert after_timeout.strategy_projection(PHASE08_PAIRS_STRATEGY_ID).state is PaperState.HEDGED
+    assert not any(alert.code == "UNHEDGED_TIMEOUT" for alert in engine.store.get_alerts(engine.run_id))
+    assert engine.replay().to_dict() == after_timeout.to_dict()
+    foundation.source.close()

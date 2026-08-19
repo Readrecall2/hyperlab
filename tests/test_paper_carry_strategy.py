@@ -388,6 +388,34 @@ def test_phase05_signal_waits_for_both_post_bar_execution_quotes() -> None:
     assert decision.observed_event_ids[-2:] == (spot.event_id, perp.event_id)
 
 
+def test_phase05_ignores_cached_prior_hour_leg_after_asymmetric_rollover() -> None:
+    strategy, strategy_hash, strategy_config_hash = _bound_strategy()
+    view = _view(strategy, strategy_hash, strategy_config_hash)
+    prior_spot = _market(
+        _SPOT,
+        _START + timedelta(minutes=59, seconds=58),
+        mid=Decimal("100"),
+        capture_ordinal=1,
+    )
+    prior_perp = _market(
+        _PERP,
+        _START + timedelta(minutes=59, seconds=59),
+        mid=Decimal("100.5"),
+        capture_ordinal=2,
+    )
+    strategy.decide({_SPOT: prior_spot, _PERP: prior_perp}, view)
+    new_spot = _market(
+        _SPOT,
+        _START + timedelta(hours=1, microseconds=184_780),
+        mid=Decimal("100.1"),
+        capture_ordinal=3,
+    )
+    asymmetric_frame = {_SPOT: new_spot, _PERP: prior_perp}
+
+    assert strategy.decide(asymmetric_frame, view) is None
+    assert strategy.decide(asymmetric_frame, view) is None
+
+
 def test_phase05_restoration_reconstructs_signal_state_without_reemitting_history() -> None:
     live, strategy_hash, strategy_config_hash = _bound_strategy()
     inputs: list[MarketEvent | PublicFundingSettlement] = []

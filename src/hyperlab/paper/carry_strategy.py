@@ -249,6 +249,7 @@ class FrozenCashAndCarryPaperStrategy:
         self._funding_order: deque[datetime] = deque()
         self._pending_bucket: datetime | None = None
         self._pending_markets: dict[str, MarketEvent] = {}
+        self._latest_markets: dict[str, MarketEvent] = {}
         self._seen_funding_ids: set[str] = set()
         self._last_market_received_at: datetime | None = None
         self._last_funding_time: datetime | None = None
@@ -389,6 +390,7 @@ class FrozenCashAndCarryPaperStrategy:
         self._funding_order.clear()
         self._pending_bucket = None
         self._pending_markets.clear()
+        self._latest_markets.clear()
         self._seen_funding_ids.clear()
         self._last_market_received_at = None
         self._last_funding_time = None
@@ -404,11 +406,12 @@ class FrozenCashAndCarryPaperStrategy:
     def _ingest_market(self, market: MarketEvent) -> bool:
         if market.instrument not in self._instruments:
             return False
-        if self._pending_markets.get(market.instrument) == market:
+        if self._latest_markets.get(market.instrument) == market:
             return False
         if self._last_market_received_at is not None and market.received_at < self._last_market_received_at:
             raise ValueError("durable Phase 05 markets must be supplied in commit-time order")
         self._last_market_received_at = market.received_at
+        self._latest_markets[market.instrument] = market
         bucket = _hour(market.received_at)
         completed = False
         if self._pending_bucket is None:

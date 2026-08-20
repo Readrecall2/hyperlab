@@ -770,7 +770,10 @@ class PaperEngine:
             episode_id = deterministic_id(
                 "paper_market_gap_episode" if market.gap else "paper_stale_feed_episode",
                 self.run_id,
-                utc_text(working.last_market_received_at or self.config.validation_started_at),
+                utc_text(
+                    working.last_market_received_at
+                    or self.config.validation_started_at
+                ),
             )
             alert_payload = self._alert_payload(
                 code=code,
@@ -779,7 +782,10 @@ class PaperEngine:
                 causation_id=episode_id,
                 at=processed,
             )
-            if not self._alert_is_durable(str(alert_payload["alert_id"])):
+            if (
+                working.state is not PaperState.PAUSED
+                and not self._alert_is_durable(str(alert_payload["alert_id"]))
+            ):
                 emit(PaperEventType.ALERT_RAISED, alert_payload)
             if working.state not in {
                 PaperState.EMERGENCY_FLATTEN,
@@ -3920,12 +3926,16 @@ class PaperEngine:
     def _entry_group_is_proportionally_filled(orders: list[PaperOrder]) -> bool:
         """Return whether a terminal partial entry preserves every requested leg ratio."""
 
-        if len(orders) < 2 or any(order.status.active or order.filled_quantity <= 0 for order in orders):
+        if len(orders) < 2 or any(
+            order.status.active or order.filled_quantity <= 0
+            for order in orders
+        ):
             return False
+
         anchor = orders[0]
+        anchor_completion = anchor.filled_quantity / anchor.intent.quantity
         return all(
-            order.filled_quantity * anchor.intent.quantity
-            == anchor.filled_quantity * order.intent.quantity
+            order.filled_quantity / order.intent.quantity == anchor_completion
             for order in orders[1:]
         )
 

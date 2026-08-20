@@ -1053,3 +1053,18 @@ def test_phase08_second_ioc_waits_for_earlier_leg_fill_before_hedging(
     assert engine.replay().to_dict() == after_timeout.to_dict()
 
     foundation.source.close()
+
+
+def test_phase08_live_decimal_noise_preserves_proportional_terminal_fill() -> None:
+    """The live 1% partial hedge must not fail because of Decimal cross-product noise."""
+
+    requested_eth = Decimal("0.045")
+    filled_eth = Decimal("0.0004500000000000000893615119968")
+
+    requested_btc = Decimal("0.00214")
+    filled_btc = Decimal("0.0000214000000000000042496363483")
+
+    assert filled_eth / requested_eth == filled_btc / requested_btc
+
+    # The historical cross-product comparison is not exact for these live values.
+    assert filled_eth * requested_btc != filled_btc * requested_eth

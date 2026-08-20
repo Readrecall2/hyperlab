@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -25,7 +26,7 @@ from hyperlab.paper.models import (
 from hyperlab.paper.reducer import apply_event, transaction_ledger_amounts
 
 SCHEMA_VERSION = 1
-STORE_SCHEMA_VERSION = 2
+STORE_SCHEMA_VERSION = 3
 GENESIS_SEQUENCE = 0
 ZERO_HASH = "0" * 64
 
@@ -475,6 +476,10 @@ CREATE TABLE paper_projection_history (
     event_head_hash TEXT NOT NULL,
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL,
+    payload_zlib BLOB,
+    payload_codec TEXT NOT NULL DEFAULT 'json',
+    last_received_at TEXT,
+    utc_date TEXT,
     projection_hash TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, revision),
@@ -686,6 +691,66 @@ def _json_object(value: str, *, label: str) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], decoded)
 
 
+
+_HISTORY_CODEC_JSON = "json"
+_HISTORY_CODEC_ZLIB_JSON_V1 = "zlib-json-v1"
+
+
+def _projection_history_storage(
+    payload: Mapping[str, JsonValue],
+    payload_json: str,
+) -> tuple[str, bytes, str, str | None, str | None]:
+    raw_last_received_at = payload.get("last_received_at")
+    last_received_at = (
+        raw_last_received_at
+        if isinstance(raw_last_received_at, str)
+        else None
+    )
+    utc_date = (
+        last_received_at[:10]
+        if last_received_at is not None and len(last_received_at) >= 10
+        else None
+    )
+    compressed = zlib.compress(payload_json.encode("utf-8"), level=6)
+    return (
+        "",
+        compressed,
+        _HISTORY_CODEC_ZLIB_JSON_V1,
+        last_received_at,
+        utc_date,
+    )
+
+
+def _projection_history_json(row: sqlite3.Row, *, label: str) -> str:
+    keys = set(row.keys())
+    codec = (
+        str(row["payload_codec"])
+        if "payload_codec" in keys
+        else _HISTORY_CODEC_JSON
+    )
+    if codec == _HISTORY_CODEC_JSON:
+        return str(row["payload_json"])
+    if codec != _HISTORY_CODEC_ZLIB_JSON_V1:
+        raise ValueError(f"{label} uses unsupported payload codec {codec!r}")
+    if "payload_zlib" not in keys or row["payload_zlib"] is None:
+        raise ValueError(f"{label} compressed payload is missing")
+    raw = row["payload_zlib"]
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError(f"{label} compressed payload has invalid storage type")
+    try:
+        return zlib.decompress(bytes(raw)).decode("utf-8")
+    except (zlib.error, UnicodeDecodeError) as error:
+        raise ValueError(f"{label} compressed payload is invalid") from error
+
+
+def _projection_history_payload(
+    row: sqlite3.Row,
+    *,
+    label: str,
+) -> dict[str, JsonValue]:
+    return _json_object(_projection_history_json(row, label=label), label=label)
+
+
 def _state_from_projection(payload: Mapping[str, JsonValue], *, default: str) -> str:
     raw = payload.get("state", payload.get("status", default))
     state = raw.value if isinstance(raw, Enum) else raw
@@ -880,7 +945,7 @@ class PaperStore:
                     "paper store schema "
                     f"{version} is newer than supported schema {STORE_SCHEMA_VERSION}"
                 )
-            if version not in {0, 1, STORE_SCHEMA_VERSION}:
+            if version not in {0, 1, 2, STORE_SCHEMA_VERSION}:
                 raise SchemaVersionError(
                     "paper store schema "
                     f"{version} has no forward migration to {STORE_SCHEMA_VERSION}"
@@ -900,6 +965,9 @@ class PaperStore:
                 )
             elif version == 1:
                 self._migrate_v1_to_v2(connection)
+                self._migrate_v2_to_v3(connection)
+            elif version == 2:
+                self._migrate_v2_to_v3(connection)
             self._verify_schema(connection)
 
     @staticmethod
@@ -927,6 +995,69 @@ class PaperStore:
             "COMMIT;"
         )
 
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        metadata = connection.execute(
+            "SELECT version FROM paper_schema WHERE singleton=1"
+        ).fetchone()
+        if metadata is None or int(metadata[0]) != 2:
+            raise SchemaVersionError("paper store v2 metadata is inconsistent")
+
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info('paper_projection_history')"
+            )
+        }
+        required_legacy = {
+            "run_id",
+            "revision",
+            "input_id",
+            "event_sequence",
+            "event_head_hash",
+            "status",
+            "payload_json",
+            "projection_hash",
+            "created_at",
+        }
+        if not required_legacy.issubset(columns):
+            raise SchemaVersionError(
+                "paper store v2 projection history differs from recognized schema"
+            )
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if "payload_zlib" not in columns:
+                connection.execute(
+                    "ALTER TABLE paper_projection_history "
+                    "ADD COLUMN payload_zlib BLOB"
+                )
+            if "payload_codec" not in columns:
+                connection.execute(
+                    "ALTER TABLE paper_projection_history "
+                    "ADD COLUMN payload_codec TEXT NOT NULL DEFAULT 'json'"
+                )
+            if "last_received_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE paper_projection_history "
+                    "ADD COLUMN last_received_at TEXT"
+                )
+            if "utc_date" not in columns:
+                connection.execute(
+                    "ALTER TABLE paper_projection_history "
+                    "ADD COLUMN utc_date TEXT"
+                )
+
+            connection.execute(
+                "UPDATE paper_schema SET version=3 WHERE singleton=1"
+            )
+            connection.execute("PRAGMA user_version=3")
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
     def _verify_schema(self, connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version != STORE_SCHEMA_VERSION:
@@ -950,6 +1081,24 @@ class PaperStore:
             raise SchemaVersionError(
                 "paper event-input index does not bind input order to event sequence"
             )
+        history_columns = {
+            str(column_row[1])
+            for column_row in connection.execute(
+                "PRAGMA table_info('paper_projection_history')"
+            )
+        }
+        required_history_columns = {
+            "payload_json",
+            "payload_zlib",
+            "payload_codec",
+            "last_received_at",
+            "utc_date",
+        }
+        if not required_history_columns.issubset(history_columns):
+            raise SchemaVersionError(
+                "paper projection history compression columns are missing"
+            )
+
         foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
         if foreign_keys != 1 or synchronous < 2:
@@ -1095,18 +1244,30 @@ class PaperStore:
                         now,
                     ),
                 )
+                (
+                    history_json,
+                    history_zlib,
+                    history_codec,
+                    history_last_received_at,
+                    history_utc_date,
+                ) = _projection_history_storage(projection, projection_json)
                 connection.execute(
                     """
                     INSERT INTO paper_projection_history (
                         run_id, revision, input_id, event_sequence, event_head_hash,
-                        status, payload_json, projection_hash, created_at
-                    ) VALUES (?, 0, NULL, 0, ?, ?, ?, ?, ?)
+                        status, payload_json, payload_zlib, payload_codec,
+                        last_received_at, utc_date, projection_hash, created_at
+                    ) VALUES (?, 0, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_run_id,
                         event_head,
                         projection_status,
-                        projection_json,
+                        history_json,
+                        history_zlib,
+                        history_codec,
+                        history_last_received_at,
+                        history_utc_date,
                         projection_hash,
                         now,
                     ),
@@ -1416,12 +1577,20 @@ class PaperStore:
                         normalized_run_id,
                     ),
                 )
+                (
+                    history_json,
+                    history_zlib,
+                    history_codec,
+                    history_last_received_at,
+                    history_utc_date,
+                ) = _projection_history_storage(projection_payload, projection_json)
                 connection.execute(
                     """
                     INSERT INTO paper_projection_history (
                         run_id, revision, input_id, event_sequence, event_head_hash,
-                        status, payload_json, projection_hash, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, payload_json, payload_zlib, payload_codec,
+                        last_received_at, utc_date, projection_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_run_id,
@@ -1430,7 +1599,11 @@ class PaperStore:
                         resulting_sequence,
                         resulting_event_head,
                         projection_status,
-                        projection_json,
+                        history_json,
+                        history_zlib,
+                        history_codec,
+                        history_last_received_at,
+                        history_utc_date,
                         projection_hash,
                         now,
                     ),
@@ -2219,14 +2392,26 @@ class PaperStore:
         ).fetchone()
         if history is None:
             issue("PROJECTION_HISTORY_HEAD_MISSING", f"projection revision {revision} is missing")
-        elif projection is not None and (
-            str(history["projection_hash"]) != str(projection["projection_hash"])
-            or str(history["payload_json"]) != str(projection["payload_json"])
-            or int(history["event_sequence"]) != event_count
-            or str(history["event_head_hash"]) != event_head
-            or str(history["status"]) != str(projection["status"])
-        ):
-            issue("PROJECTION_HISTORY_HEAD", "projection head differs from immutable history")
+        elif projection is not None:
+            try:
+                history_payload_json = _projection_history_json(
+                    history,
+                    label=f"projection revision {revision}",
+                )
+            except ValueError as error:
+                issue("PROJECTION_HISTORY_HEAD", str(error))
+                history_payload_json = ""
+            if (
+                str(history["projection_hash"]) != str(projection["projection_hash"])
+                or history_payload_json != str(projection["payload_json"])
+                or int(history["event_sequence"]) != event_count
+                or str(history["event_head_hash"]) != event_head
+                or str(history["status"]) != str(projection["status"])
+            ):
+                issue(
+                    "PROJECTION_HISTORY_HEAD",
+                    "projection head differs from immutable history",
+                )
 
         commit_count = int(run["commit_count"])
         commit_head = str(run["commit_head_hash"])
@@ -3133,11 +3318,15 @@ class PaperStore:
             if revision != expected_revision:
                 issue("PROJECTION_HISTORY_GAP", f"expected projection revision {expected_revision}")
             try:
-                payload = _json_object(
-                    str(row["payload_json"]),
+                history_payload_json = _projection_history_json(
+                    row,
                     label=f"projection revision {revision}",
                 )
-                if canonical_json(payload) != str(row["payload_json"]):
+                payload = _json_object(
+                    history_payload_json,
+                    label=f"projection revision {revision}",
+                )
+                if canonical_json(payload) != history_payload_json:
                     issue("PROJECTION_NOT_CANONICAL", f"projection revision {revision}")
                 if canonical_sha256(payload) != str(row["projection_hash"]):
                     issue("PROJECTION_HASH", f"projection revision {revision} hash differs")
@@ -3168,7 +3357,13 @@ class PaperStore:
                 ):
                     issue("PROJECTION_COMMIT_ANCHOR", f"projection revision {revision} differs")
             latest_history_hash = str(row["projection_hash"])
-            latest_history_json = str(row["payload_json"])
+            try:
+                latest_history_json = _projection_history_json(
+                    row,
+                    label=f"projection revision {revision}",
+                )
+            except ValueError:
+                latest_history_json = None
         if history_count != commit_count + 1:
             issue("PROJECTION_HISTORY_COUNT", "projection history and commit counts differ")
 
@@ -3534,11 +3729,18 @@ class PaperStore:
         with self._read_connection() as connection:
             row = connection.execute(
                 """
-                SELECT payload_json
+                SELECT *
                 FROM paper_projection_history
                 WHERE run_id=?
-                  AND json_type(payload_json, '$.last_received_at')='text'
-                  AND json_extract(payload_json, '$.last_received_at') < ?
+                  AND COALESCE(
+                        last_received_at,
+                        CASE
+                            WHEN payload_json != ''
+                             AND json_type(payload_json, '$.last_received_at')='text'
+                            THEN json_extract(payload_json, '$.last_received_at')
+                            ELSE NULL
+                        END
+                      ) < ?
                 ORDER BY revision DESC
                 LIMIT 1
                 """,
@@ -3547,7 +3749,7 @@ class PaperStore:
         if row is None:
             return None
         return PaperProjection.from_dict(
-            _json_object(str(row["payload_json"]), label="historical projection")
+            _projection_history_payload(row, label="historical projection")
         )
 
     def load_projection(self, run_id: str) -> PaperProjection:
@@ -3570,11 +3772,23 @@ class PaperStore:
                 WITH dated AS (
                     SELECT
                         h.*,
-                        CASE
-                            WHEN json_type(h.payload_json, '$.last_received_at') = 'text'
-                            THEN substr(json_extract(h.payload_json, '$.last_received_at'), 1, 10)
-                            ELSE substr(json_extract(r.config_json, '$.validation_started_at'), 1, 10)
-                        END AS utc_date
+                        COALESCE(
+                            h.utc_date,
+                            CASE
+                                WHEN h.payload_json != ''
+                                 AND json_type(h.payload_json, '$.last_received_at')='text'
+                                THEN substr(
+                                    json_extract(h.payload_json, '$.last_received_at'),
+                                    1,
+                                    10
+                                )
+                                ELSE substr(
+                                    json_extract(r.config_json, '$.validation_started_at'),
+                                    1,
+                                    10
+                                )
+                            END
+                        ) AS report_utc_date
                     FROM paper_projection_history AS h
                     JOIN paper_runs AS r ON r.run_id=h.run_id
                     WHERE h.run_id=?
@@ -3582,66 +3796,58 @@ class PaperStore:
                     SELECT
                         *,
                         row_number() OVER (
-                            PARTITION BY utc_date ORDER BY revision DESC
+                            PARTITION BY report_utc_date
+                            ORDER BY revision DESC
                         ) AS day_rank
                     FROM dated
                 )
-                SELECT
-                    run_id,
-                    revision,
-                    input_id,
-                    event_sequence,
-                    event_head_hash,
-                    status,
-                    projection_hash,
-                    created_at,
-                    utc_date,
-                    json_object(
-                        'cash', json_extract(payload_json, '$.cash'),
-                        'cost_basis', json(
-                            coalesce(json_extract(payload_json, '$.cost_basis'), '{}')
-                        ),
-                        'fees', json_extract(payload_json, '$.fees'),
-                        'initial_cash', json_extract(payload_json, '$.initial_cash'),
-                        'inventory_value', json(
-                            coalesce(json_extract(payload_json, '$.inventory_value'), '{}')
-                        ),
-                        'marks', json(coalesce(json_extract(payload_json, '$.marks'), '{}')),
-                        'peak_equity', json_extract(payload_json, '$.peak_equity'),
-                        'positions', json(
-                            coalesce(json_extract(payload_json, '$.positions'), '{}')
-                        ),
-                        'realized_pnl', json_extract(payload_json, '$.realized_pnl'),
-                        'session_date', json_extract(payload_json, '$.session_date'),
-                        'session_start_equity', json_extract(
-                            payload_json, '$.session_start_equity'
-                        )
-                    ) AS report_projection_json
+                SELECT *
                 FROM ranked
                 WHERE day_rank=1
-                ORDER BY utc_date DESC
+                ORDER BY report_utc_date DESC
                 LIMIT ?
                 """,
                 (normalized_run_id, limit),
             ).fetchall()
-        records = tuple(
-            ProjectionHistoryRecord(
-                run_id=str(row["run_id"]),
-                revision=int(row["revision"]),
-                input_id=(str(row["input_id"]) if row["input_id"] is not None else None),
-                event_sequence=int(row["event_sequence"]),
-                event_head_hash=str(row["event_head_hash"]),
-                status=str(row["status"]),
-                projection=_json_object(
-                    str(row["report_projection_json"]),
-                    label="projection history payload",
-                ),
-                projection_hash=str(row["projection_hash"]),
-                created_at=str(row["created_at"]),
-                utc_date=str(row["utc_date"]),
+
+        records: list[ProjectionHistoryRecord] = []
+        for row in rows:
+            payload = _projection_history_payload(
+                row,
+                label="projection history payload",
             )
-            for row in rows
-        )
+            report_projection: dict[str, JsonValue] = {
+                "cash": payload.get("cash"),
+                "cost_basis": payload.get("cost_basis", {}),
+                "fees": payload.get("fees"),
+                "initial_cash": payload.get("initial_cash"),
+                "inventory_value": payload.get("inventory_value", {}),
+                "marks": payload.get("marks", {}),
+                "peak_equity": payload.get("peak_equity"),
+                "positions": payload.get("positions", {}),
+                "realized_pnl": payload.get("realized_pnl"),
+                "session_date": payload.get("session_date"),
+                "session_start_equity": payload.get("session_start_equity"),
+            }
+            records.append(
+                ProjectionHistoryRecord(
+                    run_id=str(row["run_id"]),
+                    revision=int(row["revision"]),
+                    input_id=(
+                        str(row["input_id"])
+                        if row["input_id"] is not None
+                        else None
+                    ),
+                    event_sequence=int(row["event_sequence"]),
+                    event_head_hash=str(row["event_head_hash"]),
+                    status=str(row["status"]),
+                    projection=report_projection,
+                    projection_hash=str(row["projection_hash"]),
+                    created_at=str(row["created_at"]),
+                    utc_date=str(row["report_utc_date"]),
+                )
+            )
+
         return tuple(reversed(records))
 
     def get_ledger_account_total(

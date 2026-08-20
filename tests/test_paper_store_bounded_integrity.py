@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import zlib
 from collections import defaultdict
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -224,7 +225,7 @@ def test_v1_store_migrates_to_covering_event_input_index_without_head_drift(
     assert migrated.get_projection(config.run_id).to_dict() == before_projection
     assert migrated.inspect_integrity_readonly(config.run_id).ok is True
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         columns = tuple(
             str(row[2])
             for row in connection.execute(
@@ -458,3 +459,156 @@ def test_get_latest_alert_uses_bounded_indexed_severity_lookup(
         "paper_alerts_run_severity_sequence_idx" in str(row[3])
         for row in plan
     )
+
+
+def test_v3_projection_history_uses_compressed_payloads(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper-v3-compressed-history.sqlite3"
+    store, config = _build_journal(database, market_count=8)
+
+    assert store.inspect_integrity_readonly(config.run_id).ok is True
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            """
+            SELECT payload_json, payload_zlib, payload_codec
+            FROM paper_projection_history
+            WHERE run_id=?
+            ORDER BY revision DESC
+            LIMIT 1
+            """,
+            (config.run_id,),
+        ).fetchone()
+
+        assert row is not None
+        assert row[0] == ""
+        assert isinstance(row[1], bytes)
+        assert len(row[1]) > 0
+        assert row[2] == "zlib-json-v1"
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+
+    projection = store.get_projection(config.run_id)
+    before = store.get_projection_before_received_at(
+        config.run_id,
+        before=projection.last_received_at + timedelta(microseconds=1),
+    )
+    assert before is not None
+    assert before.to_dict() == projection.to_dict()
+
+    daily = store.get_daily_projection_records(config.run_id, limit=7)
+    assert daily
+    assert daily[-1].projection_hash == store.get_run(config.run_id).projection_hash
+
+
+def test_v2_store_migrates_to_v3_without_rewriting_existing_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper-v2-to-v3.sqlite3"
+    store, config = _build_journal(database, market_count=8)
+    before = store.get_run(config.run_id)
+    before_projection = store.get_projection(config.run_id).to_dict()
+    store.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DROP TRIGGER paper_projection_history_no_update"
+        )
+        rows = connection.execute(
+            """
+            SELECT run_id, revision, payload_zlib
+            FROM paper_projection_history
+            """
+        ).fetchall()
+        for run_id, revision, payload_zlib in rows:
+            assert payload_zlib is not None
+            payload_json = zlib.decompress(payload_zlib).decode("utf-8")
+            connection.execute(
+                """
+                UPDATE paper_projection_history
+                SET payload_json=?,
+                    payload_codec='json',
+                    payload_zlib=NULL,
+                    last_received_at=NULL,
+                    utc_date=NULL
+                WHERE run_id=? AND revision=?
+                """,
+                (payload_json, run_id, revision),
+            )
+        connection.execute(
+            "ALTER TABLE paper_projection_history RENAME TO paper_projection_history_v3"
+        )
+        connection.execute(
+            """
+            CREATE TABLE paper_projection_history (
+                run_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                input_id TEXT,
+                event_sequence INTEGER NOT NULL CHECK (event_sequence >= 0),
+                event_head_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                projection_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, revision),
+                FOREIGN KEY (run_id) REFERENCES paper_runs(run_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO paper_projection_history (
+                run_id, revision, input_id, event_sequence,
+                event_head_hash, status, payload_json,
+                projection_hash, created_at
+            )
+            SELECT
+                run_id, revision, input_id, event_sequence,
+                event_head_hash, status, payload_json,
+                projection_hash, created_at
+            FROM paper_projection_history_v3
+            """
+        )
+        connection.execute("DROP TABLE paper_projection_history_v3")
+        connection.executescript(
+            """
+            CREATE TRIGGER paper_projection_history_no_update
+            BEFORE UPDATE ON paper_projection_history BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'paper projection history is append-only'
+                );
+            END;
+
+            CREATE TRIGGER paper_projection_history_no_delete
+            BEFORE DELETE ON paper_projection_history BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'paper projection history is append-only'
+                );
+            END;
+            """
+        )
+        connection.execute(
+            "UPDATE paper_schema SET version=2 WHERE singleton=1"
+        )
+        connection.execute("PRAGMA user_version=2")
+
+    migrated = PaperStore(database)
+
+    assert migrated.get_run(config.run_id).head_identity == before.head_identity
+    assert migrated.get_projection(config.run_id).to_dict() == before_projection
+    assert migrated.inspect_integrity_readonly(config.run_id).ok is True
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        codecs = connection.execute(
+            """
+            SELECT DISTINCT payload_codec
+            FROM paper_projection_history
+            WHERE run_id=?
+            """,
+            (config.run_id,),
+        ).fetchall()
+
+    assert codecs == [("json",)]

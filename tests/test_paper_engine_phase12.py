@@ -152,6 +152,8 @@ def _market(
     stale: bool = False,
     gap: bool = False,
     tradable: bool = True,
+    source_connection_id: str | None = None,
+    source_connection_epoch: int | None = None,
 ) -> MarketEvent:
     return MarketEvent.create(
         received_at=at,
@@ -167,6 +169,8 @@ def _market(
         stale=stale,
         gap=gap,
         tradable=tradable,
+        source_connection_id=source_connection_id,
+        source_connection_epoch=source_connection_epoch,
     )
 
 
@@ -2823,3 +2827,58 @@ def test_resume_requires_bilateral_fresh_public_bbos(tmp_path: Path) -> None:
 
     assert resumed.state is PaperState.FLAT
     assert engine.replay().to_dict() == resumed.to_dict()
+
+def test_market_gap_does_not_duplicate_critical_while_already_paused(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    store, engine = _started_engine(tmp_path / "market-gap-dedup.sqlite3", config)
+
+    first = engine.process_market(
+        _market(
+            "gap-first",
+            _START + timedelta(seconds=1),
+            gap=True,
+            source_connection_id="connection-1",
+            source_connection_epoch=1,
+        )
+    ).projection
+
+    assert first.state is PaperState.PAUSED
+
+    engine.process_market(
+        _market(
+            "gap-same-epoch",
+            _START + timedelta(seconds=2),
+            gap=True,
+            source_connection_id="connection-1",
+            source_connection_epoch=1,
+        )
+    )
+
+    engine.process_market(
+        _market(
+            "gap-new-epoch",
+            _START + timedelta(hours=3),
+            gap=True,
+            source_connection_id="connection-2",
+            source_connection_epoch=2,
+        )
+    )
+
+    engine.process_market(
+        _market(
+            "gap-without-connection",
+            _START + timedelta(hours=6),
+            gap=True,
+        )
+    )
+
+    alerts = [
+        alert
+        for alert in store.get_alerts(config.run_id)
+        if alert.code == "MARKET_GAP"
+    ]
+
+    assert len(alerts) == 1
+    assert engine.projection().state is PaperState.PAUSED

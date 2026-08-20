@@ -3615,7 +3615,28 @@ class PaperEngine:
         elif intent.time_in_force is TimeInForce.IOC and intent.leg_number > 1:
             quantity_cap = self._hedge_quantity_cap(projection, order)
             if quantity_cap <= 0:
-                self._terminal_ioc(projection, events, order, market, processed_at=processed_at, filled=False)
+                group_id = intent.hedge_group_id
+                waiting_on_earlier_leg = (
+                    group_id is not None
+                    and any(
+                        sibling.intent.decision_id == intent.decision_id
+                        and sibling.intent.hedge_group_id == group_id
+                        and sibling.intent.leg_number < intent.leg_number
+                        and sibling.status.active
+                        and sibling.filled_quantity == 0
+                        for sibling in projection.orders.values()
+                    )
+                )
+                if waiting_on_earlier_leg:
+                    return
+                self._terminal_ioc(
+                    projection,
+                    events,
+                    order,
+                    market,
+                    processed_at=processed_at,
+                    filled=False,
+                )
                 return
         is_maker = intent.order_type is PaperOrderType.MAKER
         if is_maker:

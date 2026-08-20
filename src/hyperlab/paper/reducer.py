@@ -198,10 +198,23 @@ def _sync_portfolio_state(
         PaperState.EMERGENCY_FLATTEN,
     }:
         return
+    strategies = tuple(projection.strategy_projections.values())
+    has_unhedged_position = any(
+        strategy.positions
+        and strategy.state in {
+            PaperState.LEG_1_PENDING,
+            PaperState.HEDGE_PENDING,
+        }
+        for strategy in strategies
+    )
     target = (
-        PaperState.HEDGED
-        if any(strategy.positions for strategy in projection.strategy_projections.values())
-        else PaperState.FLAT
+        PaperState.HEDGE_PENDING
+        if has_unhedged_position
+        else (
+            PaperState.HEDGED
+            if any(strategy.positions for strategy in strategies)
+            else PaperState.FLAT
+        )
     )
     if projection.state is not target:
         projection.state = target

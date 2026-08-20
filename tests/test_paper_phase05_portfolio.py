@@ -36,6 +36,7 @@ from hyperlab.paper.models import (
     MarketEvent,
     OrderIntent,
     OrderSide,
+    OrderStatus,
     PaperExecutionConfig,
     PaperOrderType,
     PaperState,
@@ -885,4 +886,170 @@ def test_phase08_proportional_terminal_partial_iocs_are_hedged_without_timeout(
     assert after_timeout.strategy_projection(PHASE08_PAIRS_STRATEGY_ID).state is PaperState.HEDGED
     assert not any(alert.code == "UNHEDGED_TIMEOUT" for alert in engine.store.get_alerts(engine.run_id))
     assert engine.replay().to_dict() == after_timeout.to_dict()
+    foundation.source.close()
+
+
+def test_phase08_second_ioc_waits_for_earlier_leg_fill_before_hedging(
+    tmp_path: Path,
+) -> None:
+    """A later IOC leg must not NO_FILL before an earlier sibling has had a fill."""
+
+    foundation = _foundation(tmp_path)
+    engine = PaperEngine(
+        PaperStore(tmp_path / "phase08-delayed-hedge-sequencing.sqlite3"),
+        foundation.config,
+    )
+    engine.start()
+
+    strategy = foundation.config.strategy_config(PHASE08_PAIRS_STRATEGY_ID)
+    decided_at = _START + timedelta(seconds=1)
+
+    def market(
+        instrument: str,
+        ordinal: int,
+        *,
+        offset_ms: int = 0,
+        depth: str = "1",
+    ) -> MarketEvent:
+        return MarketEvent.create(
+            received_at=decided_at + timedelta(milliseconds=offset_ms),
+            instrument=instrument,
+            bid_price=Decimal("1"),
+            ask_price=Decimal("1"),
+            bid_depth=Decimal(depth),
+            ask_depth=Decimal(depth),
+            source_sequence=900_000 + ordinal,
+            capture_ordinal=ordinal,
+        )
+
+    initial_markets = {
+        _ETH: market(_ETH, 1),
+        _BTC: market(_BTC, 2),
+    }
+    anchor = initial_markets[_BTC]
+    signal = {"fixture": "phase08-delayed-hedge-sequencing"}
+
+    decision_id = DecisionIntent.identifier(
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        market_event_id=anchor.event_id,
+        action=DecisionAction.ENTRY,
+        ordinal=0,
+        signal=signal,
+    )
+
+    eth_order = OrderIntent.create(
+        decision_id=decision_id,
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        instrument=_ETH,
+        side=OrderSide.SELL,
+        quantity=Decimal("0.036"),
+        order_type=PaperOrderType.TAKER,
+        time_in_force=TimeInForce.IOC,
+        created_at=decided_at,
+        ordinal=0,
+        hedge_group_id="phase08-delayed-hedge-fixture",
+        leg_number=1,
+    )
+    btc_order = OrderIntent.create(
+        decision_id=decision_id,
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        instrument=_BTC,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.0024"),
+        order_type=PaperOrderType.TAKER,
+        time_in_force=TimeInForce.IOC,
+        created_at=decided_at,
+        ordinal=1,
+        hedge_group_id="phase08-delayed-hedge-fixture",
+        leg_number=2,
+    )
+
+    decision = DecisionIntent(
+        decision_id=decision_id,
+        run_id=foundation.config.run_id,
+        strategy_id=strategy.strategy_id,
+        strategy_name=strategy.strategy_name,
+        strategy_hash=strategy.strategy_hash,
+        strategy_config_hash=strategy.strategy_config_hash,
+        action=DecisionAction.ENTRY,
+        decided_at=decided_at,
+        received_at=decided_at,
+        market_event_id=anchor.event_id,
+        observed_event_ids=tuple(item.event_id for item in initial_markets.values()),
+        orders=(eth_order, btc_order),
+        ordinal=0,
+        signal=signal,
+    )
+
+    engine.process_market(initial_markets[_ETH])
+    engine.process_market(initial_markets[_BTC])
+    engine.submit_decision(decision, initial_markets)
+
+    # Reproduce the live ordering:
+    # BTC gets a fresh executable BBO before ETH leg 1 has produced a durable fill.
+    btc_early = engine.process_market(
+        market(_BTC, 3, offset_ms=100)
+    ).projection
+
+    assert btc_early.orders[eth_order.order_id].status is OrderStatus.ACKED
+    assert btc_early.orders[eth_order.order_id].filled_quantity == Decimal("0")
+    assert btc_early.orders[btc_order.order_id].status is OrderStatus.ACKED
+    assert btc_early.orders[btc_order.order_id].filled_quantity == Decimal("0")
+
+    # Critically: the second IOC was deferred, not terminalized as NO_FILL.
+    assert not any(
+        alert.code == "UNHEDGED_TIMEOUT"
+        for alert in engine.store.get_alerts(engine.run_id)
+    )
+
+    # Leg 1 now fills completely.
+    eth_filled = engine.process_market(
+        market(_ETH, 4, offset_ms=200)
+    ).projection
+
+    owned = eth_filled.strategy_projection(PHASE08_PAIRS_STRATEGY_ID)
+
+    assert eth_filled.orders[eth_order.order_id].status is OrderStatus.FILLED
+    assert eth_filled.orders[eth_order.order_id].filled_quantity == Decimal("0.036")
+    assert eth_filled.orders[btc_order.order_id].status is OrderStatus.ACKED
+
+    # This assertion also locks the reducer bug found from the live snapshot:
+    # a real strategy-level unhedged position must propagate to the portfolio.
+    assert owned.state is PaperState.HEDGE_PENDING
+    assert owned.positions == {_ETH: Decimal("-0.036")}
+    assert eth_filled.state is PaperState.HEDGE_PENDING
+
+    # A subsequent BTC BBO may now match leg 2 using the durable leg-1 fill
+    # to derive its hedge quantity cap.
+    hedged = engine.process_market(
+        market(_BTC, 5, offset_ms=300)
+    ).projection
+
+    owned = hedged.strategy_projection(PHASE08_PAIRS_STRATEGY_ID)
+
+    assert hedged.orders[btc_order.order_id].status is OrderStatus.FILLED
+    assert hedged.orders[btc_order.order_id].filled_quantity == Decimal("0.0024")
+    assert owned.state is PaperState.HEDGED
+    assert hedged.state is PaperState.HEDGED
+
+    # Crossing the frozen timeout must not create a false unhedged incident.
+    after_timeout = engine.process_timer(
+        as_of=decided_at + timedelta(seconds=30)
+    ).projection
+
+    assert (
+        after_timeout.strategy_projection(PHASE08_PAIRS_STRATEGY_ID).state
+        is PaperState.HEDGED
+    )
+    assert not any(
+        alert.code == "UNHEDGED_TIMEOUT"
+        for alert in engine.store.get_alerts(engine.run_id)
+    )
+
+    # Event-sourced determinism remains exact.
+    assert engine.replay().to_dict() == after_timeout.to_dict()
+
     foundation.source.close()

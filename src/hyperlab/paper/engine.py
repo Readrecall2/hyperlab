@@ -38,11 +38,16 @@ from hyperlab.paper.models import (
     deterministic_id,
     ensure_json_object,
     keyed_uniform,
+    paper_accounting_add,
+    paper_accounting_context,
+    paper_accounting_exact_difference,
+    paper_funding_amount,
     parse_utc,
     require_transition,
     utc_text,
 )
 from hyperlab.paper.reducer import (
+    PAPER_CASH_MATH_VERSION,
     apply_event,
     replay_projection,
     transaction_ledger_amounts,
@@ -85,6 +90,12 @@ class PaperStartupPreparation:
 def _raise_if_interrupted(should_stop: Callable[[], bool] | None) -> None:
     if should_stop is not None and should_stop():
         raise InterruptedError("paper startup interrupted")
+
+
+def _validated_cash_math_version(value: int) -> int:
+    if isinstance(value, bool) or value not in {1, PAPER_CASH_MATH_VERSION}:
+        raise ValueError("cash math version must be 1 or 2")
+    return value
 
 
 @dataclass(slots=True)
@@ -687,17 +698,45 @@ class PaperEngine:
         *,
         processed_at: datetime | None = None,
         execution_policy: MarketExecutionPolicy | str = MarketExecutionPolicy.EXECUTE,
+        _cash_math_version: int = PAPER_CASH_MATH_VERSION,
     ) -> PaperCommandResult:
+        cash_math_version = _validated_cash_math_version(_cash_math_version)
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            with paper_accounting_context():
+                return self._process_market(
+                    market,
+                    processed_at=processed_at,
+                    execution_policy=execution_policy,
+                    _cash_math_version=cash_math_version,
+                )
+        return self._process_market(
+            market,
+            processed_at=processed_at,
+            execution_policy=execution_policy,
+            _cash_math_version=cash_math_version,
+        )
+
+    def _process_market(
+        self,
+        market: MarketEvent,
+        *,
+        processed_at: datetime | None = None,
+        execution_policy: MarketExecutionPolicy | str = MarketExecutionPolicy.EXECUTE,
+        _cash_math_version: int = PAPER_CASH_MATH_VERSION,
+    ) -> PaperCommandResult:
+        cash_math_version = _validated_cash_math_version(_cash_math_version)
         processed = parse_utc(utc_text(processed_at or market.received_at))
         if processed < market.received_at:
             raise ValueError("market processing time cannot precede source received_at")
         policy = MarketExecutionPolicy(execution_policy)
-        input_payload = {
+        input_payload: dict[str, object] = {
             "execution_policy": policy.value,
             "input_type": "PUBLIC_MARKET_EVENT",
             "market": market.to_dict(),
             "processed_at": utc_text(processed),
         }
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            input_payload["cash_math_version"] = cash_math_version
         durable = self.store.get_input(self.run_id, market.event_id)
         duplicate_payload: Mapping[str, object] = input_payload
         if (
@@ -972,6 +1011,7 @@ class PaperEngine:
                 market,
                 liquidity,
                 processed_at=processed,
+                cash_math_version=cash_math_version,
             )
 
         self._derive_lifecycle(working, events, market, processed_at=processed)
@@ -1052,7 +1092,75 @@ class PaperEngine:
         processed_at: datetime | None = None,
         applicability: str = "APPLIED",
         source_activation_cutoff: datetime | None = None,
+        _cash_math_version: int = PAPER_CASH_MATH_VERSION,
     ) -> PaperCommandResult:
+        cash_math_version = _validated_cash_math_version(_cash_math_version)
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            with paper_accounting_context():
+                return self._post_funding(
+                    instrument=instrument,
+                    amount=amount,
+                    occurred_at=occurred_at,
+                    source_event_id=source_event_id,
+                    funding_rate=funding_rate,
+                    funding_interval_seconds=funding_interval_seconds,
+                    rate_kind=rate_kind,
+                    mark_price=mark_price,
+                    source_mark_price=source_mark_price,
+                    oracle_price=oracle_price,
+                    position_quantity=position_quantity,
+                    mark_source=mark_source,
+                    source_observation_id=source_observation_id,
+                    received_at=received_at,
+                    processed_at=processed_at,
+                    applicability=applicability,
+                    source_activation_cutoff=source_activation_cutoff,
+                    _cash_math_version=cash_math_version,
+                )
+        return self._post_funding(
+            instrument=instrument,
+            amount=amount,
+            occurred_at=occurred_at,
+            source_event_id=source_event_id,
+            funding_rate=funding_rate,
+            funding_interval_seconds=funding_interval_seconds,
+            rate_kind=rate_kind,
+            mark_price=mark_price,
+            source_mark_price=source_mark_price,
+            oracle_price=oracle_price,
+            position_quantity=position_quantity,
+            mark_source=mark_source,
+            source_observation_id=source_observation_id,
+            received_at=received_at,
+            processed_at=processed_at,
+            applicability=applicability,
+            source_activation_cutoff=source_activation_cutoff,
+            _cash_math_version=cash_math_version,
+        )
+
+    def _post_funding(
+        self,
+        *,
+        instrument: str,
+        amount: Decimal,
+        occurred_at: datetime,
+        source_event_id: str,
+        funding_rate: Decimal | None = None,
+        funding_interval_seconds: int | None = None,
+        rate_kind: str | None = None,
+        mark_price: Decimal | None = None,
+        source_mark_price: Decimal | None = None,
+        oracle_price: Decimal | None = None,
+        position_quantity: Decimal | None = None,
+        mark_source: str | None = None,
+        source_observation_id: str | None = None,
+        received_at: datetime | None = None,
+        processed_at: datetime | None = None,
+        applicability: str = "APPLIED",
+        source_activation_cutoff: datetime | None = None,
+        _cash_math_version: int = PAPER_CASH_MATH_VERSION,
+    ) -> PaperCommandResult:
+        cash_math_version = _validated_cash_math_version(_cash_math_version)
         normalized_amount = decimal_value(amount, label="funding amount")
         received = received_at or occurred_at
         processed = parse_utc(utc_text(processed_at or received))
@@ -1167,6 +1275,8 @@ class PaperEngine:
             "source_event_id": source_event_id,
             "processed_at": processed_text,
         }
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            payload["cash_math_version"] = cash_math_version
         if detailed:
             assert normalized_rate is not None
             assert normalized_position is not None
@@ -1223,7 +1333,15 @@ class PaperEngine:
                 expected_amount = Decimal(0)
                 if normalized_position != 0:
                     assert normalized_mark is not None
-                    expected_amount = -(normalized_position * normalized_mark * normalized_rate)
+                    expected_amount = (
+                        paper_funding_amount(
+                            normalized_position,
+                            normalized_mark,
+                            normalized_rate,
+                        )
+                        if cash_math_version == PAPER_CASH_MATH_VERSION
+                        else -(normalized_position * normalized_mark * normalized_rate)
+                    )
                 if normalized_amount != expected_amount:
                     raise ValueError("funding amount differs from rate, mark, and position")
             if normalized_mark_source == "PUBLIC_SETTLEMENT_MARK":
@@ -1258,7 +1376,10 @@ class PaperEngine:
                 raise ValueError("unsupported funding mark_source")
         elif current_position == 0 and normalized_amount != 0:
             raise ValueError("non-zero funding cannot be posted while flat")
+        strategy_amount_payload: dict[str, str] | None = None
+        strategy_funding_rounding: dict[str, object] | None = None
         if projection.strategy_projections:
+            contributing_strategy_ids: list[str] = []
             if not detailed:
                 if any(
                     strategy.positions.get(instrument, Decimal(0)) != 0
@@ -1285,18 +1406,88 @@ class PaperEngine:
                         if historical_strategy is not None
                         else Decimal(0)
                     )
-                    strategy_amounts[strategy_id] = (
-                        Decimal(0)
-                        if normalized_applicability == "PRE_ACTIVATION_IGNORED" or strategy_position == 0
-                        else -(strategy_position * cast(Decimal, normalized_mark) * normalized_rate)
+                    if (
+                        normalized_applicability == "PRE_ACTIVATION_IGNORED"
+                        or strategy_position == 0
+                    ):
+                        strategy_amounts[strategy_id] = Decimal(0)
+                    else:
+                        mark = cast(Decimal, normalized_mark)
+                        strategy_amounts[strategy_id] = (
+                            paper_funding_amount(
+                                strategy_position,
+                                mark,
+                                normalized_rate,
+                            )
+                            if cash_math_version == PAPER_CASH_MATH_VERSION
+                            else -(strategy_position * mark * normalized_rate)
+                        )
+                        contributing_strategy_ids.append(strategy_id)
+            attributed_amount = Decimal(0)
+            for strategy_id in sorted(strategy_amounts):
+                attributed_amount = paper_accounting_add(
+                    attributed_amount,
+                    strategy_amounts[strategy_id],
+                )
+            if (
+                cash_math_version == PAPER_CASH_MATH_VERSION
+                and attributed_amount != normalized_amount
+            ):
+                if not contributing_strategy_ids:
+                    raise ValueError(
+                        "strategy funding attribution differs from account funding"
                     )
-            if sum(strategy_amounts.values(), Decimal(0)) != normalized_amount:
+                owner = contributing_strategy_ids[-1]
+                other_amount = Decimal(0)
+                for strategy_id in sorted(strategy_amounts):
+                    if strategy_id != owner:
+                        other_amount = paper_accounting_add(
+                            other_amount,
+                            strategy_amounts[strategy_id],
+                        )
+                raw_amount = strategy_amounts[owner]
+                allocated_amount = paper_accounting_exact_difference(
+                    normalized_amount,
+                    other_amount,
+                )
+                residual = paper_accounting_exact_difference(
+                    allocated_amount,
+                    raw_amount,
+                )
+                if residual == 0:
+                    raise ValueError(
+                        "strategy funding attribution differs from account funding"
+                    )
+                strategy_amounts[owner] = allocated_amount
+                strategy_funding_rounding = {
+                    "allocated_amount": decimal_text(allocated_amount),
+                    "raw_amount": decimal_text(raw_amount),
+                    "residual": decimal_text(residual),
+                    "strategy_id": owner,
+                }
+                attributed_amount = Decimal(0)
+                for strategy_id in sorted(strategy_amounts):
+                    attributed_amount = paper_accounting_add(
+                        attributed_amount,
+                        strategy_amounts[strategy_id],
+                    )
+            if attributed_amount != normalized_amount:
                 raise ValueError("strategy funding attribution differs from account funding")
-            payload["strategy_amounts"] = {
+            strategy_amount_payload = {
                 strategy_id: decimal_text(amount) for strategy_id, amount in strategy_amounts.items()
             }
 
         event_payload = dict(payload)
+        if (
+            strategy_amount_payload is not None
+            and cash_math_version == PAPER_CASH_MATH_VERSION
+        ):
+            event_payload["strategy_amounts"] = strategy_amount_payload
+        if strategy_funding_rounding is not None:
+            event_payload["strategy_funding_rounding"] = strategy_funding_rounding
+        if strategy_amount_payload is not None and cash_math_version == 1:
+            payload["strategy_amounts"] = strategy_amount_payload
+            event_payload["strategy_amounts"] = strategy_amount_payload
         event_payload.pop("input_type")
         event_payload["funding_time"] = event_payload.pop("occurred_at")
         event_payload["source_received_at"] = received_text
@@ -2349,7 +2540,10 @@ class PaperEngine:
         legacy_source_events = iter(self.store.iter_events(self.run_id))
         legacy_source_event: StoredPaperEvent | None = None
         with TemporaryDirectory(prefix="hyperlab-paper-replay-") as directory:
-            replay_store = PaperStore(Path(directory) / "paper-replay.sqlite3")
+            replay_store = PaperStore(
+                Path(directory) / "paper-replay.sqlite3",
+                historical_replay_only=True,
+            )
             replay_engine = PaperEngine(replay_store, self.config)
             replay_engine.start()
             for record in source_inputs:
@@ -2387,6 +2581,9 @@ class PaperEngine:
                             str(payload.get("processed_at", utc_text(market.received_at)))
                         ),
                         execution_policy=str(payload.get("execution_policy", "EXECUTE")),
+                        _cash_math_version=int(
+                            str(payload.get("cash_math_version", 1))
+                        ),
                     )
                 elif input_type == "STRATEGY_DECISION":
                     raw_decision = payload.get("decision")
@@ -2483,6 +2680,9 @@ class PaperEngine:
                             )
                             if payload.get("source_activation_cutoff") is not None
                             else None
+                        ),
+                        _cash_math_version=int(
+                            str(payload.get("cash_math_version", 1))
                         ),
                     )
                 elif input_type == "TIMER":
@@ -2800,29 +3000,133 @@ class PaperEngine:
         # must preserve those chronological transaction boundaries instead of
         # summing individual postings in arbitrary transaction-hash order.
         ledger_realized_pnl = Decimal(0)
+        ledger_strategy_realized_pnl: dict[str, Decimal] = {}
         transaction_id: str | None = None
-        transaction_balances: dict[str, Decimal] = {}
+        transaction_entries: list[tuple[str, Decimal]] = []
 
-        def apply_transaction(amounts: Mapping[str, Decimal]) -> Decimal:
+        def add_amount(_account: str, left: Decimal, right: Decimal) -> Decimal:
+            return paper_accounting_add(left, right)
+
+        def attribution_rounding_account(account: str) -> str | None:
+            if account.endswith("asset:cash"):
+                return (
+                    account.removesuffix("asset:cash")
+                    + "equity:cash_attribution_rounding"
+                )
+            if account.endswith("expense:fees"):
+                return (
+                    account.removesuffix("expense:fees")
+                    + "equity:fee_attribution_rounding"
+                )
+            inventory_marker = "asset:inventory:"
+            if inventory_marker in account:
+                prefix, instrument = account.split(inventory_marker, maxsplit=1)
+                return (
+                    prefix
+                    + "equity:inventory_accounting_rounding:"
+                    + instrument
+                )
+            return None
+
+        def apply_transaction(entries: Sequence[tuple[str, Decimal]]) -> Decimal:
+            amounts: dict[str, Decimal] = {}
+            corrections: list[tuple[str, Decimal]] = []
+            index = 0
+            while index < len(entries):
+                account, amount = entries[index]
+                rounding_account = attribution_rounding_account(account)
+                if index + 1 < len(entries):
+                    next_account, next_amount = entries[index + 1]
+                else:
+                    next_account, next_amount = "", Decimal(0)
+                if (
+                    rounding_account is not None
+                    and next_account == rounding_account
+                    and next_amount == amount.copy_negate()
+                ):
+                    corrections.extend(((account, amount), (next_account, next_amount)))
+                    index += 2
+                    continue
+                amounts[account] = add_amount(
+                    account,
+                    amounts.get(account, Decimal(0)),
+                    amount,
+                )
+                index += 1
+            # Preserve the historical one-net cash operation for ordinary
+            # postings. A v2 attribution correction is then a distinct ordered
+            # posting, so it cannot be absorbed while pre-summing that net.
             for account, amount in amounts.items():
-                balances[account] = balances.get(account, Decimal(0)) + amount
-            return (
-                -amounts.get("income:realized_pnl", Decimal(0))
-                - amounts.get("expense:fees", Decimal(0))
-                - amounts.get("income:funding", Decimal(0))
+                balances[account] = add_amount(
+                    account,
+                    balances.get(account, Decimal(0)),
+                    amount,
+                )
+            for account, amount in corrections:
+                balances[account] = add_amount(
+                    account,
+                    balances.get(account, Decimal(0)),
+                    amount,
+                )
+            for strategy_id in sorted(projection.strategy_projections):
+                prefix = f"strategy:{strategy_id}:"
+                strategy_delta = paper_accounting_add(
+                    paper_accounting_add(
+                        amounts.get(
+                            prefix + "income:realized_pnl",
+                            Decimal(0),
+                        ).copy_negate(),
+                        amounts.get(
+                            prefix + "expense:fees",
+                            Decimal(0),
+                        ).copy_negate(),
+                    ),
+                    amounts.get(
+                        prefix + "income:funding",
+                        Decimal(0),
+                    ).copy_negate(),
+                )
+                ledger_strategy_realized_pnl[strategy_id] = (
+                    paper_accounting_add(
+                        ledger_strategy_realized_pnl.get(
+                            strategy_id,
+                            Decimal(0),
+                        ),
+                        strategy_delta,
+                    )
+                )
+            return paper_accounting_add(
+                paper_accounting_add(
+                    amounts.get(
+                        "income:realized_pnl",
+                        Decimal(0),
+                    ).copy_negate(),
+                    amounts.get(
+                        "expense:fees",
+                        Decimal(0),
+                    ).copy_negate(),
+                ),
+                amounts.get(
+                    "income:funding",
+                    Decimal(0),
+                ).copy_negate(),
             )
 
         for entry in self.store.iter_ledger_entries(self.run_id):
             _raise_if_interrupted(should_stop)
             if transaction_id is not None and entry.transaction_id != transaction_id:
-                ledger_realized_pnl += apply_transaction(transaction_balances)
-                transaction_balances = {}
+                ledger_realized_pnl = paper_accounting_add(
+                    ledger_realized_pnl,
+                    apply_transaction(transaction_entries),
+                )
+                transaction_entries = []
             transaction_id = entry.transaction_id
-            transaction_balances[entry.account] = (
-                transaction_balances.get(entry.account, Decimal(0)) + entry.amount
-            )
+            transaction_entries.append((entry.account, entry.amount))
         if transaction_id is not None:
-            ledger_realized_pnl += apply_transaction(transaction_balances)
+            ledger_realized_pnl = paper_accounting_add(
+                ledger_realized_pnl,
+                apply_transaction(transaction_entries),
+            )
 
         errors: list[str] = []
         if balances.get("asset:cash", Decimal(0)) != projection.cash:
@@ -2865,10 +3169,9 @@ class PaperEngine:
                 errors.append(f"strategy ledger inventory accounts differ for {strategy_id}")
             if balances.get(prefix + "expense:fees", Decimal(0)) != strategy.fees:
                 errors.append(f"strategy ledger fees differ for {strategy_id}")
-            strategy_realized = (
-                -balances.get(prefix + "income:realized_pnl", Decimal(0))
-                - balances.get(prefix + "expense:fees", Decimal(0))
-                - balances.get(prefix + "income:funding", Decimal(0))
+            strategy_realized = ledger_strategy_realized_pnl.get(
+                strategy_id,
+                Decimal(0),
             )
             if strategy_realized != strategy.realized_pnl:
                 errors.append(f"strategy ledger realized PnL differs for {strategy_id}")
@@ -3518,6 +3821,7 @@ class PaperEngine:
         liquidity: _MarketLiquidity,
         *,
         processed_at: datetime,
+        cash_math_version: int,
     ) -> None:
         intent = order.intent
         side = cast(OrderSide, intent.side)
@@ -3840,6 +4144,18 @@ class PaperEngine:
         fill_id = deterministic_id(
             "paper_fill", intent.order_id, market.event_id, order.fill_attempts, quantity, price
         )
+        fill_payload: dict[str, object] = {
+            "fee": decimal_text(fee),
+            "fill_id": fill_id,
+            "fill_price": decimal_text(price),
+            "fill_quantity": decimal_text(quantity),
+            "liquidity": "MAKER" if is_maker else "TAKER",
+            "order_id": intent.order_id,
+            "slippage_bps": decimal_text(slippage_bps),
+            "source_market_received_at": utc_text(market.received_at),
+        }
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            fill_payload["cash_math_version"] = cash_math_version
         event = self._event(
             PaperEventType.ORDER_FILLED if full else PaperEventType.ORDER_PARTIALLY_FILLED,
             at=processed_at,
@@ -3848,16 +4164,7 @@ class PaperEngine:
             correlation_id=intent.decision_id,
             payload=self._order_event_payload(
                 intent,
-                {
-                    "fee": decimal_text(fee),
-                    "fill_id": fill_id,
-                    "fill_price": decimal_text(price),
-                    "fill_quantity": decimal_text(quantity),
-                    "liquidity": "MAKER" if is_maker else "TAKER",
-                    "order_id": intent.order_id,
-                    "slippage_bps": decimal_text(slippage_bps),
-                    "source_market_received_at": utc_text(market.received_at),
-                },
+                fill_payload,
             ),
             ordinal=len(events),
         )

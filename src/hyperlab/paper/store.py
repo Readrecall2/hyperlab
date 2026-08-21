@@ -7,7 +7,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
@@ -23,7 +23,11 @@ from hyperlab.paper.models import (
     StoredPaperEvent,
     deterministic_id,
 )
-from hyperlab.paper.reducer import apply_event, transaction_ledger_amounts
+from hyperlab.paper.reducer import (
+    PAPER_CASH_MATH_VERSION,
+    apply_event,
+    transaction_ledger_amounts,
+)
 
 SCHEMA_VERSION = 1
 STORE_SCHEMA_VERSION = 3
@@ -871,8 +875,16 @@ class PaperStore:
         fault_injector: FaultInjector | None = None,
         timeout_seconds: float = 30.0,
         initialize: bool = True,
+        historical_replay_only: bool = False,
     ) -> None:
         self.path = Path(path)
+        if not isinstance(historical_replay_only, bool):
+            raise TypeError("historical_replay_only must be boolean")
+        if historical_replay_only and (not initialize or self.path.exists()):
+            raise ValueError(
+                "historical_replay_only requires a fresh disposable store"
+            )
+        self._historical_replay_only = historical_replay_only
         self._fault_injector = fault_injector
         self._timeout_seconds = timeout_seconds
         if initialize:
@@ -1442,6 +1454,7 @@ class PaperStore:
                 self._validate_replayed_append(
                     connection,
                     normalized_run_id,
+                    _input,
                     paper_events,
                     prepared_events,
                     ledger_entries,
@@ -1790,6 +1803,7 @@ class PaperStore:
         self,
         connection: sqlite3.Connection,
         run_id: str,
+        input_payload: Mapping[str, JsonValue],
         events: Sequence[PaperEvent],
         prepared_events: Sequence[_PreparedEvent],
         ledger_entries: Sequence[object],
@@ -1807,14 +1821,49 @@ class PaperStore:
                 str(durable["payload_json"]),
                 label="durable projection",
             )
-            working = PaperProjection.from_dict(cast(Mapping[str, object], durable_payload))
-        except (KeyError, TypeError, ValueError) as error:
+            working = PaperProjection.from_dict(
+                cast(Mapping[str, object], durable_payload),
+            )
+        except (DecimalException, KeyError, TypeError, ValueError) as error:
             raise AppendConflictError(
                 f"durable projection cannot be reconstructed for replay: {error}"
             ) from error
         if len(events) != len(prepared_events):
             raise AssertionError("prepared paper event count differs from replay input")
 
+        cash_event_types = {
+            PaperEventType.ORDER_PARTIALLY_FILLED,
+            PaperEventType.ORDER_FILLED,
+            PaperEventType.FUNDING_POSTED,
+        }
+        cash_events = tuple(
+            event for event in events if event.event_type in cash_event_types
+        )
+        if cash_events:
+            raw_input_version = input_payload.get("cash_math_version", 1)
+            if (
+                isinstance(raw_input_version, bool)
+                or not isinstance(raw_input_version, int)
+                or raw_input_version not in {1, PAPER_CASH_MATH_VERSION}
+            ):
+                raise AppendConflictError("input cash_math_version is not supported")
+            for event in cash_events:
+                raw_event_version = event.payload.get("cash_math_version", 1)
+                if (
+                    isinstance(raw_event_version, bool)
+                    or not isinstance(raw_event_version, int)
+                    or raw_event_version not in {1, PAPER_CASH_MATH_VERSION}
+                ):
+                    raise AppendConflictError("event cash_math_version is not supported")
+                if raw_event_version != raw_input_version:
+                    raise AppendConflictError(
+                        "cash event version differs from its durable input version"
+                    )
+            if (
+                raw_input_version != PAPER_CASH_MATH_VERSION
+                and not self._historical_replay_only
+            ):
+                raise AppendConflictError("new cash inputs and events must use cash_math_version 2")
         expected_ledger: list[LedgerEntry] = []
         for event, prepared in zip(events, prepared_events, strict=True):
             if working.last_sequence + 1 != prepared.sequence:
@@ -1828,7 +1877,7 @@ class PaperStore:
             try:
                 expected_ledger.extend(self._expected_ledger_entries(run_id, working, event))
                 apply_event(working, event)
-            except (KeyError, TypeError, ValueError) as error:
+            except (DecimalException, KeyError, TypeError, ValueError) as error:
                 raise AppendConflictError(
                     f"paper event replay failed for {event.event_id}: {error}"
                 ) from error
@@ -1856,7 +1905,13 @@ class PaperStore:
         )
         if supplied_alerts_json != expected_alerts_json:
             raise AppendConflictError("supplied alerts differ from exact ALERT_RAISED event payloads")
-        replayed_projection_json = canonical_json(working.to_dict())
+        try:
+            validated = PaperProjection.from_dict(working.to_dict())
+        except (DecimalException, KeyError, TypeError, ValueError) as error:
+            raise AppendConflictError(
+                f"replayed post-event projection violates PaperProjection invariants: {error}"
+            ) from error
+        replayed_projection_json = canonical_json(validated.to_dict())
         if supplied_projection_json != replayed_projection_json:
             raise AppendConflictError(
                 "supplied projection differs from durable projection plus supplied events"
@@ -2151,6 +2206,64 @@ class PaperStore:
         if not report.ok and raise_on_error:
             raise IntegrityError(report)
         return report
+
+    def latch_unreadable_projection(self, run_id: str) -> bool:
+        """Latch a model-invalid current projection without appending to its journal.
+
+        Runtime failure persistence normally pauses through an ordinary canonical
+        input. That path is unavailable when the durable projection itself cannot
+        be reconstructed. Revalidate under the write lock, then leave append-only
+        integrity evidence and MANUAL_REVIEW state without inventing an event or
+        commit. Return whether the latch was required.
+        """
+
+        normalized_run_id = _identifier(run_id, label="run_id")
+        with self._connect() as connection:
+            self._verify_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM paper_runs WHERE run_id=?",
+                        (normalized_run_id,),
+                    ).fetchone()
+                    is None
+                ):
+                    raise RunNotFoundError(f"unknown paper run {normalized_run_id!r}")
+                projection = connection.execute(
+                    "SELECT payload_json FROM paper_projections WHERE run_id=?",
+                    (normalized_run_id,),
+                ).fetchone()
+                if projection is None:
+                    raise AppendConflictError("durable projection is missing")
+                try:
+                    payload = _json_object(
+                        str(projection["payload_json"]),
+                        label="current projection",
+                    )
+                    PaperProjection.from_dict(
+                        cast(Mapping[str, object], payload),
+                    )
+                except (DecimalException, KeyError, TypeError, ValueError) as error:
+                    issue = IntegrityIssue(
+                        "CURRENT_PROJECTION_MODEL_INVALID",
+                        f"{type(error).__name__}: {error}",
+                    )
+                    self._persist_guard_alert(
+                        connection,
+                        normalized_run_id,
+                        code="PAPER_STORE_INTEGRITY_FAILURE",
+                        detail="durable projection cannot be reconstructed by PaperProjection",
+                        issues=(issue,),
+                    )
+                    connection.commit()
+                    return True
+                connection.rollback()
+                return False
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def inspect_integrity_readonly(self, run_id: str) -> IntegrityReport:
         """Verify a run through query-only SQLite without latching or writing."""
@@ -3400,6 +3513,15 @@ class PaperStore:
                 projected_state = _state_from_projection(payload, default=str(projection["status"]))
                 if projected_state != str(projection["status"]):
                     issue("CURRENT_PROJECTION_STATE", "current projection state differs")
+                try:
+                    PaperProjection.from_dict(
+                        cast(Mapping[str, object], payload),
+                    )
+                except (DecimalException, KeyError, TypeError, ValueError) as error:
+                    issue(
+                        "CURRENT_PROJECTION_MODEL_INVALID",
+                        f"{type(error).__name__}: {error}",
+                    )
             except (TypeError, ValueError) as error:
                 issue("CURRENT_PROJECTION_INVALID", str(error))
             if latest_history_hash is not None and (
@@ -3749,7 +3871,7 @@ class PaperStore:
         if row is None:
             return None
         return PaperProjection.from_dict(
-            _projection_history_payload(row, label="historical projection")
+            _projection_history_payload(row, label="historical projection"),
         )
 
     def load_projection(self, run_id: str) -> PaperProjection:

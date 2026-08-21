@@ -4,10 +4,10 @@ import json
 import signal
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -95,9 +95,15 @@ class SimulatedHardCrash(BaseException):
 
 
 class RaisingStrategy(HoldStrategy):
-    def __init__(self, error: BaseException) -> None:
+    def __init__(
+        self,
+        error: BaseException,
+        *,
+        before_raise: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__()
         self.error = error
+        self.before_raise = before_raise
 
     def decide(
         self,
@@ -106,6 +112,8 @@ class RaisingStrategy(HoldStrategy):
     ) -> DecisionIntent | None:
         assert markets
         assert view.config_hash
+        if self.before_raise is not None:
+            self.before_raise()
         raise self.error
 
 
@@ -648,6 +656,64 @@ def test_public_funding_is_durable_idempotent_and_conflicts_fail_closed(
     assert durable.get_projection(config.run_id).state is PaperState.MANUAL_REVIEW
 
 
+def test_runtime_v2_funding_amount_is_independent_of_ambient_decimal_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "ambient-funding.sqlite3"
+    config = replace(_config(), required_instruments=(_INSTRUMENT,))
+    clock = MutableClock(_START)
+    runtime = _runtime(
+        database,
+        QueuePublicSource([]),
+        HoldStrategy(),
+        clock,
+        run_config=config,
+    )
+    runtime.start()
+    quantity = Decimal("-1.60824649096141304")
+    mark = Decimal("25627.3357")
+    rate = Decimal("0.0000097375")
+    expected_amount = Decimal("0.4013317705351950009472354289")
+    historical = runtime.engine.projection().clone()
+    historical.positions[_INSTRUMENT] = quantity
+    monkeypatch.setattr(
+        runtime.engine.store,
+        "get_projection_before_received_at",
+        lambda *_args, **_kwargs: historical,
+    )
+    received_at = _START + timedelta(seconds=2)
+    settlement = PublicFundingSettlement(
+        event_id=deterministic_id("phase12_runtime_funding", "ambient-context"),
+        instrument=_INSTRUMENT,
+        funding_time=_START + timedelta(seconds=1),
+        received_at=received_at,
+        funding_rate=rate,
+        funding_interval_seconds=3600,
+        rate_kind="synthetic-hourly-settlement",
+        mark_price=mark,
+        oracle_price=None,
+        source_observation_id="ambient-context-funding",
+    )
+
+    with localcontext() as context:
+        context.prec = 9
+        context.rounding = ROUND_DOWN
+        step = runtime._funding_step(settlement, received_at)
+
+    funding_input = runtime.engine.store.get_input(
+        config.run_id,
+        deterministic_id("paper_funding_input", config.run_id, settlement.event_id),
+    )
+    runtime.close()
+
+    assert step.kind is PaperRuntimeStepKind.FUNDING
+    assert step.funding_result is not None
+    assert funding_input is not None
+    assert funding_input.payload["amount"] == str(expected_amount)
+    assert step.projection.realized_pnl == expected_amount
+
+
 def test_runtime_uses_injected_clock_for_durable_timer_and_never_polls_when_due(
     tmp_path: Path,
 ) -> None:
@@ -980,6 +1046,145 @@ def test_strategy_exception_is_one_durable_runtime_failure_and_clean_session_sto
     assert replay_paper_run(durable, _config().run_id).projection_hash == (
         projection.canonical_hash
     )
+
+
+def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper.sqlite3"
+    clock = MutableClock(_START + timedelta(seconds=2))
+    market = _market("unreadable-projection-runtime-failure", clock.value)
+    run_id = _config().run_id
+    anchors: dict[str, object] = {}
+
+    def corrupt_after_market_commit() -> None:
+        inspection = PaperStore(database, initialize=False)
+        assert inspection.contains_input(run_id, market.event_id)
+        assert inspection.latch_unreadable_projection(run_id) is False
+        run = inspection.get_run(run_id)
+        payload = inspection.get_projection_payload(run_id)
+        assert payload["runtime_session_generation"] == 1
+        assert payload["runtime_session_id"] is not None
+        assert payload["runtime_session_started_at"] is not None
+        assert payload["runtime_session_stopped_at"] is None
+        anchors.update(
+            {
+                "event_sequence": run.event_sequence,
+                "event_head_hash": run.event_head_hash,
+                "commit_sequence": run.commit_sequence,
+                "commit_head_hash": run.commit_head_hash,
+                "projection_revision": run.projection_revision,
+                "projection_hash": run.projection_hash,
+                "event_types": tuple(
+                    event.event.event_type for event in inspection.iter_events(run_id)
+                ),
+                "runtime_session_id": payload["runtime_session_id"],
+                "runtime_session_generation": payload[
+                    "runtime_session_generation"
+                ],
+                "runtime_session_started_at": payload[
+                    "runtime_session_started_at"
+                ],
+                "runtime_session_stopped_at": payload[
+                    "runtime_session_stopped_at"
+                ],
+            }
+        )
+        invalid_payload = dict(payload)
+        invalid_payload["archived_order_count"] = -1
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE paper_projections SET payload_json=? WHERE run_id=?",
+                (canonical_json(invalid_payload), run_id),
+            )
+
+    runtime = _runtime(
+        database,
+        QueuePublicSource([{_INSTRUMENT: market}]),
+        RaisingStrategy(
+            RuntimeError("original evaluation failure"),
+            before_raise=corrupt_after_market_commit,
+        ),
+        clock,
+    )
+
+    with pytest.raises(RuntimeError, match="original evaluation failure") as failure:
+        runtime.run_once()
+    assert all(
+        "paper runtime failure persistence also failed" not in note
+        for note in getattr(failure.value, "__notes__", ())
+    )
+    runtime.close()
+
+    durable = PaperStore(database, initialize=False)
+    after_run = durable.get_run(run_id)
+    alerts = tuple(
+        alert
+        for alert in durable.get_alerts(run_id)
+        if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+    )
+    assert after_run.status == PaperState.MANUAL_REVIEW.value
+    assert after_run.event_sequence == anchors["event_sequence"]
+    assert after_run.event_head_hash == anchors["event_head_hash"]
+    assert after_run.commit_sequence == anchors["commit_sequence"]
+    assert after_run.commit_head_hash == anchors["commit_head_hash"]
+    assert after_run.projection_revision == anchors["projection_revision"]
+    assert after_run.projection_hash == anchors["projection_hash"]
+    assert len(alerts) == 1
+    assert alerts[0].commit_sequence is None
+    assert alerts[0].alert["detail"] == (
+        "durable projection cannot be reconstructed by PaperProjection"
+    )
+    assert alerts[0].alert["issues"] == [
+        {
+            "code": "CURRENT_PROJECTION_MODEL_INVALID",
+            "detail": (
+                "ValueError: projection archived_order_count must be a "
+                "non-negative integer"
+            ),
+        }
+    ]
+    assert durable.contains_input(run_id, market.event_id)
+    assert list(durable.iter_inputs(run_id, input_type="PAPER_RUNTIME_FAILURE")) == []
+    assert tuple(
+        event.event.event_type for event in durable.iter_events(run_id)
+    ) == anchors["event_types"]
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT payload_json, effective_status FROM paper_projections "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+    assert row is not None
+    raw_payload = json.loads(str(row[0]))
+    assert row[1] == PaperState.MANUAL_REVIEW.value
+    assert raw_payload["archived_order_count"] == -1
+    for field in (
+        "runtime_session_id",
+        "runtime_session_generation",
+        "runtime_session_started_at",
+        "runtime_session_stopped_at",
+    ):
+        assert raw_payload[field] == anchors[field]
+    assert raw_payload["runtime_session_generation"] > 0
+    assert raw_payload["runtime_session_id"] is not None
+    assert raw_payload["runtime_session_stopped_at"] is None
+
+    blocked_source = QueuePublicSource([None])
+    blocked = _runtime(database, blocked_source, HoldStrategy(), clock)
+    with pytest.raises(
+        PaperAdmissionError,
+        match="model-invalid; MANUAL_REVIEW latched",
+    ):
+        blocked.start()
+    assert blocked_source.start_calls == 0
+    assert len(
+        tuple(
+            alert
+            for alert in PaperStore(database, initialize=False).get_alerts(run_id)
+            if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+        )
+    ) == 1
 
 
 def test_hard_crash_requires_one_offline_review_then_replacement_session(

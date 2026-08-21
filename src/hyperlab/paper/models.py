@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from types import MappingProxyType
 from typing import cast
@@ -18,6 +19,122 @@ from hyperlab.backtest.protocol import JsonValue, canonical_json, canonical_sha2
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CALIBRATION_STATUSES = frozenset({"CALIBRATED", "UNCALIBRATED", "SYNTHETIC", "TOY"})
 _ACTIVE_ORDER_STATUSES = frozenset({"RISK_ACCEPTED", "ACKED", "CANCEL_PENDING", "PARTIALLY_FILLED"})
+_PAPER_ACCOUNTING_CONTEXT = Context(
+    prec=28,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-999_999,
+    Emax=999_999,
+    capitals=1,
+    clamp=0,
+)
+_PAPER_EXACT_DIFFERENCE_MAX_PRECISION = 256
+
+
+@contextmanager
+def paper_accounting_context() -> Iterator[None]:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        yield
+
+
+def paper_accounting_add(left: Decimal, right: Decimal) -> Decimal:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        return left + right
+
+
+def paper_accounting_exact_difference(
+    left: Decimal,
+    right: Decimal,
+) -> Decimal:
+    left_tuple = left.as_tuple()
+    right_tuple = right.as_tuple()
+    if not isinstance(left_tuple.exponent, int) or not isinstance(
+        right_tuple.exponent,
+        int,
+    ):
+        raise ValueError("exact accounting difference requires finite decimals")
+    common_exponent = min(left_tuple.exponent, right_tuple.exponent)
+    required_precision = (
+        max(
+            len(left_tuple.digits) + left_tuple.exponent - common_exponent,
+            len(right_tuple.digits) + right_tuple.exponent - common_exponent,
+        )
+        + 1
+    )
+    if required_precision > _PAPER_EXACT_DIFFERENCE_MAX_PRECISION:
+        raise ValueError("exact accounting difference exceeds bounded precision")
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT) as context:
+        context.prec = max(context.prec, required_precision)
+        return left - right
+
+
+def paper_fill_cash_delta(
+    fill_signed: Decimal,
+    price: Decimal,
+    fee: Decimal,
+) -> Decimal:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        return -(fill_signed * price + fee)
+
+
+def paper_funding_amount(
+    position: Decimal,
+    mark: Decimal,
+    rate: Decimal,
+) -> Decimal:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        return -(position * mark * rate)
+
+
+def paper_attributed_cash(
+    initial_cash: Decimal,
+    strategy_cash: Mapping[str, Decimal],
+) -> Decimal:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        return initial_cash + sum(
+            (strategy_cash[strategy_id] for strategy_id in sorted(strategy_cash)),
+            Decimal(0),
+        )
+
+
+def paper_attributed_fees(strategy_fees: Mapping[str, Decimal]) -> Decimal:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        return sum(
+            (strategy_fees[strategy_id] for strategy_id in sorted(strategy_fees)),
+            Decimal(0),
+        )
+
+
+def paper_attributed_positions(
+    strategy_positions: Mapping[str, Mapping[str, Decimal]],
+) -> dict[str, Decimal]:
+    with localcontext(_PAPER_ACCOUNTING_CONTEXT):
+        strategy_ids = tuple(sorted(strategy_positions))
+        instruments = sorted(
+            {
+                instrument
+                for positions in strategy_positions.values()
+                for instrument in positions
+            }
+        )
+        return {
+            instrument: quantity
+            for instrument in instruments
+            if (
+                quantity := sum(
+                    (
+                        strategy_positions[strategy_id].get(
+                            instrument,
+                            Decimal(0),
+                        )
+                        for strategy_id in strategy_ids
+                    ),
+                    Decimal(0),
+                )
+            )
+            != 0
+        }
+
+
 _PAPER_ENGINE_BUILD_HASH_V2 = canonical_sha256(
     {
         "component": "hyperlab.paper",
@@ -2406,35 +2523,30 @@ class PaperProjection:
                 strategy_id = order.intent.strategy_id
                 if strategy_id is None or strategy_id not in self.strategy_projections:
                     raise ValueError("multi-strategy orders require a known explicit strategy_id")
-            instruments = {
-                instrument
-                for strategy in self.strategy_projections.values()
-                for instrument in strategy.positions
-            }
-            attributed_positions = {
-                instrument: sum(
-                    (
-                        strategy.positions.get(instrument, Decimal(0))
-                        for strategy in self.strategy_projections.values()
-                    ),
-                    Decimal(0),
-                )
-                for instrument in instruments
-            }
-            attributed_positions = {
-                instrument: quantity for instrument, quantity in attributed_positions.items() if quantity != 0
-            }
+            attributed_positions = paper_attributed_positions(
+                {
+                    strategy_id: strategy.positions
+                    for strategy_id, strategy in self.strategy_projections.items()
+                }
+            )
             if attributed_positions != self.positions:
                 raise ValueError("aggregate positions differ from durable strategy attribution")
-            attributed_cash = self.initial_cash + sum(
-                (strategy.cash for strategy in self.strategy_projections.values()),
-                Decimal(0),
+            attributed_cash = paper_attributed_cash(
+                self.initial_cash,
+                {
+                    strategy_id: strategy.cash
+                    for strategy_id, strategy in self.strategy_projections.items()
+                },
             )
             if attributed_cash != self.cash:
-                raise ValueError("aggregate cash differs from durable strategy attribution")
-            attributed_fees = sum(
-                (strategy.fees for strategy in self.strategy_projections.values()),
-                Decimal(0),
+                raise ValueError(
+                    "aggregate cash differs from durable strategy attribution"
+                )
+            attributed_fees = paper_attributed_fees(
+                {
+                    strategy_id: strategy.fees
+                    for strategy_id, strategy in self.strategy_projections.items()
+                }
             )
             if attributed_fees != self.fees:
                 raise ValueError("aggregate fees differ from durable strategy attribution")
@@ -2678,7 +2790,10 @@ class PaperProjection:
         return PaperProjection.from_dict(self.to_dict())
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, object]) -> PaperProjection:
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> PaperProjection:
         def decimal_map(name: str) -> dict[str, Decimal]:
             raw = value.get(name, {})
             if not isinstance(raw, Mapping):

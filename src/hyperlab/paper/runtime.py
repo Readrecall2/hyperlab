@@ -6,7 +6,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from enum import StrEnum
 from pathlib import Path
 from threading import Event
@@ -24,6 +24,7 @@ from hyperlab.paper.models import (
     PaperStrategyConfig,
     decimal_text,
     deterministic_id,
+    paper_funding_amount,
     parse_utc,
     utc_text,
 )
@@ -514,7 +515,9 @@ class PaperRuntime:
         return current
 
     def _persist_source_failure(self, *, as_of: datetime, error: Exception) -> None:
-        projection = self.engine.projection()
+        projection = self._projection_for_failure_persistence()
+        if projection is None:
+            return
         # The store's terminal MANUAL_REVIEW latch intentionally rejects every append.
         if projection.state is PaperState.MANUAL_REVIEW:
             return
@@ -564,6 +567,18 @@ class PaperRuntime:
         reason = f"terminal paper runtime failure: {normalized_phase}: {normalized_error_type}"
         return artifact_hash, reason
 
+    def _projection_for_failure_persistence(self) -> PaperProjection | None:
+        try:
+            return self.engine.projection()
+        except (DecimalException, KeyError, TypeError, ValueError):
+            if not self.engine.store.latch_unreadable_projection(self.engine.run_id):
+                raise
+            # No canonical input can be appended without a readable base. Keep
+            # the runtime session visibly unclosed and prevent clean shutdown
+            # from manufacturing a journal continuation after the integrity latch.
+            self._faulted = True
+            return None
+
     def _persist_runtime_failure(
         self,
         *,
@@ -572,14 +587,14 @@ class PaperRuntime:
         error_type: str,
         failure_key: str,
     ) -> PaperCommandResult | None:
-        projection = self.engine.projection()
-        if projection.state is PaperState.MANUAL_REVIEW:
-            return None
         artifact_hash, reason = self._runtime_failure_identity(
             phase=phase,
             error_type=error_type,
             failure_key=failure_key,
         )
+        projection = self._projection_for_failure_persistence()
+        if projection is None or projection.state is PaperState.MANUAL_REVIEW:
+            return None
         effective_at = as_of
         if projection.last_received_at is not None and effective_at < projection.last_received_at:
             effective_at = projection.last_received_at
@@ -773,7 +788,20 @@ class PaperRuntime:
         except RunNotFoundError:
             durable_before_start = None
         if durable_before_start is not None:
-            durable_projection = self.engine.store.get_projection(self.engine.run_id)
+            try:
+                durable_projection = self.engine.store.get_projection(
+                    self.engine.run_id
+                )
+            except (DecimalException, KeyError, TypeError, ValueError) as error:
+                if self.engine.store.latch_unreadable_projection(
+                    self.engine.run_id
+                ):
+                    self._faulted = True
+                    raise PaperAdmissionError(
+                        "durable paper projection is model-invalid; "
+                        "MANUAL_REVIEW latched"
+                    ) from error
+                raise
             runtime_restart = durable_projection.runtime_session_generation > 0
             if (
                 durable_projection.last_received_at is not None
@@ -1536,7 +1564,11 @@ class PaperRuntime:
             amount = Decimal(0)
         else:
             assert mark is not None
-            amount = -(quantity * mark * settlement.funding_rate)
+            amount = paper_funding_amount(
+                quantity,
+                mark,
+                settlement.funding_rate,
+            )
         result = self.engine.post_funding(
             instrument=settlement.instrument,
             amount=amount,

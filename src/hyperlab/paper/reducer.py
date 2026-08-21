@@ -18,9 +18,18 @@ from hyperlab.paper.models import (
     PaperStrategyProjection,
     StoredPaperEvent,
     decimal_value,
+    paper_accounting_add,
+    paper_accounting_context,
+    paper_accounting_exact_difference,
+    paper_attributed_cash,
+    paper_attributed_fees,
+    paper_attributed_positions,
+    paper_fill_cash_delta,
     parse_utc,
     require_transition,
 )
+
+PAPER_CASH_MATH_VERSION = 2
 
 
 def _payload_string(payload: Mapping[str, object], key: str) -> str:
@@ -43,6 +52,15 @@ def _event_strategy_id(event: PaperEvent) -> str | None:
         return None
     if not isinstance(raw, str) or not raw or any(character.isspace() for character in raw):
         raise ValueError("strategy_id must be a stable non-empty identifier")
+    return raw
+
+
+def _cash_math_version(event: PaperEvent) -> int:
+    raw = event.payload.get("cash_math_version")
+    if raw is None:
+        return 1
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw not in {1, 2}:
+        raise ValueError("cash_math_version must be 1 or 2")
     return raw
 
 
@@ -221,18 +239,14 @@ def _sync_portfolio_state(
         projection.state_since = at
 
 
-def _apply_strategy_fill(
-    projection: PaperProjection,
-    strategy: PaperStrategyProjection,
+def _fill_position_result(
     *,
-    instrument: str,
+    prior_quantity: Decimal,
+    prior_basis: Decimal,
+    prior_inventory_value: Decimal,
     fill_signed: Decimal,
     price: Decimal,
-    fee: Decimal,
-) -> None:
-    prior_quantity = strategy.positions.get(instrument, Decimal(0))
-    prior_basis = strategy.cost_basis.get(instrument, Decimal(0))
-    prior_inventory_value = strategy.inventory_value.get(instrument, Decimal(0))
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     new_quantity = prior_quantity + fill_signed
     realized = Decimal(0)
     inventory_change = fill_signed * price
@@ -245,15 +259,58 @@ def _apply_strategy_fill(
         current_sign = Decimal(1) if prior_quantity > 0 else Decimal(-1)
         cash_close = current_sign * closed * price
         inventory_close = (
-            -prior_inventory_value if closed == abs(prior_quantity) else -current_sign * closed * prior_basis
+            -prior_inventory_value
+            if closed == abs(prior_quantity)
+            else -current_sign * closed * prior_basis
         )
         realized = cash_close + inventory_close
         opening = abs(fill_signed) - closed
-        opening_change = (Decimal(1) if fill_signed > 0 else Decimal(-1)) * opening * price
-        new_inventory_value = prior_inventory_value + inventory_close + opening_change
-        new_basis = Decimal(0) if new_quantity == 0 else abs(new_inventory_value / new_quantity)
+        opening_change = (
+            (Decimal(1) if fill_signed > 0 else Decimal(-1))
+            * opening
+            * price
+        )
+        new_inventory_value = (
+            prior_inventory_value + inventory_close + opening_change
+        )
+        new_basis = (
+            Decimal(0)
+            if new_quantity == 0
+            else abs(new_inventory_value / new_quantity)
+        )
+    return new_quantity, new_basis, new_inventory_value, realized
 
-    strategy.cash -= fill_signed * price + fee
+
+def _apply_strategy_fill(
+    projection: PaperProjection,
+    strategy: PaperStrategyProjection,
+    *,
+    instrument: str,
+    fill_signed: Decimal,
+    price: Decimal,
+    fee: Decimal,
+    cash_math_version: int,
+) -> None:
+    prior_quantity = strategy.positions.get(instrument, Decimal(0))
+    prior_basis = strategy.cost_basis.get(instrument, Decimal(0))
+    prior_inventory_value = strategy.inventory_value.get(instrument, Decimal(0))
+    new_quantity, new_basis, new_inventory_value, realized = (
+        _fill_position_result(
+            prior_quantity=prior_quantity,
+            prior_basis=prior_basis,
+            prior_inventory_value=prior_inventory_value,
+            fill_signed=fill_signed,
+            price=price,
+        )
+    )
+
+    if cash_math_version == PAPER_CASH_MATH_VERSION:
+        strategy.cash = paper_accounting_add(
+            strategy.cash,
+            paper_fill_cash_delta(fill_signed, price, fee),
+        )
+    else:
+        strategy.cash -= fill_signed * price + fee
     strategy.fees += fee
     strategy.realized_pnl += realized - fee
     if new_quantity == 0:
@@ -270,7 +327,57 @@ def _apply_strategy_fill(
     )
 
 
+def _sync_v2_fill_attribution(
+    projection: PaperProjection,
+    *,
+    instrument: str,
+    fill_price: Decimal,
+) -> None:
+    attributed_positions = paper_attributed_positions(
+        {
+            strategy_id: strategy.positions
+            for strategy_id, strategy in projection.strategy_projections.items()
+        }
+    )
+    current_quantity = projection.positions.get(instrument, Decimal(0))
+    target_quantity = attributed_positions.get(instrument, Decimal(0))
+    if current_quantity != target_quantity:
+        current_inventory = projection.inventory_value.get(
+            instrument,
+            Decimal(0),
+        )
+        if target_quantity == 0:
+            projection.cost_basis.pop(instrument, None)
+            projection.inventory_value.pop(instrument, None)
+        else:
+            if (
+                current_quantity == 0
+                or current_inventory == 0
+                or (current_inventory > 0) != (target_quantity > 0)
+            ):
+                current_inventory = target_quantity * fill_price
+            projection.inventory_value[instrument] = current_inventory
+            projection.cost_basis[instrument] = abs(
+                current_inventory / target_quantity
+            )
+    projection.positions = attributed_positions
+    projection.cash = paper_attributed_cash(
+        projection.initial_cash,
+        {
+            strategy_id: strategy.cash
+            for strategy_id, strategy in projection.strategy_projections.items()
+        },
+    )
+    projection.fees = paper_attributed_fees(
+        {
+            strategy_id: strategy.fees
+            for strategy_id, strategy in projection.strategy_projections.items()
+        }
+    )
+
+
 def _apply_fill(projection: PaperProjection, event: PaperEvent, *, full: bool) -> None:
+    cash_math_version = _cash_math_version(event)
     order = _order(projection, event)
     event_strategy_id = _event_strategy_id(event)
     if event_strategy_id != order.intent.strategy_id:
@@ -328,27 +435,26 @@ def _apply_fill(projection: PaperProjection, event: PaperEvent, *, full: bool) -
     prior_quantity = projection.positions.get(instrument, Decimal(0))
     prior_basis = projection.cost_basis.get(instrument, Decimal(0))
     prior_inventory_value = projection.inventory_value.get(instrument, Decimal(0))
-    new_quantity = prior_quantity + fill_signed
-    realized = Decimal(0)
-    inventory_change = fill_signed * price
-
-    if prior_quantity == 0 or (prior_quantity > 0) == (fill_signed > 0):
-        new_inventory_value = prior_inventory_value + inventory_change
-        new_basis = abs(new_inventory_value / new_quantity)
-    else:
-        closed = min(abs(prior_quantity), abs(fill_signed))
-        current_sign = Decimal(1) if prior_quantity > 0 else Decimal(-1)
-        cash_close = current_sign * closed * price
-        inventory_close = (
-            -prior_inventory_value if closed == abs(prior_quantity) else -current_sign * closed * prior_basis
+    new_quantity, new_basis, new_inventory_value, realized = (
+        _fill_position_result(
+            prior_quantity=prior_quantity,
+            prior_basis=prior_basis,
+            prior_inventory_value=prior_inventory_value,
+            fill_signed=fill_signed,
+            price=price,
         )
-        realized = cash_close + inventory_close
-        opening = abs(fill_signed) - closed
-        opening_change = (Decimal(1) if fill_signed > 0 else Decimal(-1)) * opening * price
-        new_inventory_value = prior_inventory_value + inventory_close + opening_change
-        new_basis = Decimal(0) if new_quantity == 0 else abs(new_inventory_value / new_quantity)
+    )
 
-    projection.cash -= fill_signed * price + fee
+    if (
+        cash_math_version == PAPER_CASH_MATH_VERSION
+        and not projection.strategy_projections
+    ):
+        projection.cash = paper_accounting_add(
+            projection.cash,
+            paper_fill_cash_delta(fill_signed, price, fee),
+        )
+    elif cash_math_version == 1:
+        projection.cash -= fill_signed * price + fee
     projection.fees += fee
     projection.realized_pnl += realized - fee
     if new_quantity == 0:
@@ -368,12 +474,19 @@ def _apply_fill(projection: PaperProjection, event: PaperEvent, *, full: bool) -
             fill_signed=fill_signed,
             price=price,
             fee=fee,
+            cash_math_version=cash_math_version,
         )
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            _sync_v2_fill_attribution(
+                projection,
+                instrument=instrument,
+                fill_price=price,
+            )
         _sync_portfolio_state(projection, at=event.received_at)
     projection.peak_equity = max(projection.peak_equity, projection.equity)
 
 
-def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjection:
+def _apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjection:
     """Apply one validated domain event without I/O or implicit time."""
 
     if event.run_id != projection.run_id:
@@ -640,10 +753,10 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
             )
     elif event_type is PaperEventType.FUNDING_POSTED:
         _observe_public_source_time(projection, event)
+        cash_math_version = _cash_math_version(event)
         amount = decimal_value(_payload_string(event.payload, "amount"), label="funding amount")
-        projection.cash += amount
-        projection.realized_pnl += amount
         raw_strategy_amounts = event.payload.get("strategy_amounts")
+        parsed_amounts: dict[str, Decimal] | None = None
         if raw_strategy_amounts is not None:
             if not isinstance(raw_strategy_amounts, Mapping):
                 raise ValueError("strategy_amounts must be an object")
@@ -654,16 +767,107 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
                 )
                 for strategy_id, strategy_amount in raw_strategy_amounts.items()
             }
-            if sum(parsed_amounts.values(), Decimal(0)) != amount:
+            attributed_amount = Decimal(0)
+            for strategy_id in sorted(parsed_amounts):
+                attributed_amount = paper_accounting_add(
+                    attributed_amount,
+                    parsed_amounts[strategy_id],
+                )
+            if attributed_amount != amount:
                 raise ValueError("strategy funding attribution does not sum to account funding")
+        raw_rounding = event.payload.get("strategy_funding_rounding")
+        if raw_rounding is not None:
+            if cash_math_version != PAPER_CASH_MATH_VERSION:
+                raise ValueError("v1 funding cannot carry v2 strategy rounding metadata")
+            if parsed_amounts is None or not isinstance(raw_rounding, Mapping):
+                raise ValueError("strategy_funding_rounding must accompany strategy_amounts")
+            required_fields = {
+                "allocated_amount",
+                "raw_amount",
+                "residual",
+                "strategy_id",
+            }
+            if set(raw_rounding) != required_fields:
+                raise ValueError("strategy_funding_rounding fields are not canonical")
+            raw_strategy_id = raw_rounding.get("strategy_id")
+            if not isinstance(raw_strategy_id, str) or not raw_strategy_id:
+                raise ValueError("strategy funding rounding strategy_id must be a string")
+            if raw_strategy_id not in parsed_amounts:
+                raise ValueError("strategy funding rounding owner is not attributed")
+            raw_amount = decimal_value(
+                str(raw_rounding.get("raw_amount")),
+                label="raw strategy funding amount",
+            )
+            allocated_amount = decimal_value(
+                str(raw_rounding.get("allocated_amount")),
+                label="allocated strategy funding amount",
+            )
+            residual = decimal_value(
+                str(raw_rounding.get("residual")),
+                label="strategy funding rounding residual",
+            )
+            if residual == 0:
+                raise ValueError("strategy funding rounding residual must be non-zero")
+            if parsed_amounts[raw_strategy_id] != allocated_amount:
+                raise ValueError("allocated strategy funding differs from strategy_amounts")
+            if (
+                paper_accounting_exact_difference(
+                    allocated_amount,
+                    raw_amount,
+                )
+                != residual
+            ):
+                raise ValueError("strategy funding rounding metadata is inconsistent")
+        if (
+            cash_math_version == PAPER_CASH_MATH_VERSION
+            and projection.strategy_projections
+            and parsed_amounts is None
+        ):
+            raise ValueError("v2 multi-strategy funding requires strategy_amounts")
+        if (
+            cash_math_version == PAPER_CASH_MATH_VERSION
+            and not projection.strategy_projections
+        ):
+            projection.cash = paper_accounting_add(projection.cash, amount)
+        elif cash_math_version == 1:
+            projection.cash += amount
+        if cash_math_version == PAPER_CASH_MATH_VERSION:
+            projection.realized_pnl = paper_accounting_add(
+                projection.realized_pnl,
+                paper_accounting_add(Decimal(0), amount),
+            )
+        else:
+            projection.realized_pnl += amount
+        if parsed_amounts is not None:
             for strategy_id, strategy_amount in parsed_amounts.items():
                 owned = projection.strategy_projection(strategy_id)
-                owned.cash += strategy_amount
-                owned.realized_pnl += strategy_amount
+                if cash_math_version == PAPER_CASH_MATH_VERSION:
+                    owned.cash = paper_accounting_add(
+                        owned.cash,
+                        strategy_amount,
+                    )
+                    owned.realized_pnl = paper_accounting_add(
+                        owned.realized_pnl,
+                        paper_accounting_add(Decimal(0), strategy_amount),
+                    )
+                else:
+                    owned.cash += strategy_amount
+                    owned.realized_pnl += strategy_amount
                 owned.peak_equity = max(
                     owned.peak_equity,
                     owned.equity(projection.marks),
                 )
+        if (
+            cash_math_version == PAPER_CASH_MATH_VERSION
+            and projection.strategy_projections
+        ):
+            projection.cash = paper_attributed_cash(
+                projection.initial_cash,
+                {
+                    strategy_id: owned.cash
+                    for strategy_id, owned in projection.strategy_projections.items()
+                },
+            )
         projection.peak_equity = max(projection.peak_equity, projection.equity)
     elif event_type is PaperEventType.PUBLIC_SOURCE_HEALTH_RECORDED:
         instrument = _payload_string(event.payload, "instrument")
@@ -709,6 +913,21 @@ def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjecti
     return projection
 
 
+def apply_event(projection: PaperProjection, event: PaperEvent) -> PaperProjection:
+    if (
+        event.event_type
+        in {
+            PaperEventType.ORDER_PARTIALLY_FILLED,
+            PaperEventType.ORDER_FILLED,
+            PaperEventType.FUNDING_POSTED,
+        }
+        and _cash_math_version(event) == PAPER_CASH_MATH_VERSION
+    ):
+        with paper_accounting_context():
+            return _apply_event(projection, event)
+    return _apply_event(projection, event)
+
+
 def apply_stored_event(projection: PaperProjection, stored: StoredPaperEvent) -> PaperProjection:
     if stored.sequence != projection.last_sequence + 1:
         raise ValueError("stored paper event sequence is not contiguous")
@@ -739,12 +958,601 @@ def replay_projection(
     return projection
 
 
-def transaction_ledger_amounts(
+def _validate_v2_accounting_target(
+    projection: PaperProjection,
+    event: PaperEvent,
+    working: PaperProjection,
+) -> None:
+    def require_equal(actual: object, expected: object, *, label: str) -> None:
+        if actual != expected:
+            raise AssertionError(
+                f"v2 post-event {label} differs from its economic transition"
+            )
+
+    if event.event_type in {
+        PaperEventType.ORDER_PARTIALLY_FILLED,
+        PaperEventType.ORDER_FILLED,
+    }:
+        order = _order(projection, event)
+        quantity = decimal_value(
+            _payload_string(event.payload, "fill_quantity"),
+            label="fill_quantity",
+            positive=True,
+        )
+        price = decimal_value(
+            _payload_string(event.payload, "fill_price"),
+            label="fill_price",
+            positive=True,
+        )
+        fee = decimal_value(
+            _payload_string(event.payload, "fee"),
+            label="fee",
+        )
+        instrument = order.intent.instrument
+        fill_signed = cast(OrderSide, order.intent.side).sign * quantity
+        owner_id = order.intent.strategy_id
+        expected_strategy_cash: dict[str, Decimal] = {}
+        expected_strategy_fees: dict[str, Decimal] = {}
+        expected_strategy_positions: dict[str, dict[str, Decimal]] = {}
+        for strategy_id, prior in sorted(
+            projection.strategy_projections.items()
+        ):
+            expected_cash = prior.cash
+            expected_fees = prior.fees
+            expected_realized = prior.realized_pnl
+            expected_positions = dict(prior.positions)
+            expected_basis = dict(prior.cost_basis)
+            expected_inventory = dict(prior.inventory_value)
+            if strategy_id == owner_id:
+                (
+                    new_quantity,
+                    new_basis,
+                    new_inventory,
+                    realized,
+                ) = _fill_position_result(
+                    prior_quantity=prior.positions.get(
+                        instrument,
+                        Decimal(0),
+                    ),
+                    prior_basis=prior.cost_basis.get(
+                        instrument,
+                        Decimal(0),
+                    ),
+                    prior_inventory_value=prior.inventory_value.get(
+                        instrument,
+                        Decimal(0),
+                    ),
+                    fill_signed=fill_signed,
+                    price=price,
+                )
+                expected_cash = paper_accounting_add(
+                    prior.cash,
+                    paper_fill_cash_delta(fill_signed, price, fee),
+                )
+                expected_fees = paper_accounting_add(prior.fees, fee)
+                expected_realized = paper_accounting_add(
+                    prior.realized_pnl,
+                    realized - fee,
+                )
+                if new_quantity == 0:
+                    expected_positions.pop(instrument, None)
+                    expected_basis.pop(instrument, None)
+                    expected_inventory.pop(instrument, None)
+                else:
+                    expected_positions[instrument] = new_quantity
+                    expected_basis[instrument] = new_basis
+                    expected_inventory[instrument] = new_inventory
+            observed = working.strategy_projection(strategy_id)
+            require_equal(
+                observed.cash,
+                expected_cash,
+                label=f"strategy cash for {strategy_id}",
+            )
+            require_equal(
+                observed.fees,
+                expected_fees,
+                label=f"strategy fees for {strategy_id}",
+            )
+            require_equal(
+                observed.realized_pnl,
+                expected_realized,
+                label=f"strategy realized PnL for {strategy_id}",
+            )
+            require_equal(
+                observed.positions,
+                expected_positions,
+                label=f"strategy positions for {strategy_id}",
+            )
+            require_equal(
+                observed.cost_basis,
+                expected_basis,
+                label=f"strategy cost basis for {strategy_id}",
+            )
+            require_equal(
+                observed.inventory_value,
+                expected_inventory,
+                label=f"strategy inventory for {strategy_id}",
+            )
+            expected_strategy_cash[strategy_id] = expected_cash
+            expected_strategy_fees[strategy_id] = expected_fees
+            expected_strategy_positions[strategy_id] = expected_positions
+
+        (
+            raw_quantity,
+            raw_basis,
+            raw_inventory,
+            aggregate_realized,
+        ) = _fill_position_result(
+            prior_quantity=projection.positions.get(
+                instrument,
+                Decimal(0),
+            ),
+            prior_basis=projection.cost_basis.get(
+                instrument,
+                Decimal(0),
+            ),
+            prior_inventory_value=projection.inventory_value.get(
+                instrument,
+                Decimal(0),
+            ),
+            fill_signed=fill_signed,
+            price=price,
+        )
+        expected_positions = dict(projection.positions)
+        expected_basis = dict(projection.cost_basis)
+        expected_inventory = dict(projection.inventory_value)
+        if raw_quantity == 0:
+            expected_positions.pop(instrument, None)
+            expected_basis.pop(instrument, None)
+            expected_inventory.pop(instrument, None)
+        else:
+            expected_positions[instrument] = raw_quantity
+            expected_basis[instrument] = raw_basis
+            expected_inventory[instrument] = raw_inventory
+        if projection.strategy_projections:
+            expected_positions = paper_attributed_positions(
+                expected_strategy_positions
+            )
+            target_quantity = expected_positions.get(
+                instrument,
+                Decimal(0),
+            )
+            if target_quantity != raw_quantity:
+                if target_quantity == 0:
+                    expected_basis.pop(instrument, None)
+                    expected_inventory.pop(instrument, None)
+                else:
+                    if (
+                        raw_quantity == 0
+                        or raw_inventory == 0
+                        or (raw_inventory > 0) != (target_quantity > 0)
+                    ):
+                        raw_inventory = target_quantity * price
+                    expected_inventory[instrument] = raw_inventory
+                    expected_basis[instrument] = abs(
+                        raw_inventory / target_quantity
+                    )
+            expected_cash = paper_attributed_cash(
+                projection.initial_cash,
+                expected_strategy_cash,
+            )
+            expected_fees = paper_attributed_fees(
+                expected_strategy_fees
+            )
+        else:
+            expected_cash = paper_accounting_add(
+                projection.cash,
+                paper_fill_cash_delta(fill_signed, price, fee),
+            )
+            expected_fees = paper_accounting_add(projection.fees, fee)
+        require_equal(working.cash, expected_cash, label="aggregate cash")
+        require_equal(working.fees, expected_fees, label="aggregate fees")
+        require_equal(
+            working.realized_pnl,
+            paper_accounting_add(
+                projection.realized_pnl,
+                aggregate_realized - fee,
+            ),
+            label="aggregate realized PnL",
+        )
+        require_equal(
+            working.positions,
+            expected_positions,
+            label="aggregate positions",
+        )
+        require_equal(
+            working.cost_basis,
+            expected_basis,
+            label="aggregate cost basis",
+        )
+        require_equal(
+            working.inventory_value,
+            expected_inventory,
+            label="aggregate inventory",
+        )
+        return
+
+    amount = decimal_value(
+        _payload_string(event.payload, "amount"),
+        label="funding amount",
+    )
+    raw_strategy_amounts = event.payload.get("strategy_amounts")
+    strategy_amounts = (
+        {
+            str(strategy_id): decimal_value(
+                str(strategy_amount),
+                label=f"strategy funding {strategy_id}",
+            )
+            for strategy_id, strategy_amount in raw_strategy_amounts.items()
+        }
+        if isinstance(raw_strategy_amounts, Mapping)
+        else {}
+    )
+    expected_strategy_cash = {}
+    for strategy_id, prior in sorted(projection.strategy_projections.items()):
+        strategy_amount = strategy_amounts.get(strategy_id, Decimal(0))
+        expected_cash = paper_accounting_add(prior.cash, strategy_amount)
+        expected_realized = paper_accounting_add(
+            prior.realized_pnl,
+            paper_accounting_add(Decimal(0), strategy_amount),
+        )
+        observed = working.strategy_projection(strategy_id)
+        require_equal(
+            observed.cash,
+            expected_cash,
+            label=f"strategy cash for {strategy_id}",
+        )
+        require_equal(
+            observed.realized_pnl,
+            expected_realized,
+            label=f"strategy realized PnL for {strategy_id}",
+        )
+        require_equal(
+            observed.fees,
+            prior.fees,
+            label=f"strategy fees for {strategy_id}",
+        )
+        require_equal(
+            observed.positions,
+            prior.positions,
+            label=f"strategy positions for {strategy_id}",
+        )
+        require_equal(
+            observed.cost_basis,
+            prior.cost_basis,
+            label=f"strategy cost basis for {strategy_id}",
+        )
+        require_equal(
+            observed.inventory_value,
+            prior.inventory_value,
+            label=f"strategy inventory for {strategy_id}",
+        )
+        expected_strategy_cash[strategy_id] = expected_cash
+    expected_cash = (
+        paper_attributed_cash(
+            projection.initial_cash,
+            expected_strategy_cash,
+        )
+        if projection.strategy_projections
+        else paper_accounting_add(projection.cash, amount)
+    )
+    require_equal(working.cash, expected_cash, label="aggregate cash")
+    require_equal(working.fees, projection.fees, label="aggregate fees")
+    require_equal(
+        working.realized_pnl,
+        paper_accounting_add(
+            projection.realized_pnl,
+            paper_accounting_add(Decimal(0), amount),
+        ),
+        label="aggregate realized PnL",
+    )
+    require_equal(
+        working.positions,
+        projection.positions,
+        label="aggregate positions",
+    )
+    require_equal(
+        working.cost_basis,
+        projection.cost_basis,
+        label="aggregate cost basis",
+    )
+    require_equal(
+        working.inventory_value,
+        projection.inventory_value,
+        label="aggregate inventory",
+    )
+
+
+def _independent_v2_ordinary_ledger_entries(
     projection: PaperProjection,
     event: PaperEvent,
 ) -> tuple[tuple[str, Decimal], ...]:
-    """Return exact debit-positive entries for a fill, balanced to zero."""
+    """Reconstruct economic postings before any rounding reconciliation."""
 
+    if event.event_type is PaperEventType.FUNDING_POSTED:
+        amount = decimal_value(
+            _payload_string(event.payload, "amount"),
+            label="funding amount",
+        )
+        ledger_amount = paper_accounting_add(Decimal(0), amount)
+        expected: list[tuple[str, Decimal]] = [
+            ("asset:cash", ledger_amount),
+            ("income:funding", ledger_amount.copy_negate()),
+        ]
+        raw_strategy_amounts = event.payload.get("strategy_amounts")
+        if raw_strategy_amounts is not None:
+            if not isinstance(raw_strategy_amounts, Mapping):
+                raise ValueError("strategy_amounts must be an object")
+            for strategy_id, raw_amount in sorted(
+                raw_strategy_amounts.items()
+            ):
+                strategy_amount = paper_accounting_add(
+                    Decimal(0),
+                    decimal_value(
+                        str(raw_amount),
+                        label=f"strategy funding {strategy_id}",
+                    ),
+                )
+                expected.extend(
+                    [
+                        (
+                            f"strategy:{strategy_id}:asset:cash",
+                            strategy_amount,
+                        ),
+                        (
+                            f"strategy:{strategy_id}:income:funding",
+                            strategy_amount.copy_negate(),
+                        ),
+                    ]
+                )
+        return tuple(expected)
+
+    order = _order(projection, event)
+    quantity = decimal_value(
+        _payload_string(event.payload, "fill_quantity"),
+        label="fill_quantity",
+        positive=True,
+    )
+    price = decimal_value(
+        _payload_string(event.payload, "fill_price"),
+        label="fill_price",
+        positive=True,
+    )
+    fee = decimal_value(
+        _payload_string(event.payload, "fee"),
+        label="fee",
+    )
+    instrument = order.intent.instrument
+    signed_fill = cast(OrderSide, order.intent.side).sign * quantity
+
+    def reconstruct_fill_entries(
+        *,
+        current: Decimal,
+        basis: Decimal,
+        inventory_value: Decimal,
+        prefix: str = "",
+    ) -> list[tuple[str, Decimal]]:
+        reconstructed: list[tuple[str, Decimal]] = []
+        closing = Decimal(0)
+        if current != 0 and (current > 0) != (signed_fill > 0):
+            closing = min(abs(current), abs(signed_fill))
+            cash_close = (
+                (Decimal(1) if current > 0 else Decimal(-1))
+                * closing
+                * price
+            )
+            inventory_close = (
+                -inventory_value
+                if closing == abs(current)
+                else -(
+                    Decimal(1) if current > 0 else Decimal(-1)
+                )
+                * closing
+                * basis
+            )
+            realized = -(cash_close + inventory_close)
+            reconstructed.extend(
+                [
+                    (prefix + "asset:cash", cash_close),
+                    (
+                        prefix + f"asset:inventory:{instrument}",
+                        inventory_close,
+                    ),
+                    (prefix + "income:realized_pnl", realized),
+                ]
+            )
+        opening = abs(signed_fill) - closing
+        if opening:
+            signed_opening = (
+                Decimal(1) if signed_fill > 0 else Decimal(-1)
+            ) * opening
+            reconstructed.extend(
+                [
+                    (prefix + "asset:cash", -signed_opening * price),
+                    (
+                        prefix + f"asset:inventory:{instrument}",
+                        signed_opening * price,
+                    ),
+                ]
+            )
+        if fee:
+            reconstructed.extend(
+                [
+                    (prefix + "asset:cash", -fee),
+                    (prefix + "expense:fees", fee),
+                ]
+            )
+        return reconstructed
+
+    expected = reconstruct_fill_entries(
+        current=projection.positions.get(instrument, Decimal(0)),
+        basis=projection.cost_basis.get(instrument, Decimal(0)),
+        inventory_value=projection.inventory_value.get(
+            instrument,
+            Decimal(0),
+        ),
+    )
+    if order.intent.strategy_id is not None:
+        strategy = projection.strategy_projection(order.intent.strategy_id)
+        expected.extend(
+            reconstruct_fill_entries(
+                current=strategy.positions.get(
+                    instrument,
+                    Decimal(0),
+                ),
+                basis=strategy.cost_basis.get(
+                    instrument,
+                    Decimal(0),
+                ),
+                inventory_value=strategy.inventory_value.get(
+                    instrument,
+                    Decimal(0),
+                ),
+                prefix=f"strategy:{order.intent.strategy_id}:",
+            )
+        )
+    return tuple(expected)
+
+
+def _with_attribution_rounding_entries(
+    projection: PaperProjection,
+    event: PaperEvent,
+    entries: list[tuple[str, Decimal]],
+) -> tuple[tuple[str, Decimal], ...]:
+    if _cash_math_version(event) != PAPER_CASH_MATH_VERSION:
+        return tuple(entries)
+    if tuple(entries) != _independent_v2_ordinary_ledger_entries(
+        projection,
+        event,
+    ):
+        raise AssertionError(
+            "v2 ordinary ledger entries differ from economic postings"
+        )
+    working = projection.clone()
+    apply_event(working, event)
+    _validate_v2_accounting_target(projection, event, working)
+    account_targets = [
+        (
+            "asset:cash",
+            "equity:cash_attribution_rounding",
+            projection.cash,
+            working.cash,
+            True,
+        ),
+        *(
+            (
+                f"strategy:{strategy_id}:asset:cash",
+                f"strategy:{strategy_id}:equity:cash_attribution_rounding",
+                strategy.cash,
+                working.strategy_projection(strategy_id).cash,
+                True,
+            )
+            for strategy_id, strategy in sorted(
+                projection.strategy_projections.items()
+            )
+        ),
+        (
+            "expense:fees",
+            "equity:fee_attribution_rounding",
+            projection.fees,
+            working.fees,
+            True,
+        ),
+        *(
+            (
+                f"strategy:{strategy_id}:expense:fees",
+                f"strategy:{strategy_id}:equity:fee_attribution_rounding",
+                strategy.fees,
+                working.strategy_projection(strategy_id).fees,
+                False,
+            )
+            for strategy_id, strategy in sorted(
+                projection.strategy_projections.items()
+            )
+        ),
+        *(
+            (
+                f"asset:inventory:{instrument}",
+                f"equity:inventory_accounting_rounding:{instrument}",
+                projection.inventory_value.get(instrument, Decimal(0)),
+                working.inventory_value.get(instrument, Decimal(0)),
+                True,
+            )
+            for instrument in sorted(
+                set(projection.inventory_value) | set(working.inventory_value)
+            )
+        ),
+        *(
+            (
+                f"strategy:{strategy_id}:asset:inventory:{instrument}",
+                (
+                    f"strategy:{strategy_id}:"
+                    f"equity:inventory_accounting_rounding:{instrument}"
+                ),
+                strategy.inventory_value.get(instrument, Decimal(0)),
+                working.strategy_projection(strategy_id).inventory_value.get(
+                    instrument,
+                    Decimal(0),
+                ),
+                True,
+            )
+            for strategy_id, strategy in sorted(
+                projection.strategy_projections.items()
+            )
+            for instrument in sorted(
+                set(strategy.inventory_value)
+                | set(
+                    working.strategy_projection(
+                        strategy_id
+                    ).inventory_value
+                )
+            )
+        ),
+    ]
+    for (
+        account,
+        rounding_account,
+        prior_value,
+        target_value,
+        allow_correction,
+    ) in account_targets:
+        transaction_amount = Decimal(0)
+        for entry_account, amount in entries:
+            if entry_account == account:
+                transaction_amount = paper_accounting_add(
+                    transaction_amount,
+                    amount,
+                )
+        ledger_value = paper_accounting_add(prior_value, transaction_amount)
+        residual = paper_accounting_exact_difference(
+            target_value,
+            ledger_value,
+        )
+        if residual:
+            if not allow_correction:
+                raise AssertionError(
+                    f"v2 strategy ledger target differs for {account}"
+                )
+            entries.extend(
+                [
+                    (account, residual),
+                    (rounding_account, -residual),
+                ]
+            )
+            ledger_value = paper_accounting_add(ledger_value, residual)
+        if ledger_value != target_value:
+            raise AssertionError(
+                "v2 attribution rounding ledger does not reach its target"
+            )
+    if sum((amount for _, amount in entries), Decimal(0)) != 0:
+        raise AssertionError("generated cash ledger transaction is not exactly balanced")
+    return tuple(entries)
+
+
+def _transaction_ledger_amounts(
+    projection: PaperProjection,
+    event: PaperEvent,
+) -> tuple[tuple[str, Decimal], ...]:
     if event.event_type not in {
         PaperEventType.ORDER_PARTIALLY_FILLED,
         PaperEventType.ORDER_FILLED,
@@ -752,10 +1560,23 @@ def transaction_ledger_amounts(
     }:
         return ()
     if event.event_type is PaperEventType.FUNDING_POSTED:
+        cash_math_version = _cash_math_version(event)
         amount = decimal_value(_payload_string(event.payload, "amount"), label="funding amount")
+        ledger_amount = (
+            paper_accounting_add(Decimal(0), amount)
+            if cash_math_version == PAPER_CASH_MATH_VERSION
+            else amount
+        )
         entries: list[tuple[str, Decimal]] = [
-            ("asset:cash", amount),
-            ("income:funding", -amount),
+            ("asset:cash", ledger_amount),
+            (
+                "income:funding",
+                (
+                    ledger_amount.copy_negate()
+                    if cash_math_version == PAPER_CASH_MATH_VERSION
+                    else -amount
+                ),
+            ),
         ]
         raw_strategy_amounts = event.payload.get("strategy_amounts")
         if raw_strategy_amounts is not None:
@@ -766,13 +1587,28 @@ def transaction_ledger_amounts(
                     str(raw_amount),
                     label=f"strategy funding {strategy_id}",
                 )
+                ledger_strategy_amount = (
+                    paper_accounting_add(Decimal(0), strategy_amount)
+                    if cash_math_version == PAPER_CASH_MATH_VERSION
+                    else strategy_amount
+                )
                 entries.extend(
                     [
-                        (f"strategy:{strategy_id}:asset:cash", strategy_amount),
-                        (f"strategy:{strategy_id}:income:funding", -strategy_amount),
+                        (
+                            f"strategy:{strategy_id}:asset:cash",
+                            ledger_strategy_amount,
+                        ),
+                        (
+                            f"strategy:{strategy_id}:income:funding",
+                            (
+                                ledger_strategy_amount.copy_negate()
+                                if cash_math_version == PAPER_CASH_MATH_VERSION
+                                else -strategy_amount
+                            ),
+                        ),
                     ]
                 )
-        return tuple(entries)
+        return _with_attribution_rounding_entries(projection, event, entries)
     order = _order(projection, event)
     quantity = decimal_value(
         _payload_string(event.payload, "fill_quantity"), label="fill_quantity", positive=True
@@ -844,12 +1680,24 @@ def transaction_ledger_amounts(
                 prefix=f"strategy:{order.intent.strategy_id}:",
             )
         )
+    entries = list(_with_attribution_rounding_entries(projection, event, entries))
     if sum((amount for _, amount in entries), Decimal(0)) != 0:
         raise AssertionError("generated fill ledger transaction is not exactly balanced")
     return tuple(entries)
 
 
+def transaction_ledger_amounts(
+    projection: PaperProjection,
+    event: PaperEvent,
+) -> tuple[tuple[str, Decimal], ...]:
+    """Return debit-positive entries under the frozen accounting context."""
+
+    with paper_accounting_context():
+        return _transaction_ledger_amounts(projection, event)
+
+
 __all__ = [
+    "PAPER_CASH_MATH_VERSION",
     "apply_event",
     "apply_stored_event",
     "replay_projection",

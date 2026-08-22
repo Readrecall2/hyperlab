@@ -203,6 +203,84 @@ def test_large_journal_integrity_scan_has_bounded_python_side_cardinality(
     assert len(corrupt_report.issues) < 16
 
 
+def test_large_journal_integrity_scan_has_bounded_sql_query_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, config = _build_journal(
+        tmp_path / "bounded-query-count.sqlite3",
+        market_count=512,
+    )
+    read_connection = store._read_connection
+    statements: list[str] = []
+
+    class CountingConnection(_NoFetchAllConnection):
+        def execute(
+            self,
+            sql: str,
+            parameters: tuple[object, ...] = (),
+        ) -> _NoFetchAllCursor:
+            statements.append(" ".join(sql.split()))
+            return super().execute(sql, parameters)
+
+    def counting_connection() -> CountingConnection:
+        return CountingConnection(read_connection())
+
+    monkeypatch.setattr(store, "_read_connection", counting_connection)
+
+    assert store.inspect_integrity_readonly(config.run_id).ok is True
+    # Commit components and projection/commit anchors must be streamed in
+    # order. Query count must not grow once per retained commit/revision.
+    assert len(statements) < 64
+    assert not any(
+        "SELECT event_hash FROM paper_events WHERE run_id=? AND input_id=?" in statement
+        for statement in statements
+    )
+    assert not any(
+        "FROM paper_projection_history WHERE run_id=? AND revision=?" in statement for statement in statements
+    )
+
+
+def test_ledger_heavy_semantic_reconciliation_uses_one_streaming_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    store = PaperStore(tmp_path / "ledger-heavy-reconciliation.sqlite3")
+    engine = PaperEngine(store, config)
+    engine.start()
+    for ordinal in range(512):
+        engine.post_funding(
+            instrument=_INSTRUMENT,
+            amount=Decimal("0"),
+            occurred_at=_START + timedelta(milliseconds=ordinal + 1),
+            source_event_id=f"{ordinal + 1:064x}",
+        )
+    projection = engine.projection()
+    ledger_entry_count = sum(1 for _entry in store.iter_ledger_entries(config.run_id))
+    read_connection = store._read_connection
+    statements: list[str] = []
+
+    class CountingConnection(_NoFetchAllConnection):
+        def execute(
+            self,
+            sql: str,
+            parameters: tuple[object, ...] = (),
+        ) -> _NoFetchAllCursor:
+            statements.append(" ".join(sql.split()))
+            return super().execute(sql, parameters)
+
+    def counting_connection() -> CountingConnection:
+        return CountingConnection(read_connection())
+
+    monkeypatch.setattr(store, "_read_connection", counting_connection)
+
+    assert ledger_entry_count == 1_026
+    assert engine._ledger_reconciliation_errors(projection) == ()
+    assert len(statements) == 1
+    assert "FROM paper_ledger_entries AS ledger" in statements[0]
+
+
 def test_v1_store_migrates_to_covering_event_input_index_without_head_drift(
     tmp_path: Path,
 ) -> None:
@@ -213,9 +291,7 @@ def test_v1_store_migrates_to_covering_event_input_index_without_head_drift(
     store.close()
     with sqlite3.connect(database) as connection:
         connection.execute("DROP INDEX paper_events_input_idx")
-        connection.execute(
-            "CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id)"
-        )
+        connection.execute("CREATE INDEX paper_events_input_idx ON paper_events(run_id, input_id)")
         connection.execute("UPDATE paper_schema SET version=1 WHERE singleton=1")
         connection.execute("PRAGMA user_version=1")
 
@@ -227,10 +303,7 @@ def test_v1_store_migrates_to_covering_event_input_index_without_head_drift(
     with sqlite3.connect(database) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         columns = tuple(
-            str(row[2])
-            for row in connection.execute(
-                "PRAGMA index_info('paper_events_input_idx')"
-            )
+            str(row[2]) for row in connection.execute("PRAGMA index_info('paper_events_input_idx')")
         )
         input_id = connection.execute(
             "SELECT input_id FROM paper_commits WHERE run_id=? AND commit_sequence=2",
@@ -440,10 +513,7 @@ def test_get_latest_alert_uses_bounded_indexed_severity_lookup(
     assert store.get_latest_alert(config.run_id, severity="INFO") is None
 
     with sqlite3.connect(database) as connection:
-        indexes = {
-            str(row[1])
-            for row in connection.execute("PRAGMA index_list('paper_alerts')")
-        }
+        indexes = {str(row[1]) for row in connection.execute("PRAGMA index_list('paper_alerts')")}
         plan = connection.execute(
             """
             EXPLAIN QUERY PLAN
@@ -455,10 +525,7 @@ def test_get_latest_alert_uses_bounded_indexed_severity_lookup(
             (config.run_id, "CRITICAL"),
         ).fetchall()
     assert "paper_alerts_run_severity_sequence_idx" in indexes
-    assert any(
-        "paper_alerts_run_severity_sequence_idx" in str(row[3])
-        for row in plan
-    )
+    assert any("paper_alerts_run_severity_sequence_idx" in str(row[3]) for row in plan)
 
 
 def test_v3_projection_history_uses_compressed_payloads(
@@ -511,9 +578,7 @@ def test_v2_store_migrates_to_v3_without_rewriting_existing_history(
     store.close()
 
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "DROP TRIGGER paper_projection_history_no_update"
-        )
+        connection.execute("DROP TRIGGER paper_projection_history_no_update")
         rows = connection.execute(
             """
             SELECT run_id, revision, payload_zlib
@@ -535,9 +600,7 @@ def test_v2_store_migrates_to_v3_without_rewriting_existing_history(
                 """,
                 (payload_json, run_id, revision),
             )
-        connection.execute(
-            "ALTER TABLE paper_projection_history RENAME TO paper_projection_history_v3"
-        )
+        connection.execute("ALTER TABLE paper_projection_history RENAME TO paper_projection_history_v3")
         connection.execute(
             """
             CREATE TABLE paper_projection_history (
@@ -589,9 +652,7 @@ def test_v2_store_migrates_to_v3_without_rewriting_existing_history(
             END;
             """
         )
-        connection.execute(
-            "UPDATE paper_schema SET version=2 WHERE singleton=1"
-        )
+        connection.execute("UPDATE paper_schema SET version=2 WHERE singleton=1")
         connection.execute("PRAGMA user_version=2")
 
     migrated = PaperStore(database)

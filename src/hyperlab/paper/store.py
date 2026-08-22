@@ -4,12 +4,14 @@ import json
 import sqlite3
 import zlib
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, DecimalException, InvalidOperation
 from enum import Enum
+from itertools import groupby
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import Protocol, Self, cast
 
@@ -32,12 +34,14 @@ from hyperlab.paper.reducer import (
 SCHEMA_VERSION = 1
 STORE_SCHEMA_VERSION = 3
 GENESIS_SEQUENCE = 0
+_HISTORICAL_REPLAY_STORE_CAPABILITY = object()
 ZERO_HASH = "0" * 64
 
 
 def _raise_if_interrupted(should_stop: Callable[[], bool] | None) -> None:
     if should_stop is not None and should_stop():
         raise InterruptedError("paper startup interrupted")
+
 
 FAULT_STAGES = frozenset(
     {
@@ -695,7 +699,6 @@ def _json_object(value: str, *, label: str) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], decoded)
 
 
-
 _HISTORY_CODEC_JSON = "json"
 _HISTORY_CODEC_ZLIB_JSON_V1 = "zlib-json-v1"
 
@@ -705,16 +708,8 @@ def _projection_history_storage(
     payload_json: str,
 ) -> tuple[str, bytes, str, str | None, str | None]:
     raw_last_received_at = payload.get("last_received_at")
-    last_received_at = (
-        raw_last_received_at
-        if isinstance(raw_last_received_at, str)
-        else None
-    )
-    utc_date = (
-        last_received_at[:10]
-        if last_received_at is not None and len(last_received_at) >= 10
-        else None
-    )
+    last_received_at = raw_last_received_at if isinstance(raw_last_received_at, str) else None
+    utc_date = last_received_at[:10] if last_received_at is not None and len(last_received_at) >= 10 else None
     compressed = zlib.compress(payload_json.encode("utf-8"), level=6)
     return (
         "",
@@ -727,11 +722,7 @@ def _projection_history_storage(
 
 def _projection_history_json(row: sqlite3.Row, *, label: str) -> str:
     keys = set(row.keys())
-    codec = (
-        str(row["payload_codec"])
-        if "payload_codec" in keys
-        else _HISTORY_CODEC_JSON
-    )
+    codec = str(row["payload_codec"]) if "payload_codec" in keys else _HISTORY_CODEC_JSON
     if codec == _HISTORY_CODEC_JSON:
         return str(row["payload_json"])
     if codec != _HISTORY_CODEC_ZLIB_JSON_V1:
@@ -876,20 +867,49 @@ class PaperStore:
         timeout_seconds: float = 30.0,
         initialize: bool = True,
         historical_replay_only: bool = False,
+        _historical_replay_capability: object | None = None,
     ) -> None:
         self.path = Path(path)
         if not isinstance(historical_replay_only, bool):
             raise TypeError("historical_replay_only must be boolean")
+        if historical_replay_only and (
+            _historical_replay_capability is not _HISTORICAL_REPLAY_STORE_CAPABILITY
+        ):
+            raise ValueError("historical_replay_only is restricted to the internal temporary-store factory")
+        if not historical_replay_only and _historical_replay_capability is not None:
+            raise ValueError("historical replay capability requires historical_replay_only")
         if historical_replay_only and (not initialize or self.path.exists()):
-            raise ValueError(
-                "historical_replay_only requires a fresh disposable store"
-            )
+            raise ValueError("historical replay factory requires a fresh disposable store")
         self._historical_replay_only = historical_replay_only
+        self._historical_replay_closed = False
         self._fault_injector = fault_injector
         self._timeout_seconds = timeout_seconds
         self._replay_connection: sqlite3.Connection | None = None
         if initialize:
             self.initialize()
+
+    @classmethod
+    def _create_temporary_historical_replay(
+        cls,
+        temporary_directory: TemporaryDirectory[str],
+        *,
+        filename: str = "paper-replay.sqlite3",
+    ) -> Self:
+        """Create replay-only storage whose path is owned by a live temp directory."""
+
+        if not isinstance(temporary_directory, TemporaryDirectory):
+            raise TypeError("temporary historical replay requires TemporaryDirectory ownership")
+        if not filename or Path(filename).name != filename:
+            raise ValueError("temporary historical replay filename must be one path component")
+        root = Path(temporary_directory.name).resolve(strict=True)
+        path = (root / filename).resolve()
+        if path.parent != root:
+            raise ValueError("temporary historical replay path escaped its owned directory")
+        return cls(
+            path,
+            historical_replay_only=True,
+            _historical_replay_capability=_HISTORICAL_REPLAY_STORE_CAPABILITY,
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -908,8 +928,23 @@ class PaperStore:
 
         connection = self._replay_connection
         self._replay_connection = None
+        if self._historical_replay_only:
+            self._historical_replay_closed = True
         if connection is not None:
             connection.close()
+
+    @property
+    def historical_replay_only(self) -> bool:
+        """Whether this is the fresh disposable replay-only store."""
+
+        return self._historical_replay_only
+
+    def _historical_replay_engine_capability(self) -> object:
+        if not self._historical_replay_only:
+            raise ValueError("store is not a temporary historical replay store")
+        if self._historical_replay_closed:
+            raise RuntimeError("temporary historical replay store is closed")
+        return _HISTORICAL_REPLAY_STORE_CAPABILITY
 
     def _inject(self, stage: str) -> None:
         if stage not in FAULT_STAGES:
@@ -924,6 +959,8 @@ class PaperStore:
         del name, size
 
     def _connect(self) -> sqlite3.Connection:
+        if self._historical_replay_only and self._historical_replay_closed:
+            raise RuntimeError("temporary historical replay store is closed")
         if self._historical_replay_only and self._replay_connection is not None:
             return self._replay_connection
         connection = sqlite3.connect(
@@ -974,13 +1011,11 @@ class PaperStore:
             }
             if version > STORE_SCHEMA_VERSION:
                 raise SchemaVersionError(
-                    "paper store schema "
-                    f"{version} is newer than supported schema {STORE_SCHEMA_VERSION}"
+                    f"paper store schema {version} is newer than supported schema {STORE_SCHEMA_VERSION}"
                 )
             if version not in {0, 1, 2, STORE_SCHEMA_VERSION}:
                 raise SchemaVersionError(
-                    "paper store schema "
-                    f"{version} has no forward migration to {STORE_SCHEMA_VERSION}"
+                    f"paper store schema {version} has no forward migration to {STORE_SCHEMA_VERSION}"
                 )
             if version == 0:
                 if tables:
@@ -1004,19 +1039,14 @@ class PaperStore:
 
     @staticmethod
     def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
-        metadata = connection.execute(
-            "SELECT version FROM paper_schema WHERE singleton=1"
-        ).fetchone()
+        metadata = connection.execute("SELECT version FROM paper_schema WHERE singleton=1").fetchone()
         legacy_columns = tuple(
-            str(row[2])
-            for row in connection.execute("PRAGMA index_info('paper_events_input_idx')")
+            str(row[2]) for row in connection.execute("PRAGMA index_info('paper_events_input_idx')")
         )
         if metadata is None or int(metadata[0]) != 1:
             raise SchemaVersionError("paper store v1 metadata is inconsistent")
         if legacy_columns != ("run_id", "input_id"):
-            raise SchemaVersionError(
-                "paper store v1 event-input index differs from the recognized schema"
-            )
+            raise SchemaVersionError("paper store v1 event-input index differs from the recognized schema")
         connection.executescript(
             "BEGIN IMMEDIATE;\n"
             "DROP INDEX paper_events_input_idx;\n"
@@ -1029,18 +1059,11 @@ class PaperStore:
 
     @staticmethod
     def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
-        metadata = connection.execute(
-            "SELECT version FROM paper_schema WHERE singleton=1"
-        ).fetchone()
+        metadata = connection.execute("SELECT version FROM paper_schema WHERE singleton=1").fetchone()
         if metadata is None or int(metadata[0]) != 2:
             raise SchemaVersionError("paper store v2 metadata is inconsistent")
 
-        columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info('paper_projection_history')"
-            )
-        }
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info('paper_projection_history')")}
         required_legacy = {
             "run_id",
             "revision",
@@ -1053,36 +1076,23 @@ class PaperStore:
             "created_at",
         }
         if not required_legacy.issubset(columns):
-            raise SchemaVersionError(
-                "paper store v2 projection history differs from recognized schema"
-            )
+            raise SchemaVersionError("paper store v2 projection history differs from recognized schema")
 
         connection.execute("BEGIN IMMEDIATE")
         try:
             if "payload_zlib" not in columns:
-                connection.execute(
-                    "ALTER TABLE paper_projection_history "
-                    "ADD COLUMN payload_zlib BLOB"
-                )
+                connection.execute("ALTER TABLE paper_projection_history ADD COLUMN payload_zlib BLOB")
             if "payload_codec" not in columns:
                 connection.execute(
                     "ALTER TABLE paper_projection_history "
                     "ADD COLUMN payload_codec TEXT NOT NULL DEFAULT 'json'"
                 )
             if "last_received_at" not in columns:
-                connection.execute(
-                    "ALTER TABLE paper_projection_history "
-                    "ADD COLUMN last_received_at TEXT"
-                )
+                connection.execute("ALTER TABLE paper_projection_history ADD COLUMN last_received_at TEXT")
             if "utc_date" not in columns:
-                connection.execute(
-                    "ALTER TABLE paper_projection_history "
-                    "ADD COLUMN utc_date TEXT"
-                )
+                connection.execute("ALTER TABLE paper_projection_history ADD COLUMN utc_date TEXT")
 
-            connection.execute(
-                "UPDATE paper_schema SET version=3 WHERE singleton=1"
-            )
+            connection.execute("UPDATE paper_schema SET version=3 WHERE singleton=1")
             connection.execute("PRAGMA user_version=3")
             connection.commit()
         except BaseException:
@@ -1094,8 +1104,7 @@ class PaperStore:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version != STORE_SCHEMA_VERSION:
             raise SchemaVersionError(
-                "paper store schema "
-                f"{version} is not supported by schema {STORE_SCHEMA_VERSION} code"
+                f"paper store schema {version} is not supported by schema {STORE_SCHEMA_VERSION} code"
             )
         try:
             row = connection.execute("SELECT version FROM paper_schema WHERE singleton=1").fetchone()
@@ -1105,19 +1114,13 @@ class PaperStore:
             raise SchemaVersionError("paper store schema metadata disagrees with PRAGMA user_version")
         event_input_columns = tuple(
             str(index_row[2])
-            for index_row in connection.execute(
-                "PRAGMA index_info('paper_events_input_idx')"
-            )
+            for index_row in connection.execute("PRAGMA index_info('paper_events_input_idx')")
         )
         if event_input_columns != ("run_id", "input_id", "sequence"):
-            raise SchemaVersionError(
-                "paper event-input index does not bind input order to event sequence"
-            )
+            raise SchemaVersionError("paper event-input index does not bind input order to event sequence")
         history_columns = {
             str(column_row[1])
-            for column_row in connection.execute(
-                "PRAGMA table_info('paper_projection_history')"
-            )
+            for column_row in connection.execute("PRAGMA table_info('paper_projection_history')")
         }
         required_history_columns = {
             "payload_json",
@@ -1127,9 +1130,7 @@ class PaperStore:
             "utc_date",
         }
         if not required_history_columns.issubset(history_columns):
-            raise SchemaVersionError(
-                "paper projection history compression columns are missing"
-            )
+            raise SchemaVersionError("paper projection history compression columns are missing")
 
         foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -1337,7 +1338,8 @@ class PaperStore:
             raise ValueError("expected_sequence must be a non-negative integer or None")
         self._inject("before_begin")
         with self._connect() as connection:
-            self._verify_schema(connection)
+            if not self._historical_replay_only:
+                self._verify_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
             committed = False
             try:
@@ -1403,10 +1405,14 @@ class PaperStore:
                     raise ConcurrentWriteError(
                         f"expected event sequence {expected_sequence}, durable sequence is {current_sequence}"
                     )
-                guard_issues = self._collect_append_head_issues(
-                    connection,
-                    normalized_run_id,
-                    run,
+                guard_issues = (
+                    ()
+                    if self._historical_replay_only
+                    else self._collect_append_head_issues(
+                        connection,
+                        normalized_run_id,
+                        run,
+                    )
                 )
                 if guard_issues:
                     self._persist_guard_alert(
@@ -1863,9 +1869,7 @@ class PaperStore:
             PaperEventType.ORDER_FILLED,
             PaperEventType.FUNDING_POSTED,
         }
-        cash_events = tuple(
-            event for event in events if event.event_type in cash_event_types
-        )
+        cash_events = tuple(event for event in events if event.event_type in cash_event_types)
         if cash_events:
             raw_input_version = input_payload.get("cash_math_version", 1)
             if (
@@ -1883,13 +1887,8 @@ class PaperStore:
                 ):
                     raise AppendConflictError("event cash_math_version is not supported")
                 if raw_event_version != raw_input_version:
-                    raise AppendConflictError(
-                        "cash event version differs from its durable input version"
-                    )
-            if (
-                raw_input_version != PAPER_CASH_MATH_VERSION
-                and not self._historical_replay_only
-            ):
+                    raise AppendConflictError("cash event version differs from its durable input version")
+            if raw_input_version != PAPER_CASH_MATH_VERSION and not self._historical_replay_only:
                 raise AppendConflictError("new cash inputs and events must use cash_math_version 2")
         expected_ledger: list[LedgerEntry] = []
         for event, prepared in zip(events, prepared_events, strict=True):
@@ -3277,9 +3276,108 @@ class PaperStore:
                 return []
             return cast(list[str], parsed)
 
+        def component_commit_sequence(row: sqlite3.Row) -> int:
+            return int(row["commit_sequence"])
+
+        component_groups: dict[
+            str,
+            Iterator[tuple[int, Iterator[sqlite3.Row]]],
+        ] = {
+            "event": groupby(
+                connection.execute(
+                    """
+                    SELECT inbox.commit_sequence, event.event_hash
+                    FROM paper_events AS event
+                    JOIN paper_inbox AS inbox
+                      ON inbox.run_id=event.run_id AND inbox.input_id=event.input_id
+                    WHERE event.run_id=?
+                    ORDER BY inbox.commit_sequence, event.sequence
+                    """,
+                    (run_id,),
+                ),
+                key=component_commit_sequence,
+            ),
+            "ledger": groupby(
+                connection.execute(
+                    """
+                    SELECT inbox.commit_sequence, ledger.transaction_hash
+                    FROM paper_ledger_transactions AS ledger
+                    JOIN paper_inbox AS inbox
+                      ON inbox.run_id=ledger.run_id AND inbox.input_id=ledger.input_id
+                    WHERE ledger.run_id=?
+                    ORDER BY inbox.commit_sequence, ledger.rowid
+                    """,
+                    (run_id,),
+                ),
+                key=component_commit_sequence,
+            ),
+            "alert": groupby(
+                connection.execute(
+                    """
+                    SELECT commit_sequence, payload_hash
+                    FROM paper_alerts
+                    WHERE run_id=? AND commit_sequence IS NOT NULL
+                    ORDER BY commit_sequence, rowid
+                    """,
+                    (run_id,),
+                ),
+                key=component_commit_sequence,
+            ),
+        }
+        pending_component_groups = {name: next(groups, None) for name, groups in component_groups.items()}
+        component_issue_codes = {
+            "event": "COMMIT_EVENT_HASHES",
+            "ledger": "COMMIT_LEDGER_HASHES",
+            "alert": "COMMIT_ALERT_HASHES",
+        }
+
+        def commit_component_hashes(
+            name: str,
+            commit_sequence: int,
+            column: str,
+        ) -> list[str]:
+            pending = pending_component_groups[name]
+            while pending is not None and pending[0] < commit_sequence:
+                orphan_sequence, orphan_rows = pending
+                orphan_hashes = [str(component[column]) for component in orphan_rows]
+                self._observe_integrity_buffer(
+                    f"commit_{name}_hashes",
+                    len(orphan_hashes),
+                )
+                issue(
+                    component_issue_codes[name],
+                    f"component rows reference missing commit {orphan_sequence}",
+                )
+                pending = next(component_groups[name], None)
+            if pending is None or pending[0] > commit_sequence:
+                pending_component_groups[name] = pending
+                return []
+            _sequence, rows = pending
+            hashes = [str(component[column]) for component in rows]
+            pending_component_groups[name] = next(component_groups[name], None)
+            return hashes
+
         expected_commit_previous = _commit_genesis(run_id, config_hash)
         commit_rows = connection.execute(
-            "SELECT * FROM paper_commits WHERE run_id=? ORDER BY commit_sequence",
+            """
+            SELECT commit_row.*,
+                   inbox.input_id AS inbox_input_id,
+                   inbox.commit_hash AS inbox_commit_hash,
+                   inbox.first_event_sequence AS inbox_first_event_sequence,
+                   inbox.last_event_sequence AS inbox_last_event_sequence,
+                   history.input_id AS history_input_id,
+                   history.revision AS history_revision,
+                   history.projection_hash AS history_projection_hash
+            FROM paper_commits AS commit_row
+            LEFT JOIN paper_inbox AS inbox
+              ON inbox.run_id=commit_row.run_id
+             AND inbox.commit_sequence=commit_row.commit_sequence
+            LEFT JOIN paper_projection_history AS history
+              ON history.run_id=commit_row.run_id
+             AND history.revision=commit_row.commit_sequence
+            WHERE commit_row.run_id=?
+            ORDER BY commit_row.commit_sequence
+            """,
             (run_id,),
         )
         commit_count = 0
@@ -3298,36 +3396,21 @@ class PaperStore:
             first_raw = row["first_event_sequence"]
             first_sequence = int(first_raw) if first_raw is not None else None
             last_sequence = int(row["last_event_sequence"])
-            expected_hashes = [
-                str(component["event_hash"])
-                for component in connection.execute(
-                    """
-                    SELECT event_hash FROM paper_events
-                    WHERE run_id=? AND input_id=? ORDER BY sequence
-                    """,
-                    (run_id, input_id),
-                )
-            ]
-            expected_ledger_hashes = [
-                str(component["transaction_hash"])
-                for component in connection.execute(
-                    """
-                    SELECT transaction_hash FROM paper_ledger_transactions
-                    WHERE run_id=? AND input_id=? ORDER BY rowid
-                    """,
-                    (run_id, input_id),
-                )
-            ]
-            expected_alert_hashes = [
-                str(component["payload_hash"])
-                for component in connection.execute(
-                    """
-                    SELECT payload_hash FROM paper_alerts
-                    WHERE run_id=? AND commit_sequence=? ORDER BY rowid
-                    """,
-                    (run_id, commit_sequence),
-                )
-            ]
+            expected_hashes = commit_component_hashes(
+                "event",
+                commit_sequence,
+                "event_hash",
+            )
+            expected_ledger_hashes = commit_component_hashes(
+                "ledger",
+                commit_sequence,
+                "transaction_hash",
+            )
+            expected_alert_hashes = commit_component_hashes(
+                "alert",
+                commit_sequence,
+                "payload_hash",
+            )
             self._observe_integrity_buffer("commit_event_hashes", len(expected_hashes))
             self._observe_integrity_buffer("commit_ledger_hashes", len(expected_ledger_hashes))
             self._observe_integrity_buffer("commit_alert_hashes", len(expected_alert_hashes))
@@ -3382,38 +3465,55 @@ class PaperStore:
             if calculated_commit_hash != str(row["commit_hash"]):
                 issue("COMMIT_HASH", f"commit {commit_sequence} hash differs")
             expected_commit_previous = str(row["commit_hash"])
-            history_anchor = connection.execute(
-                """
-                SELECT input_id, revision, projection_hash
-                FROM paper_projection_history WHERE run_id=? AND revision=?
-                """,
-                (run_id, commit_sequence),
-            ).fetchone()
             if (
-                history_anchor is None
-                or cast(str | None, history_anchor["input_id"]) != input_id
+                row["history_revision"] is None
+                or cast(str | None, row["history_input_id"]) != input_id
                 or int(row["projection_revision"]) != commit_sequence
-                or int(history_anchor["revision"]) != commit_sequence
-                or str(history_anchor["projection_hash"]) != str(row["projection_hash"])
+                or int(row["history_revision"]) != commit_sequence
+                or str(row["history_projection_hash"]) != str(row["projection_hash"])
             ):
                 issue(
                     "PROJECTION_COMMIT_ANCHOR",
                     f"projection revision {commit_sequence} differs",
                 )
-            inbox = connection.execute(
-                "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence=?",
-                (run_id, commit_sequence),
-            ).fetchone()
-            if inbox is None:
+            if row["inbox_input_id"] is None:
                 issue("COMMIT_INPUT_MISSING", f"commit {commit_sequence} has no inbox record")
             elif (
-                str(inbox["input_id"]) != input_id
-                or str(inbox["commit_hash"]) != str(row["commit_hash"])
-                or (int(inbox["first_event_sequence"]) if inbox["first_event_sequence"] is not None else None)
+                str(row["inbox_input_id"]) != input_id
+                or str(row["inbox_commit_hash"]) != str(row["commit_hash"])
+                or (
+                    int(row["inbox_first_event_sequence"])
+                    if row["inbox_first_event_sequence"] is not None
+                    else None
+                )
                 != first_sequence
-                or int(inbox["last_event_sequence"]) != last_sequence
+                or int(row["inbox_last_event_sequence"]) != last_sequence
             ):
                 issue("COMMIT_INPUT_MISMATCH", f"commit {commit_sequence} differs from inbox")
+        for name, pending in pending_component_groups.items():
+            while pending is not None:
+                orphan_sequence, orphan_rows = pending
+                orphan_hashes = [
+                    str(
+                        component[
+                            {
+                                "event": "event_hash",
+                                "ledger": "transaction_hash",
+                                "alert": "payload_hash",
+                            }[name]
+                        ]
+                    )
+                    for component in orphan_rows
+                ]
+                self._observe_integrity_buffer(
+                    f"commit_{name}_hashes",
+                    len(orphan_hashes),
+                )
+                issue(
+                    component_issue_codes[name],
+                    f"component rows reference missing commit {orphan_sequence}",
+                )
+                pending = next(component_groups[name], None)
         if inbox_count != commit_count:
             issue("INBOX_COMMIT_COUNT", "inbox and commit counts differ")
         if commit_count != int(run["commit_count"]):
@@ -3444,7 +3544,18 @@ class PaperStore:
             issue("COMMIT_ALERT_HASHES", "a committed alert has no owning commit")
 
         history_rows = connection.execute(
-            "SELECT * FROM paper_projection_history WHERE run_id=? ORDER BY revision",
+            """
+            SELECT history.*,
+                   commit_row.input_id AS anchor_input_id,
+                   commit_row.projection_revision AS anchor_projection_revision,
+                   commit_row.projection_hash AS anchor_projection_hash
+            FROM paper_projection_history AS history
+            LEFT JOIN paper_commits AS commit_row
+              ON commit_row.run_id=history.run_id
+             AND commit_row.commit_sequence=history.revision
+            WHERE history.run_id=?
+            ORDER BY history.revision
+            """,
             (run_id,),
         )
         history_count = 0
@@ -3457,6 +3568,7 @@ class PaperStore:
             revision = int(row["revision"])
             if revision != expected_revision:
                 issue("PROJECTION_HISTORY_GAP", f"expected projection revision {expected_revision}")
+            history_payload_json: str | None = None
             try:
                 history_payload_json = _projection_history_json(
                     row,
@@ -3481,29 +3593,15 @@ class PaperStore:
                     issue("PROJECTION_STATE", f"projection revision {revision} state differs")
             except (TypeError, ValueError) as error:
                 issue("PROJECTION_INVALID", f"projection revision {revision}: {error}")
-            if revision > 0:
-                anchor = connection.execute(
-                    """
-                    SELECT input_id, projection_revision, projection_hash
-                    FROM paper_commits WHERE run_id=? AND commit_sequence=?
-                    """,
-                    (run_id, revision),
-                ).fetchone()
-                if (
-                    anchor is None
-                    or str(anchor["input_id"]) != cast(str | None, row["input_id"])
-                    or int(anchor["projection_revision"]) != revision
-                    or str(anchor["projection_hash"]) != str(row["projection_hash"])
-                ):
-                    issue("PROJECTION_COMMIT_ANCHOR", f"projection revision {revision} differs")
+            if revision > 0 and (
+                row["anchor_input_id"] is None
+                or str(row["anchor_input_id"]) != cast(str | None, row["input_id"])
+                or int(row["anchor_projection_revision"]) != revision
+                or str(row["anchor_projection_hash"]) != str(row["projection_hash"])
+            ):
+                issue("PROJECTION_COMMIT_ANCHOR", f"projection revision {revision} differs")
             latest_history_hash = str(row["projection_hash"])
-            try:
-                latest_history_json = _projection_history_json(
-                    row,
-                    label=f"projection revision {revision}",
-                )
-            except ValueError:
-                latest_history_json = None
+            latest_history_json = history_payload_json
         if history_count != commit_count + 1:
             issue("PROJECTION_HISTORY_COUNT", "projection history and commit counts differ")
 
@@ -3982,11 +4080,7 @@ class PaperStore:
                 ProjectionHistoryRecord(
                     run_id=str(row["run_id"]),
                     revision=int(row["revision"]),
-                    input_id=(
-                        str(row["input_id"])
-                        if row["input_id"] is not None
-                        else None
-                    ),
+                    input_id=(str(row["input_id"]) if row["input_id"] is not None else None),
                     event_sequence=int(row["event_sequence"]),
                     event_head_hash=str(row["event_head_hash"]),
                     status=str(row["status"]),
@@ -4138,6 +4232,7 @@ class PaperStore:
                 (normalized_run_id, normalized_alert_id),
             ).fetchone()
         return row is not None
+
     def get_latest_alert(
         self,
         run_id: str,
@@ -4171,11 +4266,7 @@ class PaperStore:
         return AlertRecord(
             run_id=str(row["run_id"]),
             alert_id=str(row["alert_id"]),
-            commit_sequence=(
-                int(row["commit_sequence"])
-                if row["commit_sequence"] is not None
-                else None
-            ),
+            commit_sequence=(int(row["commit_sequence"]) if row["commit_sequence"] is not None else None),
             event_sequence=int(row["event_sequence"]),
             severity=str(row["severity"]),
             code=str(row["code"]),
@@ -4183,7 +4274,6 @@ class PaperStore:
             payload_hash=str(row["payload_hash"]),
             created_at=str(row["created_at"]),
         )
-
 
     def get_alerts(self, run_id: str) -> tuple[AlertRecord, ...]:
         normalized_run_id = _identifier(run_id, label="run_id")

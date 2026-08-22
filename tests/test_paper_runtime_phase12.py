@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal, localcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 from typer.testing import CliRunner
@@ -90,6 +91,7 @@ class RestoreHoldStrategy(HoldStrategy):
         self.restore_calls += 1
         self.restored_event_ids = [market.event_id for market in markets]
 
+
 class SimulatedHardCrash(BaseException):
     pass
 
@@ -115,7 +117,6 @@ class RaisingStrategy(HoldStrategy):
         if self.before_raise is not None:
             self.before_raise()
         raise self.error
-
 
 
 class QueuePublicSource:
@@ -222,6 +223,27 @@ def _runtime(
     )
 
 
+def test_runtime_rejects_temporary_historical_replay_store(tmp_path: Path) -> None:
+    temporary_directory = TemporaryDirectory(dir=tmp_path)
+    store = PaperStore._create_temporary_historical_replay(
+        temporary_directory,
+        filename="runtime-rejected.sqlite3",
+    )
+    engine = PaperEngine._for_historical_replay(store, _config())
+
+    with pytest.raises(
+        PaperAdmissionError,
+        match="rejects temporary historical replay-only stores",
+    ):
+        PaperRuntime(
+            engine,
+            HoldStrategy(),
+            QueuePublicSource([]),
+        )
+    store.close()
+    temporary_directory.cleanup()
+
+
 def test_runtime_reconciles_before_first_public_source_poll(tmp_path: Path) -> None:
     database = tmp_path / "paper.sqlite3"
     clock = MutableClock(_START + timedelta(seconds=2))
@@ -233,9 +255,7 @@ def test_runtime_reconciles_before_first_public_source_poll(tmp_path: Path) -> N
         store = PaperStore(database, initialize=False)
         projection = store.get_projection(_config().run_id)
         assert projection.reconciled is True
-        observed_event_types.extend(
-            event.event.event_type for event in store.get_events(_config().run_id)
-        )
+        observed_event_types.extend(event.event.event_type for event in store.get_events(_config().run_id))
 
     source = QueuePublicSource([{_INSTRUMENT: market}], before_poll=assert_reconciled_before_poll)
     runtime = _runtime(database, source, strategy, clock)
@@ -295,17 +315,14 @@ def test_public_source_poll_failure_is_durably_paused_and_replay_exact(
     store = PaperStore(database, initialize=False)
     projection = store.get_projection(_config().run_id)
     assert projection.state is PaperState.PAUSED
-    source_failures = list(
-        store.iter_inputs(_config().run_id, input_type="PUBLIC_SOURCE_FAILURE")
-    )
+    source_failures = list(store.iter_inputs(_config().run_id, input_type="PUBLIC_SOURCE_FAILURE"))
     assert len(source_failures) == 1
-    assert source_failures[0].payload["reason"] == (
-        "terminal public source failure: RuntimeError"
-    )
+    assert source_failures[0].payload["reason"] == ("terminal public source failure: RuntimeError")
     assert "fixture detail" not in json.dumps(source_failures[0].payload)
     replay = replay_paper_run(store, _config().run_id)
     assert replay.projection_hash == projection.canonical_hash
     assert replay.to_dict()["status"] == "REPLAY_EXACT"
+
 
 @pytest.mark.parametrize(
     ("item", "error_match"),
@@ -354,19 +371,12 @@ def test_invalid_returned_source_item_is_durably_paused_before_original_error(
 
     store = PaperStore(database, initialize=False)
     projection = store.get_projection(config.run_id)
-    failures = list(
-        store.iter_inputs(config.run_id, input_type="PUBLIC_SOURCE_FAILURE")
-    )
+    failures = list(store.iter_inputs(config.run_id, input_type="PUBLIC_SOURCE_FAILURE"))
     assert projection.state is PaperState.PAUSED
     assert len(failures) == 1
-    assert failures[0].payload["reason"] == (
-        "terminal public source failure: PaperAdmissionError"
-    )
-    assert replay_paper_run(store, config.run_id).projection_hash == (
-        projection.canonical_hash
-    )
+    assert failures[0].payload["reason"] == ("terminal public source failure: PaperAdmissionError")
+    assert replay_paper_run(store, config.run_id).projection_hash == (projection.canonical_hash)
     runtime.close()
-
 
 
 def test_public_source_poll_failure_is_durable_while_runtime_already_paused(
@@ -401,9 +411,7 @@ def test_public_source_poll_failure_is_durable_while_runtime_already_paused(
 
     store = PaperStore(database, initialize=False)
     assert store.get_projection(run_id).state is PaperState.PAUSED
-    failures = list(
-        store.iter_inputs(run_id, input_type="PUBLIC_SOURCE_FAILURE")
-    )
+    failures = list(store.iter_inputs(run_id, input_type="PUBLIC_SOURCE_FAILURE"))
     assert len(failures) == 1
 
 
@@ -602,9 +610,7 @@ def test_public_funding_is_durable_idempotent_and_conflicts_fail_closed(
     assert first_step.kind is PaperRuntimeStepKind.FUNDING
     assert first_step.funding_event_id == settlement.event_id
     assert first_step.projection.realized_pnl == 0
-    funding_input_id = deterministic_id(
-        "paper_funding_input", config.run_id, settlement.event_id
-    )
+    funding_input_id = deterministic_id("paper_funding_input", config.run_id, settlement.event_id)
     durable = PaperStore(database, initialize=False)
     funding_input = durable.get_input(config.run_id, funding_input_id)
     assert funding_input is not None
@@ -629,13 +635,16 @@ def test_public_funding_is_durable_idempotent_and_conflicts_fail_closed(
 
     assert duplicate_step.kind is PaperRuntimeStepKind.DUPLICATE
     assert duplicate_step.duplicate_event_ids == (settlement.event_id,)
-    assert len(
-        [
-            event
-            for event in durable.get_events(config.run_id)
-            if event.event.event_type is PaperEventType.FUNDING_POSTED
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in durable.get_events(config.run_id)
+                if event.event.event_type is PaperEventType.FUNDING_POSTED
+            ]
+        )
+        == 1
+    )
     assert replay_paper_run(durable, config.run_id).run_id == config.run_id
 
     corrected = replace(
@@ -854,9 +863,7 @@ def test_restart_rejects_divergent_redelivery_and_latches_manual_review(
     assert durable.get_projection(_config().run_id).state is PaperState.MANUAL_REVIEW
     # The terminal store latch forbids a second failure append; the original
     # idempotency error and its durable MANUAL_REVIEW transition are authoritative.
-    assert list(
-        durable.iter_inputs(_config().run_id, input_type="PUBLIC_SOURCE_FAILURE")
-    ) == []
+    assert list(durable.iter_inputs(_config().run_id, input_type="PUBLIC_SOURCE_FAILURE")) == []
 
 
 def test_fresh_producer_fifo_backlog_reaches_old_event_and_fails_closed(
@@ -904,13 +911,8 @@ def test_fresh_producer_fifo_backlog_reaches_old_event_and_fails_closed(
         stale_market.event_id,
     )
     assert durable.get_projection(config.run_id).state is PaperState.PAUSED
-    assert any(
-        alert.code == "STALE_MARKET_DATA"
-        for alert in durable.get_alerts(config.run_id)
-    )
-    failures = list(
-        durable.iter_inputs(config.run_id, input_type="PUBLIC_SOURCE_FAILURE")
-    )
+    assert any(alert.code == "STALE_MARKET_DATA" for alert in durable.get_alerts(config.run_id))
+    failures = list(durable.iter_inputs(config.run_id, input_type="PUBLIC_SOURCE_FAILURE"))
     assert len(failures) == 1
 
 
@@ -974,6 +976,7 @@ def test_run_forever_stops_and_closes_source_cleanly(tmp_path: Path) -> None:
     assert source.stop_calls == 1
     assert source.close_calls == 1
 
+
 def test_clean_runtime_session_stops_and_restarts_without_failure(
     tmp_path: Path,
 ) -> None:
@@ -994,12 +997,8 @@ def test_clean_runtime_session_stops_and_restarts_without_failure(
     stopped = durable.get_projection(_config().run_id)
     assert stopped.runtime_session_active is False
     assert stopped.runtime_session_stopped_at == _START + timedelta(seconds=2)
-    assert list(
-        durable.iter_inputs(_config().run_id, input_type="PAPER_RUNTIME_FAILURE")
-    ) == []
-    assert replay_paper_run(durable, _config().run_id).projection_hash == (
-        stopped.canonical_hash
-    )
+    assert list(durable.iter_inputs(_config().run_id, input_type="PAPER_RUNTIME_FAILURE")) == []
+    assert replay_paper_run(durable, _config().run_id).projection_hash == (stopped.canonical_hash)
 
     second = _runtime(
         database,
@@ -1032,9 +1031,7 @@ def test_strategy_exception_is_one_durable_runtime_failure_and_clean_session_sto
 
     durable = PaperStore(database, initialize=False)
     projection = durable.get_projection(_config().run_id)
-    failures = list(
-        durable.iter_inputs(_config().run_id, input_type="PAPER_RUNTIME_FAILURE")
-    )
+    failures = list(durable.iter_inputs(_config().run_id, input_type="PAPER_RUNTIME_FAILURE"))
     assert durable.contains_input(_config().run_id, market.event_id)
     assert projection.state is PaperState.PAUSED
     assert projection.runtime_session_active is False
@@ -1043,9 +1040,7 @@ def test_strategy_exception_is_one_durable_runtime_failure_and_clean_session_sto
         "terminal paper runtime failure: MARKET_EVALUATION: RuntimeError"
     )
     assert "secret strategy detail" not in json.dumps(failures[0].payload)
-    assert replay_paper_run(durable, _config().run_id).projection_hash == (
-        projection.canonical_hash
-    )
+    assert replay_paper_run(durable, _config().run_id).projection_hash == (projection.canonical_hash)
 
 
 def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
@@ -1075,19 +1070,11 @@ def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
                 "commit_head_hash": run.commit_head_hash,
                 "projection_revision": run.projection_revision,
                 "projection_hash": run.projection_hash,
-                "event_types": tuple(
-                    event.event.event_type for event in inspection.iter_events(run_id)
-                ),
+                "event_types": tuple(event.event.event_type for event in inspection.iter_events(run_id)),
                 "runtime_session_id": payload["runtime_session_id"],
-                "runtime_session_generation": payload[
-                    "runtime_session_generation"
-                ],
-                "runtime_session_started_at": payload[
-                    "runtime_session_started_at"
-                ],
-                "runtime_session_stopped_at": payload[
-                    "runtime_session_stopped_at"
-                ],
+                "runtime_session_generation": payload["runtime_session_generation"],
+                "runtime_session_started_at": payload["runtime_session_started_at"],
+                "runtime_session_stopped_at": payload["runtime_session_stopped_at"],
             }
         )
         invalid_payload = dict(payload)
@@ -1119,9 +1106,7 @@ def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
     durable = PaperStore(database, initialize=False)
     after_run = durable.get_run(run_id)
     alerts = tuple(
-        alert
-        for alert in durable.get_alerts(run_id)
-        if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+        alert for alert in durable.get_alerts(run_id) if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
     )
     assert after_run.status == PaperState.MANUAL_REVIEW.value
     assert after_run.event_sequence == anchors["event_sequence"]
@@ -1132,27 +1117,19 @@ def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
     assert after_run.projection_hash == anchors["projection_hash"]
     assert len(alerts) == 1
     assert alerts[0].commit_sequence is None
-    assert alerts[0].alert["detail"] == (
-        "durable projection cannot be reconstructed by PaperProjection"
-    )
+    assert alerts[0].alert["detail"] == ("durable projection cannot be reconstructed by PaperProjection")
     assert alerts[0].alert["issues"] == [
         {
             "code": "CURRENT_PROJECTION_MODEL_INVALID",
-            "detail": (
-                "ValueError: projection archived_order_count must be a "
-                "non-negative integer"
-            ),
+            "detail": ("ValueError: projection archived_order_count must be a non-negative integer"),
         }
     ]
     assert durable.contains_input(run_id, market.event_id)
     assert list(durable.iter_inputs(run_id, input_type="PAPER_RUNTIME_FAILURE")) == []
-    assert tuple(
-        event.event.event_type for event in durable.iter_events(run_id)
-    ) == anchors["event_types"]
+    assert tuple(event.event.event_type for event in durable.iter_events(run_id)) == anchors["event_types"]
     with sqlite3.connect(database) as connection:
         row = connection.execute(
-            "SELECT payload_json, effective_status FROM paper_projections "
-            "WHERE run_id=?",
+            "SELECT payload_json, effective_status FROM paper_projections WHERE run_id=?",
             (run_id,),
         ).fetchone()
     assert row is not None
@@ -1178,13 +1155,16 @@ def test_runtime_failure_latches_an_unreadable_projection_without_fake_journal(
     ):
         blocked.start()
     assert blocked_source.start_calls == 0
-    assert len(
-        tuple(
-            alert
-            for alert in PaperStore(database, initialize=False).get_alerts(run_id)
-            if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+    assert (
+        len(
+            tuple(
+                alert
+                for alert in PaperStore(database, initialize=False).get_alerts(run_id)
+                if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+            )
         )
-    ) == 1
+        == 1
+    )
 
 
 def test_hard_crash_requires_one_offline_review_then_replacement_session(
@@ -1210,9 +1190,7 @@ def test_hard_crash_requires_one_offline_review_then_replacement_session(
     ambiguous = durable.get_projection(config.run_id)
     assert durable.contains_input(config.run_id, market.event_id)
     assert ambiguous.runtime_session_active is True
-    assert list(
-        durable.iter_inputs(config.run_id, input_type="PAPER_RUNTIME_FAILURE")
-    ) == []
+    assert list(durable.iter_inputs(config.run_id, input_type="PAPER_RUNTIME_FAILURE")) == []
 
     blocked_source = QueuePublicSource([None])
     blocked = _runtime(
@@ -1227,19 +1205,14 @@ def test_hard_crash_requires_one_offline_review_then_replacement_session(
     assert blocked_source.start_calls == 0
 
     paused = durable.get_projection(config.run_id)
-    failures = list(
-        durable.iter_inputs(config.run_id, input_type="PAPER_RUNTIME_FAILURE")
-    )
+    failures = list(durable.iter_inputs(config.run_id, input_type="PAPER_RUNTIME_FAILURE"))
     assert paused.state is PaperState.PAUSED
     assert paused.runtime_session_active is True
     assert len(failures) == 1
     assert failures[0].payload["reason"] == (
-        "terminal paper runtime failure: UNCLOSED_RUNTIME_SESSION: "
-        "UnclosedRuntimeSessionError"
+        "terminal paper runtime failure: UNCLOSED_RUNTIME_SESSION: UnclosedRuntimeSessionError"
     )
-    assert replay_paper_run(durable, config.run_id).projection_hash == (
-        paused.canonical_hash
-    )
+    assert replay_paper_run(durable, config.run_id).projection_hash == (paused.canonical_hash)
 
     review_engine = PaperEngine(PaperStore(database, initialize=False), config)
     with PaperRuntimeLease(database, config.run_id):
@@ -1453,9 +1426,7 @@ def test_runtime_rejects_cadence_or_release_drift_before_source_and_lease(
             cadence_source,
             config=PaperRuntimeConfig(
                 timer_interval_seconds=config.runtime_timer_interval_seconds,
-                source_poll_timeout_seconds=(
-                    config.runtime_source_poll_timeout_seconds * 2
-                ),
+                source_poll_timeout_seconds=(config.runtime_source_poll_timeout_seconds * 2),
             ),
             clock=MutableClock(_START + timedelta(seconds=2)),
         )
@@ -1471,12 +1442,8 @@ def test_runtime_rejects_cadence_or_release_drift_before_source_and_lease(
             HoldStrategy(),
             release_source,
             config=PaperRuntimeConfig(
-                timer_interval_seconds=(
-                    mismatched_release.runtime_timer_interval_seconds
-                ),
-                source_poll_timeout_seconds=(
-                    mismatched_release.runtime_source_poll_timeout_seconds
-                ),
+                timer_interval_seconds=(mismatched_release.runtime_timer_interval_seconds),
+                source_poll_timeout_seconds=(mismatched_release.runtime_source_poll_timeout_seconds),
             ),
             clock=MutableClock(_START + timedelta(seconds=2)),
         )
@@ -1682,6 +1649,7 @@ def test_restart_and_replay_use_streaming_history_iterators(
 
     assert replay.event_count == restored.last_sequence
     assert replay.projection_hash == restored.canonical_hash
+
 
 def test_runtime_environment_mismatch_rejects_before_lease_store_or_source(
     tmp_path: Path,

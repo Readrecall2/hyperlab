@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal, localcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -214,9 +216,7 @@ def _strategy_decision(
         decided_at=decided_at,
         received_at=max(market.received_at for market in markets.values()),
         market_event_id=primary.event_id,
-        observed_event_ids=tuple(
-            markets[instrument].event_id for instrument in sorted(markets)
-        ),
+        observed_event_ids=tuple(markets[instrument].event_id for instrument in sorted(markets)),
         orders=tuple(
             OrderIntent.create(
                 decision_id=decision_id,
@@ -612,9 +612,7 @@ def _phase08_asymmetric_exit_stall(
     ticked = engine.process_timer(as_of=_START + timedelta(seconds=4, milliseconds=500))
     assert ticked.projection.to_dict() != stalled.to_dict()
     assert ticked.projection.state is PaperState.HEDGED
-    assert ticked.projection.strategy_projections[phase08.strategy_id].state is (
-        PaperState.EMERGENCY_FLATTEN
-    )
+    assert ticked.projection.strategy_projections[phase08.strategy_id].state is (PaperState.EMERGENCY_FLATTEN)
     assert ticked.projection.strategy_projections[phase08.strategy_id].positions == {
         _BTC: Decimal("-0.001329999999999999974352726946")
     }
@@ -809,19 +807,13 @@ def test_phase08_strategy_level_emergency_flatten_retries_only_residual_owner(
 
     residual = Decimal("-0.001329999999999999974352726946")
     assert original_btc_order.status is OrderStatus.EXPIRED
-    assert original_btc_order.filled_quantity == Decimal(
-        "0.0002200000000000000256472730537"
-    )
+    assert original_btc_order.filled_quantity == Decimal("0.0002200000000000000256472730537")
     assert phase08_stalled.positions == {_BTC: residual}
     assert phase08_stalled.state is PaperState.EMERGENCY_FLATTEN
-    assert stalled.strategy_projections[other.strategy_id].positions == {
-        _BTC: Decimal("0.01")
-    }
+    assert stalled.strategy_projections[other.strategy_id].positions == {_BTC: Decimal("0.01")}
     assert stalled.state is PaperState.HEDGED
     assert not any(order.status.active for order in stalled.orders.values())
-    assert not any(
-        alert.code == "UNHEDGED_TIMEOUT" for alert in engine.store.get_alerts(config.run_id)
-    )
+    assert not any(alert.code == "UNHEDGED_TIMEOUT" for alert in engine.store.get_alerts(config.run_id))
     engine.store.close()
 
     connection_id = "phase08-emergency-runtime-1"
@@ -899,9 +891,7 @@ def test_phase08_strategy_level_emergency_flatten_retries_only_residual_owner(
     assert emergency_exit_id is not None
     assert emergency_exit_id != original_exit_id
     emergency_orders = [
-        order
-        for order in planned.projection.orders.values()
-        if order.intent.decision_id == emergency_exit_id
+        order for order in planned.projection.orders.values() if order.intent.decision_id == emergency_exit_id
     ]
     assert len(emergency_orders) == 1
     emergency_order = emergency_orders[0]
@@ -920,9 +910,7 @@ def test_phase08_strategy_level_emergency_flatten_retries_only_residual_owner(
     assert pending_timer.projection.strategy_projections[phase08.strategy_id].state is (
         PaperState.EMERGENCY_FLATTEN
     )
-    assert pending_timer.projection.strategy_projections[phase08.strategy_id].positions == {
-        _BTC: residual
-    }
+    assert pending_timer.projection.strategy_projections[phase08.strategy_id].positions == {_BTC: residual}
     flattened = runtime.run_once()
     assert flattened.kind is PaperRuntimeStepKind.MARKET
     flattened_phase08 = flattened.projection.strategy_projections[phase08.strategy_id]
@@ -981,9 +969,7 @@ def test_phase08_strategy_level_emergency_flatten_retries_only_residual_owner(
     reconciled = recovered.reconcile(as_of=_START + timedelta(seconds=8)).projection
     assert recovered.replay().to_dict() == reconciled.to_dict()
     assert recovered.verify_input_replay().to_dict() == reconciled.to_dict()
-    assert replay_paper_run(recovered_store, config.run_id).projection_hash == (
-        reconciled.canonical_hash
-    )
+    assert replay_paper_run(recovered_store, config.run_id).projection_hash == (reconciled.canonical_hash)
     recovered_store.close()
 
 
@@ -1042,9 +1028,7 @@ def test_strategy_level_emergency_flatten_owned_market_failure_stays_fail_closed
             execution_policy=MarketExecutionPolicy.BOOTSTRAP_OBSERVE_ONLY,
         )
         runtime._latest_markets[_BTC] = market
-        as_of = market.received_at + timedelta(
-            seconds=config.risk.stale_after_seconds + 1
-        )
+        as_of = market.received_at + timedelta(seconds=config.risk.stale_after_seconds + 1)
 
     result = runtime._ensure_automatic_emergency_flatten(
         engine.projection(),
@@ -1054,12 +1038,9 @@ def test_strategy_level_emergency_flatten_owned_market_failure_stays_fail_closed
     assert result is None
     assert after.positions == before_positions
     assert {
-        strategy_id: dict(strategy.positions)
-        for strategy_id, strategy in after.strategy_projections.items()
+        strategy_id: dict(strategy.positions) for strategy_id, strategy in after.strategy_projections.items()
     } == before_strategy_positions
-    assert after.strategy_projections[phase08.strategy_id].state is (
-        PaperState.EMERGENCY_FLATTEN
-    )
+    assert after.strategy_projections[phase08.strategy_id].state is (PaperState.EMERGENCY_FLATTEN)
     assert after.strategy_projections[other.strategy_id].state is PaperState.HEDGED
     assert [
         record
@@ -1071,7 +1052,6 @@ def test_strategy_level_emergency_flatten_owned_market_failure_stays_fail_closed
     ] == before_exit_inputs
     assert engine.verify_input_replay().to_dict() == after.to_dict()
     engine.store.close()
-
 
 
 def test_strategy_evaluation_failure_is_local_and_durable(tmp_path: Path) -> None:
@@ -1243,9 +1223,7 @@ def test_v2_repeated_live_fills_keep_cash_and_both_ledgers_exact() -> None:
         for _ in range(8):
             legacy_aggregate -= fill_notional
             legacy_strategy -= fill_notional
-            legacy_gaps.append(
-                legacy_aggregate - (Decimal("2000") + legacy_strategy)
-            )
+            legacy_gaps.append(legacy_aggregate - (Decimal("2000") + legacy_strategy))
     assert legacy_gaps[4] == Decimal("2E-24")
     assert legacy_gaps[7] == Decimal("3E-24")
 
@@ -1283,10 +1261,7 @@ def test_v2_repeated_live_fills_keep_cash_and_both_ledgers_exact() -> None:
         )
         assert projection.cash == paper_attributed_cash(
             projection.initial_cash,
-            {
-                strategy_id: strategy.cash
-                for strategy_id, strategy in projection.strategy_projections.items()
-            },
+            {strategy_id: strategy.cash for strategy_id, strategy in projection.strategy_projections.items()},
         )
         assert ledger_cash["asset:cash"] == projection.cash
         assert (
@@ -1317,10 +1292,7 @@ def test_v2_fill_rounding_residual_is_applied_after_economic_cash_net() -> None:
     }
     prior_cash = paper_attributed_cash(
         initial_cash,
-        {
-            strategy_id: strategy.cash
-            for strategy_id, strategy in strategies.items()
-        },
+        {strategy_id: strategy.cash for strategy_id, strategy in strategies.items()},
     )
     assert prior_cash == Decimal("4542.054073541283487446100719")
     projection = PaperProjection(
@@ -1568,8 +1540,7 @@ def test_v2_fill_canonicalizes_position_and_fee_strategy_attribution() -> None:
         for account, amount in initial_ledger
     ]
     ledger_entries.extend(
-        SimpleNamespace(transaction_id="fill", account=account, amount=amount)
-        for account, amount in entries
+        SimpleNamespace(transaction_id="fill", account=account, amount=amount) for account, amount in entries
     )
 
     apply_event(projection, event)
@@ -1577,25 +1548,17 @@ def test_v2_fill_canonicalizes_position_and_fee_strategy_attribution() -> None:
     assert projection.positions == {_BTC: canonical_total}
     assert projection.fees == canonical_total
     assert projection.positions == paper_attributed_positions(
-        {
-            strategy_id: strategy.positions
-            for strategy_id, strategy in projection.strategy_projections.items()
-        }
+        {strategy_id: strategy.positions for strategy_id, strategy in projection.strategy_projections.items()}
     )
     assert projection.fees == paper_attributed_fees(
-        {
-            strategy_id: strategy.fees
-            for strategy_id, strategy in projection.strategy_projections.items()
-        }
+        {strategy_id: strategy.fees for strategy_id, strategy in projection.strategy_projections.items()}
     )
     assert projection.inventory_value[_BTC] == legacy_aggregate
     assert projection.clone().to_dict() == projection.to_dict()
 
     engine = object.__new__(PaperEngine)
     engine.config = SimpleNamespace(run_id=projection.run_id)
-    engine.store = SimpleNamespace(
-        iter_ledger_entries=lambda run_id: iter(ledger_entries)
-    )
+    engine.store = SimpleNamespace(iter_ledger_entries=lambda run_id: iter(ledger_entries))
     with localcontext() as context:
         context.prec = 9
         context.rounding = ROUND_DOWN
@@ -1791,9 +1754,7 @@ def test_v2_strategy_reversal_inventory_rounding_reconciles_exactly() -> None:
         strategy_id="alpha",
         strategy_name="alpha",
         strategy_hash=deterministic_id("v2_reversal_strategy"),
-        strategy_config_hash=deterministic_id(
-            "v2_reversal_strategy_config"
-        ),
+        strategy_config_hash=deterministic_id("v2_reversal_strategy_config"),
         positions={_BTC: Decimal(1)},
         cost_basis={_BTC: prior_inventory},
         inventory_value={_BTC: prior_inventory},
@@ -1849,8 +1810,7 @@ def test_v2_strategy_reversal_inventory_rounding_reconciles_exactly() -> None:
     correction_entries = [
         (index, amount)
         for index, (account, amount) in enumerate(entries)
-        if account == strategy_inventory_account
-        and abs(amount) < Decimal("1E-20")
+        if account == strategy_inventory_account and abs(amount) < Decimal("1E-20")
     ]
     assert correction_entries == [(12, Decimal("3.5E-26"))]
     correction_index, correction = correction_entries[0]
@@ -1868,17 +1828,14 @@ def test_v2_strategy_reversal_inventory_rounding_reconciles_exactly() -> None:
         for account, amount in initial_ledger
     ]
     ledger_entries.extend(
-        SimpleNamespace(transaction_id="fill", account=account, amount=amount)
-        for account, amount in entries
+        SimpleNamespace(transaction_id="fill", account=account, amount=amount) for account, amount in entries
     )
 
     apply_event(projection, event)
 
     engine = object.__new__(PaperEngine)
     engine.config = SimpleNamespace(run_id=projection.run_id)
-    engine.store = SimpleNamespace(
-        iter_ledger_entries=lambda run_id: iter(ledger_entries)
-    )
+    engine.store = SimpleNamespace(iter_ledger_entries=lambda run_id: iter(ledger_entries))
     assert projection.strategy_projections["alpha"].inventory_value == {
         _BTC: Decimal("-0.089724876652792511865979365")
     }
@@ -1892,9 +1849,7 @@ def test_strategy_realized_pnl_reconciliation_preserves_transaction_order() -> N
         strategy_id="alpha",
         strategy_name="alpha",
         strategy_hash=deterministic_id("v2_realized_order_strategy"),
-        strategy_config_hash=deterministic_id(
-            "v2_realized_order_strategy_config"
-        ),
+        strategy_config_hash=deterministic_id("v2_realized_order_strategy_config"),
         cash=final_funding,
         fees=funding_then_fee,
         realized_pnl=final_funding,
@@ -1963,9 +1918,7 @@ def test_strategy_realized_pnl_reconciliation_preserves_transaction_order() -> N
     ]
     engine = object.__new__(PaperEngine)
     engine.config = SimpleNamespace(run_id=projection.run_id)
-    engine.store = SimpleNamespace(
-        iter_ledger_entries=lambda run_id: iter(ledger_entries)
-    )
+    engine.store = SimpleNamespace(iter_ledger_entries=lambda run_id: iter(ledger_entries))
 
     assert engine._ledger_reconciliation_errors(projection) == ()
 
@@ -2048,17 +2001,13 @@ def test_v2_rounding_accounts_reject_material_accounting_mutation(
                 updated.inventory_value[_BTC],
                 Decimal(100),
             )
-            updated.cost_basis[_BTC] = abs(
-                updated.inventory_value[_BTC] / updated.positions[_BTC]
-            )
+            updated.cost_basis[_BTC] = abs(updated.inventory_value[_BTC] / updated.positions[_BTC])
         else:
             owner.inventory_value[_BTC] = paper_accounting_add(
                 owner.inventory_value[_BTC],
                 Decimal(100),
             )
-            owner.cost_basis[_BTC] = abs(
-                owner.inventory_value[_BTC] / owner.positions[_BTC]
-            )
+            owner.cost_basis[_BTC] = abs(owner.inventory_value[_BTC] / owner.positions[_BTC])
         return updated
 
     with monkeypatch.context() as patch:
@@ -2082,9 +2031,7 @@ def test_v2_rounding_accounts_reject_balanced_but_false_ordinary_ledger() -> Non
         strategy_id="alpha",
         strategy_name="alpha",
         strategy_hash=deterministic_id("v2_false_ledger_strategy"),
-        strategy_config_hash=deterministic_id(
-            "v2_false_ledger_strategy_config"
-        ),
+        strategy_config_hash=deterministic_id("v2_false_ledger_strategy_config"),
     )
     projection = PaperProjection(
         run_id=deterministic_id("v2_false_ledger_run"),
@@ -2218,12 +2165,8 @@ def test_v2_fill_projection_is_independent_of_ambient_decimal_context() -> None:
     assert observed_entries == expected_entries
     assert observed.to_dict() == expected.to_dict()
     assert observed.fees == Decimal("0.1234567890123456789012345678")
-    assert observed.inventory_value[_BTC] == Decimal(
-        "1.234567890123456789012345678"
-    )
-    assert observed.realized_pnl == Decimal(
-        "-0.1234567890123456789012345678"
-    )
+    assert observed.inventory_value[_BTC] == Decimal("1.234567890123456789012345678")
+    assert observed.realized_pnl == Decimal("-0.1234567890123456789012345678")
 
 
 def test_v2_market_input_replay_is_independent_of_ambient_decimal_context(
@@ -2265,15 +2208,11 @@ def test_v2_market_input_replay_is_independent_of_ambient_decimal_context(
         context.rounding = ROUND_DOWN
         filled = engine.process_market(second).projection
 
-    event_hashes = tuple(
-        event.event_hash for event in store.iter_events(config.run_id)
-    )
+    event_hashes = tuple(event.event_hash for event in store.iter_events(config.run_id))
     replayed = engine.verify_input_replay()
 
     assert replayed.to_dict() == filled.to_dict()
-    assert tuple(
-        event.event_hash for event in store.iter_events(config.run_id)
-    ) == event_hashes
+    assert tuple(event.event_hash for event in store.iter_events(config.run_id)) == event_hashes
     assert observed.clone().to_dict() == observed.to_dict()
 
 
@@ -2328,10 +2267,7 @@ def test_v2_multistrategy_funding_uses_canonical_cash_and_rounding_ledger() -> N
     assert projection.cash == expected_cash
     assert projection.cash == paper_attributed_cash(
         projection.initial_cash,
-        {
-            strategy_id: strategy.cash
-            for strategy_id, strategy in projection.strategy_projections.items()
-        },
+        {strategy_id: strategy.cash for strategy_id, strategy in projection.strategy_projections.items()},
     )
     assert ledger_cash["asset:cash"] == expected_cash
     assert ledger_cash["strategy:phase05_sentiment_btc:asset:cash"] == (
@@ -2440,9 +2376,7 @@ def test_v2_funding_realized_pnl_uses_the_booked_strategy_amount() -> None:
     ) in entries
     apply_event(projection, event)
 
-    assert projection.strategy_projections["zeta"].realized_pnl == Decimal(
-        "0.7607771538154576807794339684"
-    )
+    assert projection.strategy_projections["zeta"].realized_pnl == Decimal("0.7607771538154576807794339684")
     assert projection.realized_pnl == paper_accounting_add(
         prior_realized,
         account_amount,
@@ -2570,12 +2504,8 @@ def test_v2_funding_allocates_and_records_non_distributive_rounding_residual(
         "zeta": "1.1717386981716144432164247357",
     }
     assert rounding["strategy_id"] == "zeta"
-    assert Decimal(str(rounding["raw_amount"])) == Decimal(
-        "1.171738698171614443216424736"
-    )
-    assert Decimal(str(rounding["allocated_amount"])) == Decimal(
-        strategy_amounts["zeta"]
-    )
+    assert Decimal(str(rounding["raw_amount"])) == Decimal("1.171738698171614443216424736")
+    assert Decimal(str(rounding["allocated_amount"])) == Decimal(strategy_amounts["zeta"])
     assert Decimal(str(rounding["residual"])) == Decimal("-3E-28")
     funding_ledger = tuple(
         entry.amount
@@ -2587,10 +2517,7 @@ def test_v2_funding_allocates_and_records_non_distributive_rounding_residual(
         assert sum(funding_ledger, Decimal(0)) == 0
     assert funded.cash == paper_attributed_cash(
         funded.initial_cash,
-        {
-            strategy_id: strategy.cash
-            for strategy_id, strategy in funded.strategy_projections.items()
-        },
+        {strategy_id: strategy.cash for strategy_id, strategy in funded.strategy_projections.items()},
     )
     assert engine.replay().to_dict() == funded.to_dict()
 
@@ -2608,22 +2535,18 @@ def test_historical_v1_cash_input_replay_preserves_events_and_ledger(
     beta = _strategy_config("beta", instrument=_BTC)
     config = replace(
         _portfolio_config((alpha, beta)),
-        release_code_sha256=(
-            "9085bb4a11095e478f3056feba8eb81d93dffd014d1c72e409f7f24c2657c35d"
-        ),
-        runtime_environment_sha256=(
-            "9c41d224d2a2ae66a47617906f3f9ad8bb9df4a7de259af0c116d585274df732"
-        ),
+        release_code_sha256=("9085bb4a11095e478f3056feba8eb81d93dffd014d1c72e409f7f24c2657c35d"),
+        runtime_environment_sha256=("9c41d224d2a2ae66a47617906f3f9ad8bb9df4a7de259af0c116d585274df732"),
     )
-    assert config.config_hash == (
-        "8a3c601e69ce529a2a7200c93b97ca4d9c248711a1cdde4b8e89d6d9a90648c8"
+    assert config.config_hash == ("8a3c601e69ce529a2a7200c93b97ca4d9c248711a1cdde4b8e89d6d9a90648c8")
+    assert config.run_id == ("b091fd6478ef246f9df6ce51bd27e07c0bf111a3fd899f8b86837c184cb4cf47")
+    temporary_directory = TemporaryDirectory(dir=tmp_path)
+    database = Path(temporary_directory.name) / "historical-v1.sqlite3"
+    fixture_store = PaperStore._create_temporary_historical_replay(
+        temporary_directory,
+        filename=database.name,
     )
-    assert config.run_id == (
-        "b091fd6478ef246f9df6ce51bd27e07c0bf111a3fd899f8b86837c184cb4cf47"
-    )
-    database = tmp_path / "historical-v1.sqlite3"
-    fixture_store = PaperStore(database, historical_replay_only=True)
-    fixture_engine = PaperEngine(fixture_store, config)
+    fixture_engine = PaperEngine._for_historical_replay(fixture_store, config)
     fixture_engine.start()
     first = _market("historical-v1-first", _START)
     observed = fixture_engine.process_market(
@@ -2663,9 +2586,7 @@ def test_historical_v1_cash_input_replay_preserves_events_and_ledger(
         _cash_math_version=1,
     ).projection
 
-    v1_inputs = tuple(
-        fixture_store.iter_inputs(config.run_id, input_type="PUBLIC_MARKET_EVENT")
-    )
+    v1_inputs = tuple(fixture_store.iter_inputs(config.run_id, input_type="PUBLIC_MARKET_EVENT"))
     v1_funding_inputs = tuple(
         fixture_store.iter_inputs(
             config.run_id,
@@ -2696,12 +2617,8 @@ def test_historical_v1_cash_input_replay_preserves_events_and_ledger(
     assert len(v1_funding_events) == 1
     assert "cash_math_version" not in v1_funding_events[0].event.payload
     assert "strategy_funding_rounding" not in v1_funding_events[0].event.payload
-    event_hashes = tuple(
-        event.event_hash for event in fixture_store.iter_events(config.run_id)
-    )
-    ledger_hashes = tuple(
-        entry.entry_hash for entry in fixture_store.iter_ledger_entries(config.run_id)
-    )
+    event_hashes = tuple(event.event_hash for event in fixture_store.iter_events(config.run_id))
+    ledger_hashes = tuple(entry.entry_hash for entry in fixture_store.iter_ledger_entries(config.run_id))
     assert event_hashes == (
         "2b214c395658c69c99daa943416bf51b14b2c3c56654e2bfeb9f4dd474155992",
         "72d4f2dd00a2006a5fc407081b8d8017205782e704d1d1fabd96a0da2bee8efc",
@@ -2738,21 +2655,26 @@ def test_historical_v1_cash_input_replay_preserves_events_and_ledger(
         "cf6e86f2fc47f672684dd2d14d1104ffa44707c6c1d7698699d5336f9f06d044"
     )
 
+    fixture_store.close()
     with pytest.raises(
         ValueError,
-        match="historical_replay_only requires a fresh disposable store",
+        match="restricted to the internal temporary-store factory",
     ):
         PaperStore(database, historical_replay_only=True)
     ordinary_store = PaperStore(database, initialize=False)
-    replayed = PaperEngine(ordinary_store, config).verify_input_replay()
+    ordinary_engine = PaperEngine(ordinary_store, config)
+    replayed = ordinary_engine.verify_input_replay()
 
     assert replayed.to_dict() == durable_projection.to_dict()
-    assert tuple(
-        event.event_hash for event in ordinary_store.iter_events(config.run_id)
-    ) == event_hashes
-    assert tuple(
-        entry.entry_hash for entry in ordinary_store.iter_ledger_entries(config.run_id)
-    ) == ledger_hashes
+    assert tuple(event.event_hash for event in ordinary_store.iter_events(config.run_id)) == event_hashes
+    assert (
+        tuple(entry.entry_hash for entry in ordinary_store.iter_ledger_entries(config.run_id))
+        == ledger_hashes
+    )
+    ordinary_store.close()
+    del fixture_engine, fixture_store, ordinary_engine, ordinary_store
+    gc.collect()
+    temporary_directory.cleanup()
 
 
 def test_append_rejects_model_invalid_cash_before_any_durable_write(
@@ -2806,13 +2728,16 @@ def test_append_rejects_model_invalid_cash_before_any_durable_write(
     assert tuple(store.iter_ledger_entries(config.run_id)) == before_ledger
     assert store.get_alerts(config.run_id) == before_alerts
     with sqlite3.connect(store.path) as connection:
-        assert tuple(
-            int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in (
-                "paper_commits",
-                "paper_projection_history",
+        assert (
+            tuple(
+                int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "paper_commits",
+                    "paper_projection_history",
+                )
             )
-        ) == before_counts
+            == before_counts
+        )
     assert store.contains_input(config.run_id, market.event_id) is False
     assert store.verify_integrity(config.run_id).ok
 
@@ -2935,13 +2860,16 @@ def test_append_rejects_cash_input_event_version_mismatch_before_any_write(
     assert tuple(store.iter_ledger_entries(config.run_id)) == before_ledger
     assert store.get_alerts(config.run_id) == before_alerts
     with sqlite3.connect(store.path) as connection:
-        assert tuple(
-            int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in (
-                "paper_commits",
-                "paper_projection_history",
+        assert (
+            tuple(
+                int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "paper_commits",
+                    "paper_projection_history",
+                )
             )
-        ) == before_counts
+            == before_counts
+        )
     assert store.verify_integrity(config.run_id).ok
 
 
@@ -2960,9 +2888,7 @@ def test_decimal_overflow_projection_is_latched_without_journal_append(
     before_ledger = tuple(store.iter_ledger_entries(config.run_id))
     with sqlite3.connect(store.path) as connection:
         before_history_count = int(
-            connection.execute(
-                "SELECT count(*) FROM paper_projection_history"
-            ).fetchone()[0]
+            connection.execute("SELECT count(*) FROM paper_projection_history").fetchone()[0]
         )
 
     invalid = store.get_projection_payload(config.run_id)
@@ -2979,17 +2905,14 @@ def test_decimal_overflow_projection_is_latched_without_journal_append(
 
     readonly = store.inspect_integrity_readonly(config.run_id)
     assert any(
-        issue.code == "CURRENT_PROJECTION_MODEL_INVALID"
-        and issue.detail.startswith("Overflow:")
+        issue.code == "CURRENT_PROJECTION_MODEL_INVALID" and issue.detail.startswith("Overflow:")
         for issue in readonly.issues
     )
     assert store.latch_unreadable_projection(config.run_id) is True
 
     after_run = store.get_run(config.run_id)
     alerts = tuple(
-        alert
-        for alert in store.get_alerts(config.run_id)
-        if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
+        alert for alert in store.get_alerts(config.run_id) if alert.code == "PAPER_STORE_INTEGRITY_FAILURE"
     )
     assert after_run.status == PaperState.MANUAL_REVIEW.value
     assert after_run.event_sequence == before_run.event_sequence
@@ -3005,11 +2928,10 @@ def test_decimal_overflow_projection_is_latched_without_journal_append(
     assert alerts[0].commit_sequence is None
     assert alerts[0].alert["issues"][0]["detail"].startswith("Overflow:")
     with sqlite3.connect(store.path) as connection:
-        assert int(
-            connection.execute(
-                "SELECT count(*) FROM paper_projection_history"
-            ).fetchone()[0]
-        ) == before_history_count
+        assert (
+            int(connection.execute("SELECT count(*) FROM paper_projection_history").fetchone()[0])
+            == before_history_count
+        )
 
 
 def test_round_trip_realized_pnl_fees_and_portfolio_totals_are_attributed(

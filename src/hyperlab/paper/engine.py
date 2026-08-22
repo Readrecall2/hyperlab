@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from itertools import zip_longest
-from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import cast
+from typing import Self, cast
 
 import pandas as pd
 
@@ -72,9 +71,8 @@ def _temporary_historical_replay_store() -> Iterator[PaperStore]:
 
     temporary_directory = TemporaryDirectory(prefix="hyperlab-paper-replay-")
     try:
-        replay_store = PaperStore(
-            Path(temporary_directory.name) / "paper-replay.sqlite3",
-            historical_replay_only=True,
+        replay_store = PaperStore._create_temporary_historical_replay(
+            temporary_directory,
         )
         try:
             yield replay_store
@@ -170,18 +168,49 @@ class PaperEngine:
     transport dependency.
     """
 
-    def __init__(self, store: PaperStore, config: PaperRunConfig) -> None:
+    def __init__(
+        self,
+        store: PaperStore,
+        config: PaperRunConfig,
+        *,
+        _historical_replay_capability: object | None = None,
+    ) -> None:
         if not isinstance(store, PaperStore):
             raise TypeError("store must be a PaperStore")
         if not isinstance(config, PaperRunConfig):
             raise TypeError("config must be a PaperRunConfig")
+        if (
+            store.historical_replay_only
+            and _historical_replay_capability is not store._historical_replay_engine_capability()
+        ):
+            raise ValueError("temporary historical replay store requires the internal replay engine factory")
+        if not store.historical_replay_only and _historical_replay_capability is not None:
+            raise ValueError("historical replay capability requires a replay-only store")
         self.store = store
         self.config = config
+        self._config_hash = config.config_hash
+        self._run_id = deterministic_id("paper_run", self._config_hash)
         self.store.initialize()
+
+    @classmethod
+    def _for_historical_replay(
+        cls,
+        store: PaperStore,
+        config: PaperRunConfig,
+    ) -> Self:
+        return cls(
+            store,
+            config,
+            _historical_replay_capability=store._historical_replay_engine_capability(),
+        )
 
     @property
     def run_id(self) -> str:
-        return self.config.run_id
+        try:
+            return self._run_id
+        except AttributeError:
+            # Preserve established object.__new__-based forensic helpers.
+            return self.config.run_id
 
     def start(
         self,
@@ -200,14 +229,14 @@ class PaperEngine:
         _raise_if_interrupted(should_stop)
         initial = PaperProjection(
             run_id=self.run_id,
-            config_hash=self.config.config_hash,
+            config_hash=self._config_hash,
             initial_cash=self.config.initial_cash,
         )
         try:
             durable = self.store.get_run(self.run_id)
         except RunNotFoundError:
             durable = self.store.create_run(self.config, initial)
-        if durable.config_hash != self.config.config_hash:
+        if durable.config_hash != self._config_hash:
             raise RunConflictError("paper run configuration drift is forbidden")
 
         verification: _VerifiedPaperState | None = None
@@ -223,7 +252,7 @@ class PaperEngine:
 
         input_id = deterministic_id("paper_input_run_started", self.run_id)
         input_payload = {
-            "config_hash": self.config.config_hash,
+            "config_hash": self._config_hash,
             "input_type": "RUN_START",
             "run_id": self.run_id,
         }
@@ -233,7 +262,7 @@ class PaperEngine:
         else:
             projection = self.projection()
             run_payload: dict[str, object] = {
-                "config_hash": self.config.config_hash,
+                "config_hash": self._config_hash,
                 "run_kind": self.config.run_kind,
                 "strategy_hash": self.config.strategy_hash,
             }
@@ -318,7 +347,7 @@ class PaperEngine:
 
     def projection(self) -> PaperProjection:
         projection = self.store.get_projection(self.run_id)
-        if projection.config_hash != self.config.config_hash:
+        if projection.config_hash != self._config_hash:
             raise RunConflictError("durable paper projection has a different frozen config hash")
         return projection
 
@@ -504,11 +533,13 @@ class PaperEngine:
         protective_pending_exit = (
             decision.action is DecisionAction.EXIT
             and bool(self.config.strategies)
-            and projection.state in {
+            and projection.state
+            in {
                 PaperState.REDUCE_ONLY,
                 PaperState.EMERGENCY_FLATTEN,
             }
-            and decision_state in {
+            and decision_state
+            in {
                 PaperState.LEG_1_PENDING,
                 PaperState.HEDGE_PENDING,
                 PaperState.EXIT_PENDING,
@@ -528,8 +559,7 @@ class PaperEngine:
             and not protective_pending_exit
         ):
             raise ValueError(
-                "EXIT decisions require a hedged/protective state or a global "
-                "protective reduce-only unwind"
+                "EXIT decisions require a hedged/protective state or a global protective reduce-only unwind"
             )
 
         events: list[PaperEvent] = []
@@ -714,7 +744,9 @@ class PaperEngine:
             target = (
                 working.state
                 if protective_pending_exit and accepted
-                else PaperState.EXIT_PENDING if accepted else protective_exit_state
+                else PaperState.EXIT_PENDING
+                if accepted
+                else protective_exit_state
             )
         else:
             target = PaperState.EXIT_PENDING if accepted else PaperState.HEDGED
@@ -852,10 +884,7 @@ class PaperEngine:
             episode_id = deterministic_id(
                 "paper_market_gap_episode" if market.gap else "paper_stale_feed_episode",
                 self.run_id,
-                utc_text(
-                    working.last_market_received_at
-                    or self.config.validation_started_at
-                ),
+                utc_text(working.last_market_received_at or self.config.validation_started_at),
             )
             alert_payload = self._alert_payload(
                 code=code,
@@ -864,9 +893,8 @@ class PaperEngine:
                 causation_id=episode_id,
                 at=processed,
             )
-            if (
-                working.state is not PaperState.PAUSED
-                and not self._alert_is_durable(str(alert_payload["alert_id"]))
+            if working.state is not PaperState.PAUSED and not self._alert_is_durable(
+                str(alert_payload["alert_id"])
             ):
                 emit(PaperEventType.ALERT_RAISED, alert_payload)
             if working.state not in {
@@ -1449,10 +1477,7 @@ class PaperEngine:
                         if historical_strategy is not None
                         else Decimal(0)
                     )
-                    if (
-                        normalized_applicability == "PRE_ACTIVATION_IGNORED"
-                        or strategy_position == 0
-                    ):
+                    if normalized_applicability == "PRE_ACTIVATION_IGNORED" or strategy_position == 0:
                         strategy_amounts[strategy_id] = Decimal(0)
                     else:
                         mark = cast(Decimal, normalized_mark)
@@ -1472,14 +1497,9 @@ class PaperEngine:
                     attributed_amount,
                     strategy_amounts[strategy_id],
                 )
-            if (
-                cash_math_version == PAPER_CASH_MATH_VERSION
-                and attributed_amount != normalized_amount
-            ):
+            if cash_math_version == PAPER_CASH_MATH_VERSION and attributed_amount != normalized_amount:
                 if not contributing_strategy_ids:
-                    raise ValueError(
-                        "strategy funding attribution differs from account funding"
-                    )
+                    raise ValueError("strategy funding attribution differs from account funding")
                 owner = contributing_strategy_ids[-1]
                 other_amount = Decimal(0)
                 for strategy_id in sorted(strategy_amounts):
@@ -1498,9 +1518,7 @@ class PaperEngine:
                     raw_amount,
                 )
                 if residual == 0:
-                    raise ValueError(
-                        "strategy funding attribution differs from account funding"
-                    )
+                    raise ValueError("strategy funding attribution differs from account funding")
                 strategy_amounts[owner] = allocated_amount
                 strategy_funding_rounding = {
                     "allocated_amount": decimal_text(allocated_amount),
@@ -1521,10 +1539,7 @@ class PaperEngine:
             }
 
         event_payload = dict(payload)
-        if (
-            strategy_amount_payload is not None
-            and cash_math_version == PAPER_CASH_MATH_VERSION
-        ):
+        if strategy_amount_payload is not None and cash_math_version == PAPER_CASH_MATH_VERSION:
             event_payload["strategy_amounts"] = strategy_amount_payload
         if strategy_funding_rounding is not None:
             event_payload["strategy_funding_rounding"] = strategy_funding_rounding
@@ -1580,7 +1595,7 @@ class PaperEngine:
         input_id = deterministic_id("paper_stress_result_input", self.run_id, artifact)
         payload = {
             "artifact_hash": artifact,
-            "config_hash": self.config.config_hash,
+            "config_hash": self._config_hash,
             "evaluated_event_head_hash": projection.last_event_hash,
             "evaluated_event_sequence": projection.last_sequence,
             "evaluated_at": utc_text(evaluated_at),
@@ -1620,7 +1635,7 @@ class PaperEngine:
         input_id = deterministic_id("paper_resilience_exercise_input", self.run_id, normalized, artifact)
         payload = {
             "artifact_hash": artifact,
-            "config_hash": self.config.config_hash,
+            "config_hash": self._config_hash,
             "exercise": normalized,
             "exercised_at": utc_text(exercised_at),
             "input_type": "RESILIENCE_EXERCISE",
@@ -1661,7 +1676,7 @@ class PaperEngine:
         input_id = deterministic_id("paper_observation_coverage_input", self.run_id, artifact)
         payload = {
             "artifact_hash": artifact,
-            "config_hash": self.config.config_hash,
+            "config_hash": self._config_hash,
             "continuous": bool(continuous),
             "input_type": "OBSERVATION_COVERAGE",
             "window_end": utc_text(window_end),
@@ -1776,9 +1791,7 @@ class PaperEngine:
                 )
                 if as_of - (strategy.state_since or self.config.validation_started_at)
                 >= timedelta(
-                    seconds=self.config.strategy_config(
-                        strategy.strategy_id
-                    ).risk.unhedged_timeout_seconds
+                    seconds=self.config.strategy_config(strategy.strategy_id).risk.unhedged_timeout_seconds
                 )
             )
             unhedged_timed_out = bool(timed_out_strategies)
@@ -1843,15 +1856,11 @@ class PaperEngine:
         if unhedged_timed_out:
             if working.strategy_projections:
                 for strategy in timed_out_strategies:
-                    strategy_since = (
-                        strategy.state_since or self.config.validation_started_at
-                    )
+                    strategy_since = strategy.state_since or self.config.validation_started_at
                     alert_payload = self._alert_payload(
                         code="UNHEDGED_TIMEOUT",
                         severity=AlertSeverity.CRITICAL,
-                        message=(
-                            "strategy unhedged simulated exposure exceeded its frozen timeout"
-                        ),
+                        message=("strategy unhedged simulated exposure exceeded its frozen timeout"),
                         causation_id=deterministic_id(
                             "paper_strategy_unhedged_episode",
                             self.run_id,
@@ -2321,7 +2330,7 @@ class PaperEngine:
             failure_artifact = deterministic_id(
                 "paper_runtime_failure_v1",
                 self.run_id,
-                self.config.config_hash,
+                self._config_hash,
                 "UNCLOSED_RUNTIME_SESSION",
                 "UnclosedRuntimeSessionError",
                 session_id,
@@ -2421,26 +2430,17 @@ class PaperEngine:
             if isinstance(strategy_ids, str):
                 raise TypeError("strategy_ids must be a sequence of strategy identifiers")
             requested_strategy_ids = tuple(strategy_ids)
-            if (
-                not requested_strategy_ids
-                or len(set(requested_strategy_ids)) != len(requested_strategy_ids)
-            ):
-                raise ValueError(
-                    "strategy-scoped emergency flatten requires unique strategy identifiers"
-                )
+            if not requested_strategy_ids or len(set(requested_strategy_ids)) != len(requested_strategy_ids):
+                raise ValueError("strategy-scoped emergency flatten requires unique strategy identifiers")
             requested_strategy_ids = tuple(sorted(requested_strategy_ids))
             if portfolio_protective:
-                raise ValueError(
-                    "portfolio protective emergency flatten cannot be narrowed by strategy"
-                )
+                raise ValueError("portfolio protective emergency flatten cannot be narrowed by strategy")
         elif not portfolio_protective:
             raise ValueError("automatic flatten requires a protective paper state")
 
         if projection.strategy_projections:
             if requested_strategy_ids is None:
-                selected_strategies = tuple(
-                    sorted(projection.strategy_projections.items())
-                )
+                selected_strategies = tuple(sorted(projection.strategy_projections.items()))
             else:
                 try:
                     selected_strategies = tuple(
@@ -2455,13 +2455,11 @@ class PaperEngine:
                         "strategy-scoped emergency flatten references an unknown strategy"
                     ) from error
                 if any(
-                    strategy.state is not PaperState.EMERGENCY_FLATTEN
-                    or not strategy.positions
+                    strategy.state is not PaperState.EMERGENCY_FLATTEN or not strategy.positions
                     for _strategy_id, strategy in selected_strategies
                 ):
                     raise ValueError(
-                        "strategy-scoped emergency flatten requires exposed "
-                        "EMERGENCY_FLATTEN strategies"
+                        "strategy-scoped emergency flatten requires exposed EMERGENCY_FLATTEN strategies"
                     )
             owned_positions = {
                 strategy_id: dict(strategy.positions)
@@ -2548,9 +2546,7 @@ class PaperEngine:
                 raise AssertionError("attributed emergency flatten produced no decisions")
             return last_result
         if requested_strategy_ids is not None:
-            raise ValueError(
-                "strategy-scoped emergency flatten requires attributed projections"
-            )
+            raise ValueError("strategy-scoped emergency flatten requires attributed projections")
         if not projection.positions:
             raise ValueError("emergency_flatten requires an open simulated position")
         if any(instrument not in markets for instrument in projection.positions):
@@ -2615,7 +2611,7 @@ class PaperEngine:
 
         replayed = replay_projection(
             run_id=self.run_id,
-            config_hash=self.config.config_hash,
+            config_hash=self._config_hash,
             initial_cash=self.config.initial_cash,
             events=interruptible_events(),
         )
@@ -2629,14 +2625,29 @@ class PaperEngine:
             raise ValueError("event replay head differs from the durable hash-chain head")
         return replayed
 
-    def verify_input_replay(self) -> PaperProjection:
+    def verify_input_replay(
+        self,
+        *,
+        _source_integrity: IntegrityReport | None = None,
+    ) -> PaperProjection:
         """Re-run the canonical inbox through a fresh engine and compare outputs exactly."""
 
+        source_head = self.store.get_run(self.run_id).head_identity
+        if _source_integrity is not None:
+            if not _source_integrity.ok or _source_integrity.run_id != self.run_id:
+                raise ValueError("canonical input replay requires a valid source integrity attestation")
+            if (
+                _source_integrity.event_count != source_head[3]
+                or _source_integrity.event_head_hash != source_head[4]
+                or _source_integrity.commit_count != source_head[5]
+                or _source_integrity.commit_head_hash != source_head[6]
+            ):
+                raise ConcurrentWriteError("paper durable head differs from the source integrity attestation")
         source_inputs = self.store.iter_inputs(self.run_id)
         legacy_source_events = iter(self.store.iter_events(self.run_id))
         legacy_source_event: StoredPaperEvent | None = None
         with _temporary_historical_replay_store() as replay_store:
-            replay_engine = PaperEngine(replay_store, self.config)
+            replay_engine = PaperEngine._for_historical_replay(replay_store, self.config)
             replay_engine.start()
             for record in source_inputs:
                 payload = record.payload
@@ -2673,9 +2684,7 @@ class PaperEngine:
                             str(payload.get("processed_at", utc_text(market.received_at)))
                         ),
                         execution_policy=str(payload.get("execution_policy", "EXECUTE")),
-                        _cash_math_version=int(
-                            str(payload.get("cash_math_version", 1))
-                        ),
+                        _cash_math_version=int(str(payload.get("cash_math_version", 1))),
                     )
                 elif input_type == "STRATEGY_DECISION":
                     raw_decision = payload.get("decision")
@@ -2773,18 +2782,21 @@ class PaperEngine:
                             if payload.get("source_activation_cutoff") is not None
                             else None
                         ),
-                        _cash_math_version=int(
-                            str(payload.get("cash_math_version", 1))
-                        ),
+                        _cash_math_version=int(str(payload.get("cash_math_version", 1))),
                     )
                 elif input_type == "TIMER":
                     replay_engine.process_timer(
                         as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
                     )
                 elif input_type == "RECONCILE":
-                    replay_engine.reconcile(
-                        as_of=datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
-                    )
+                    reconcile_at = datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
+                    if _source_integrity is None:
+                        replay_engine.reconcile(as_of=reconcile_at)
+                    else:
+                        replay_engine._reconcile(
+                            as_of=reconcile_at,
+                            verification=replay_engine._verified_historical_replay_prefix(),
+                        )
                 elif input_type == "STRESS_RESULT":
                     replay_engine.record_stress_result(
                         artifact_hash=str(payload["artifact_hash"]),
@@ -2886,6 +2898,13 @@ class PaperEngine:
                 else:
                     raise ValueError(f"unsupported durable replay input type {input_type!r}")
 
+            replay_integrity = replay_store.inspect_integrity_readonly(self.run_id)
+            if not replay_integrity.ok:
+                raise IntegrityError(replay_integrity)
+            replayed = replay_store.get_projection(self.run_id)
+            semantic_errors = replay_engine._ledger_reconciliation_errors(replayed)
+            if semantic_errors:
+                raise _LedgerReconciliationError("; ".join(semantic_errors))
             for source_event, replay_event in zip_longest(
                 self.store.iter_events(self.run_id),
                 replay_store.iter_events(self.run_id),
@@ -2903,10 +2922,58 @@ class PaperEngine:
             ):
                 if source_entry is None or replay_entry is None or source_entry.entry != replay_entry.entry:
                     raise ValueError("canonical input replay produced a different ledger")
-            replayed = replay_store.get_projection(self.run_id)
+            source_alerts = tuple(
+                (
+                    alert.run_id,
+                    alert.alert_id,
+                    alert.commit_sequence,
+                    alert.event_sequence,
+                    alert.severity,
+                    alert.code,
+                    alert.alert,
+                    alert.payload_hash,
+                )
+                for alert in self.store.get_alerts(self.run_id)
+            )
+            replay_alerts = tuple(
+                (
+                    alert.run_id,
+                    alert.alert_id,
+                    alert.commit_sequence,
+                    alert.event_sequence,
+                    alert.severity,
+                    alert.code,
+                    alert.alert,
+                    alert.payload_hash,
+                )
+                for alert in replay_store.get_alerts(self.run_id)
+            )
+            if source_alerts != replay_alerts:
+                raise ValueError("canonical input replay produced different paper alerts")
             if replayed.to_dict() != self.projection().to_dict():
                 raise ValueError("canonical input replay produced a different projection")
+            if self.store.get_run(self.run_id).head_identity != source_head:
+                raise ConcurrentWriteError("paper durable head changed during canonical input replay")
             return replayed
+
+    def _verified_historical_replay_prefix(self) -> _VerifiedPaperState:
+        """Certify an inductively replayed prefix without rescanning its history."""
+
+        if not self.store.historical_replay_only:
+            raise ValueError("historical replay prefix verification requires a disposable store")
+        before = self.store.get_run(self.run_id)
+        projection = self.projection()
+        report = self.store.inspect_head_integrity_readonly(self.run_id)
+        after = self.store.get_run(self.run_id)
+        if after.head_identity != before.head_identity:
+            raise ConcurrentWriteError("paper replay-store head changed during prefix verification")
+        if not report.ok:
+            raise IntegrityError(report)
+        return _VerifiedPaperState(
+            head_identity=after.head_identity,
+            report=report,
+            projection=projection,
+        )
 
     def reconcile(
         self,
@@ -3096,23 +3163,13 @@ class PaperEngine:
 
         def attribution_rounding_account(account: str) -> str | None:
             if account.endswith("asset:cash"):
-                return (
-                    account.removesuffix("asset:cash")
-                    + "equity:cash_attribution_rounding"
-                )
+                return account.removesuffix("asset:cash") + "equity:cash_attribution_rounding"
             if account.endswith("expense:fees"):
-                return (
-                    account.removesuffix("expense:fees")
-                    + "equity:fee_attribution_rounding"
-                )
+                return account.removesuffix("expense:fees") + "equity:fee_attribution_rounding"
             inventory_marker = "asset:inventory:"
             if inventory_marker in account:
                 prefix, instrument = account.split(inventory_marker, maxsplit=1)
-                return (
-                    prefix
-                    + "equity:inventory_accounting_rounding:"
-                    + instrument
-                )
+                return prefix + "equity:inventory_accounting_rounding:" + instrument
             return None
 
         def apply_transaction(entries: Sequence[tuple[str, Decimal]]) -> Decimal:
@@ -3173,14 +3230,12 @@ class PaperEngine:
                         Decimal(0),
                     ).copy_negate(),
                 )
-                ledger_strategy_realized_pnl[strategy_id] = (
-                    paper_accounting_add(
-                        ledger_strategy_realized_pnl.get(
-                            strategy_id,
-                            Decimal(0),
-                        ),
-                        strategy_delta,
-                    )
+                ledger_strategy_realized_pnl[strategy_id] = paper_accounting_add(
+                    ledger_strategy_realized_pnl.get(
+                        strategy_id,
+                        Decimal(0),
+                    ),
+                    strategy_delta,
                 )
             return paper_accounting_add(
                 paper_accounting_add(
@@ -3273,7 +3328,8 @@ class PaperEngine:
         events: Sequence[PaperEvent],
         explicit_ledger: Sequence[LedgerEntry] = (),
     ) -> PaperCommandResult:
-        working = base.clone()
+        working = base if self.store.historical_replay_only else base.clone()
+        expected_sequence = base.last_sequence
         ledger = list(explicit_ledger)
         alerts: list[dict[str, object]] = []
         previous_hash = working.last_event_hash
@@ -3316,9 +3372,12 @@ class PaperEngine:
             ledger,
             working,
             alerts=alerts,
-            expected_sequence=base.last_sequence,
+            expected_sequence=expected_sequence,
         )
-        return PaperCommandResult(append=append, projection=self.projection())
+        return PaperCommandResult(
+            append=append,
+            projection=working if self.store.historical_replay_only else self.projection(),
+        )
 
     def _event(
         self,
@@ -4013,16 +4072,13 @@ class PaperEngine:
             quantity_cap = self._hedge_quantity_cap(projection, order)
             if quantity_cap <= 0:
                 group_id = intent.hedge_group_id
-                waiting_on_earlier_leg = (
-                    group_id is not None
-                    and any(
-                        sibling.intent.decision_id == intent.decision_id
-                        and sibling.intent.hedge_group_id == group_id
-                        and sibling.intent.leg_number < intent.leg_number
-                        and sibling.status.active
-                        and sibling.filled_quantity == 0
-                        for sibling in projection.orders.values()
-                    )
+                waiting_on_earlier_leg = group_id is not None and any(
+                    sibling.intent.decision_id == intent.decision_id
+                    and sibling.intent.hedge_group_id == group_id
+                    and sibling.intent.leg_number < intent.leg_number
+                    and sibling.status.active
+                    and sibling.filled_quantity == 0
+                    for sibling in projection.orders.values()
                 )
                 if waiting_on_earlier_leg:
                     return
@@ -4320,18 +4376,12 @@ class PaperEngine:
     def _entry_group_is_proportionally_filled(orders: list[PaperOrder]) -> bool:
         """Return whether a terminal partial entry preserves every requested leg ratio."""
 
-        if len(orders) < 2 or any(
-            order.status.active or order.filled_quantity <= 0
-            for order in orders
-        ):
+        if len(orders) < 2 or any(order.status.active or order.filled_quantity <= 0 for order in orders):
             return False
 
         anchor = orders[0]
         anchor_completion = anchor.filled_quantity / anchor.intent.quantity
-        return all(
-            order.filled_quantity / order.intent.quantity == anchor_completion
-            for order in orders[1:]
-        )
+        return all(order.filled_quantity / order.intent.quantity == anchor_completion for order in orders[1:])
 
     def _derive_lifecycle(
         self,

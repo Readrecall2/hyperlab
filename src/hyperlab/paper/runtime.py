@@ -36,7 +36,12 @@ from hyperlab.paper.runner import (
     PaperStrategyView,
     PortfolioRunner,
 )
-from hyperlab.paper.store import ConcurrentWriteError, PaperStore, RunNotFoundError
+from hyperlab.paper.store import (
+    ConcurrentWriteError,
+    IntegrityError,
+    PaperStore,
+    RunNotFoundError,
+)
 
 PUBLIC_MARKET_SCHEMA_VERSION = 1
 PUBLIC_MARKET_SOURCE_KIND = "PUBLIC_NORMALIZED"
@@ -282,9 +287,7 @@ def replay_paper_run(store: PaperStore, run_id: str) -> PaperReplayVerification:
 
     def require_stable_head() -> None:
         if store.get_run(run_id).head_identity != expected_head:
-            raise ConcurrentWriteError(
-                "paper durable head changed during replay verification"
-            ) from None
+            raise ConcurrentWriteError("paper durable head changed during replay verification") from None
 
     integrity = store.inspect_integrity_readonly(run_id)
     require_stable_head()
@@ -323,8 +326,10 @@ def replay_paper_run(store: PaperStore, run_id: str) -> PaperReplayVerification:
     if replayed.last_sequence != run.event_sequence or replayed.last_event_hash != run.event_head_hash:
         raise PaperAdmissionError("event replay differs from the durable hash-chain head")
     try:
-        input_replayed = PaperEngine(store, config).verify_input_replay()
-    except ValueError:
+        input_replayed = PaperEngine(store, config).verify_input_replay(
+            _source_integrity=integrity,
+        )
+    except (IntegrityError, ValueError):
         require_stable_head()
         raise
     require_stable_head()
@@ -359,6 +364,8 @@ class PaperRuntime:
     ) -> None:
         if not isinstance(engine, PaperEngine):
             raise TypeError("engine must be a PaperEngine")
+        if engine.store.historical_replay_only:
+            raise PaperAdmissionError("PaperRuntime rejects temporary historical replay-only stores")
         descriptor = source.descriptor
         if not isinstance(descriptor, PublicSourceDescriptor):
             raise TypeError("source descriptor must be a PublicSourceDescriptor")
@@ -805,17 +812,12 @@ class PaperRuntime:
             durable_before_start = None
         if durable_before_start is not None:
             try:
-                durable_projection = self.engine.store.get_projection(
-                    self.engine.run_id
-                )
+                durable_projection = self.engine.store.get_projection(self.engine.run_id)
             except (DecimalException, KeyError, TypeError, ValueError) as error:
-                if self.engine.store.latch_unreadable_projection(
-                    self.engine.run_id
-                ):
+                if self.engine.store.latch_unreadable_projection(self.engine.run_id):
                     self._faulted = True
                     raise PaperAdmissionError(
-                        "durable paper projection is model-invalid; "
-                        "MANUAL_REVIEW latched"
+                        "durable paper projection is model-invalid; MANUAL_REVIEW latched"
                     ) from error
                 raise
             runtime_restart = durable_projection.runtime_session_generation > 0
@@ -987,13 +989,8 @@ class PaperRuntime:
         instruments: Iterable[str] | None = None,
     ) -> Iterable[MarketEvent]:
         admitted = frozenset(instruments) if instruments is not None else None
-        for item in self._durable_public_inputs(
-            after_commit_sequence=after_commit_sequence
-        ):
-            if (
-                isinstance(item, MarketEvent)
-                and (admitted is None or item.instrument in admitted)
-            ):
+        for item in self._durable_public_inputs(after_commit_sequence=after_commit_sequence):
+            if isinstance(item, MarketEvent) and (admitted is None or item.instrument in admitted):
                 yield item
 
     def _restore_strategy(
@@ -1018,9 +1015,7 @@ class PaperRuntime:
                 if incremental
                 else getattr(adapter, "restore_public_inputs", None)
             )
-            if incremental and restore_public is None and hasattr(
-                adapter, "restore_public_inputs"
-            ):
+            if incremental and restore_public is None and hasattr(adapter, "restore_public_inputs"):
                 after_commit_sequence = 0
                 restore_public = adapter.restore_public_inputs
             restore = (
@@ -1037,9 +1032,7 @@ class PaperRuntime:
                 else self._durable_markets(
                     after_commit_sequence=after_commit_sequence,
                     instruments=(
-                        strategy_config.required_instruments
-                        if strategy_config is not None
-                        else None
+                        strategy_config.required_instruments if strategy_config is not None else None
                     ),
                 )
             )
@@ -1233,8 +1226,7 @@ class PaperRuntime:
             else:
                 try:
                     strategies = tuple(
-                        projection.strategy_projections[strategy_id]
-                        for strategy_id in strategy_ids
+                        projection.strategy_projections[strategy_id] for strategy_id in strategy_ids
                     )
                 except KeyError as error:
                     raise PaperAdmissionError(
@@ -1266,9 +1258,7 @@ class PaperRuntime:
                     return True
             return False
         if strategy_ids is not None:
-            raise PaperAdmissionError(
-                "strategy-scoped emergency flatten requires attributed projections"
-            )
+            raise PaperAdmissionError("strategy-scoped emergency flatten requires attributed projections")
         decision_id = projection.current_exit_decision_id
         if decision_id is None:
             return False
@@ -1300,22 +1290,17 @@ class PaperRuntime:
         stale_after = timedelta(seconds=self.engine.config.risk.stale_after_seconds)
         if strategy_ids is not None:
             if not projection.strategy_projections:
-                raise PaperAdmissionError(
-                    "strategy-scoped emergency markets require attributed projections"
-                )
+                raise PaperAdmissionError("strategy-scoped emergency markets require attributed projections")
             try:
                 selected_strategies = tuple(
-                    projection.strategy_projections[strategy_id]
-                    for strategy_id in strategy_ids
+                    projection.strategy_projections[strategy_id] for strategy_id in strategy_ids
                 )
             except KeyError as error:
                 raise PaperAdmissionError(
                     "automatic emergency markets reference an unknown strategy"
                 ) from error
             instruments = {
-                instrument
-                for strategy in selected_strategies
-                for instrument in strategy.positions
+                instrument for strategy in selected_strategies for instrument in strategy.positions
             }
         elif projection.strategy_projections:
             instruments = {
@@ -1357,24 +1342,17 @@ class PaperRuntime:
             sorted(
                 strategy_id
                 for strategy_id, strategy in projection.strategy_projections.items()
-                if strategy.positions
-                and strategy.state is PaperState.EMERGENCY_FLATTEN
+                if strategy.positions and strategy.state is PaperState.EMERGENCY_FLATTEN
             )
         )
         target_strategy_ids: tuple[str, ...] | None = None
         if portfolio_protective:
             has_attributed_position = (
-                any(
-                    strategy.positions
-                    for strategy in projection.strategy_projections.values()
-                )
+                any(strategy.positions for strategy in projection.strategy_projections.values())
                 if projection.strategy_projections
                 else bool(projection.positions)
             )
-            if (
-                not has_attributed_position
-                or self._runtime_emergency_exit_is_active(projection)
-            ):
+            if not has_attributed_position or self._runtime_emergency_exit_is_active(projection):
                 return None
         else:
             target_strategy_ids = tuple(
@@ -1400,10 +1378,7 @@ class PaperRuntime:
                 decided_at=as_of,
                 reason=(
                     _AUTOMATIC_EMERGENCY_FLATTEN_REASON
-                    if (
-                        projection.state is PaperState.EMERGENCY_FLATTEN
-                        or target_strategy_ids is not None
-                    )
+                    if (projection.state is PaperState.EMERGENCY_FLATTEN or target_strategy_ids is not None)
                     else _AUTOMATIC_PROTECTIVE_FLATTEN_REASON
                 ),
                 strategy_ids=target_strategy_ids,
@@ -1678,9 +1653,7 @@ class PaperRuntime:
             observed_projection,
             as_of=observed_at,
         )
-        final_projection = (
-            protective.projection if protective is not None else observed_projection
-        )
+        final_projection = protective.projection if protective is not None else observed_projection
         return PaperRuntimeStep(
             kind=PaperRuntimeStepKind.FUNDING,
             projection=final_projection,

@@ -1224,11 +1224,25 @@ class PaperRuntime:
     def _runtime_emergency_exit_is_active(
         self,
         projection: PaperProjection,
+        *,
+        strategy_ids: tuple[str, ...] | None = None,
     ) -> bool:
         if projection.strategy_projections:
+            if strategy_ids is None:
+                strategies = tuple(projection.strategy_projections.values())
+            else:
+                try:
+                    strategies = tuple(
+                        projection.strategy_projections[strategy_id]
+                        for strategy_id in strategy_ids
+                    )
+                except KeyError as error:
+                    raise PaperAdmissionError(
+                        "automatic emergency flatten references an unknown strategy"
+                    ) from error
             decision_ids = tuple(
                 strategy.current_exit_decision_id
-                for strategy in projection.strategy_projections.values()
+                for strategy in strategies
                 if strategy.current_exit_decision_id is not None
             )
             for strategy_decision_id in decision_ids:
@@ -1251,6 +1265,10 @@ class PaperRuntime:
                 if raw_decision.get("action") == "EXIT" and any(order.status.active for order in orders):
                     return True
             return False
+        if strategy_ids is not None:
+            raise PaperAdmissionError(
+                "strategy-scoped emergency flatten requires attributed projections"
+            )
         decision_id = projection.current_exit_decision_id
         if decision_id is None:
             return False
@@ -1274,20 +1292,39 @@ class PaperRuntime:
         projection: PaperProjection,
         *,
         as_of: datetime,
+        strategy_ids: tuple[str, ...] | None = None,
     ) -> dict[str, MarketEvent] | None:
         if projection.last_received_at is not None and as_of < projection.last_received_at:
             raise PaperAdmissionError("automatic emergency flatten clock precedes durable state")
         markets: dict[str, MarketEvent] = {}
         stale_after = timedelta(seconds=self.engine.config.risk.stale_after_seconds)
-        instruments = (
-            {
+        if strategy_ids is not None:
+            if not projection.strategy_projections:
+                raise PaperAdmissionError(
+                    "strategy-scoped emergency markets require attributed projections"
+                )
+            try:
+                selected_strategies = tuple(
+                    projection.strategy_projections[strategy_id]
+                    for strategy_id in strategy_ids
+                )
+            except KeyError as error:
+                raise PaperAdmissionError(
+                    "automatic emergency markets reference an unknown strategy"
+                ) from error
+            instruments = {
+                instrument
+                for strategy in selected_strategies
+                for instrument in strategy.positions
+            }
+        elif projection.strategy_projections:
+            instruments = {
                 instrument
                 for strategy in projection.strategy_projections.values()
                 for instrument in strategy.positions
             }
-            if projection.strategy_projections
-            else set(projection.positions)
-        )
+        else:
+            instruments = set(projection.positions)
         for instrument in sorted(instruments):
             market = self._latest_markets.get(instrument)
             if market is None:
@@ -1312,22 +1349,49 @@ class PaperRuntime:
         *,
         as_of: datetime,
     ) -> PaperCommandResult | None:
-        has_attributed_position = (
-            any(strategy.positions for strategy in projection.strategy_projections.values())
-            if projection.strategy_projections
-            else bool(projection.positions)
+        portfolio_protective = projection.state in {
+            PaperState.EMERGENCY_FLATTEN,
+            PaperState.REDUCE_ONLY,
+        }
+        local_emergency_strategy_ids = tuple(
+            sorted(
+                strategy_id
+                for strategy_id, strategy in projection.strategy_projections.items()
+                if strategy.positions
+                and strategy.state is PaperState.EMERGENCY_FLATTEN
+            )
         )
-        if (
-            projection.state
-            not in {
-                PaperState.EMERGENCY_FLATTEN,
-                PaperState.REDUCE_ONLY,
-            }
-            or not has_attributed_position
-            or self._runtime_emergency_exit_is_active(projection)
-        ):
-            return None
-        markets = self._durable_emergency_markets(projection, as_of=as_of)
+        target_strategy_ids: tuple[str, ...] | None = None
+        if portfolio_protective:
+            has_attributed_position = (
+                any(
+                    strategy.positions
+                    for strategy in projection.strategy_projections.values()
+                )
+                if projection.strategy_projections
+                else bool(projection.positions)
+            )
+            if (
+                not has_attributed_position
+                or self._runtime_emergency_exit_is_active(projection)
+            ):
+                return None
+        else:
+            target_strategy_ids = tuple(
+                strategy_id
+                for strategy_id in local_emergency_strategy_ids
+                if not self._runtime_emergency_exit_is_active(
+                    projection,
+                    strategy_ids=(strategy_id,),
+                )
+            )
+            if not target_strategy_ids:
+                return None
+        markets = self._durable_emergency_markets(
+            projection,
+            as_of=as_of,
+            strategy_ids=target_strategy_ids,
+        )
         if markets is None:
             return None
         try:
@@ -1336,9 +1400,13 @@ class PaperRuntime:
                 decided_at=as_of,
                 reason=(
                     _AUTOMATIC_EMERGENCY_FLATTEN_REASON
-                    if projection.state is PaperState.EMERGENCY_FLATTEN
+                    if (
+                        projection.state is PaperState.EMERGENCY_FLATTEN
+                        or target_strategy_ids is not None
+                    )
                     else _AUTOMATIC_PROTECTIVE_FLATTEN_REASON
                 ),
+                strategy_ids=target_strategy_ids,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise PaperAdmissionError("automatic emergency flatten failed closed") from error

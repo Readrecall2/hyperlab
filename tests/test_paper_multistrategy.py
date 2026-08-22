@@ -24,6 +24,7 @@ from hyperlab.paper.models import (
     DecisionAction,
     DecisionIntent,
     MarketEvent,
+    MarketExecutionPolicy,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -161,16 +162,87 @@ def _market(
     instrument: str = _BTC,
     bid: str = "100",
     ask: str = "100",
+    bid_depth: str = "1000",
+    ask_depth: str = "1000",
+    tradable: bool = True,
+    source_event_kind: str | None = None,
+    source_connection_id: str | None = None,
+    source_connection_epoch: int | None = None,
 ) -> MarketEvent:
     return MarketEvent.create(
         received_at=at,
         instrument=instrument,
         bid_price=Decimal(bid),
         ask_price=Decimal(ask),
-        bid_depth=Decimal("1000"),
-        ask_depth=Decimal("1000"),
+        bid_depth=Decimal(bid_depth),
+        ask_depth=Decimal(ask_depth),
         source_sequence=int(deterministic_id("multistrategy_market", label)[:8], 16),
         capture_ordinal=0 if instrument == _BTC else 1,
+        tradable=tradable,
+        source_event_kind=source_event_kind,
+        source_connection_id=source_connection_id,
+        source_connection_epoch=source_connection_epoch,
+    )
+
+
+def _strategy_decision(
+    config: PaperRunConfig,
+    strategy: PaperStrategyConfig,
+    markets: Mapping[str, MarketEvent],
+    *,
+    action: DecisionAction,
+    order_specs: tuple[tuple[str, OrderSide, str], ...],
+    decided_at: datetime,
+    ordinal: int,
+) -> DecisionIntent:
+    primary = markets[order_specs[0][0]]
+    decision_id = DecisionIntent.identifier(
+        run_id=config.run_id,
+        strategy_id=strategy.strategy_id,
+        market_event_id=primary.event_id,
+        action=action,
+        ordinal=ordinal,
+    )
+    return DecisionIntent(
+        decision_id=decision_id,
+        run_id=config.run_id,
+        strategy_id=strategy.strategy_id,
+        strategy_name=strategy.strategy_name,
+        strategy_hash=strategy.strategy_hash,
+        strategy_config_hash=strategy.strategy_config_hash,
+        action=action,
+        decided_at=decided_at,
+        received_at=max(market.received_at for market in markets.values()),
+        market_event_id=primary.event_id,
+        observed_event_ids=tuple(
+            markets[instrument].event_id for instrument in sorted(markets)
+        ),
+        orders=tuple(
+            OrderIntent.create(
+                decision_id=decision_id,
+                run_id=config.run_id,
+                strategy_id=strategy.strategy_id,
+                instrument=instrument,
+                side=side,
+                quantity=Decimal(quantity),
+                order_type=PaperOrderType.TAKER,
+                time_in_force=TimeInForce.IOC,
+                created_at=decided_at,
+                ordinal=index,
+                reduce_only=action is DecisionAction.EXIT,
+                hedge_group_id=(
+                    deterministic_id(
+                        "phase08_incident_hedge_group",
+                        decision_id,
+                    )
+                    if action is DecisionAction.ENTRY and len(order_specs) > 1
+                    else None
+                ),
+                leg_number=index + 1,
+            )
+            for index, (instrument, side, quantity) in enumerate(order_specs)
+        ),
+        ordinal=ordinal,
     )
 
 
@@ -423,6 +495,132 @@ def _run_two_frames(
     return engine, runner
 
 
+def _phase08_asymmetric_exit_stall(
+    database: Path,
+) -> tuple[
+    PaperRunConfig,
+    PaperEngine,
+    PaperStrategyConfig,
+    PaperStrategyConfig,
+    PaperProjection,
+]:
+    phase08 = replace(
+        _strategy_config("phase08_robust_pairs", instrument=_ETH),
+        required_instruments=(_BTC, _ETH),
+    )
+    other = _strategy_config("phase05_hold", instrument=_BTC)
+    config = _portfolio_config((phase08, other))
+    engine = PaperEngine(PaperStore(database), config)
+    engine.start()
+
+    entry_markets = {
+        _BTC: _market("phase08-entry-btc", _START + timedelta(seconds=1)),
+        _ETH: _market(
+            "phase08-entry-eth",
+            _START + timedelta(seconds=1),
+            instrument=_ETH,
+        ),
+    }
+    for market in sorted(
+        entry_markets.values(),
+        key=lambda item: (item.received_at, item.capture_ordinal),
+    ):
+        engine.process_market(
+            market,
+            execution_policy=MarketExecutionPolicy.BOOTSTRAP_OBSERVE_ONLY,
+        )
+    engine.submit_decision(
+        _strategy_decision(
+            config,
+            phase08,
+            entry_markets,
+            action=DecisionAction.ENTRY,
+            order_specs=(
+                (_ETH, OrderSide.BUY, "0.051"),
+                (_BTC, OrderSide.SELL, "0.00155"),
+            ),
+            decided_at=_START + timedelta(seconds=1),
+            ordinal=0,
+        ),
+        entry_markets,
+    )
+    engine.submit_decision(
+        _strategy_decision(
+            config,
+            other,
+            {_BTC: entry_markets[_BTC]},
+            action=DecisionAction.ENTRY,
+            order_specs=((_BTC, OrderSide.BUY, "0.01"),),
+            decided_at=_START + timedelta(seconds=1),
+            ordinal=0,
+        ),
+        {_BTC: entry_markets[_BTC]},
+    )
+    engine.process_market(
+        _market(
+            "phase08-entry-fill-eth",
+            _START + timedelta(seconds=2),
+            instrument=_ETH,
+        )
+    )
+    hedged = engine.process_market(
+        _market("phase08-entry-fill-btc", _START + timedelta(seconds=2))
+    ).projection
+    assert hedged.strategy_projections[phase08.strategy_id].state is PaperState.HEDGED
+    assert hedged.strategy_projections[other.strategy_id].state is PaperState.HEDGED
+    assert hedged.state is PaperState.HEDGED
+
+    exit_markets = {
+        _BTC: _market("phase08-exit-btc", _START + timedelta(seconds=3)),
+        _ETH: _market(
+            "phase08-exit-eth",
+            _START + timedelta(seconds=3),
+            instrument=_ETH,
+        ),
+    }
+    engine.submit_decision(
+        _strategy_decision(
+            config,
+            phase08,
+            exit_markets,
+            action=DecisionAction.EXIT,
+            order_specs=(
+                (_ETH, OrderSide.SELL, "0.051"),
+                (_BTC, OrderSide.BUY, "0.00155"),
+            ),
+            decided_at=_START + timedelta(seconds=3),
+            ordinal=1,
+        ),
+        exit_markets,
+    )
+    engine.process_market(
+        _market(
+            "phase08-exit-fill-eth",
+            _START + timedelta(seconds=4),
+            instrument=_ETH,
+        )
+    )
+    stalled = engine.process_market(
+        _market(
+            "phase08-exit-partial-btc",
+            _START + timedelta(seconds=4),
+            bid="77981",
+            ask="77981",
+            ask_depth="0.0022",
+        )
+    ).projection
+    ticked = engine.process_timer(as_of=_START + timedelta(seconds=4, milliseconds=500))
+    assert ticked.projection.to_dict() != stalled.to_dict()
+    assert ticked.projection.state is PaperState.HEDGED
+    assert ticked.projection.strategy_projections[phase08.strategy_id].state is (
+        PaperState.EMERGENCY_FLATTEN
+    )
+    assert ticked.projection.strategy_projections[phase08.strategy_id].positions == {
+        _BTC: Decimal("-0.001329999999999999974352726946")
+    }
+    return config, engine, phase08, other, ticked.projection
+
+
 def test_legacy_schema_v2_config_and_identity_are_unchanged() -> None:
     legacy = PaperRunConfig(
         strategy_name="legacy_fixture",
@@ -592,6 +790,288 @@ def test_portfolio_risk_rejection_dominates_every_strategy(tmp_path: Path) -> No
     )
 
     assert engine.projection().positions == {}
+
+
+def test_phase08_strategy_level_emergency_flatten_retries_only_residual_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper.sqlite3"
+    config, engine, phase08, other, stalled = _phase08_asymmetric_exit_stall(database)
+    phase08_stalled = stalled.strategy_projections[phase08.strategy_id]
+    other_before = stalled.strategy_projections[other.strategy_id].to_dict()
+    original_exit_id = phase08_stalled.current_exit_decision_id
+    assert original_exit_id is not None
+    original_btc_order = next(
+        order
+        for order in stalled.orders.values()
+        if order.intent.decision_id == original_exit_id and order.intent.instrument == _BTC
+    )
+
+    residual = Decimal("-0.001329999999999999974352726946")
+    assert original_btc_order.status is OrderStatus.EXPIRED
+    assert original_btc_order.filled_quantity == Decimal(
+        "0.0002200000000000000256472730537"
+    )
+    assert phase08_stalled.positions == {_BTC: residual}
+    assert phase08_stalled.state is PaperState.EMERGENCY_FLATTEN
+    assert stalled.strategy_projections[other.strategy_id].positions == {
+        _BTC: Decimal("0.01")
+    }
+    assert stalled.state is PaperState.HEDGED
+    assert not any(order.status.active for order in stalled.orders.values())
+    assert not any(
+        alert.code == "UNHEDGED_TIMEOUT" for alert in engine.store.get_alerts(config.run_id)
+    )
+    engine.store.close()
+
+    connection_id = "phase08-emergency-runtime-1"
+    clock = MutableClock(_START + timedelta(seconds=5))
+    connect_markets = {
+        instrument: _market(
+            f"phase08-emergency-connect-{instrument}",
+            clock.value,
+            instrument=instrument,
+            tradable=False,
+            source_event_kind="connect",
+            source_connection_id=connection_id,
+            source_connection_epoch=1,
+        )
+        for instrument in (_BTC, _ETH)
+    }
+    plan_at = _START + timedelta(seconds=5, milliseconds=500)
+    plan_markets = {
+        instrument: _market(
+            f"phase08-emergency-plan-{instrument}",
+            plan_at,
+            instrument=instrument,
+            source_event_kind="bbo",
+            source_connection_id=connection_id,
+            source_connection_epoch=1,
+        )
+        for instrument in (_BTC, _ETH)
+    }
+    runtime = _runtime(
+        database,
+        config,
+        (RestoreHoldStrategy(phase08), RestoreHoldStrategy(other)),
+        QueuePublicSource(
+            [
+                connect_markets,
+                plan_markets,
+                {
+                    instrument: _market(
+                        f"phase08-emergency-fill-{instrument}",
+                        _START + timedelta(seconds=6, milliseconds=500),
+                        instrument=instrument,
+                        source_event_kind="bbo",
+                        source_connection_id=connection_id,
+                        source_connection_epoch=1,
+                    )
+                    for instrument in (_BTC, _ETH)
+                },
+                {
+                    instrument: _market(
+                        f"phase08-emergency-post-flat-{instrument}",
+                        _START + timedelta(seconds=7, milliseconds=500),
+                        instrument=instrument,
+                        source_event_kind="bbo",
+                        source_connection_id=connection_id,
+                        source_connection_epoch=1,
+                    )
+                    for instrument in (_BTC, _ETH)
+                },
+            ]
+        ),
+        clock,
+    )
+
+    connected = runtime.run_once()
+    assert connected.kind is PaperRuntimeStepKind.MARKET
+    assert (
+        connected.projection.strategy_projections[phase08.strategy_id].current_exit_decision_id
+        == original_exit_id
+    )
+    clock.value = plan_at
+    planned = runtime.run_once()
+    assert planned.kind is PaperRuntimeStepKind.MARKET
+    planned_phase08 = planned.projection.strategy_projections[phase08.strategy_id]
+    emergency_exit_id = planned_phase08.current_exit_decision_id
+    assert emergency_exit_id is not None
+    assert emergency_exit_id != original_exit_id
+    emergency_orders = [
+        order
+        for order in planned.projection.orders.values()
+        if order.intent.decision_id == emergency_exit_id
+    ]
+    assert len(emergency_orders) == 1
+    emergency_order = emergency_orders[0]
+    assert emergency_order.intent.strategy_id == phase08.strategy_id
+    assert emergency_order.intent.instrument == _BTC
+    assert emergency_order.intent.side is OrderSide.BUY
+    assert emergency_order.intent.quantity == abs(residual)
+    assert emergency_order.intent.reduce_only is True
+    assert emergency_order.intent.order_type is PaperOrderType.TAKER
+    assert emergency_order.intent.time_in_force is TimeInForce.IOC
+    assert planned.projection.strategy_projections[other.strategy_id].to_dict() == other_before
+
+    clock.value = _START + timedelta(seconds=6, milliseconds=500)
+    pending_timer = runtime.run_once()
+    assert pending_timer.kind is PaperRuntimeStepKind.TIMER
+    assert pending_timer.projection.strategy_projections[phase08.strategy_id].state is (
+        PaperState.EMERGENCY_FLATTEN
+    )
+    assert pending_timer.projection.strategy_projections[phase08.strategy_id].positions == {
+        _BTC: residual
+    }
+    flattened = runtime.run_once()
+    assert flattened.kind is PaperRuntimeStepKind.MARKET
+    flattened_phase08 = flattened.projection.strategy_projections[phase08.strategy_id]
+    assert flattened_phase08.state is PaperState.FLAT
+    assert flattened_phase08.positions == {}
+    assert flattened.projection.strategy_projections[other.strategy_id].to_dict() == other_before
+    assert flattened.projection.positions == {_BTC: Decimal("0.01")}
+    assert flattened.projection.positions == paper_attributed_positions(
+        {
+            strategy_id: strategy.positions
+            for strategy_id, strategy in flattened.projection.strategy_projections.items()
+        }
+    )
+    filled_emergency_order = flattened.projection.orders[emergency_order.intent.order_id]
+    assert filled_emergency_order.status is OrderStatus.FILLED
+    assert filled_emergency_order.filled_quantity == abs(residual)
+
+    exit_inputs = [
+        record
+        for record in runtime.engine.store.iter_inputs(
+            config.run_id,
+            input_type="STRATEGY_DECISION",
+        )
+        if record.payload["decision"]["action"] == "EXIT"
+        and record.payload["decision"]["strategy_id"] == phase08.strategy_id
+    ]
+    assert len(exit_inputs) == 2
+
+    clock.value = _START + timedelta(seconds=7, milliseconds=500)
+    flat_timer = runtime.run_once()
+    assert flat_timer.kind is PaperRuntimeStepKind.TIMER
+    assert flat_timer.projection.positions == {_BTC: Decimal("0.01")}
+    assert flat_timer.projection.strategy_projections[phase08.strategy_id].positions == {}
+    post_flat = runtime.run_once()
+    assert post_flat.kind is PaperRuntimeStepKind.MARKET
+    assert post_flat.projection.positions == {_BTC: Decimal("0.01")}
+    assert post_flat.projection.strategy_projections[phase08.strategy_id].positions == {}
+    assert (
+        len(
+            [
+                record
+                for record in runtime.engine.store.iter_inputs(
+                    config.run_id,
+                    input_type="STRATEGY_DECISION",
+                )
+                if record.payload["decision"]["action"] == "EXIT"
+                and record.payload["decision"]["strategy_id"] == phase08.strategy_id
+            ]
+        )
+        == 2
+    )
+    runtime.close()
+
+    recovered_store = PaperStore(database, initialize=False)
+    recovered = PaperEngine(recovered_store, config)
+    reconciled = recovered.reconcile(as_of=_START + timedelta(seconds=8)).projection
+    assert recovered.replay().to_dict() == reconciled.to_dict()
+    assert recovered.verify_input_replay().to_dict() == reconciled.to_dict()
+    assert replay_paper_run(recovered_store, config.run_id).projection_hash == (
+        reconciled.canonical_hash
+    )
+    recovered_store.close()
+
+
+@pytest.mark.parametrize("market_mode", ("missing", "stale"))
+def test_strategy_level_emergency_flatten_owned_market_failure_stays_fail_closed(
+    tmp_path: Path,
+    market_mode: str,
+) -> None:
+    database = tmp_path / f"{market_mode}.sqlite3"
+    config, engine, phase08, other, stalled = _phase08_asymmetric_exit_stall(database)
+    before_positions = stalled.positions
+    before_strategy_positions = {
+        strategy_id: dict(strategy.positions)
+        for strategy_id, strategy in stalled.strategy_projections.items()
+    }
+    before_exit_inputs = [
+        record
+        for record in engine.store.iter_inputs(
+            config.run_id,
+            input_type="STRATEGY_DECISION",
+        )
+        if record.payload["decision"]["action"] == "EXIT"
+    ]
+    runtime = PaperRuntime(
+        engine,
+        (RestoreHoldStrategy(phase08), RestoreHoldStrategy(other)),
+        QueuePublicSource([]),
+        config=PaperRuntimeConfig(
+            timer_interval_seconds=config.runtime_timer_interval_seconds,
+            source_poll_timeout_seconds=config.runtime_source_poll_timeout_seconds,
+        ),
+        clock=MutableClock(_START + timedelta(seconds=5)),
+    )
+
+    if market_mode == "missing":
+        market = _market(
+            "phase08-emergency-unrelated-eth",
+            _START + timedelta(seconds=5),
+            instrument=_ETH,
+        )
+        engine.process_market(
+            market,
+            processed_at=market.received_at,
+            execution_policy=MarketExecutionPolicy.BOOTSTRAP_OBSERVE_ONLY,
+        )
+        runtime._latest_markets[_ETH] = market
+        as_of = market.received_at
+    else:
+        market = _market(
+            "phase08-emergency-stale-btc",
+            _START + timedelta(seconds=5),
+        )
+        engine.process_market(
+            market,
+            processed_at=market.received_at,
+            execution_policy=MarketExecutionPolicy.BOOTSTRAP_OBSERVE_ONLY,
+        )
+        runtime._latest_markets[_BTC] = market
+        as_of = market.received_at + timedelta(
+            seconds=config.risk.stale_after_seconds + 1
+        )
+
+    result = runtime._ensure_automatic_emergency_flatten(
+        engine.projection(),
+        as_of=as_of,
+    )
+    after = engine.projection()
+    assert result is None
+    assert after.positions == before_positions
+    assert {
+        strategy_id: dict(strategy.positions)
+        for strategy_id, strategy in after.strategy_projections.items()
+    } == before_strategy_positions
+    assert after.strategy_projections[phase08.strategy_id].state is (
+        PaperState.EMERGENCY_FLATTEN
+    )
+    assert after.strategy_projections[other.strategy_id].state is PaperState.HEDGED
+    assert [
+        record
+        for record in engine.store.iter_inputs(
+            config.run_id,
+            input_type="STRATEGY_DECISION",
+        )
+        if record.payload["decision"]["action"] == "EXIT"
+    ] == before_exit_inputs
+    assert engine.verify_input_replay().to_dict() == after.to_dict()
+    engine.store.close()
+
 
 
 def test_strategy_evaluation_failure_is_local_and_durable(tmp_path: Path) -> None:

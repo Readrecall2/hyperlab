@@ -2409,17 +2409,63 @@ class PaperEngine:
         *,
         decided_at: datetime,
         reason: str,
+        strategy_ids: Sequence[str] | None = None,
     ) -> PaperCommandResult:
         projection = self.projection()
-        if projection.state not in {
+        portfolio_protective = projection.state in {
             PaperState.EMERGENCY_FLATTEN,
             PaperState.REDUCE_ONLY,
-        }:
+        }
+        requested_strategy_ids: tuple[str, ...] | None = None
+        if strategy_ids is not None:
+            if isinstance(strategy_ids, str):
+                raise TypeError("strategy_ids must be a sequence of strategy identifiers")
+            requested_strategy_ids = tuple(strategy_ids)
+            if (
+                not requested_strategy_ids
+                or len(set(requested_strategy_ids)) != len(requested_strategy_ids)
+            ):
+                raise ValueError(
+                    "strategy-scoped emergency flatten requires unique strategy identifiers"
+                )
+            requested_strategy_ids = tuple(sorted(requested_strategy_ids))
+            if portfolio_protective:
+                raise ValueError(
+                    "portfolio protective emergency flatten cannot be narrowed by strategy"
+                )
+        elif not portfolio_protective:
             raise ValueError("automatic flatten requires a protective paper state")
+
         if projection.strategy_projections:
+            if requested_strategy_ids is None:
+                selected_strategies = tuple(
+                    sorted(projection.strategy_projections.items())
+                )
+            else:
+                try:
+                    selected_strategies = tuple(
+                        (
+                            strategy_id,
+                            projection.strategy_projections[strategy_id],
+                        )
+                        for strategy_id in requested_strategy_ids
+                    )
+                except KeyError as error:
+                    raise ValueError(
+                        "strategy-scoped emergency flatten references an unknown strategy"
+                    ) from error
+                if any(
+                    strategy.state is not PaperState.EMERGENCY_FLATTEN
+                    or not strategy.positions
+                    for _strategy_id, strategy in selected_strategies
+                ):
+                    raise ValueError(
+                        "strategy-scoped emergency flatten requires exposed "
+                        "EMERGENCY_FLATTEN strategies"
+                    )
             owned_positions = {
                 strategy_id: dict(strategy.positions)
-                for strategy_id, strategy in projection.strategy_projections.items()
+                for strategy_id, strategy in selected_strategies
                 if strategy.positions
             }
             if not owned_positions:
@@ -2501,6 +2547,10 @@ class PaperEngine:
             if last_result is None:
                 raise AssertionError("attributed emergency flatten produced no decisions")
             return last_result
+        if requested_strategy_ids is not None:
+            raise ValueError(
+                "strategy-scoped emergency flatten requires attributed projections"
+            )
         if not projection.positions:
             raise ValueError("emergency_flatten requires an open simulated position")
         if any(instrument not in markets for instrument in projection.positions):

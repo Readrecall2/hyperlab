@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -12,6 +13,7 @@ import pytest
 from hyperlab.backtest.costs import CostRule, CostSchedule, SlippageModel
 from hyperlab.backtest.execution import MakerFillModel
 from hyperlab.paper import (
+    ConcurrentWriteError,
     DecisionAction,
     DecisionIntent,
     IdempotencyConflictError,
@@ -41,6 +43,7 @@ from hyperlab.paper import (
 )
 from hyperlab.paper.models import PaperOrder, legal_transition, require_transition
 from hyperlab.paper.reducer import apply_event
+from hyperlab.paper.runtime import replay_paper_run
 
 _START = datetime(2026, 8, 13, 10, tzinfo=UTC)
 _INSTRUMENT = "HYPERLIQUID:BTC:perp"
@@ -152,6 +155,7 @@ def _market(
     stale: bool = False,
     gap: bool = False,
     tradable: bool = True,
+    source_event_kind: str | None = None,
     source_connection_id: str | None = None,
     source_connection_epoch: int | None = None,
 ) -> MarketEvent:
@@ -169,6 +173,7 @@ def _market(
         stale=stale,
         gap=gap,
         tradable=tradable,
+        source_event_kind=source_event_kind,
         source_connection_id=source_connection_id,
         source_connection_epoch=source_connection_epoch,
     )
@@ -2881,4 +2886,148 @@ def test_market_gap_does_not_duplicate_critical_while_already_paused(
     ]
 
     assert len(alerts) == 1
+    assert engine.projection().state is PaperState.PAUSED
+
+
+def test_market_gap_resync_while_paused_has_exact_event_input_and_full_replay(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    store, engine = _started_engine(
+        tmp_path / "market-gap-resync-replay.sqlite3",
+        config,
+    )
+    connection_id = "market-gap-resync-connection"
+    engine.start_runtime_session(
+        as_of=_START + timedelta(seconds=1),
+        session_id="f" * 64,
+        generation=1,
+    )
+    engine.process_market(
+        _market(
+            "market-bbo-before-gap",
+            _START + timedelta(seconds=2),
+            source_event_kind="bbo",
+            source_connection_id=connection_id,
+            source_connection_epoch=1,
+        )
+    )
+    scenario = (
+        _market(
+            "market-gap",
+            _START + timedelta(seconds=3),
+            gap=True,
+            tradable=False,
+            source_event_kind="gap",
+            source_connection_id=connection_id,
+            source_connection_epoch=1,
+        ),
+        _market(
+            "market-resync-start",
+            _START + timedelta(seconds=4),
+            tradable=False,
+            source_event_kind="resync_start",
+            source_connection_id=connection_id,
+            source_connection_epoch=2,
+        ),
+        _market(
+            "market-resync-complete",
+            _START + timedelta(seconds=5),
+            tradable=False,
+            source_event_kind="resync_complete",
+            source_connection_id=connection_id,
+            source_connection_epoch=2,
+        ),
+        _market(
+            "market-connect",
+            _START + timedelta(seconds=6),
+            tradable=False,
+            source_event_kind="connect",
+            source_connection_id=connection_id,
+            source_connection_epoch=2,
+        ),
+        _market(
+            "market-fresh-bbo-while-paused",
+            _START + timedelta(seconds=7),
+            source_event_kind="bbo",
+            source_connection_id=connection_id,
+            source_connection_epoch=2,
+        ),
+    )
+    for market in scenario:
+        engine.process_market(market)
+
+    durable = engine.projection()
+    assert durable.state is PaperState.PAUSED
+    assert durable.runtime_session_active is True
+    assert durable.last_public_source_received_at == scenario[-1].received_at
+    assert (
+        durable.last_market_received_at_by_instrument[_INSTRUMENT]
+        == scenario[-1].received_at
+    )
+    assert engine.replay().to_dict() == durable.to_dict()
+    assert engine.verify_input_replay().to_dict() == durable.to_dict()
+    assert (
+        replay_paper_run(store, config.run_id).projection_hash
+        == durable.canonical_hash
+    )
+
+
+@pytest.mark.parametrize("verification", ("event", "full"))
+def test_market_gap_resync_concurrent_head_advance_is_not_a_stable_replay_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification: str,
+) -> None:
+    config = _config()
+    store, engine = _started_engine(
+        tmp_path / f"market-gap-resync-{verification}.sqlite3",
+        config,
+    )
+    connection_id = "market-gap-race-connection"
+    engine.process_market(
+        _market(
+            "market-gap-before-replay-race",
+            _START + timedelta(seconds=1),
+            gap=True,
+            tradable=False,
+            source_event_kind="gap",
+            source_connection_id=connection_id,
+            source_connection_epoch=1,
+        )
+    )
+    original_iter_events = store.iter_events
+    advanced = False
+
+    def iter_gap_then_concurrent_resync(
+        replay_run_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> Iterator[object]:
+        nonlocal advanced
+        yield from original_iter_events(
+            replay_run_id,
+            after_sequence=after_sequence,
+        )
+        if not advanced:
+            advanced = True
+            engine.process_market(
+                _market(
+                    "concurrent-resync-complete",
+                    _START + timedelta(seconds=2),
+                    tradable=False,
+                    source_event_kind="resync_complete",
+                    source_connection_id=connection_id,
+                    source_connection_epoch=2,
+                )
+            )
+
+    monkeypatch.setattr(store, "iter_events", iter_gap_then_concurrent_resync)
+    with pytest.raises(ConcurrentWriteError, match="durable head changed"):
+        if verification == "event":
+            engine.replay()
+        else:
+            replay_paper_run(store, config.run_id)
+
+    assert advanced is True
     assert engine.projection().state is PaperState.PAUSED

@@ -659,6 +659,7 @@ def test_false_frozen_runtime_cadence_facts_are_rejected(
 @pytest.mark.parametrize(
     ("field", "mutated"),
     [
+        ("active_runtime_pause_and_kill_require_lease", True),
         ("runtime_acquired_after_release_and_frozen_binding_checks", False),
         (
             "runtime_acquired_before_engine_start_startup_reconciliation_and_public_source_start",
@@ -666,7 +667,6 @@ def test_false_frozen_runtime_cadence_facts_are_rejected(
         ),
         ("runtime_admission_failure_releases_lock", False),
         ("read_only_status_report_require_lease", True),
-        ("operator_pause_resume_kill_require_lease", True),
         ("second_runtime_for_exact_database_and_run_rejected", False),
         ("runtime_held_until_close", False),
         ("standalone_reconcile_acquired_after_release_check", False),
@@ -677,6 +677,12 @@ def test_false_frozen_runtime_cadence_facts_are_rejected(
         ("standalone_replay_failure_releases_lock", False),
         ("standalone_replay_held_until_completion", False),
         ("standalone_replay_requires_stopped_runtime", False),
+        ("standalone_resume_acquired_after_release_check", False),
+        ("standalone_resume_config_and_release_rechecked_under_lease", False),
+        ("standalone_resume_failure_releases_lock", False),
+        ("standalone_resume_held_until_completion", False),
+        ("standalone_resume_requires_lease_before_mutation", False),
+        ("standalone_resume_requires_stopped_runtime", False),
         (
             "contention_action",
             "BLOCK_ALL_WRITER_PROCESSES",

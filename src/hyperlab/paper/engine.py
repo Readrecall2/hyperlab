@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gc
-from collections.abc import Callable, Mapping, Sequence
+import sys
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -62,6 +64,47 @@ from hyperlab.paper.store import (
     RunConflictError,
     RunNotFoundError,
 )
+
+
+@contextmanager
+def _temporary_historical_replay_store() -> Iterator[PaperStore]:
+    """Yield a disposable replay store and close it before temp cleanup."""
+
+    temporary_directory = TemporaryDirectory(prefix="hyperlab-paper-replay-")
+    try:
+        replay_store = PaperStore(
+            Path(temporary_directory.name) / "paper-replay.sqlite3",
+            historical_replay_only=True,
+        )
+        try:
+            yield replay_store
+        finally:
+            primary_error = sys.exception()
+            try:
+                replay_store.close()
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "temporary replay-store cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            finally:
+                # sqlite3 connection/cursor cycles can otherwise survive until
+                # after TemporaryDirectory cleanup and keep the DB open on Windows.
+                del replay_store
+                gc.collect()
+    finally:
+        primary_error = sys.exception()
+        try:
+            temporary_directory.cleanup()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "temporary replay-directory cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2527,9 +2570,12 @@ class PaperEngine:
             events=interruptible_events(),
         )
         durable = self.projection()
+        after = self.store.get_run(self.run_id)
+        if after.head_identity != run.head_identity:
+            raise ConcurrentWriteError("paper durable head changed during event replay")
         if replayed.to_dict() != durable.to_dict():
             raise ValueError("event replay differs from the durable paper projection")
-        if replayed.last_event_hash != run.event_head_hash:
+        if replayed.last_event_hash != after.event_head_hash:
             raise ValueError("event replay head differs from the durable hash-chain head")
         return replayed
 
@@ -2539,11 +2585,7 @@ class PaperEngine:
         source_inputs = self.store.iter_inputs(self.run_id)
         legacy_source_events = iter(self.store.iter_events(self.run_id))
         legacy_source_event: StoredPaperEvent | None = None
-        with TemporaryDirectory(prefix="hyperlab-paper-replay-") as directory:
-            replay_store = PaperStore(
-                Path(directory) / "paper-replay.sqlite3",
-                historical_replay_only=True,
-            )
+        with _temporary_historical_replay_store() as replay_store:
             replay_engine = PaperEngine(replay_store, self.config)
             replay_engine.start()
             for record in source_inputs:
@@ -2814,11 +2856,6 @@ class PaperEngine:
             replayed = replay_store.get_projection(self.run_id)
             if replayed.to_dict() != self.projection().to_dict():
                 raise ValueError("canonical input replay produced a different projection")
-            replay_store.close()
-            # sqlite3 connection/cursor cycles can otherwise survive until a
-            # later collection and keep the temporary replay DB open on Windows.
-            del replay_engine, replay_store
-            gc.collect()
             return replayed
 
     def reconcile(

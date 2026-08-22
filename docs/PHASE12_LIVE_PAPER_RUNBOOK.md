@@ -248,14 +248,16 @@ Optional cadence overrides are accepted only when they equal those frozen values
 
 The runtime acquires a nonblocking OS-held exclusive lease for the exact canonical database and
 run before engine start, reconciliation, and public-source start, and holds it through bounded
-close. Standalone `paper replay` and `paper reconcile` acquire that same lease and therefore
-require the runtime to be stopped. A second runtime, replay, or reconcile for that exact
+close. Standalone `paper replay`, `paper reconcile`, and reviewed `paper resume` (standard or
+explicit offline unclosed-session recovery) acquire that same lease and therefore require the
+runtime to be stopped. A second runtime or any of those stopped-runtime operations for that exact
 database/run is rejected. The adjacent dotfile can persist after close; OS lock ownership, not
 file existence, is the authority.
 
-`pause`, `resume`, and `kill` intentionally do not take the runtime lease. Their mutations are
-serialized by SQLite `BEGIN IMMEDIATE` and expected-head/hash checks; a race fails closed. Status,
-report, and dashboard reads never take the runtime lease.
+`pause` and `kill` intentionally remain active-runtime emergency controls. Their mutations are
+serialized by SQLite `BEGIN IMMEDIATE` and expected-head/hash checks; a race fails closed.
+`resume` rechecks the durable config and release under the lease before constructing a mutable
+store or engine. Status, report, and dashboard reads never take the runtime lease.
 
 Never run two Paper runtime processes against the same database. If startup blocks on source
 identity, readiness, stale data, a gap, or malformed data, preserve the database and logs; do not

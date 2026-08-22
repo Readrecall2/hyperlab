@@ -36,7 +36,7 @@ from hyperlab.paper.runner import (
     PaperStrategyView,
     PortfolioRunner,
 )
-from hyperlab.paper.store import PaperStore, RunNotFoundError
+from hyperlab.paper.store import ConcurrentWriteError, PaperStore, RunNotFoundError
 
 PUBLIC_MARKET_SCHEMA_VERSION = 1
 PUBLIC_MARKET_SOURCE_KIND = "PUBLIC_NORMALIZED"
@@ -277,11 +277,20 @@ class PaperReplayVerification:
 def replay_paper_run(store: PaperStore, run_id: str) -> PaperReplayVerification:
     """Re-run the canonical inbox in an isolated store; source stays read-only."""
 
+    run = store.get_run(run_id)
+    expected_head = run.head_identity
+
+    def require_stable_head() -> None:
+        if store.get_run(run_id).head_identity != expected_head:
+            raise ConcurrentWriteError(
+                "paper durable head changed during replay verification"
+            ) from None
+
     integrity = store.inspect_integrity_readonly(run_id)
+    require_stable_head()
     if not integrity.ok:
         codes = ", ".join(issue.code for issue in integrity.issues)
         raise PaperAdmissionError(f"paper replay requires full readonly integrity: {codes}")
-    run = store.get_run(run_id)
     config = PaperRunConfig.from_dict(run.config_snapshot)
     if config.config_hash != run.config_hash or config.run_id != run.run_id:
         raise PaperAdmissionError("stored paper config is not bound to its durable run identity")
@@ -308,13 +317,20 @@ def replay_paper_run(store: PaperStore, run_id: str) -> PaperReplayVerification:
         events=events,
     )
     durable = store.get_projection(run.run_id)
+    require_stable_head()
     if replayed.to_dict() != durable.to_dict():
         raise PaperAdmissionError("event replay differs from the durable paper projection")
     if replayed.last_sequence != run.event_sequence or replayed.last_event_hash != run.event_head_hash:
         raise PaperAdmissionError("event replay differs from the durable hash-chain head")
-    input_replayed = PaperEngine(store, config).verify_input_replay()
+    try:
+        input_replayed = PaperEngine(store, config).verify_input_replay()
+    except ValueError:
+        require_stable_head()
+        raise
+    require_stable_head()
     if input_replayed.to_dict() != replayed.to_dict():
         raise PaperAdmissionError("canonical input replay differs from event replay")
+    require_stable_head()
     return PaperReplayVerification(
         run_id=run.run_id,
         config_hash=run.config_hash,

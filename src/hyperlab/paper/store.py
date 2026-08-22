@@ -887,6 +887,7 @@ class PaperStore:
         self._historical_replay_only = historical_replay_only
         self._fault_injector = fault_injector
         self._timeout_seconds = timeout_seconds
+        self._replay_connection: sqlite3.Connection | None = None
         if initialize:
             self.initialize()
 
@@ -900,9 +901,15 @@ class PaperStore:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc_value, traceback
+        self.close()
 
     def close(self) -> None:
-        """Compatibility no-op: operations use short-lived SQLite connections."""
+        """Release the connection held by a disposable historical replay store."""
+
+        connection = self._replay_connection
+        self._replay_connection = None
+        if connection is not None:
+            connection.close()
 
     def _inject(self, stage: str) -> None:
         if stage not in FAULT_STAGES:
@@ -917,6 +924,8 @@ class PaperStore:
         del name, size
 
     def _connect(self) -> sqlite3.Connection:
+        if self._historical_replay_only and self._replay_connection is not None:
+            return self._replay_connection
         connection = sqlite3.connect(
             self.path,
             timeout=self._timeout_seconds,
@@ -924,12 +933,23 @@ class PaperStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("PRAGMA synchronous=FULL")
         connection.execute(f"PRAGMA busy_timeout={int(self._timeout_seconds * 1_000)}")
+        try:
+            if self._historical_replay_only:
+                connection.execute("PRAGMA journal_mode=MEMORY")
+                connection.execute("PRAGMA synchronous=OFF")
+                self._replay_connection = connection
+            else:
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA synchronous=FULL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _read_connection(self) -> sqlite3.Connection:
+        if self._historical_replay_only:
+            return self._connect()
         uri = f"{self.path.resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(
             uri,
@@ -1113,7 +1133,14 @@ class PaperStore:
 
         foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
-        if foreign_keys != 1 or synchronous < 2:
+        if self._historical_replay_only:
+            journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).upper()
+            if foreign_keys != 1 or journal_mode != "MEMORY" or synchronous != 0:
+                raise SchemaVersionError(
+                    "historical replay store requires foreign_keys=ON, "
+                    "journal_mode=MEMORY, and synchronous=OFF"
+                )
+        elif foreign_keys != 1 or synchronous < 2:
             raise SchemaVersionError("paper store requires foreign_keys=ON and synchronous=FULL")
 
     def create_run(

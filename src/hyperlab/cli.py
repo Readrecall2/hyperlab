@@ -181,8 +181,8 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "fa9ec49ba8149f089b6d909b76d65759ab015fde8f47513d4ba72cb5ddd4bbc6"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "a6bbce51a0f3f8ddfc47f5c18e4030b6daddeccc4e65d6da143432e7909b92ce"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "385d6bdb310d4083a2da4e4771860991b0fa5637d531ee429b8c23fd37e432fa"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "71ecacafcb3fd428c7b0253e52b40c9cf02e76242390d95ab324c83f51aef61b"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -2844,35 +2844,19 @@ def paper_resume(
         "OFFLINE_UNCLOSED_SESSION" if offline_unclosed_recovery else "STANDARD"
     )
     try:
-        if offline_unclosed_recovery:
-            with PaperRuntimeLease(resolved, run_id):
-                leased_config = _load_stored_paper_config(resolved, run_id)
-                _require_current_paper_release(leased_config)
-                if leased_config.to_dict() != config.to_dict():
-                    raise typer.BadParameter(
-                        "Le snapshot paper durable a changé avant la reprise offline"
-                    )
-                store = PaperStore(resolved, initialize=False)
-                try:
-                    result, incident_artifact_hash, review_artifact_hash = (
-                        _paper_resume_from_store(
-                            store=store,
-                            config=leased_config,
-                            run_id=run_id,
-                            normalized_review=normalized_review,
-                            as_of=as_of,
-                            recovery_mode=recovery_mode,
-                        )
-                    )
-                finally:
-                    _close_preserving_active_exception(store.close)
-        else:
+        with PaperRuntimeLease(resolved, run_id):
+            leased_config = _load_stored_paper_config(resolved, run_id)
+            _require_current_paper_release(leased_config)
+            if leased_config.to_dict() != config.to_dict():
+                raise typer.BadParameter(
+                    "Le snapshot paper durable a changé avant la reprise"
+                )
             store = PaperStore(resolved, initialize=False)
             try:
                 result, incident_artifact_hash, review_artifact_hash = (
                     _paper_resume_from_store(
                         store=store,
-                        config=config,
+                        config=leased_config,
                         run_id=run_id,
                         normalized_review=normalized_review,
                         as_of=as_of,

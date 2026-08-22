@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -13,8 +15,21 @@ import ops.phase12.paper_supervisor as paper_supervisor
 from hyperlab.cli import _phase12_paper_source_factory
 from hyperlab.paper.collector_source import HyperliquidPaperPublicSource
 from hyperlab.paper.engine import PaperEngine
-from hyperlab.paper.models import PaperExecutionConfig, PaperRiskLimits, PaperRunConfig, PaperState
-from hyperlab.paper.runtime import PaperRuntimeLease, PublicSourceDescriptor
+from hyperlab.paper.models import (
+    DecisionIntent,
+    MarketEvent,
+    PaperExecutionConfig,
+    PaperRiskLimits,
+    PaperRunConfig,
+    PaperState,
+)
+from hyperlab.paper.runner import PaperStrategyView
+from hyperlab.paper.runtime import (
+    PaperRuntime,
+    PaperRuntimeConfig,
+    PaperRuntimeLease,
+    PublicSourceDescriptor,
+)
 from hyperlab.paper.store import PaperStore
 from ops.phase12.paper_supervisor import inspect_durable_start
 
@@ -488,6 +503,171 @@ def test_supervisor_admits_exact_reviewed_unclosed_recovery(tmp_path: Path) -> N
     result = inspect_durable_start(database, config, now=_START + timedelta(seconds=5))
     assert result["status"] == "READY"
     assert result["runtime_session_active"] is True
+
+
+def test_supervisor_recovers_sqlite_locked_runtime_crash_only_after_offline_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    database = tmp_path / "paper.sqlite3"
+    runtime_at = _START + timedelta(seconds=2)
+    instrument = "HYPERLIQUID:BTC:perp"
+    market = MarketEvent.create(
+        received_at=runtime_at,
+        instrument=instrument,
+        bid_price=Decimal("100"),
+        ask_price=Decimal("101"),
+        bid_depth=Decimal("10"),
+        ask_depth=Decimal("11"),
+        source_sequence=1,
+    )
+
+    class _HoldStrategy:
+        strategy_name = config.strategy_name
+        strategy_hash = config.strategy_hash
+
+        def decide(
+            self,
+            markets: Mapping[str, MarketEvent],
+            view: PaperStrategyView,
+        ) -> DecisionIntent | None:
+            assert markets
+            assert view.config_hash == config.config_hash
+            return None
+
+    class _QueueSource:
+        descriptor = PublicSourceDescriptor(config.data_source, config.data_hash)
+
+        def __init__(self, frames: list[object | None]) -> None:
+            self.frames = list(frames)
+
+        def start(self) -> None:
+            pass
+
+        def poll(self, *, timeout_seconds: float) -> object | None:
+            assert timeout_seconds > 0
+            return self.frames.pop(0) if self.frames else None
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def runtime(source: _QueueSource, *, at: datetime) -> PaperRuntime:
+        return PaperRuntime(
+            PaperEngine(PaperStore(database), config),
+            _HoldStrategy(),
+            source,
+            config=PaperRuntimeConfig(
+                timer_interval_seconds=config.runtime_timer_interval_seconds,
+                source_poll_timeout_seconds=config.runtime_source_poll_timeout_seconds,
+            ),
+            clock=lambda: at,
+        )
+
+    crashed = runtime(_QueueSource([{instrument: market}]), at=runtime_at)
+    started = crashed.start().projection
+    crashed_session_id = started.runtime_session_id
+    assert started.runtime_session_active is True
+    assert started.runtime_session_generation == 1
+    assert crashed_session_id is not None
+
+    def database_locked(*_args: object, **_kwargs: object) -> object:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(crashed.engine.store, "append_atomic", database_locked)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked") as failure:
+            crashed.run_once()
+        assert any(
+            "paper runtime failure persistence also failed: "
+            "OperationalError: database is locked" in note
+            for note in getattr(failure.value, "__notes__", ())
+        )
+        while_running = inspect_durable_start(
+            database,
+            config,
+            now=_START + timedelta(seconds=3),
+        )
+        assert while_running["blockers"] == ["RUNTIME_LEASE_ALREADY_HELD"]
+    finally:
+        crashed.close()
+        crashed.engine.store.close()
+
+    with PaperRuntimeLease(database, config.run_id):
+        pass
+
+    first = inspect_durable_start(
+        database,
+        config,
+        now=_START + timedelta(seconds=3),
+    )
+    second = inspect_durable_start(
+        database,
+        config,
+        now=_START + timedelta(seconds=4),
+    )
+    assert first["status"] == second["status"] == "REFUSED"
+    assert "UNCLOSED_RUNTIME_SESSION_REQUIRES_REVIEW" in first["blockers"]
+    assert "UNCLOSED_RUNTIME_SESSION_REQUIRES_REVIEW" in second["blockers"]
+
+    durable = PaperStore(database, initialize=False)
+    try:
+        paused = durable.get_projection(config.run_id)
+        failures = tuple(durable.iter_inputs(config.run_id, input_type="PAPER_RUNTIME_FAILURE"))
+        assert paused.state is PaperState.PAUSED
+        assert paused.runtime_session_active is True
+        assert paused.runtime_session_id == crashed_session_id
+        assert paused.runtime_session_generation == 1
+        assert len(failures) == 1
+        assert failures[0].payload["reason"] == (
+            "terminal paper runtime failure: UNCLOSED_RUNTIME_SESSION: "
+            "UnclosedRuntimeSessionError"
+        )
+    finally:
+        durable.close()
+
+    review_store = PaperStore(database, initialize=False)
+    try:
+        review_engine = PaperEngine(review_store, config)
+        with PaperRuntimeLease(database, config.run_id):
+            reviewed = review_engine.resume_from_pause(
+                as_of=_START + timedelta(seconds=5),
+                review_artifact_hash="9" * 64,
+                reviewed_critical_incident_count=paused.critical_incident_count,
+                reviewed_last_critical_incident_at=paused.last_critical_incident_at,
+                recovery_mode="OFFLINE_UNCLOSED_SESSION",
+            ).projection
+        assert reviewed.state is PaperState.FLAT
+        assert reviewed.runtime_session_active is True
+        assert reviewed.runtime_session_id == crashed_session_id
+        assert reviewed.runtime_session_generation == 1
+    finally:
+        review_store.close()
+
+    replacement_runtime = runtime(
+        _QueueSource([None]),
+        at=_START + timedelta(seconds=6),
+    )
+    replacement = replacement_runtime.start().projection
+    try:
+        assert replacement.runtime_session_active is True
+        assert replacement.runtime_session_generation == 2
+        assert replacement.runtime_session_id != crashed_session_id
+        starts = tuple(
+            replacement_runtime.engine.store.iter_inputs(
+                config.run_id,
+                input_type="RUNTIME_SESSION_STARTED",
+            )
+        )
+        assert len(starts) == 2
+        assert starts[-1].payload["generation"] == 2
+        assert starts[-1].payload["replaces_unclosed_session_id"] == crashed_session_id
+    finally:
+        replacement_runtime.close()
+        replacement_runtime.engine.store.close()
 
 
 def test_supervisor_rejects_unresolved_critical_incident(tmp_path: Path) -> None:

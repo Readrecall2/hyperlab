@@ -618,7 +618,9 @@ _PAPER_RUNTIME_SCOPE_FACTS: Mapping[str, object] = MappingProxyType(
 _PAPER_RUNTIME_LEASE_FACTS: Mapping[str, object] = MappingProxyType(
     {
         'canonical_database_path': 'RESOLVE_STRICT_THEN_OS_PATH_NORMCASE',
-        'contention_action': 'BLOCK_SECOND_RUNTIME_OR_STANDALONE_REPLAY_OR_RECONCILE',
+        'contention_action': (
+            'BLOCK_SECOND_RUNTIME_OR_STANDALONE_REPLAY_OR_RECONCILE_OR_RESUME'
+        ),
         'identity_fields': [
             'CANONICAL_DATABASE_PATH',
             'RUN_ID',
@@ -636,8 +638,8 @@ _PAPER_RUNTIME_LEASE_FACTS: Mapping[str, object] = MappingProxyType(
         ],
         'schema': 'paper-runtime-exclusive-os-lock-v1',
         'os_crash_releases_lock': True,
+        'active_runtime_pause_and_kill_require_lease': False,
         'read_only_status_report_require_lease': False,
-        'operator_pause_resume_kill_require_lease': False,
         'runtime_acquired_after_release_and_frozen_binding_checks': True,
         'runtime_acquired_before_engine_start_startup_reconciliation_and_public_source_start': True,
         'runtime_admission_failure_releases_lock': True,
@@ -652,6 +654,12 @@ _PAPER_RUNTIME_LEASE_FACTS: Mapping[str, object] = MappingProxyType(
         'standalone_replay_failure_releases_lock': True,
         'standalone_replay_held_until_completion': True,
         'standalone_replay_requires_stopped_runtime': True,
+        'standalone_resume_acquired_after_release_check': True,
+        'standalone_resume_config_and_release_rechecked_under_lease': True,
+        'standalone_resume_failure_releases_lock': True,
+        'standalone_resume_held_until_completion': True,
+        'standalone_resume_requires_lease_before_mutation': True,
+        'standalone_resume_requires_stopped_runtime': True,
     }
 )
 

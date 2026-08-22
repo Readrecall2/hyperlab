@@ -861,7 +861,7 @@ def test_standalone_reconcile_rejects_stale_release_before_lease_or_mutation(
     assert database.read_bytes() == before
 
 
-def test_resume_rejects_stale_release_before_engine_or_mutation(
+def test_resume_rejects_stale_release_before_lease_or_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -880,13 +880,13 @@ def test_resume_rejects_stale_release_before_engine_or_mutation(
     store.close()
     before = database.read_bytes()
 
-    class ForbiddenEngine:
+    class ForbiddenLease:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            raise AssertionError("stale release must block before engine construction")
+            raise AssertionError("stale release must block before lease acquisition")
 
     monkeypatch.setattr(
-        "hyperlab.paper.engine.PaperEngine",
-        ForbiddenEngine,
+        "hyperlab.paper.runtime.PaperRuntimeLease",
+        ForbiddenLease,
     )
 
     result = _invoke_operator(
@@ -1033,9 +1033,8 @@ def test_resume_atomically_rejects_a_newer_critical_incident(
         store.close()
 
 
-def test_pause_then_reviewed_resume_is_audited_and_deterministic(
+def test_pause_then_standard_resume_requires_lease_and_is_audited_and_deterministic(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, config = _durable_run(tmp_path)
     pause_at = _START + timedelta(seconds=2)
@@ -1059,16 +1058,21 @@ def test_pause_then_reviewed_resume_is_audited_and_deterministic(
         )
     )
 
-    class ForbiddenLease:
-        def __init__(self, _database: Path, _run_id: str) -> None:
-            raise AssertionError("standard resume must remain unleased")
-
-    monkeypatch.setattr(
-        "hyperlab.paper.runtime.PaperRuntimeLease",
-        ForbiddenLease,
-    )
-
     resume_at = _START + timedelta(seconds=3)
+    before_resume = database.read_bytes()
+    with PaperRuntimeLease(database, config.run_id):
+        blocked = _invoke_operator(
+            "resume",
+            config.run_id,
+            database,
+            at=resume_at,
+            extra=["--review-reason", "public feed and ledger reviewed"],
+        )
+
+    assert blocked.exit_code == 2, blocked.output
+    assert "already active" in blocked.output.lower()
+    assert database.read_bytes() == before_resume
+
     resume = _invoke_operator(
         "resume",
         config.run_id,
@@ -1100,6 +1104,56 @@ def test_pause_then_reviewed_resume_is_audited_and_deterministic(
         assert resume_input.payload["reviewed_last_critical_incident_at"] is None
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("offline_unclosed_recovery", (False, True))
+def test_resume_rereads_and_compares_durable_config_under_lease_for_both_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offline_unclosed_recovery: bool,
+) -> None:
+    database, config = _durable_run(tmp_path)
+    store = PaperStore(database, initialize=False)
+    engine = PaperEngine(store, config)
+    engine.pause(
+        as_of=_START + timedelta(seconds=2),
+        reason="operator inspection",
+        operator_artifact_hash="f" * 64,
+    )
+    store.close()
+    before = database.read_bytes()
+    changed = replace(config, parameters={"technical_only": True, "version": 2})
+    loaded: list[PaperRunConfig] = []
+    release_checks: list[str] = []
+
+    def load_once_then_change(_database: Path, _run_id: str) -> PaperRunConfig:
+        selected = config if not loaded else changed
+        loaded.append(selected)
+        return selected
+
+    monkeypatch.setattr(cli_module, "_load_stored_paper_config", load_once_then_change)
+    monkeypatch.setattr(
+        cli_module,
+        "_require_current_paper_release",
+        lambda selected: release_checks.append(selected.config_hash),
+    )
+    extra = ["--review-reason", "public feed and ledger reviewed"]
+    if offline_unclosed_recovery:
+        extra.append("--offline-unclosed-recovery")
+
+    result = _invoke_operator(
+        "resume",
+        config.run_id,
+        database,
+        at=_START + timedelta(seconds=3),
+        extra=extra,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "snapshot paper durable a changé avant la reprise" in result.output
+    assert loaded == [config, changed]
+    assert release_checks == [config.config_hash, changed.config_hash]
+    assert database.read_bytes() == before
 
 
 def test_offline_unclosed_recovery_requires_lease_and_is_explicitly_audited(

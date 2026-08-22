@@ -145,7 +145,11 @@ def test_historical_phase12_readiness_is_valid_evidence_but_not_current_authoriz
 
     assert not decision.ready
     assert [(item.code, item.location) for item in decision.blockers] == [
-        ("EVIDENCE_SEMANTIC_VERIFICATION_FAILED", "evidence.RUNTIME_SOURCE_ATTESTATION")
+        ("EVIDENCE_SEMANTIC_VERIFICATION_FAILED", "evidence.CRASH_RECOVERY"),
+        (
+            "EVIDENCE_SEMANTIC_VERIFICATION_FAILED",
+            "evidence.RUNTIME_SOURCE_ATTESTATION",
+        ),
     ]
     assert manifest.environment is EnvironmentClass.PAPER
     assert manifest.purpose is profile.purpose
@@ -173,6 +177,31 @@ def test_multistrategy_readiness_manifest_is_exact_semantic_paper_runtime() -> N
     assert manifest.subject.candidate_id == MULTISTRATEGY_CANDIDATE_ID
     assert manifest.subject.source_identity == PHASE12_PHASE05_PUBLIC_SOURCE_NAME
     assert set(manifest.evidence) == set(profile.required_checks)
+    for evidence_name in ("crash_recovery", "runtime_source_attestation"):
+        payload = json.loads(
+            (
+                MULTISTRATEGY_ROOT / "evidence" / f"{evidence_name}.json"
+            ).read_text(encoding="utf-8")
+        )
+        lease = payload["facts"]["runtime_lease"]
+        assert lease["contention_action"] == (
+            "BLOCK_SECOND_RUNTIME_OR_STANDALONE_REPLAY_OR_RECONCILE_OR_RESUME"
+        )
+        assert lease["active_runtime_pause_and_kill_require_lease"] is False
+        assert "operator_pause_resume_kill_require_lease" not in lease
+        for field in (
+            "standalone_reconcile_acquired_after_release_check",
+            "standalone_reconcile_failure_releases_lock",
+            "standalone_reconcile_held_until_completion",
+            "standalone_reconcile_requires_stopped_runtime",
+            "standalone_resume_acquired_after_release_check",
+            "standalone_resume_config_and_release_rechecked_under_lease",
+            "standalone_resume_failure_releases_lock",
+            "standalone_resume_held_until_completion",
+            "standalone_resume_requires_lease_before_mutation",
+            "standalone_resume_requires_stopped_runtime",
+        ):
+            assert lease[field] is True
     config = _config(MULTISTRATEGY_ROOT)
     assert config.schema_version == 3
     assert config.portfolio_id == "964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb"

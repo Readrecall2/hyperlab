@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, DecimalException, InvalidOperation
@@ -12,7 +14,7 @@ from enum import Enum
 from itertools import groupby
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Protocol, Self, cast
 
 from hyperlab.backtest.protocol import JsonValue, canonical_json, canonical_sha256
@@ -128,6 +130,8 @@ class CanonicalRecord(Protocol):
 
 
 FaultInjector = Callable[[str], None]
+_HistoricalReplayObserver = Callable[[str, str, Mapping[str, object]], None]
+_EMPTY_REPLAY_OBSERVATION_METADATA: Mapping[str, object] = MappingProxyType({})
 
 
 class PaperStoreError(RuntimeError):
@@ -686,7 +690,7 @@ def _record_dict(value: object, *, label: str) -> dict[str, JsonValue]:
 def _canonical_record(value: object, *, label: str) -> tuple[dict[str, JsonValue], str, str]:
     payload = _record_dict(value, label=label)
     payload_json = canonical_json(payload)
-    return payload, payload_json, canonical_sha256(payload)
+    return payload, payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
 
 def _json_object(value: str, *, label: str) -> dict[str, JsonValue]:
@@ -882,6 +886,7 @@ class PaperStore:
             raise ValueError("historical replay factory requires a fresh disposable store")
         self._historical_replay_only = historical_replay_only
         self._historical_replay_closed = False
+        self._historical_replay_observer: _HistoricalReplayObserver | None = None
         self._fault_injector = fault_injector
         self._timeout_seconds = timeout_seconds
         self._replay_connection: sqlite3.Connection | None = None
@@ -945,6 +950,69 @@ class PaperStore:
         if self._historical_replay_closed:
             raise RuntimeError("temporary historical replay store is closed")
         return _HISTORICAL_REPLAY_STORE_CAPABILITY
+
+    def _set_historical_replay_observer(
+        self,
+        observer: _HistoricalReplayObserver | None,
+    ) -> _HistoricalReplayObserver | None:
+        """Install diagnostic-only observation on a disposable historical replay store.
+
+        The returned previous observer lets the diagnostic restore state in a
+        ``finally`` block. Normal stores cannot enable this private hook.
+        """
+
+        if not self._historical_replay_only:
+            raise ValueError("historical replay observation requires a temporary replay store")
+        if observer is not None and not callable(observer):
+            raise TypeError("historical replay observer must be callable or None")
+        previous = self._historical_replay_observer
+        self._historical_replay_observer = observer
+        return previous
+
+    @staticmethod
+    @contextmanager
+    def _historical_replay_observation(
+        observer: _HistoricalReplayObserver,
+        operation: str,
+        metadata: Mapping[str, object] = _EMPTY_REPLAY_OBSERVATION_METADATA,
+    ) -> Iterator[None]:
+        """Balance one diagnostic span without masking a primary store failure."""
+
+        observer(operation, "begin", metadata)
+        primary_error: BaseException | None = None
+        try:
+            yield
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                observer(operation, "end", metadata)
+            except BaseException as observer_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "historical replay observer close failed with "
+                    f"{type(observer_error).__name__}"
+                )
+
+    def _historical_replay_append_conflict(self, message: str) -> AppendConflictError:
+        observer = self._historical_replay_observer
+        if observer is None:
+            return AppendConflictError(message)
+        observer(
+            "validation_failure_diagnostic",
+            "begin",
+            _EMPTY_REPLAY_OBSERVATION_METADATA,
+        )
+        try:
+            return AppendConflictError(message)
+        finally:
+            observer(
+                "validation_failure_diagnostic",
+                "end",
+                _EMPTY_REPLAY_OBSERVATION_METADATA,
+            )
 
     def _inject(self, stage: str) -> None:
         if stage not in FAULT_STAGES:
@@ -1843,22 +1911,50 @@ class PaperStore:
         alerts: Sequence[object],
         supplied_projection_json: str,
     ) -> None:
-        durable = connection.execute(
-            "SELECT payload_json FROM paper_projections WHERE run_id=?",
-            (run_id,),
-        ).fetchone()
+        observer = self._historical_replay_observer
+        if observer is None:
+            durable = connection.execute(
+                "SELECT payload_json FROM paper_projections WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        else:
+            with self._historical_replay_observation(
+                observer,
+                "validation_projection_sqlite_load",
+            ):
+                durable = connection.execute(
+                    "SELECT payload_json FROM paper_projections WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
         if durable is None:
-            raise AppendConflictError("durable projection is missing")
+            raise self._historical_replay_append_conflict("durable projection is missing")
         try:
-            durable_payload = _json_object(
-                str(durable["payload_json"]),
-                label="durable projection",
-            )
-            working = PaperProjection.from_dict(
-                cast(Mapping[str, object], durable_payload),
-            )
+            if observer is None:
+                durable_payload = _json_object(
+                    str(durable["payload_json"]),
+                    label="durable projection",
+                )
+                working = PaperProjection.from_dict(
+                    cast(Mapping[str, object], durable_payload),
+                )
+            else:
+                with self._historical_replay_observation(
+                    observer,
+                    "validation_projection_record_decode",
+                ):
+                    durable_payload = _json_object(
+                        str(durable["payload_json"]),
+                        label="durable projection",
+                    )
+                with self._historical_replay_observation(
+                    observer,
+                    "validation_state_reconstruction",
+                ):
+                    working = PaperProjection.from_dict(
+                        cast(Mapping[str, object], durable_payload),
+                    )
         except (DecimalException, KeyError, TypeError, ValueError) as error:
-            raise AppendConflictError(
+            raise self._historical_replay_append_conflict(
                 f"durable projection cannot be reconstructed for replay: {error}"
             ) from error
         if len(events) != len(prepared_events):
@@ -1877,7 +1973,9 @@ class PaperStore:
                 or not isinstance(raw_input_version, int)
                 or raw_input_version not in {1, PAPER_CASH_MATH_VERSION}
             ):
-                raise AppendConflictError("input cash_math_version is not supported")
+                raise self._historical_replay_append_conflict(
+                    "input cash_math_version is not supported"
+                )
             for event in cash_events:
                 raw_event_version = event.payload.get("cash_math_version", 1)
                 if (
@@ -1885,61 +1983,166 @@ class PaperStore:
                     or not isinstance(raw_event_version, int)
                     or raw_event_version not in {1, PAPER_CASH_MATH_VERSION}
                 ):
-                    raise AppendConflictError("event cash_math_version is not supported")
+                    raise self._historical_replay_append_conflict(
+                        "event cash_math_version is not supported"
+                    )
                 if raw_event_version != raw_input_version:
-                    raise AppendConflictError("cash event version differs from its durable input version")
+                    raise self._historical_replay_append_conflict(
+                        "cash event version differs from its durable input version"
+                    )
             if raw_input_version != PAPER_CASH_MATH_VERSION and not self._historical_replay_only:
-                raise AppendConflictError("new cash inputs and events must use cash_math_version 2")
+                raise self._historical_replay_append_conflict(
+                    "new cash inputs and events must use cash_math_version 2"
+                )
         expected_ledger: list[LedgerEntry] = []
         for event, prepared in zip(events, prepared_events, strict=True):
             if working.last_sequence + 1 != prepared.sequence:
-                raise AppendConflictError(
+                raise self._historical_replay_append_conflict(
                     "durable projection sequence does not continue into the supplied events"
                 )
             if working.last_event_hash != prepared.previous_hash:
-                raise AppendConflictError(
+                raise self._historical_replay_append_conflict(
                     "durable projection event head does not continue into the supplied events"
                 )
             try:
-                expected_ledger.extend(self._expected_ledger_entries(run_id, working, event))
-                apply_event(working, event)
+                if observer is None:
+                    expected_ledger.extend(
+                        self._expected_ledger_entries(run_id, working, event)
+                    )
+                    apply_event(working, event)
+                else:
+                    with self._historical_replay_observation(
+                        observer,
+                        "validation_ledger_reconstruction",
+                    ):
+                        expected_ledger.extend(
+                            self._expected_ledger_entries(run_id, working, event)
+                        )
+                    with self._historical_replay_observation(
+                        observer,
+                        "validation_event_apply",
+                    ):
+                        apply_event(working, event)
             except (DecimalException, KeyError, TypeError, ValueError) as error:
-                raise AppendConflictError(
+                raise self._historical_replay_append_conflict(
                     f"paper event replay failed for {event.event_id}: {error}"
                 ) from error
             working.last_sequence = prepared.sequence
             working.last_event_hash = prepared.event_hash
 
-        expected_ledger_json = canonical_json([entry.to_dict() for entry in expected_ledger])
-        supplied_ledger_json = canonical_json(
-            [
-                _record_dict(entry, label=f"ledger_entries[{index}]")
-                for index, entry in enumerate(ledger_entries)
-            ]
-        )
-        if supplied_ledger_json != expected_ledger_json:
-            raise AppendConflictError("supplied ledger entries differ from exact reducer-derived entries")
-        expected_alerts_json = canonical_json(
-            [
-                _record_dict(event.payload, label="ALERT_RAISED payload")
-                for event in events
-                if event.event_type is PaperEventType.ALERT_RAISED
-            ]
-        )
-        supplied_alerts_json = canonical_json(
-            [_record_dict(alert, label=f"alerts[{index}]") for index, alert in enumerate(alerts)]
-        )
-        if supplied_alerts_json != expected_alerts_json:
-            raise AppendConflictError("supplied alerts differ from exact ALERT_RAISED event payloads")
+        if observer is None:
+            expected_ledger_json = canonical_json(
+                [entry.to_dict() for entry in expected_ledger]
+            )
+            supplied_ledger_json = canonical_json(
+                [
+                    _record_dict(entry, label=f"ledger_entries[{index}]")
+                    for index, entry in enumerate(ledger_entries)
+                ]
+            )
+            ledger_matches = supplied_ledger_json == expected_ledger_json
+        else:
+            with self._historical_replay_observation(
+                observer,
+                "validation_ledger_expected_canonicalization",
+            ):
+                expected_ledger_json = canonical_json(
+                    [entry.to_dict() for entry in expected_ledger]
+                )
+            with self._historical_replay_observation(
+                observer,
+                "validation_ledger_supplied_canonicalization",
+            ):
+                supplied_ledger_json = canonical_json(
+                    [
+                        _record_dict(entry, label=f"ledger_entries[{index}]")
+                        for index, entry in enumerate(ledger_entries)
+                    ]
+                )
+            with self._historical_replay_observation(
+                observer,
+                "validation_ledger_comparison",
+            ):
+                ledger_matches = supplied_ledger_json == expected_ledger_json
+        if not ledger_matches:
+            raise self._historical_replay_append_conflict(
+                "supplied ledger entries differ from exact reducer-derived entries"
+            )
+        if observer is None:
+            expected_alerts_json = canonical_json(
+                [
+                    _record_dict(event.payload, label="ALERT_RAISED payload")
+                    for event in events
+                    if event.event_type is PaperEventType.ALERT_RAISED
+                ]
+            )
+            supplied_alerts_json = canonical_json(
+                [
+                    _record_dict(alert, label=f"alerts[{index}]")
+                    for index, alert in enumerate(alerts)
+                ]
+            )
+            alerts_match = supplied_alerts_json == expected_alerts_json
+        else:
+            with self._historical_replay_observation(
+                observer,
+                "validation_alert_expected_canonicalization",
+            ):
+                expected_alerts_json = canonical_json(
+                    [
+                        _record_dict(event.payload, label="ALERT_RAISED payload")
+                        for event in events
+                        if event.event_type is PaperEventType.ALERT_RAISED
+                    ]
+                )
+            with self._historical_replay_observation(
+                observer,
+                "validation_alert_supplied_canonicalization",
+            ):
+                supplied_alerts_json = canonical_json(
+                    [
+                        _record_dict(alert, label=f"alerts[{index}]")
+                        for index, alert in enumerate(alerts)
+                    ]
+                )
+            with self._historical_replay_observation(
+                observer,
+                "validation_alert_comparison",
+            ):
+                alerts_match = supplied_alerts_json == expected_alerts_json
+        if not alerts_match:
+            raise self._historical_replay_append_conflict(
+                "supplied alerts differ from exact ALERT_RAISED event payloads"
+            )
         try:
-            validated = PaperProjection.from_dict(working.to_dict())
+            if observer is None:
+                validated = PaperProjection.from_dict(working.to_dict())
+            else:
+                with self._historical_replay_observation(
+                    observer,
+                    "validation_projection_reconstruction",
+                ):
+                    validated = PaperProjection.from_dict(working.to_dict())
         except (DecimalException, KeyError, TypeError, ValueError) as error:
-            raise AppendConflictError(
+            raise self._historical_replay_append_conflict(
                 f"replayed post-event projection violates PaperProjection invariants: {error}"
             ) from error
-        replayed_projection_json = canonical_json(validated.to_dict())
-        if supplied_projection_json != replayed_projection_json:
-            raise AppendConflictError(
+        if observer is None:
+            replayed_projection_json = canonical_json(validated.to_dict())
+            projection_matches = supplied_projection_json == replayed_projection_json
+        else:
+            with self._historical_replay_observation(
+                observer,
+                "validation_projection_canonicalization",
+            ):
+                replayed_projection_json = canonical_json(validated.to_dict())
+            with self._historical_replay_observation(
+                observer,
+                "validation_projection_comparison",
+            ):
+                projection_matches = supplied_projection_json == replayed_projection_json
+        if not projection_matches:
+            raise self._historical_replay_append_conflict(
                 "supplied projection differs from durable projection plus supplied events"
             )
 
@@ -4517,24 +4720,92 @@ class PaperStore:
     ) -> Iterable[InputRecord]:
         """Stream the canonical inbox in commit order with bounded memory."""
 
-        normalized_run_id = _identifier(run_id, label="run_id")
-        normalized_type = _identifier(input_type, label="input_type") if input_type is not None else None
-        if (
-            isinstance(after_commit_sequence, bool)
-            or not isinstance(after_commit_sequence, int)
-            or after_commit_sequence < 0
-        ):
-            raise ValueError("after_commit_sequence must be a non-negative integer")
-        sql = "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence>?"
-        parameters: list[object] = [normalized_run_id, after_commit_sequence]
-        if normalized_type is not None:
-            sql += " AND json_extract(payload_json, '$.input_type')=?"
-            parameters.append(normalized_type)
-        sql += " ORDER BY commit_sequence, input_id"
+        observer = self._historical_replay_observer if input_type is not None else None
+        query_metadata: Mapping[str, object] = _EMPTY_REPLAY_OBSERVATION_METADATA
+        if observer is not None:
+            query_metadata = {
+                "after_commit_sequence": after_commit_sequence,
+                "has_input_type_filter": True,
+                "parameter_count": 3,
+                "query_shape": "paper_inbox_run_after_commit_input_type_ordered",
+            }
+        if observer is None:
+            normalized_run_id = _identifier(run_id, label="run_id")
+            normalized_type = (
+                _identifier(input_type, label="input_type")
+                if input_type is not None
+                else None
+            )
+            if (
+                isinstance(after_commit_sequence, bool)
+                or not isinstance(after_commit_sequence, int)
+                or after_commit_sequence < 0
+            ):
+                raise ValueError("after_commit_sequence must be a non-negative integer")
+            sql = "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence>?"
+            parameters: list[object] = [normalized_run_id, after_commit_sequence]
+            if normalized_type is not None:
+                sql += " AND json_extract(payload_json, '$.input_type')=?"
+                parameters.append(normalized_type)
+            sql += " ORDER BY commit_sequence, input_id"
+        else:
+            with self._historical_replay_observation(
+                observer,
+                "filtered_input_query_prepare",
+                query_metadata,
+            ):
+                normalized_run_id = _identifier(run_id, label="run_id")
+                normalized_type = (
+                    _identifier(input_type, label="input_type")
+                    if input_type is not None
+                    else None
+                )
+                if (
+                    isinstance(after_commit_sequence, bool)
+                    or not isinstance(after_commit_sequence, int)
+                    or after_commit_sequence < 0
+                ):
+                    raise ValueError(
+                        "after_commit_sequence must be a non-negative integer"
+                    )
+                sql = "SELECT * FROM paper_inbox WHERE run_id=? AND commit_sequence>?"
+                parameters = [normalized_run_id, after_commit_sequence]
+                if normalized_type is not None:
+                    sql += " AND json_extract(payload_json, '$.input_type')=?"
+                    parameters.append(normalized_type)
+                sql += " ORDER BY commit_sequence, input_id"
         with self._read_connection() as connection:
-            cursor = connection.execute(sql, parameters)
-            for row in cursor:
-                yield self._input_from_row(row)
+            if observer is None:
+                cursor = connection.execute(sql, parameters)
+                for row in cursor:
+                    yield self._input_from_row(row)
+                return
+            with self._historical_replay_observation(
+                observer,
+                "filtered_input_sqlite_execute",
+                query_metadata,
+            ):
+                cursor = connection.execute(sql, parameters)
+            while True:
+                try:
+                    with self._historical_replay_observation(
+                        observer,
+                        "filtered_input_fetch",
+                    ):
+                        row = next(cursor)
+                except StopIteration:
+                    break
+                row_metadata = {
+                    "commit_sequence": int(row["commit_sequence"]),
+                    "payload_json_characters": len(str(row["payload_json"])),
+                }
+                with self._historical_replay_observation(
+                    observer,
+                    "filtered_input_row_reconstruct",
+                    row_metadata,
+                ):
+                    record = self._input_from_row(row)
+                yield record
 
     def get_inputs(self, run_id: str) -> tuple[InputRecord, ...]:
         """Return the canonical inbox in durable commit order for exact replay."""

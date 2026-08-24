@@ -382,7 +382,7 @@ class _PreparedAlert:
     payload_hash: str
 
 
-_SCHEMA_SQL = """
+PAPER_STORE_SCHEMA_SQL = """
 CREATE TABLE paper_schema (
     singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
     version INTEGER NOT NULL CHECK (version > 0),
@@ -1093,7 +1093,7 @@ class PaperStore:
                 created_at = _now_text().replace("'", "''")
                 connection.executescript(
                     "BEGIN IMMEDIATE;\n"
-                    + _SCHEMA_SQL
+                    + PAPER_STORE_SCHEMA_SQL
                     + f"\nINSERT INTO paper_schema VALUES (1, {STORE_SCHEMA_VERSION}, "
                     + f"'{created_at}');\n"
                     + f"PRAGMA user_version={STORE_SCHEMA_VERSION};\nCOMMIT;"
@@ -4844,6 +4844,7 @@ class PaperStore:
 __all__ = [
     "FAULT_STAGES",
     "PAPER_STATES",
+    "PAPER_STORE_SCHEMA_SQL",
     "SCHEMA_VERSION",
     "STORE_SCHEMA_VERSION",
     "AlertRecord",

@@ -488,6 +488,46 @@ def verify_manifest(
         raise ManifestFormatError("manifest final head is incompatible with last segment")
 
 
+def verify_manifest_transition(parent: Manifest, child: Manifest) -> None:
+    """Verify one append-only authenticated manifest-chain transition.
+
+    verify_manifest closes the invariants inside one snapshot. A parent root
+    alone does not prove that the child retained the parent's descriptors or
+    identities, so repository publication must also call this transition
+    verifier before advancing an external anchor.
+    """
+
+    if type(parent) is not Manifest or type(child) is not Manifest:
+        raise TypeError("manifest transition requires exact Manifest values")
+    verify_manifest(parent)
+    verify_manifest(child)
+
+    if parent.generation == UINT64_MAX:
+        raise ManifestFormatError("manifest generation cannot advance past uint64 maximum")
+    if child.generation != parent.generation + 1:
+        raise ManifestFormatError("child manifest generation is not the next generation")
+    if child.parent_manifest_root != parent.identity.root:
+        raise ManifestFormatError("child manifest parent root differs from parent identity")
+
+    if child.store_id != parent.store_id or child.run_id != parent.run_id:
+        raise ManifestFormatError("child manifest store or run identity drifted")
+    if (
+        child.run_identity != parent.run_identity
+        or child.config_identity != parent.config_identity
+        or child.code_identity != parent.code_identity
+        or child.runtime_identity != parent.runtime_identity
+    ):
+        raise ManifestFormatError("child manifest attested identities drifted")
+    if child.start_prefix_root != parent.start_prefix_root:
+        raise ManifestFormatError("child manifest start prefix root drifted")
+
+    parent_count = len(parent.segments)
+    if len(child.segments) <= parent_count:
+        raise ManifestFormatError("child manifest must append at least one segment")
+    if child.segments[:parent_count] != parent.segments:
+        raise ManifestFormatError("child manifest replaced or mutated an existing descriptor")
+
+
 def verify_manifest_segments(
     manifest: Manifest,
     segments: Sequence[SegmentArtifact],
@@ -684,4 +724,5 @@ __all__ = [
     "manifest_to_bytes",
     "verify_manifest",
     "verify_manifest_segments",
+    "verify_manifest_transition",
 ]

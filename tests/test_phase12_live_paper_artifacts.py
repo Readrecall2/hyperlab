@@ -485,6 +485,7 @@ def test_multistrategy_release_code_manifest_binds_the_exact_reviewed_checkout()
     expected_paths = {
         "pyproject.toml",
         "requirements-runtime.lock",
+        "scripts/certify_storage_v4_phase1b.py",
         "scripts/generate_phase12_live_paper_artifacts.py",
         *(
             path.relative_to(ROOT).as_posix()
@@ -775,6 +776,10 @@ def test_generator_rejects_an_early_release_file_changed_after_its_read(
     )
     (repository / "scripts" / "generate_phase12_live_paper_artifacts.py").write_text(
         "GENERATOR = True\n",
+        encoding="utf-8",
+    )
+    (repository / "scripts" / "certify_storage_v4_phase1b.py").write_text(
+        "CERTIFIER = True\n",
         encoding="utf-8",
     )
     (repository / "src" / "hyperlab" / "early.py").write_text(

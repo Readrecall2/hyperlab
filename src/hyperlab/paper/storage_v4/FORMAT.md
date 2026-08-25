@@ -1,17 +1,20 @@
 # HyperLab Storage v4 immutable prototype format (protocol v1)
 
-This document specifies the Phase 1A binary contract. All integers are unsigned,
-big-endian, and fixed-width (`u16`, `u32`, or `u64`). Text is strict UTF-8 and is
-prefixed by a `u32` byte length. Optional values use a one-byte tag: `0x00` means
-absent and `0x01` means present. A present variable-length value still carries its
-length, so absent and present-empty are distinct. Hash values stored in the binary
-formats are exactly 32 raw bytes; lowercase hexadecimal is only an external view.
+This document specifies the Phase 1A immutable binary core and the Phase 1B
+checkpointed engine and recovery contract. Unless a section explicitly describes
+SQLite or canonical JSON, all integers are unsigned, big-endian, and fixed-width
+(`u16`, `u32`, or `u64`). Text is strict UTF-8 and is prefixed by a `u32` byte
+length. Optional values use a one-byte tag: `0x00` means absent and `0x01` means
+present. A present variable-length value still carries its length, so absent and
+present-empty are distinct. Hash values stored in the binary formats are exactly
+32 raw bytes; lowercase hexadecimal is only an external view.
 
 ## Logical hashes
 
-The protocol domains are `HL4-ROW`, `HL4-COMMIT`, `HL4-PREFIX`,
+The Phase 1A protocol domains are `HL4-ROW`, `HL4-COMMIT`, `HL4-PREFIX`,
 `HL4-MERKLE-LEAF`, `HL4-MERKLE-NODE`, `HL4-MERKLE-ROOT`, `HL4-SEGMENT`,
-and `HL4-MANIFEST`.
+and `HL4-MANIFEST`. Phase 1B adds `HL4-CHECKPOINT` and
+`HL4-CANDIDATE-SEGMENT-DESCRIPTORS`.
 Every logical preimage starts with the length-prefixed domain followed by protocol
 version `u16(1)`. Variable data is length-prefixed before it is appended. SHA-256
 is then applied to the complete preimage. The shared `framed_hash(D, F...)`
@@ -201,7 +204,267 @@ body or materializing descriptors. Phase 1A defaults are 64 MiB for the complete
 file and body, 1 MiB per descriptor, and 65,536 descriptors. These are parser
 safety limits rather than a production manifest sizing claim.
 
-Phase 1A does **not** publish or verify an external/root-owned anchor. Therefore a
-valid standalone manifest detects internal corruption and a supplied wrong parent,
-but does not prevent an attacker from rolling the whole self-consistent manifest
-chain back. Anti-rollback publication is explicitly outside this prototype.
+An authenticated manifest file alone still does not prevent rollback of an entire
+self-consistent chain. Phase 1B combines the manifest chain with an independently
+opened anchor and refuses a generation/root that does not match that authority.
+The included local anchor is a functional witness of this protocol, not proof of
+an externally protected or root-owned production authority.
+
+## Phase 1B logical storage modes
+
+The storage mode is part of the logical contract and the two modes are not
+interchangeable:
+
+- `V3_COMPATIBILITY_IMPORT` preserves a certified V3 canonical JSONL record so
+  it can be rematerialized byte for byte.
+- `V4_NATIVE` stores a typed reference to bytes in a raw immutable segment. It
+  does not wrap or duplicate a V3 canonical record.
+
+A compatibility import requires exactly one strict canonical JSON object followed
+by exactly one LF. Missing LF, CRLF, extra lines, non-canonical JSON, non-object
+values, and non-finite floats are rejected. The LF is not stored. The exact object
+text is stored as a UTF-8 string and rematerialization appends exactly one LF. A
+finite V3 float is thus preserved as its exact canonical JSON text inside that
+string, not introduced as a float into the float-free V4 canonical logical value.
+
+The exact compatibility envelope has keys `canonical_json`,
+`canonical_sha256`, `contract`, and `mode`. The hash is lowercase SHA-256 of
+the exact UTF-8 object bytes; `contract` is
+`hyperlab.storage_v4.v3_compatibility_record.v1`; and `mode` is
+`V3_COMPATIBILITY_IMPORT`.
+
+The certified importer owns one cursor per ordered stream and drains only rows
+for the current commit. It never groups a complete component stream in memory.
+Checkpoint materialization is lazy and occurs only at an actual seal boundary.
+Ledger balances use exact integer-coefficient/decimal-exponent accumulation;
+there is no Decimal context precision or silent rounding ceiling.
+
+A native reference has exactly the keys `byte_length`, `byte_offset`,
+`contract`, `lake_id`, `mode`, `payload_sha256`, `physical_sha256`,
+`segment_identity`, `source_first_sequence`, `source_last_sequence`, and
+`stream_id`. Its contract is
+`hyperlab.storage_v4.raw_segment_reference.v1` and its mode is `V4_NATIVE`.
+Resolution authenticates the segment key, complete physical hash, nonempty
+in-bounds interval, payload hash, stream, and nonreversed source range before
+returning bytes.
+
+`DeterministicRawLakeEmulator` is an in-memory one-shot resolver for local tests.
+It rejects duplicate registration, physical aliases, bad bounds, and hash
+mismatches. It is not a durable raw lake, capacity implementation, or ownership
+witness.
+
+## Bounded SQLite overlay
+
+The overlay stores only the complete mutable tail after an authenticated base.
+`create` refuses an existing path and `open_existing` refuses a missing path;
+expected state is never silently created. Schema identity and `user_version` are
+checked on open. Every durable connection requires SQLite
+`journal_mode=DELETE` and `synchronous=FULL`.
+
+Schema v2 metadata binds store ID, run ID, storage mode, the four
+run/config/code/runtime identities, codec profile, immutable genesis
+generation/root/commit/prefix, seal thresholds, current base manifest
+generation/root/commit/prefix, tail commit/row/stored-byte counters, and head.
+Open requires the complete expected `OverlayIdentity` before any retained tail
+is read. A schema-v1 overlay is deliberately ambiguous and rejected rather than
+silently upgraded.
+Protocol `u64` values are stored as zero-padded 20-character decimal text, which
+avoids SQLite's signed-integer limit while preserving lexical order.
+
+Before the first manifest, the only valid base-manifest sentinel is generation
+zero with the all-zero 32-byte root. Generation zero with a nonzero root and a
+positive generation with the zero root are corrupt. The sentinel is overlay
+metadata only, not a fake manifest, checkpoint, commit, or anchor record;
+published manifests and anchors start at generation 1.
+
+Append and `advance_base` use `BEGIN IMMEDIATE`. Append reads the transactional
+metadata written with the prior commit, then requires the same run, exact next
+sequence, exact prior prefix, and a complete authenticated commit frame. An exact
+duplicate returns false.
+Conflicting duplicate/overlap, gap, wrong run/root, malformed record, overflow,
+or counter mismatch rolls back with structured `OverlayError`.
+
+`StorageRepository.overlay_state` is an O(1) seal-polling view of that same
+transactional metadata; it does not rescan the retained tail after every append.
+Complete tail decoding and reconciliation remain mandatory at seal, startup/
+recovery, and full audit.
+
+The tail is seal-ready when either `seal_rows` logical rows or `seal_bytes`
+stored encoded bytes is reached. These are admission thresholds, not capacity
+measurements. `advance_base` validates the new base, deletes only its covered
+prefix, proves and preserves any contiguous tail, recomputes counters, and updates
+metadata atomically. Exact repetition is idempotent; rollback, fork, gap, or
+incompatible tail fails closed.
+
+## Checkpoint and descriptor-set digest
+
+A checkpoint is magic `HL4CHK\x00\x01`, format `u16(1)`, body size
+`u64`, body, then raw checkpoint root. The root is exactly
+`framed_hash(HL4-CHECKPOINT, frame_bytes(body))`.
+
+The body contains, in order: logical protocol version; store ID, run ID, and mode;
+target manifest generation and optional parent; starting prefix; covered commit
+sequence, prefix, and segment identity; candidate descriptor digest; run/config/
+code/runtime identities; historical commit count; sorted cumulative stream counts
+using `u64`; then framed strict canonical JSON objects for adapter, ledger,
+projection, sessions, incidents, cursors, and stream heads, in that exact order.
+Generation 1 has no parent; later generations require one. All bindings, counts,
+identities, covered head, generation, parent, and mode are checked, so stale,
+future, cross-run, or partial matches are rejected.
+
+The candidate descriptor digest is
+`framed_hash(HL4-CANDIDATE-SEGMENT-DESCRIPTORS,`
+`frame_bytes(u32(count) || each(frame_bytes(descriptor_material))))`. Prior
+descriptors retain their checkpoint-root option; the new final descriptor is
+digested with that option absent. The resulting checkpoint root is then inserted
+into the final descriptor. This two-stage rule breaks the circular dependency
+between a checkpoint root and the descriptor that names it.
+
+## Manifest authority and publication
+
+A valid manifest transition is exactly parent generation plus one, cites the
+exact parent root, retains store/run and run/config/code/runtime identities and
+starting prefix, retains every parent descriptor byte for byte, and appends at
+least one contiguous prefix-linked descriptor. Rewriting history, skipping a
+generation, or presenting a same-generation fork is rejected.
+
+Segments are content-addressed by physical SHA-256 with suffix `.hl4s`,
+checkpoints by checkpoint root with `.hl4c`, and manifests by manifest root with
+`.hl4m`. Immutable publication uses a fresh exclusive temporary file, flush,
+file fsync, exact readback, non-overwriting publication, and directory fsync.
+An existing byte-identical object is idempotent; divergent bytes at that address
+are corruption.
+
+Seal publication has this exact causal order:
+
+1. immutable segment;
+2. complete checkpoint after computing the candidate descriptor digest;
+3. append-only manifest after inserting the checkpoint root;
+4. authoritative external anchor compare-and-swap;
+5. mutable `CURRENT` cache;
+6. `overlay.advance_base`.
+
+The anchor, not `CURRENT`, decides the committed head. Anchor updates are
+monotone compare-and-swap: exact repetition is idempotent, but stale expectation,
+rollback, or fork is rejected. Any generation jump is accepted only after the
+repository verifies the intervening manifest chain.
+
+One repository instance first acquires the anchor/store-scoped OS advisory
+writer lease and then the repository-root `WRITER.LEASE`; both remain held from
+create/open until `close()`, and are released in reverse order. Two different
+repository roots attached to the same anchor/store authority therefore cannot
+write concurrently. A second writer fails immediately; process exit releases
+the OS locks and harmless lease files may remain. The local implementation binds
+its sidecar to the canonical anchor path and `StoreId`, and refuses symlinks,
+Windows reparse points, replacement, or divergent lease identity. These leases
+are concurrency admission, not root-owned external authority, and do not replace
+anchor compare-and-swap.
+
+`CURRENT` is strict canonical JSON plus LF with `format_version`,
+`generation`, `manifest_root`, and `store_id`. It is only a replaceable
+cache. Missing, stale, or corrupt `CURRENT` is repaired from the anchor after
+the exact manifest and checkpoint authenticate; a newer or conflicting cache
+never overrides the anchor. Genesis has no `CURRENT`, and symlinks are not
+followed.
+
+## Startup, recovery, and full audit
+
+Normal anchored startup follows this order: exact anchor, exact anchored manifest,
+checkpoint bound by its final descriptor, verified/reconciled overlay tail, then
+`CURRENT` repair. It reads no historical segment payload. The report exposes
+`segments_read = 0`, `checkpoint_used`,
+`historical_segments_not_read`, `historical_commits_not_read`,
+`historical_rows_not_read`, `tail_entries_replayed`,
+`tail_rows_replayed`, and the final integrity result.
+
+Reopen also inspects only the bounded identity/generation/parent prefix of each
+manifest namespace file to discover a possible direct interrupted-seal
+successor; it does not parse every cumulative historical manifest. That O(N)
+metadata prefix work is in the same asymptotic bound as the N descriptors in
+the current cumulative manifest. A clean reopen still reads zero segment
+payloads. If one exact orphan successor is adopted, the report truthfully counts
+its one segment and covered commits/rows as read and subtracts them from the
+`historical_*_not_read` counters.
+
+The phrase "startup O(tail)" is scoped to historical commit/row payload I/O and
+replay. Exact parser work is
+`O(size(anchored manifest) + size(checkpoint) + size(tail))`. Protocol-v1
+manifests repeat the descriptor prefix, so Phase 1B does not claim constant
+startup work in the number of historical segment descriptors.
+
+If the overlay trails the anchor, recovery advances it only after proving that its
+base is the strict genesis sentinel or an ancestor in the authenticated chain. An
+overlay ahead of the anchor, on a fork, with a bad attachment, or with mismatched
+counters is rejected. A crash after anchor publication but before `CURRENT` or
+overlay advancement is recoverable without granting authority to either later
+write.
+
+`full_audit` is the separate O(N) path. It authenticates the entire manifest
+chain, detects same-generation forks and invalid manifest namespace
+entries, verifies every generation checkpoint, reads every segment, and reconciles
+physical/logical identities, prefix chains, commits, rows, bytes, stream totals,
+and every persisted checkpoint state. Its ordered
+`CheckpointStateWitness(covered_commit_sequence, state_sha256)` values are
+derived from checkpoint bytes actually reread during that audit, not from
+in-memory states retained by the sealer. Normal startup does not imply this
+full-history audit.
+
+## Fault injection and fail-closed behavior
+
+Deterministic fault points surround temporary writes, flushes, file and directory
+fsyncs, exclusive publication/rename, segment/checkpoint/manifest publication,
+anchor and `CURRENT` publication, and overlay transactions before and after
+commit. An injected failure is raised at its selected occurrence. Reopen must
+resolve to the last authenticated anchored generation plus a valid tail or fail
+closed. Unanchored immutable objects and orphan temporary files have no authority;
+exact immutable publication and overlay operations remain safely retryable. One
+special interrupted-seal case is recoverable: if the namespace contains exactly
+one fully authenticated direct manifest successor whose sole appended segment
+matches an exact prefix of the durable overlay tail, reopen may compare-and-swap
+that successor into the anchor and advance the overlay while preserving any
+contiguous suffix. Invalid namespace entries, zero/multiple candidates, a fork,
+wrong generation/parent, extra descriptors, bad segment/checkpoint bytes, or a
+tail mismatch fail closed.
+
+## Golden Phase 1B certification provenance
+
+The compatibility certifier keeps the authenticated Golden source identities
+separate from the identities of the code that creates the Storage v4 store.
+Before creating a result directory and again immediately before report
+publication, it recomputes the canonical multistrategy Paper release-code and
+runtime-environment digests and requires exact equality with explicit CLI
+inputs. The repository manifest/checkpoint/overlay `code_identity` and
+`runtime_identity` are those certifier identities, while `config_identity` is
+SHA-256 of the canonical configuration payload. That payload binds the Golden
+root/source/run and source config/code/runtime identities, mode, store ID, codec,
+seal thresholds, heartbeat/safety limits, and certifier code/runtime.
+
+The immutable report publishes the Golden and certifier namespaces separately,
+including the complete canonical configuration payload and digest. `COMPLETE`
+repeats certifier code/configuration/runtime digests plus the report digest.
+The progress log remains `RUNNING` through its final durable
+`certification_gates_passed` record and is closed first; `COMPLETE` v2 is the
+last publication and the only persisted success state.
+The external Golden pin is hashed through a stable regular-file handle and
+stable device/inode/mode/size/mtime witness around both Golden verifications.
+Peak RSS is either measured by the platform process API or explicitly reported
+`UNAVAILABLE` with a reason; a missing value is never treated as capacity proof.
+
+## Evidence and platform limits
+
+Phase 1B is Paper-only. It introduces no signer, wallet, private API, live-order
+path, deployment, economic result, or real-money certification.
+
+SQLite `LocalAnchor` is a local functional witness of schema, `DELETE/FULL`,
+compare-and-swap, and recovery. It does not prove Linux root ownership, resistance
+to a compromised administrator, remote attestation, or an operational external
+authority. Local Windows evidence exercises functional logic and the Windows
+directory-flush path; it does not certify Linux/ext4 durability. POSIX fsync code
+likewise does not prove that a production Linux host was configured or tested.
+
+`V3_COMPATIBILITY_IMPORT` carries exact V3 canonical text, so its measured size
+is not V4-native capacity evidence. Durable raw-lake ingestion, representative
+`V4_NATIVE` capacity, long-run growth, compaction, an external/root-owned
+anchor, and Linux crash/power-loss evidence remain future work. This format makes
+no `0.20 GiB/h` claim, no throughput or storage-capacity certification, and no
+economic claim.

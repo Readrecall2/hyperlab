@@ -48,19 +48,19 @@ The production technical mapping is:
 - perpetual: `HL:HYPE:perp`, public source asset `HYPE`;
 - Phase 08: `HL:ETH:perp` and `HL:BTC:perp`.
 
-The dedicated successor release evidence records:
+The dedicated successor release evidence records the stable semantic identities:
 
 - portfolio ID `964323215b055b977faf1ef713f4642226cedcdec2a779ecf0ae5a27f68f41bb`;
-- config hash `cc04ebcb3ec434f019021e79b1d0fd6280bca13420566c8469fe3c408989f37a`;
-- run ID `88b7800ad58ef0605ac6c345b23ecf7cdb55bd3d2cca442c0675e1f0a6c49f9c`;
 - Phase 05 strategy hash `76e4b4ab6c1af42bb408a2f22163affbb88b0e717d49f2e88696c5abd0063f0f`;
 - Phase 05 strategy-config hash `d5d0c18e77a3e1a5ba1a11f9fda646ce9bd8d4a68c476d4d620a62886bc4af24`;
 - Phase 08 strategy hash `239ca1f27b9563a8fcacb5faa756364b6fc70240246dc086ac0be1633d8abb0d`;
-- Phase 08 strategy-config hash `3c41aff21544b83e03bf53a991b268a3e3c9e97c448ec353e47bfd470eadd75d`;
-- source data hash `8bb32496710de5464ce95b01fc033183e826a6954cb88d787b9ff55e96cbf671`;
-- release-code hash `719359294c825dbdaf3c5286bf5a09b000ee498dbd4f637f9d1c00fdef049525`;
-- readiness manifest hash `d53c88bd073ce17aa958bb0da20fe7dd28e4d5e405840eaa0d28dc3e6248a580`;
-- readiness profile hash `e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a`.
+- Phase 08 strategy-config hash `3c41aff21544b83e03bf53a991b268a3e3c9e97c448ec353e47bfd470eadd75d`.
+
+Generated config, run, source, release-code, readiness-manifest, readiness-profile, and runtime
+identities are authoritative only in
+`config/paper/phase08-phase05-multistrategy-paper-v1/technical-evidence.json` and
+`artifact-index.json`. They must be refreshed with the canonical generator and its `--check`;
+this document does not mirror those source-dependent pins.
 
 The Windows runtime-environment hash remains recorded in `technical-evidence.json`; a future Linux bundle must generate and bind its own host-specific value.
 

@@ -242,10 +242,25 @@ Golden V3 preserves the complete logical V3 history and is authoritative for fut
 `V3_COMPATIBILITY_IMPORT` and differential validation. Such an importer may retain a one-to-one
 mapping for every V3 logical record.
 
+Storage v4 Phase 1B has now certified that compatibility path against the complete Golden:
+252,262 commits, 1,011,362 logical rows, and all 13 streams were preserved exactly through 21
+overlay/segment/manifest/checkpoint cycles, with one persisted checkpoint-state witness per
+checkpoint. The certified terminal store has final prefix root
+`f32965fa0b24cc189e271d682136680c2867c76074724e552a43e248897665ba` and manifest root
+`a85846c7899ddf8693e4882716e80274fec18663c66958445c788822bbb41398`. Authenticated startup
+used the terminal checkpoint with zero historical segments and zero tail entries replayed. This
+proves historical payload replay `O(tail)` for the compatibility engine; metadata authentication
+remains `O(current_manifest + checkpoint + tail)` because the current manifest is cumulative.
+
+The compatibility segments occupy 317,492,777 bytes and the complete local Storage v4 store
+528,250,030 bytes. These are Windows compatibility-import observations, not a `V4_NATIVE`
+capacity result, Linux/ext4 durability certification, or economic evidence. The Golden source,
+manifest, and external pin remain byte-identical.
+
 This does not decide the physical shape of `V4_NATIVE`. A future native writer may reference
 immutable raw segments and retain only the decision/audit/replay records its reviewed contract
 requires; it need not copy every market update into the same V3 tables. That separation requires a
-later design and certification phase. Golden V3 does not modify Storage v4 Phase 1A.
+later design and certification phase.
 
 ## Verdicts
 

@@ -7,10 +7,10 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T18:00:00Z`;
-- operator arm deadline: `2026-08-27T17:30:00Z`;
-- unique slug: `h1-20260827t180000z-a007df56`;
-- service: `hyperlab-h1-20260827t180000z-a007df56.service`;
+- start: `2026-08-27T21:00:00Z`;
+- operator arm deadline: `2026-08-27T20:30:00Z`;
+- unique slug: `h1-20260827t210000z-c0043345`;
+- service: `hyperlab-h1-20260827t210000z-c0043345.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).
@@ -74,6 +74,13 @@ remote roots, disk budget, and service name. The commit cannot be embedded in
 its own Git bytes, so the separately hashed handoff is the non-circular binding
 between source identity and the canonical campaign manifest.
 
+Every byte-level identity for a Git-tracked policy, fee, readiness, launch-plan,
+or source artifact hashes the exact `HEAD` blob rather than platform-materialized
+worktree bytes. A Windows worktree may differ only by reversible CRLF expansion
+of the canonical LF blob. Any other byte difference, untracked identity path,
+missing file, or symlink fails generation locally before a handoff is created.
+Consequently, a clean Linux checkout recomputes the same evidence as Windows.
+
 ## Persistent service and recovery
 
 The rendered systemd unit runs as `hyperlab`, is read-only except for the one
@@ -118,3 +125,10 @@ execution stopped before `sudo install` because GNU `df` rejects `-P` combined
 with `--output`. Its append-only receipt marks it
 `ABANDONED_BEFORE_VOLUME_PREPARATION_DF_OPTION_INCOMPATIBILITY` and records
 `NO_DIRECTORY_PREPARATION_NO_TRANSFER_NO_SERVICE_NO_NETWORK_COLLECTION`.
+
+The V5 slug `h1-20260827t180000z-a007df56` remains byte-identical and must not
+be repaired or reused. Transfer, exact clone, venv bootstrap, import preflight,
+and campaign-seed installation completed, then portable-identity verification
+failed before systemd installation. Its append-only receipt marks it
+`ABANDONED_AFTER_TRANSFER_BEFORE_SYSTEMD_PORTABLE_IDENTITY_MISMATCH` and records
+that no service, collector, or network collection started.

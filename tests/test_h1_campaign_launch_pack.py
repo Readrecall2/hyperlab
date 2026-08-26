@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -73,9 +74,9 @@ def _volume_snapshot() -> dict[str, object]:
 def test_launch_plan_freezes_unique_roots_times_and_full_disk_budget() -> None:
     plan = launch_pack.validate_plan(_plan())
     assert plan["boundary"] == "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-    assert plan["campaign_slug"] == "h1-20260827t180000z-a007df56"
-    assert plan["starts_at_utc"] == "2026-08-27T18:00:00Z"
-    assert plan["arm_deadline_utc"] == "2026-08-27T17:30:00Z"
+    assert plan["campaign_slug"] == "h1-20260827t210000z-c0043345"
+    assert plan["starts_at_utc"] == "2026-08-27T21:00:00Z"
+    assert plan["arm_deadline_utc"] == "2026-08-27T20:30:00Z"
     disk = plan["disk"]
     assert isinstance(disk, dict)
     assert disk["maximum_raw_bytes"] == 128 * 1024**3
@@ -121,7 +122,7 @@ def test_incoming_path_validation_refuses_escape_or_reuse(path: str) -> None:
 
 
 def test_remote_path_validation_accepts_only_split_home_and_volume_roots() -> None:
-    slug = "h1-20260827t180000z-a007df56"
+    slug = "h1-20260827t210000z-c0043345"
     assert launch_pack.validate_remote_path(
         f"/home/hyperlab/hyperlab-h1/incoming/{slug}", category="incoming", slug=slug
     )
@@ -140,13 +141,51 @@ def test_inventory_binds_policy_fee_review_lock_and_raw_ceiling() -> None:
     inventory = launch_pack.build_inventory(ROOT, _plan())
     assert inventory == {
         "fee_artifact_sha256": "b01bc3787fc4d1f45e7f138e0803966d0dd4ca2595dbc0fedbb631ad74c9fb26",
-        "fee_review_sha256": launch_pack.sha256_file(
-            ROOT / "config/paper/hyperliquid-tier0-fee-review-2026-08-26T223048Z.json"
-        ),
-        "policy_config_file_sha256": "cdaf814e0b8a24524f6372ed6f83da76e1a1e7016336cb27407e9021a12f0063",
+        "fee_review_sha256": "76c0c8645b02e04de4f1e4d044d0b164c0654757365a03f25b3f9ae9e1be23be",
+        "policy_config_file_sha256": "2e27bcd0bdb8ab94e48c3f08ff8c0f325f03d6e3a1da9be4f82d64217e372bab",
         "policy_config_sha256": "020a3410b1c6adc8605b87f0827f5909a9fefc4e400d14bc3eb76f1453735244",
-        "requirements_lock_sha256": "55438cb49b92215e78fc78888643654b70b982dd62b14b2775039a6dad8194d6",
+        "requirements_lock_sha256": "4cef405fa03cb354539256c975e54e49c0785b3797a638e4ca6920e3ec5b067e",
     }
+
+
+def test_git_identity_hash_uses_lf_blob_for_crlf_worktree_and_refuses_other_drift(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "portable-git-identity"
+    repo.mkdir()
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-C", str(repo), *arguments], check=True, capture_output=True
+        )
+
+    git("init", "--quiet")
+    git("config", "user.email", "h1-portability@example.invalid")
+    git("config", "user.name", "H1 Portability Test")
+    git("config", "core.autocrlf", "true")
+    identity = repo / "identity.txt"
+    canonical = b"policy=public-only\nfees=tier0\n"
+    identity.write_bytes(canonical)
+    git("add", "identity.txt")
+    git("commit", "--quiet", "-m", "portable identity fixture")
+    assert git("show", "HEAD:identity.txt").stdout == canonical
+
+    identity.unlink()
+    git("checkout-index", "--force", "--", "identity.txt")
+    assert identity.read_bytes() == canonical.replace(b"\n", b"\r\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--refresh", "--", "identity.txt"],
+        check=False,
+        capture_output=True,
+    )
+    assert git("status", "--porcelain", "--", "identity.txt").stdout == b""
+    assert launch_pack.portable_git_file_sha256(repo, "identity.txt") == (
+        launch_pack.sha256_bytes(canonical)
+    )
+
+    identity.write_bytes(b"policy=public-only\r\nfees=changed\r\n")
+    with pytest.raises(launch_pack.LaunchPackError, match="beyond reversible CRLF"):
+        launch_pack.portable_git_file_sha256(repo, "identity.txt")
 
 
 def test_fee_review_is_official_current_and_does_not_rewrite_history() -> None:
@@ -182,6 +221,23 @@ def test_v4_df_failure_is_append_only_and_preparation_never_started() -> None:
         "cause": "GNU_DF_OPTIONS_P_AND_OUTPUT_ARE_MUTUALLY_EXCLUSIVE",
         "execution_effect": (
             "NO_DIRECTORY_PREPARATION_NO_TRANSFER_NO_SERVICE_NO_NETWORK_COLLECTION"
+        ),
+    }
+
+
+def test_v5_portable_identity_failure_is_append_only_and_no_service_started() -> None:
+    receipt = json.loads(
+        (OPS / "h1-20260827t180000z-a007df56-abandonment.json").read_text(encoding="utf-8")
+    )
+    assert receipt == {
+        "abandonment_status": (
+            "ABANDONED_AFTER_TRANSFER_BEFORE_SYSTEMD_PORTABLE_IDENTITY_MISMATCH"
+        ),
+        "campaign_slug": "h1-20260827t180000z-a007df56",
+        "cause": "WINDOWS_CRLF_WORKTREE_HASHES_DIVERGED_FROM_CANONICAL_GIT_LF_CHECKOUT",
+        "execution_effect": (
+            "TRANSFER_CLONE_BOOTSTRAP_IMPORT_PREFLIGHT_CAMPAIGN_SEED_ONLY_"
+            "NO_SYSTEMD_NO_SERVICE_NO_NETWORK_COLLECTION"
         ),
     }
 
@@ -410,8 +466,8 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     }
     waiting_cmd = (
         "/usr/bin/bash /mnt/HC_Volume_106716684/hyperlab-h1/sources/"
-        "h1-20260827t180000z-a007df56/ops/h1_campaign/run_collector.sh "
-        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t180000z-a007df56/handoff.json"
+        "h1-20260827t210000z-c0043345/ops/h1_campaign/run_collector.sh "
+        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-c0043345/handoff.json"
     )
     armed = launch_pack.evaluate_monitor(
         active_state="active",
@@ -424,7 +480,7 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     assert armed["status"] == "H1_SERVICE_ARMED_PREPARED_NOT_STARTED"
     running_health = {**prepared_health, "terminal_health": "RUNNING"}
     collect_cmd = (
-        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t180000z-a007df56/.venv/bin/python "
+        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-c0043345/.venv/bin/python "
         "-m hyperlab research-data h1-collect "
         f"--campaign-root {campaign} --config /home/hyperlab/config.json"
     )
@@ -543,7 +599,7 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "findmnt -rn -T" in tabby
     assert "H1_VOLUME_DEVICE='/dev/sdb'" in tabby
     assert "H1_VOLUME_MOUNT='/mnt/HC_Volume_106716684'" in tabby
-    assert "H1_ARM_DEADLINE_UTC='2026-08-27T17:30:00Z'" in tabby
+    assert "H1_ARM_DEADLINE_UTC='2026-08-27T20:30:00Z'" in tabby
     assert "git clone --no-checkout" in tabby
     assert "checkout --detach" in tabby
     assert r"printf '%s  %s\n'" in tabby

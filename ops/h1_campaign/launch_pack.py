@@ -73,6 +73,31 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def portable_git_file_sha256(repo_root: Path, repo_relative_path: object) -> str:
+    text = _required_text(repo_relative_path, label="Git identity path").replace("\\", "/")
+    relative = PurePosixPath(text)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise LaunchPackError("Git identity path must remain repository-relative")
+    worktree_path = repo_root.joinpath(*relative.parts)
+    if worktree_path.is_symlink() or not worktree_path.is_file():
+        raise LaunchPackError(f"Git identity path is absent or unsafe: {relative}")
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"HEAD:{relative.as_posix()}"],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise LaunchPackError(f"Git identity path is not tracked at HEAD: {relative}")
+    canonical = completed.stdout
+    worktree = worktree_path.read_bytes()
+    if worktree != canonical and worktree.replace(b"\r\n", b"\n") != canonical:
+        raise LaunchPackError(
+            "Git identity worktree bytes differ from HEAD beyond reversible CRLF materialization: "
+            f"{relative}"
+        )
+    return sha256_bytes(canonical)
+
+
 def _load_object(path: Path) -> dict[str, Any]:
     try:
         decoded = json.loads(path.read_text(encoding="utf-8"))
@@ -354,12 +379,11 @@ def build_inventory(repo_root: Path, plan: Mapping[str, object]) -> dict[str, ob
     config_path = repo_root / str(checked["policy_config_path"])
     fee_path = repo_root / str(checked["fee_artifact_path"])
     review_path = repo_root / str(checked["fee_review_path"])
-    lock_path = repo_root / str(checked["requirements_lock_path"])
     config = _load_object(config_path)
     _load_object(fee_path)
     review = _load_object(review_path)
     config_fee_sha = str(config.get("costs", {}).get("fee_artifact_sha256", ""))
-    fee_sha = sha256_file(fee_path)
+    fee_sha = portable_git_file_sha256(repo_root, checked["fee_artifact_path"])
     if config_fee_sha != fee_sha:
         raise LaunchPackError("H1 config does not bind the reviewed historical fee artifact")
     if review.get("boundary") != BOUNDARY:
@@ -391,10 +415,14 @@ def build_inventory(repo_root: Path, plan: Mapping[str, object]) -> dict[str, ob
         raise LaunchPackError("disk budget no longer covers the exact H1 raw ceiling")
     return {
         "fee_artifact_sha256": fee_sha,
-        "fee_review_sha256": sha256_file(review_path),
-        "policy_config_file_sha256": sha256_file(config_path),
+        "fee_review_sha256": portable_git_file_sha256(repo_root, checked["fee_review_path"]),
+        "policy_config_file_sha256": portable_git_file_sha256(
+            repo_root, checked["policy_config_path"]
+        ),
         "policy_config_sha256": _canonical_config_sha256(config_path),
-        "requirements_lock_sha256": sha256_file(lock_path),
+        "requirements_lock_sha256": portable_git_file_sha256(
+            repo_root, checked["requirements_lock_path"]
+        ),
     }
 
 
@@ -539,7 +567,9 @@ def _handoff_body(
         },
         "inventory": dict(inventory),
         "launch_plan_path": "ops/h1_campaign/launch-plan-v1.json",
-        "launch_plan_sha256": sha256_file(repo_root / "ops/h1_campaign/launch-plan-v1.json"),
+        "launch_plan_sha256": portable_git_file_sha256(
+            repo_root, "ops/h1_campaign/launch-plan-v1.json"
+        ),
         "remote": plan["remote"],
         "schema_version": 1,
         "service_name": plan["service_name"],
@@ -902,14 +932,18 @@ def finalize_launch_pack(
         "vps-install.sh",
     )
     source_artifacts = {
-        f"ops/h1_campaign/{name}": sha256_file(repo_root / "ops/h1_campaign" / name)
+        f"ops/h1_campaign/{name}": portable_git_file_sha256(
+            repo_root, f"ops/h1_campaign/{name}"
+        )
         for name in script_names
     }
     source_inventory = {
         "boundary": BOUNDARY,
         "inventory": inventory,
         "launch_plan_path": "ops/h1_campaign/launch-plan-v1.json",
-        "launch_plan_sha256": sha256_file(repo_root / "ops/h1_campaign/launch-plan-v1.json"),
+        "launch_plan_sha256": portable_git_file_sha256(
+            repo_root, "ops/h1_campaign/launch-plan-v1.json"
+        ),
         "source_artifacts": source_artifacts,
         "source_commit": source_commit,
     }
@@ -1257,7 +1291,9 @@ def _verify_repository_and_campaign(handoff_path: Path) -> tuple[dict[str, objec
     if _git_output(source_root, "status", "--porcelain"):
         raise LaunchPackError("VPS source clone is not clean")
     plan_path = source_root / str(handoff["launch_plan_path"])
-    if sha256_file(plan_path) != handoff["launch_plan_sha256"]:
+    if portable_git_file_sha256(source_root, handoff["launch_plan_path"]) != handoff[
+        "launch_plan_sha256"
+    ]:
         raise LaunchPackError("launch plan hash differs from handoff")
     plan = validate_plan(_load_object(plan_path))
     inventory = build_inventory(source_root, plan)

@@ -55,8 +55,11 @@ _PUBLIC_WEBSOCKET_URLS = {
     HYPERLIQUID_PUBLIC_WEBSOCKET_URL,
     POLYMARKET_PUBLIC_WEBSOCKET_URL,
     "wss://mainnet.zklighter.elliot.ai/stream",
+    "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
 }
 _LIGHTER_PUBLIC_HTTP_PATH = "/api/v1/orderBooks"
+_LIGHTER_PUBLIC_WEBSOCKET_PATH = "/stream"
+_LIGHTER_PUBLIC_WEBSOCKET_QUERIES = {"", "readonly=true"}
 _LIGHTER_PUBLIC_CHANNEL = re.compile(r"^(?:order_book|ticker|market_stats|trade)/[0-9]+$")
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}$")
 
@@ -174,7 +177,9 @@ class PublicWebsocketSubscription:
         if any(marker in serialized for marker in forbidden_markers):
             raise ValueError("credentialed or user-scoped WebSocket subscription is forbidden")
         if parsed.hostname == "mainnet.zklighter.elliot.ai" and (
-            set(self.payload) != {"channel", "type"}
+            parsed.path != _LIGHTER_PUBLIC_WEBSOCKET_PATH
+            or parsed.query not in _LIGHTER_PUBLIC_WEBSOCKET_QUERIES
+            or set(self.payload) != {"channel", "type"}
             or self.payload.get("type") != "subscribe"
             or type(self.payload.get("channel")) is not str
             or _LIGHTER_PUBLIC_CHANNEL.fullmatch(cast(str, self.payload["channel"])) is None
@@ -777,6 +782,11 @@ def all_public_route_specs() -> tuple[PublicHttpRequest | PublicWebsocketSubscri
         *lighter.websocket_subscriptions(
             feeds=("order_book", "ticker", "market_stats", "trades"),
             market_indices=(0,),
+        ),
+        *lighter.websocket_subscriptions(
+            feeds=("order_book", "ticker", "market_stats", "trades"),
+            market_indices=(0,),
+            websocket_url="wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
         ),
         polymarket.market_census_request(limit=1),
         polymarket.event_census_request(limit=1),

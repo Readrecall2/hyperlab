@@ -30,6 +30,7 @@ from .envelope import CaptureProvenance, SessionEnvelopeFactory, Venue
 from .lighter import (
     LIGHTER_METADATA_VERSION,
     LIGHTER_PUBLIC_HTTP_URL,
+    LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
     LIGHTER_PUBLIC_WEBSOCKET_URL,
     LighterPublicAdapter,
     lighter_market_census,
@@ -138,12 +139,14 @@ class ProbeReport:
     root_sha256: str | None
     limitations: tuple[str, ...]
     error: str | None
+    connection_attempts: tuple[dict[str, CanonicalValue], ...] = ()
 
     def to_dict(self) -> dict[str, CanonicalValue]:
         return {
             "boundary": self.boundary,
             "bytes": self.bytes,
             "collection_id": self.collection_id,
+            "connection_attempts": list(self.connection_attempts),
             "duplicates": self.duplicates,
             "elapsed_ms": self.elapsed_ms,
             "error": self.error,
@@ -572,28 +575,34 @@ def _lighter_probe(
     stop_requested: Callable[[], bool],
     progress: Callable[[int], None],
     session: HttpSession,
+    connection_attempts: list[dict[str, CanonicalValue]],
 ) -> tuple[str, ...]:
     import websocket
 
     from hyperlab.collector.websocket import UrlWebsocketClientFactory
 
     adapter = LighterPublicAdapter()
-    http_provenance = CaptureProvenance(
-        factory.provenance.collection_id,
-        f"{LIGHTER_PUBLIC_HTTP_URL}/orderBooks",
-        "PUBLIC_HTTP",
-    )
-    ws_provenance = CaptureProvenance(
-        factory.provenance.collection_id,
-        LIGHTER_PUBLIC_WEBSOCKET_URL,
-        "PUBLIC_WEBSOCKET",
-    )
-    metadata_requests = adapter.public_http_requests(
-        feeds=config.feeds,
-        market_indices=(),
-    )
+    limitations: list[str] = []
     market_indices: tuple[int, ...]
-    if metadata_requests:
+    if config.instruments:
+        try:
+            market_indices = tuple(int(item) for item in config.instruments)
+        except ValueError as error:
+            raise ValueError("Lighter instruments must be decimal market indices") from error
+        if "metadata" in config.feeds:
+            limitations.append("LIGHTER_METADATA_NOT_OBSERVED_EXPLICIT_MARKET_INDEX")
+    else:
+        metadata_requests = adapter.public_http_requests(
+            feeds=config.feeds,
+            market_indices=(),
+        )
+        if not metadata_requests:
+            raise ValueError("Lighter census requires the public metadata feed")
+        http_provenance = CaptureProvenance(
+            factory.provenance.collection_id,
+            f"{LIGHTER_PUBLIC_HTTP_URL}/orderBooks",
+            "PUBLIC_HTTP",
+        )
         raw_metadata = _execute_http(
             session,
             metadata_requests[0],
@@ -609,78 +618,86 @@ def _lighter_probe(
             provenance=http_provenance,
         )
         _append_lighter_bounded(writer, counters, metadata_envelope, config)
-        by_id = {item.market_id: item for item in catalog}
-        if config.instruments:
-            try:
-                market_indices = tuple(int(item) for item in config.instruments)
-            except ValueError as error:
-                raise ValueError("Lighter instruments must be decimal market indices") from error
-            missing = sorted(set(market_indices) - set(by_id))
-            if missing:
-                raise ValueError(f"Lighter metadata omitted requested market indices: {missing}")
-        else:
-            active = tuple(item.market_id for item in catalog if item.status.lower() == "active")
-            market_indices = active[: config.census_limit]
-            if not market_indices:
-                raise LookupError("Lighter metadata exposed no active public market in census")
-    else:
-        if not config.instruments:
-            raise ValueError("Lighter census requires the public metadata feed")
-        try:
-            market_indices = tuple(int(item) for item in config.instruments)
-        except ValueError as error:
-            raise ValueError("Lighter instruments must be decimal market indices") from error
+        active = tuple(item.market_id for item in catalog if item.status.lower() == "active")
+        market_indices = active[: config.census_limit]
+        if not market_indices:
+            raise LookupError("Lighter metadata exposed no active public market in census")
 
-    subscriptions = adapter.websocket_subscriptions(
-        feeds=config.feeds,
-        market_indices=market_indices,
+    websocket_modes = (
+        ("normal", LIGHTER_PUBLIC_WEBSOCKET_URL),
+        ("readonly", LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL),
     )
-    if not subscriptions:
-        return ("LIGHTER_WEBSOCKET_NOT_REQUESTED",)
-    connector = UrlWebsocketClientFactory(
-        LIGHTER_PUBLIC_WEBSOCKET_URL,
-        queue_capacity=1_024,
-        venue="lighter",
-        socket_role="lighter-public-probe-v1",
-        allow_environment_proxy=False,
-    )
-    delays = (0.25, 0.5, 1.0, 2.0, 4.0)
-    attempt = 0
-    connected_once = False
     last_connection_error: BaseException | None = None
-    last_ping = time.monotonic()
-    last_progress = last_ping
-    socket: Any = None
-    try:
-        while time.monotonic() < deadline and not stop_requested():
-            if socket is None:
-                try:
-                    socket = connector.connect(
-                        "public", max(0.05, min(10.0, deadline - time.monotonic()))
-                    )
-                    for subscription in subscriptions:
-                        socket.send_json(dict(subscription.payload))
-                    attempt = 0
-                    last_connection_error = None
-                    connected_once = True
-                except (
-                    ConnectionError,
-                    OSError,
-                    TimeoutError,
-                    websocket.WebSocketException,
-                ) as caught:
-                    last_connection_error = caught
-                    if socket is not None:
-                        socket.close()
-                        socket = None
-                    if time.monotonic() >= deadline:
-                        raise ConnectionError(
-                            "Lighter public WebSocket remained unavailable"
-                        ) from caught
-                    time.sleep(min(delays[min(attempt, len(delays) - 1)], max(deadline - time.monotonic(), 0)))
-                    attempt += 1
-                    continue
-            try:
+    for mode, websocket_url in websocket_modes:
+        subscriptions = adapter.websocket_subscriptions(
+            feeds=config.feeds,
+            market_indices=market_indices,
+            websocket_url=websocket_url,
+        )
+        if not subscriptions:
+            return (*limitations, "LIGHTER_WEBSOCKET_NOT_REQUESTED")
+        connector = UrlWebsocketClientFactory(
+            websocket_url,
+            queue_capacity=1_024,
+            venue="lighter",
+            socket_role=f"lighter-public-probe-v1-{mode}",
+            allow_environment_proxy=False,
+        )
+        attempt_started_ns = time.monotonic_ns()
+        socket: Any = None
+        try:
+            socket = connector.connect_paused(
+                "public", max(0.05, min(10.0, deadline - time.monotonic()))
+            )
+        except (
+            ConnectionError,
+            OSError,
+            TimeoutError,
+            websocket.WebSocketException,
+        ) as caught:
+            last_connection_error = caught
+            status = getattr(caught, "status_code", None)
+            message = str(caught).strip()
+            connection_attempts.append(
+                {
+                    "duration_ms": max(
+                        0, (time.monotonic_ns() - attempt_started_ns) // 1_000_000
+                    ),
+                    "error_message": message[:4096] or type(caught).__name__,
+                    "error_type": type(caught).__name__,
+                    "handshake_result": "FAILED_BEFORE_COLLECTION",
+                    "http_status": status if type(status) is int else None,
+                    "logical_url": websocket_url,
+                    "mode": mode,
+                }
+            )
+            continue
+
+        connection_attempts.append(
+            {
+                "duration_ms": max(
+                    0, (time.monotonic_ns() - attempt_started_ns) // 1_000_000
+                ),
+                "error_message": None,
+                "error_type": None,
+                "handshake_result": "HTTP_101",
+                "http_status": 101,
+                "logical_url": websocket_url,
+                "mode": mode,
+            }
+        )
+        ws_provenance = CaptureProvenance(
+            factory.provenance.collection_id,
+            websocket_url,
+            "PUBLIC_WEBSOCKET",
+        )
+        last_ping = time.monotonic()
+        last_progress = last_ping
+        try:
+            for subscription in subscriptions:
+                socket.send_json(dict(subscription.payload))
+            socket.start_receiving()
+            while time.monotonic() < deadline and not stop_requested():
                 received = socket.receive(timeout_seconds=1.0)
                 snapshot = socket.telemetry_snapshot()
                 counters.queue_high_water = max(
@@ -711,25 +728,26 @@ def _lighter_probe(
                 if now - last_progress >= config.progress_interval_seconds:
                     progress(writer.frame_count)
                     last_progress = now
-            except BufferError:
-                snapshot = socket.telemetry_snapshot()
-                counters.queue_high_water = max(
-                    counters.queue_high_water, int(snapshot.get("queue_high_water", 0))
-                )
-                raise
-            except (ConnectionError, OSError, TimeoutError, websocket.WebSocketException):
-                socket.close()
-                socket = None
-                counters.begin_reconnect(factory)
-                adapter.begin_connection_epoch()
-    finally:
-        if socket is not None:
+        except BufferError:
+            snapshot = socket.telemetry_snapshot()
+            counters.queue_high_water = max(
+                counters.queue_high_water, int(snapshot.get("queue_high_water", 0))
+            )
+            raise
+        except (ConnectionError, OSError, TimeoutError, websocket.WebSocketException) as caught:
+            raise ConnectionError(
+                "Lighter public WebSocket disconnected after successful handshake; "
+                "automatic retry is disabled"
+            ) from caught
+        finally:
             socket.close()
-    if not connected_once and last_connection_error is not None and not stop_requested():
-        raise ConnectionError("Lighter public WebSocket never connected") from last_connection_error
-    if not stop_requested() and time.monotonic() >= deadline:
-        raise _ProbeBoundaryReached("MAX_DURATION_REACHED")
-    return ()
+        if not stop_requested() and time.monotonic() >= deadline:
+            raise _ProbeBoundaryReached("MAX_DURATION_REACHED")
+        return tuple(limitations)
+
+    raise ConnectionError(
+        "Lighter official normal and readonly public WebSocket handshakes failed"
+    ) from last_connection_error
 
 
 def _polymarket_probe(
@@ -1185,6 +1203,7 @@ def run_public_probe(
     terminal = "COMPLETE"
     error: str | None = None
     limitations: tuple[str, ...] = ()
+    connection_attempts: list[dict[str, CanonicalValue]] = []
     manifest: ManifestRecord | None = None
     selected_http_session_factory = (
         _default_lighter_http_session
@@ -1206,6 +1225,7 @@ def run_public_probe(
             "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
             "bytes": writer.stored_segment_bytes,
             "collection_id": collection_id,
+            "connection_attempts": list(connection_attempts),
             "duplicates": counters.duplicates,
             "elapsed_ms": int((time.monotonic() - started) * 1_000),
             "error": None,
@@ -1276,6 +1296,7 @@ def run_public_probe(
                 stop_requested=stop_requested,
                 progress=publish_running,
                 session=session,
+                connection_attempts=connection_attempts,
             )
         elif config.venue is Venue.POLYMARKET:
             limitations = _polymarket_probe(
@@ -1353,6 +1374,7 @@ def run_public_probe(
         root_sha256=None if manifest is None else manifest.root_sha256,
         limitations=limitations,
         error=error,
+        connection_attempts=tuple(connection_attempts),
     )
     _atomic_json(reports_root / "health.json", report.to_dict())
     _atomic_json(reports_root / "result.json", report.to_dict())

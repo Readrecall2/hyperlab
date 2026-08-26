@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,7 @@ from typer.testing import CliRunner
 
 from hyperlab.cli import app
 from hyperlab.collector import websocket as websocket_module
-from hyperlab.collector.websocket import UrlWebsocketClientFactory
+from hyperlab.collector.websocket import ReceivedWireMessage, UrlWebsocketClientFactory
 from hyperlab.research_data import lighter as lighter_module
 from hyperlab.research_data.adapters import (
     PublicHttpRequest,
@@ -27,12 +29,19 @@ from hyperlab.research_data.lighter import (
     LIGHTER_DOCUMENTARY_CONTRACT,
     LIGHTER_METADATA_VERSION,
     LIGHTER_PUBLIC_HTTP_URL,
+    LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
     LIGHTER_PUBLIC_WEBSOCKET_URL,
+    LIGHTER_PUBLIC_WEBSOCKET_URLS,
     LighterPublicAdapter,
     lighter_market_census,
 )
 from hyperlab.research_data.lighter_report import (
     LIGHTER_GREEN,
+    LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN,
+    LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY,
+    LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN,
+    LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS,
+    build_lighter_access_completion_report,
     build_lighter_probe_report,
 )
 from hyperlab.research_data.probe import (
@@ -41,6 +50,7 @@ from hyperlab.research_data.probe import (
     _Counters,
     _default_lighter_http_session,
     _ProbeBoundaryReached,
+    run_public_probe,
 )
 from hyperlab.research_data.segments import (
     ResearchDataIntegrityError,
@@ -104,6 +114,59 @@ def test_lighter_public_metadata_and_subscriptions_are_exactly_allowlisted() -> 
     assert all(item.url == LIGHTER_PUBLIC_WEBSOCKET_URL for item in subscriptions)
     assert all(set(item.payload) == {"channel", "type"} for item in subscriptions)
     assert all(item.payload["type"] == "subscribe" for item in subscriptions)
+    readonly_subscriptions = adapter.websocket_subscriptions(
+        feeds=("order_book", "ticker", "market_stats", "trades"),
+        market_indices=(0,),
+        websocket_url=LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
+    )
+    assert LIGHTER_PUBLIC_WEBSOCKET_URLS == (
+        LIGHTER_PUBLIC_WEBSOCKET_URL,
+        LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
+    )
+    assert all(
+        item.url == LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL
+        for item in readonly_subscriptions
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "ws://mainnet.zklighter.elliot.ai/stream",
+        "wss://evil.example/stream",
+        "wss://mainnet.zklighter.elliot.ai/other",
+        "wss://mainnet.zklighter.elliot.ai/stream?readonly=false",
+        "wss://mainnet.zklighter.elliot.ai/stream?readonly=true&extra=1",
+        "wss://mainnet.zklighter.elliot.ai/stream?extra=1&readonly=true",
+        "wss://mainnet.zklighter.elliot.ai/stream?readonly=true#fragment",
+    ),
+)
+def test_lighter_websocket_rejects_every_non_exact_official_url(url: str) -> None:
+    with pytest.raises(ValueError):
+        PublicWebsocketSubscription(
+            url=url,
+            payload={"channel": "order_book/0", "type": "subscribe"},
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"channel": "account_all/1", "type": "subscribe"},
+        {"channel": "account_orders/0/1", "type": "subscribe"},
+        {"channel": "order_book/0", "type": "jsonapi/sendtx"},
+        {"data": {}, "type": "jsonapi/sendtxbatch"},
+        {"auth": "forbidden", "channel": "order_book/0", "type": "subscribe"},
+    ),
+)
+def test_lighter_websocket_rejects_private_or_transactional_messages(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="allowlisted public channel"):
+        PublicWebsocketSubscription(
+            url=LIGHTER_PUBLIC_WEBSOCKET_URL,
+            payload=payload,
+        )
 
 
 def test_lighter_market_census_preserves_public_precision_and_fee_strings() -> None:
@@ -232,7 +295,10 @@ def test_lighter_capability_audit_has_no_private_or_transaction_surface() -> Non
     assert "lighter" not in imported_names
     assert "SignerClient" not in imported_names
     assert "Exchange" not in imported_names
-    assert "?readonly=true" not in Path(lighter_module.__file__).read_text(encoding="utf-8")
+    source = Path(lighter_module.__file__).read_text(encoding="utf-8")
+    assert LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL in source
+    assert "SignerClient" not in source
+    assert "sendtx" not in source.lower()
 
     with pytest.raises(ValueError, match="restricted to documented public market metadata"):
         PublicHttpRequest(
@@ -290,6 +356,168 @@ def test_lighter_default_transports_disable_environment_proxies(
         assert vars(session)["trust_env"] is False
     finally:
         session.close()
+
+
+def _ws_completion_config(output_root: Path, *, max_frames: int = 1) -> ProbeConfig:
+    return ProbeConfig(
+        output_root=output_root,
+        venue=Venue.LIGHTER,
+        feeds=("order_book", "ticker", "market_stats", "trades"),
+        instruments=("0",),
+        census_limit=0,
+        duration_seconds=1,
+        max_bytes=64 * 1024 * 1024,
+        max_segment_bytes=16 * 1024 * 1024,
+        rotation_seconds=150,
+        progress_interval_seconds=10,
+        collection_id="fixture-lighter-access-completion",
+        max_frames=max_frames,
+        max_segments=4,
+    )
+
+
+class _NoHttpSession:
+    def get(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Lighter explicit market_index completion must not call REST")
+
+    def post(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Lighter public completion must never POST")
+
+    def close(self) -> None:
+        return None
+
+
+class _FixturePublicSocket:
+    def __init__(self, payloads: list[bytes]) -> None:
+        self.payloads = payloads
+        self.subscriptions: list[dict[str, object]] = []
+        self.started = False
+        self.closed = False
+
+    def send_json(self, payload: dict[str, object]) -> None:
+        self.subscriptions.append(payload)
+
+    def start_receiving(self) -> None:
+        self.started = True
+
+    def receive(self, timeout_seconds: float) -> ReceivedWireMessage | None:
+        assert timeout_seconds == 1.0
+        assert self.started is True
+        if not self.payloads:
+            return None
+        return ReceivedWireMessage(
+            self.payloads.pop(0).decode("utf-8"),
+            datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+            received_monotonic_ns=time.monotonic_ns(),
+        )
+
+    def telemetry_snapshot(self) -> dict[str, object]:
+        return {"queue_high_water": 1}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_lighter_explicit_market_index_starts_websocket_without_rest_census(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls: list[str] = []
+    socket = _FixturePublicSocket([_raw("lighter_order_book_snapshot.json")])
+
+    class Connector:
+        def __init__(self, url: str, **kwargs: object) -> None:
+            urls.append(url)
+            assert kwargs["allow_environment_proxy"] is False
+
+        def connect_paused(self, network: str, timeout: float) -> _FixturePublicSocket:
+            assert network == "public" and 0 < timeout <= 10
+            return socket
+
+    monkeypatch.setattr(websocket_module, "UrlWebsocketClientFactory", Connector)
+    report = run_public_probe(
+        _ws_completion_config(tmp_path / "explicit-index"),
+        http_session_factory=_NoHttpSession,
+    )
+    assert report.frames == 1
+    assert report.terminal_health == "MAX_FRAMES_REACHED"
+    assert urls == [LIGHTER_PUBLIC_WEBSOCKET_URL]
+    assert report.connection_attempts[0]["handshake_result"] == "HTTP_101"
+    assert {item["channel"] for item in socket.subscriptions} == {
+        "order_book/0",
+        "ticker/0",
+        "market_stats/0",
+        "trade/0",
+    }
+
+
+def test_lighter_handshake_falls_back_once_to_official_readonly_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls: list[str] = []
+    readonly_socket = _FixturePublicSocket([_raw("lighter_order_book_snapshot.json")])
+
+    class SyntheticHandshakeFailure(ConnectionError):
+        status_code = 403
+
+    class Connector:
+        def __init__(self, url: str, **kwargs: object) -> None:
+            self.url = url
+            urls.append(url)
+            assert kwargs["allow_environment_proxy"] is False
+
+        def connect_paused(self, network: str, timeout: float) -> _FixturePublicSocket:
+            assert network == "public" and 0 < timeout <= 10
+            if self.url == LIGHTER_PUBLIC_WEBSOCKET_URL:
+                raise SyntheticHandshakeFailure("SYNTHETIC/FIXTURE normal HTTP 403")
+            return readonly_socket
+
+    monkeypatch.setattr(websocket_module, "UrlWebsocketClientFactory", Connector)
+    report = run_public_probe(
+        _ws_completion_config(tmp_path / "readonly-fallback"),
+        http_session_factory=_NoHttpSession,
+    )
+    assert urls == list(LIGHTER_PUBLIC_WEBSOCKET_URLS)
+    assert [attempt["handshake_result"] for attempt in report.connection_attempts] == [
+        "FAILED_BEFORE_COLLECTION",
+        "HTTP_101",
+    ]
+    assert report.connection_attempts[0]["http_status"] == 403
+    assert report.reconnects == 0
+
+
+def test_lighter_two_failed_handshakes_are_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls: list[str] = []
+
+    class Connector:
+        def __init__(self, url: str, **_kwargs: object) -> None:
+            self.url = url
+            urls.append(url)
+
+        def connect_paused(self, _network: str, _timeout: float) -> _FixturePublicSocket:
+            raise ConnectionError(f"SYNTHETIC/FIXTURE unavailable:{self.url}")
+
+    monkeypatch.setattr(websocket_module, "UrlWebsocketClientFactory", Connector)
+    output = tmp_path / "exhausted"
+    report = run_public_probe(
+        _ws_completion_config(output),
+        http_session_factory=_NoHttpSession,
+    )
+    assert report.frames == 0
+    assert report.terminal_health == "PUBLIC_SOURCE_UNAVAILABLE"
+    assert urls == list(LIGHTER_PUBLIC_WEBSOCKET_URLS)
+    completion = build_lighter_access_completion_report(output)
+    assert completion["verdict"] == LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS
+    result_path = output / "reports" / "result.json"
+    inconsistent = json.loads(result_path.read_bytes())
+    inconsistent["terminal_health"] = "COMPLETE"
+    result_path.write_bytes(canonical_json_bytes(inconsistent))
+    blocked = build_lighter_access_completion_report(output)
+    assert blocked["verdict"] == LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY
 
 
 def _bounded_config(output_root: Path, *, max_frames: int = 5000, max_segments: int = 4) -> ProbeConfig:
@@ -452,6 +680,114 @@ def _complete_probe_output(tmp_path: Path) -> Path:
     return output
 
 
+def _complete_access_output(tmp_path: Path, *, readonly: bool = False) -> Path:
+    output = tmp_path / ("lighter-readonly-access" if readonly else "lighter-normal-access")
+    reports = output / "reports"
+    reports.mkdir(parents=True)
+    factory = _factory()
+    adapter = LighterPublicAdapter()
+    writer = ResearchSegmentWriter(
+        output / "raw",
+        collection_id="fixture-lighter-collection",
+        max_segment_bytes=1_000_000,
+        rotation_seconds=150,
+        max_total_bytes=64 * 1024 * 1024,
+    )
+    for index, name in enumerate(
+        (
+            "lighter_order_book_snapshot.json",
+            "lighter_ticker.json",
+            "lighter_market_stats.json",
+            "lighter_trades.json",
+        ),
+        start=1,
+    ):
+        writer.append(
+            adapter.envelope_from_websocket(
+                _raw(name),
+                factory=factory,
+                receive_timestamp_utc_ns=1_800_000_000_000_000_000 + index,
+                receive_monotonic_ns=index,
+                provenance=CaptureProvenance(
+                    "fixture-lighter-collection",
+                    (
+                        LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL
+                        if readonly
+                        else LIGHTER_PUBLIC_WEBSOCKET_URL
+                    ),
+                    "PUBLIC_WEBSOCKET",
+                ),
+            )
+        )
+    manifest = writer.close()
+    assert manifest is not None
+    failed_normal = {
+        "duration_ms": 10,
+        "error_message": "SYNTHETIC/FIXTURE normal HTTP 403",
+        "error_type": "SyntheticHandshakeFailure",
+        "handshake_result": "FAILED_BEFORE_COLLECTION",
+        "http_status": 403,
+        "logical_url": LIGHTER_PUBLIC_WEBSOCKET_URL,
+        "mode": "normal",
+    }
+    successful = {
+        "duration_ms": 20,
+        "error_message": None,
+        "error_type": None,
+        "handshake_result": "HTTP_101",
+        "http_status": 101,
+        "logical_url": (
+            LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL
+            if readonly
+            else LIGHTER_PUBLIC_WEBSOCKET_URL
+        ),
+        "mode": "readonly" if readonly else "normal",
+    }
+    attempts = [failed_normal, successful] if readonly else [successful]
+    result = {
+        "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+        "bytes": manifest.stored_segment_bytes,
+        "collection_id": "fixture-lighter-collection",
+        "connection_attempts": attempts,
+        "duplicates": 0,
+        "elapsed_ms": 1000,
+        "error": None,
+        "frames": 4,
+        "gaps": 0,
+        "limitations": [],
+        "manifest_sha256": manifest.manifest_sha256,
+        "queue_high_water": 1,
+        "reconnects": 0,
+        "requested_duration_seconds": 600,
+        "root_sha256": manifest.root_sha256,
+        "schema_version": 1,
+        "segments": len(manifest.segments),
+        "source_timestamp_max_ns": 1786372092759000000,
+        "source_timestamp_min_ns": 1773854156654000000,
+        "terminal_health": "MAX_FRAMES_REACHED",
+        "venue": "lighter",
+    }
+    config = {
+        "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+        "census_limit": 0,
+        "duration_seconds": 600,
+        "feeds": ["order_book", "ticker", "market_stats", "trades"],
+        "instruments": ["0"],
+        "max_bytes": 64 * 1024 * 1024,
+        "max_frames": 5000,
+        "max_segment_bytes": 16 * 1024 * 1024,
+        "max_segments": 4,
+        "progress_interval_seconds": "10",
+        "proxy_policy": "DIRECT_ONLY_ENVIRONMENT_PROXY_DISABLED",
+        "rotation_seconds": "150",
+        "schema_version": 1,
+        "venue": "lighter",
+    }
+    (reports / "result.json").write_bytes(canonical_json_bytes(result))
+    (reports / "probe-config.json").write_bytes(canonical_json_bytes(config))
+    return output
+
+
 def test_lighter_report_authenticates_recovery_and_separates_observed_from_documentary(
     tmp_path: Path,
 ) -> None:
@@ -476,6 +812,35 @@ def test_lighter_report_authenticates_recovery_and_separates_observed_from_docum
     ]
     assert report["metadata_and_public_fees_observed"][0]["symbol"] == "ETH"
     assert report["raw_evidence"]["replay_gap_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("readonly", "expected_verdict"),
+    (
+        (False, LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN),
+        (True, LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN),
+    ),
+)
+def test_lighter_access_completion_report_preserves_recovery_and_unknown_metadata(
+    tmp_path: Path,
+    readonly: bool,
+    expected_verdict: str,
+) -> None:
+    report = build_lighter_access_completion_report(
+        _complete_access_output(tmp_path, readonly=readonly)
+    )
+    assert report["verdict"] == expected_verdict
+    assert report["raw_evidence"]["offline_recovery"] == (
+        "PASS_EXPLICIT_MANIFEST_FULL_REPLAY"
+    )
+    assert report["metadata_precision_and_fees"]["status"] == (
+        "UNKNOWN_NOT_OBSERVED_NO_REST_CENSUS"
+    )
+    assert report["metadata_precision_and_fees"]["price_precision"] is None
+    assert report["metadata_and_public_fees_observed"] == []
+    assert report["symbols_observed_in_public_payloads"] == ["ETH"]
+    assert report["access"]["rest_census"]["attempted_in_completion"] is False
+    assert report["capture"]["reconnects"] == 0
 
 
 def test_lighter_report_fails_closed_on_terminal_counter_divergence(
@@ -511,6 +876,11 @@ def test_lighter_research_only_cli_exposes_all_four_probe_bounds_and_offline_rep
     report_help = runner.invoke(app, ["research-data", "lighter-report", "--help"])
     assert report_help.exit_code == 0
     assert "strictement offline" in report_help.output
+    completion_help = runner.invoke(
+        app, ["research-data", "lighter-access-completion", "--help"]
+    )
+    assert completion_help.exit_code == 0
+    assert "--output-root" in completion_help.output
 
 
 def test_six_hundred_second_window_is_lighter_only(tmp_path: Path) -> None:

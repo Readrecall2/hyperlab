@@ -14,12 +14,30 @@ from hyperlab.ghost.models import VenueHealth
 
 from .canonical import CanonicalValue, canonical_json_bytes, canonical_value
 from .envelope import PublicDataEnvelope
-from .lighter import LIGHTER_DOCUMENTARY_CONTRACT, lighter_market_census
+from .lighter import (
+    LIGHTER_DOCUMENTARY_CONTRACT,
+    LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
+    LIGHTER_PUBLIC_WEBSOCKET_URL,
+    lighter_market_census,
+)
 from .segments import ResearchSegmentReader
 
 LIGHTER_GREEN = "LIGHTER_PUBLIC_PROBE_V1_GREEN"
 LIGHTER_UNAVAILABLE = "LIGHTER_PUBLIC_SOURCE_UNAVAILABLE_BOUNDED"
 LIGHTER_REPORT_NAME = "lighter-public-probe-v1.json"
+LIGHTER_ACCESS_COMPLETION_REPORT_NAME = (
+    "lighter-official-public-access-completion-v1.json"
+)
+LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN = "LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN"
+LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN = (
+    "LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN"
+)
+LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS = (
+    "LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS"
+)
+LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY = (
+    "LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY"
+)
 _SUCCESS_TERMINALS = {
     "COMPLETE",
     "MAX_BYTES_REACHED",
@@ -348,10 +366,237 @@ def write_lighter_probe_report(output_root: Path) -> dict[str, CanonicalValue]:
     return report
 
 
+def _access_attempts(result: Mapping[str, Any]) -> list[dict[str, CanonicalValue]]:
+    raw_attempts = result.get("connection_attempts")
+    if not isinstance(raw_attempts, list) or len(raw_attempts) > 2:
+        raise ValueError("Lighter access completion requires at most two handshake attempts")
+    expected = (
+        ("normal", LIGHTER_PUBLIC_WEBSOCKET_URL),
+        ("readonly", LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL),
+    )
+    attempts: list[dict[str, CanonicalValue]] = []
+    for index, raw in enumerate(raw_attempts):
+        if not isinstance(raw, Mapping):
+            raise ValueError("Lighter handshake attempt must be an object")
+        mode, url = expected[index]
+        if raw.get("mode") != mode or raw.get("logical_url") != url:
+            raise ValueError("Lighter handshake attempts violated the official URL order")
+        duration_ms = _required_int(raw.get("duration_ms"), label="handshake duration")
+        handshake_result = _required_text(
+            raw.get("handshake_result"), label="handshake result"
+        )
+        if handshake_result not in {"HTTP_101", "FAILED_BEFORE_COLLECTION"}:
+            raise ValueError("Lighter handshake result is not recognized")
+        status = raw.get("http_status")
+        if status is not None and type(status) is not int:
+            raise ValueError("Lighter handshake HTTP status must be integer or null")
+        error_type = raw.get("error_type")
+        error_message = raw.get("error_message")
+        if any(value is not None and type(value) is not str for value in (error_type, error_message)):
+            raise ValueError("Lighter handshake error fields must be text or null")
+        if handshake_result == "HTTP_101":
+            if status != 101 or error_type is not None or error_message is not None:
+                raise ValueError("successful Lighter handshake evidence is inconsistent")
+        elif not error_type or not error_message:
+            raise ValueError("failed Lighter handshake must preserve its exact available error")
+        attempts.append(
+            {
+                "duration_ms": duration_ms,
+                "error_message": cast(str | None, error_message),
+                "error_type": cast(str | None, error_type),
+                "handshake_result": handshake_result,
+                "http_status": status,
+                "logical_url": url,
+                "mode": mode,
+            }
+        )
+    if len(attempts) == 2 and attempts[0]["handshake_result"] != "FAILED_BEFORE_COLLECTION":
+        raise ValueError("readonly Lighter handshake is allowed only after normal handshake failure")
+    if any(item["handshake_result"] == "HTTP_101" for item in attempts[:-1]):
+        raise ValueError("Lighter access completion continued after a successful handshake")
+    return attempts
+
+
+def build_lighter_access_completion_report(
+    output_root: Path,
+) -> dict[str, CanonicalValue]:
+    """Authenticate and classify the one-shot official WebSocket completion probe."""
+
+    base = cast(dict[str, Any], build_lighter_probe_report(output_root))
+    result = _read_object(output_root / "reports" / "result.json")
+    config = _read_object(output_root / "reports" / "probe-config.json")
+    attempts = _access_attempts(result)
+    if config.get("instruments") != ["0"]:
+        raise ValueError("Lighter access completion requires documented market_index 0")
+    if config.get("feeds") != ["order_book", "ticker", "market_stats", "trades"]:
+        raise ValueError("Lighter access completion requires the four documented public feeds")
+
+    frames = _required_int(result.get("frames"), label="frame count")
+    gaps = _required_int(result.get("gaps"), label="gap count")
+    reconnects = _required_int(result.get("reconnects"), label="reconnect count")
+    terminal = _required_text(result.get("terminal_health"), label="terminal health")
+    successful = [item for item in attempts if item["handshake_result"] == "HTTP_101"]
+    if frames and not successful:
+        raise ValueError("Lighter raw frames require a successful recorded handshake")
+
+    feed_counts_raw = base.get("feed_counts")
+    if not isinstance(feed_counts_raw, Mapping):
+        raise ValueError("Lighter recovered feed counts must be an object")
+    websocket_feeds = ("order_book", "ticker", "market_stats", "trades")
+    all_public_feeds_observed = all(
+        type(feed_counts_raw.get(feed)) is int and cast(int, feed_counts_raw[feed]) > 0
+        for feed in websocket_feeds
+    )
+    raw_evidence = base.get("raw_evidence")
+    if not isinstance(raw_evidence, Mapping):
+        raise ValueError("Lighter recovered raw evidence must be an object")
+    recovered = raw_evidence.get("offline_recovery") == "PASS_EXPLICIT_MANIFEST_FULL_REPLAY"
+    green = (
+        len(successful) == 1
+        and terminal in _SUCCESS_TERMINALS
+        and frames > 0
+        and gaps == 0
+        and reconnects == 0
+        and recovered
+        and all_public_feeds_observed
+    )
+    exhausted = (
+        len(attempts) == 2
+        and not successful
+        and all(item["handshake_result"] == "FAILED_BEFORE_COLLECTION" for item in attempts)
+        and terminal == "PUBLIC_SOURCE_UNAVAILABLE"
+        and frames == 0
+        and result.get("manifest_sha256") is None
+    )
+    if green:
+        verdict = (
+            LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN
+            if successful[0]["mode"] == "normal"
+            else LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN
+        )
+    elif exhausted:
+        verdict = LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS
+    else:
+        verdict = LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY
+
+    observed_symbols: set[str] = set()
+    manifest_sha256 = result.get("manifest_sha256")
+    if type(manifest_sha256) is str:
+        reader = ResearchSegmentReader(
+            output_root / "raw", manifest_sha256=manifest_sha256
+        )
+        for envelope in reader.iter_envelopes():
+            try:
+                payload = json.loads(envelope.raw_payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            ticker = payload.get("ticker")
+            stats = payload.get("market_stats")
+            candidates = (
+                ticker.get("s") if isinstance(ticker, Mapping) else None,
+                stats.get("symbol") if isinstance(stats, Mapping) else None,
+            )
+            observed_symbols.update(
+                value for value in candidates if type(value) is str and value
+            )
+
+    contract = base.get("documentary_contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("Lighter documentary contract must be an object")
+    channels = {
+        feed: {
+            "frames": cast(int, feed_counts_raw.get(feed, 0)),
+            "observed_without_auth": cast(int, feed_counts_raw.get(feed, 0)) > 0,
+            "requested": True,
+        }
+        for feed in websocket_feeds
+    }
+    base["access"] = {
+        "channels": channels,
+        "handshake_attempts": attempts,
+        "proxy_policy": "DIRECT_ONLY_ENVIRONMENT_PROXY_DISABLED",
+        "rest_census": {
+            "attempted_in_completion": False,
+            "historical_evidence_preserved_at": "docs/evidence/lighter-public-probe-v1",
+            "historical_scope": "GET_orderBooks_HTTP_403_FROM_PRIOR_WINDOWS_PATH_ONLY",
+        },
+    }
+    base["documentation_observation_separation"] = {
+        "documentation": {
+            "contract_sha256": contract.get("contract_sha256"),
+            "network_observation": False,
+            "retrieved_on": "2026-08-26",
+            "url": "https://apidocs.lighter.xyz/docs/websocket-reference",
+        },
+        "observations": {
+            "account_or_tier_observed": False,
+            "handshake_attempts": attempts,
+            "metadata_rest_census_observed": False,
+            "raw_frames_observed": frames,
+        },
+    }
+    base["metadata_precision_and_fees"] = {
+        "market_index": 0,
+        "maker_fee": None,
+        "market_type": None,
+        "min_base_amount": None,
+        "min_quote_amount": None,
+        "price_precision": None,
+        "size_precision": None,
+        "status": "UNKNOWN_NOT_OBSERVED_NO_REST_CENSUS",
+        "taker_fee": None,
+    }
+    base["metadata_and_public_fees_observed"] = []
+    base["report_kind"] = "LIGHTER_OFFICIAL_PUBLIC_ACCESS_COMPLETION_V1"
+    base["schema_version"] = 2
+    base["symbols_observed_in_public_payloads"] = sorted(observed_symbols)
+    base["future_ghost_eligibility"] = (
+        "ELIGIBLE_FOR_FUTURE_BOUNDED_GHOST_DATA_QUALITY_STUDY_NOT_ALPHA"
+        if green
+        else "NOT_ELIGIBLE_FROM_THIS_COMPLETION_EVIDENCE"
+    )
+    limitations = base.get("limitations")
+    if not isinstance(limitations, list):
+        raise ValueError("Lighter report limitations must be an array")
+    base["limitations"] = [
+        *limitations,
+        "PRIOR_REST_403_NOT_REEXECUTED",
+        "MARKET_INDEX_0_FROM_OFFICIAL_DOCUMENTATION_EXAMPLE",
+        "MARKET_METADATA_PRECISION_AND_FEES_UNKNOWN_WITHOUT_REST_CENSUS",
+        "NO_AUTOMATIC_RETRY_OR_RECONNECT_IN_ACCESS_COMPLETION",
+    ]
+    base["verdict"] = verdict
+    base["verdict_scope"] = "OFFICIAL_PUBLIC_WEBSOCKET_ACCESS_AND_BOUNDED_RECOVERY_ONLY"
+    report = canonical_value(base)
+    if not isinstance(report, dict):
+        raise AssertionError("canonical Lighter completion report must remain an object")
+    return report
+
+
+def write_lighter_access_completion_report(
+    output_root: Path,
+) -> dict[str, CanonicalValue]:
+    report = build_lighter_access_completion_report(output_root)
+    _atomic_json(
+        output_root / "reports" / LIGHTER_ACCESS_COMPLETION_REPORT_NAME,
+        report,
+    )
+    return report
+
+
 __all__ = [
+    "LIGHTER_ACCESS_COMPLETION_REPORT_NAME",
     "LIGHTER_GREEN",
+    "LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN",
+    "LIGHTER_OFFICIAL_WS_ACCESS_BLOCKED_INTEGRITY",
+    "LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN",
+    "LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS",
     "LIGHTER_REPORT_NAME",
     "LIGHTER_UNAVAILABLE",
+    "build_lighter_access_completion_report",
     "build_lighter_probe_report",
+    "write_lighter_access_completion_report",
     "write_lighter_probe_report",
 ]

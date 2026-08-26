@@ -33,12 +33,16 @@
       "offset_semantics": "API_SERVER_CURSOR_INCREASES_BUT_NEED_NOT_BE_CONTIGUOUS"
     },
     "public_rest": ["orderBooks", "orderBookDetails", "recentTrades"],
-    "public_websocket": ["order_book", "ticker", "market_stats", "trade"]
+    "public_websocket": ["order_book", "ticker", "market_stats", "trade"],
+    "public_websocket_urls": ["wss://mainnet.zklighter.elliot.ai/stream", "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"],
+    "restricted_region_readonly_mode": "EXACT_QUERY_readonly=true",
+    "documented_example_market_indices": [0],
+    "websocket_subscription_formats": ["order_book/{MARKET_INDEX}", "ticker/{MARKET_INDEX}", "market_stats/{MARKET_INDEX}", "trade/{MARKET_INDEX}"]
   },
   "capture_date": "2026-08-26",
   "comparable_scenarios_ms": [100, 250, 500, 1000],
   "document_pages": [
-    {"page_update_label_at_capture": "Updated 15 days ago", "url": "https://apidocs.lighter.xyz/docs/websocket-reference"},
+    {"page_update_label_at_capture": "Updated 15 days ago", "retrieved_on": "2026-08-26", "url": "https://apidocs.lighter.xyz/docs/websocket-reference"},
     {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/orderbooks"},
     {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/orderbookdetails"},
     {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/recenttrades"},
@@ -54,9 +58,9 @@
     "SIGNER_OR_SIGNING_SDK",
     "SEND_TX_OR_SEND_TX_BATCH",
     "CREATE_CANCEL_MODIFY_ORDER",
-    "PROXY_OR_READONLY_REGION_BYPASS"
+    "PROXY_OR_UNDOCUMENTED_ACCESS_BYPASS"
   ],
-  "metadata_version": "lighter-official-public-api-2026-08-26-v1",
+  "metadata_version": "lighter-official-public-api-2026-08-26-v2",
   "rate_limits_documentary": {
     "standard_rest_requests_per_rolling_minute": 60,
     "websocket_connections_per_ip": 255,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -536,9 +537,12 @@ class SQLiteOverlay:
                 "refusing to create an overlay through a symbolic link",
                 path=str(selected_path),
             )
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for name in ("O_BINARY", "O_NOINHERIT", "O_NOFOLLOW"):
+            flags |= int(getattr(os, name, 0))
         try:
-            with selected_path.open("xb"):
-                pass
+            descriptor = os.open(selected_path, flags, 0o600)
+            os.close(descriptor)
         except FileExistsError as error:
             raise OverlayError(
                 OverlayErrorCode.ALREADY_EXISTS,

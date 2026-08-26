@@ -158,6 +158,28 @@ def test_raw_publication_crash_matrix_recovers_exactly_and_idempotently(
     repeated.close()
 
 
+def test_full_audit_refuses_a_hardlinked_raw_segment(tmp_path: Path) -> None:
+    store, anchor, config = _new_store(tmp_path)
+    store.seal(_artifact(tmp_path, 1))
+    store.close()
+    segment = next((tmp_path / "raw" / "segments").glob("*.hl4r"))
+    sibling = tmp_path / "raw-segment-hardlink.hl4r"
+    sibling.hardlink_to(segment)
+
+    reopened = RawStore.open_existing(tmp_path / "raw", anchor=anchor, config=config)
+    try:
+        with pytest.raises(RawStoreError) as caught:
+            reopened.full_audit()
+        assert caught.value.code is RawStoreErrorCode.PATH_LAYOUT
+    finally:
+        reopened.close()
+        sibling.unlink()
+
+    final = RawStore.open_existing(tmp_path / "raw", anchor=anchor, config=config)
+    assert final.full_audit().records_read == 1
+    final.close()
+
+
 @pytest.mark.parametrize(
     ("fault_point", "expected_first_status"),
     (

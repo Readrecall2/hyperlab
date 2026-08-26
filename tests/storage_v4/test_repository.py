@@ -502,6 +502,37 @@ def test_manifest_publication_crash_is_adopted_before_append_and_reseal(
     recovered.close()
 
 
+def test_full_audit_refuses_a_hardlinked_paper_segment(tmp_path: Path) -> None:
+    repository, anchor, config = _new_repository(tmp_path)
+    _append(repository, 1)
+    _seal(repository, historical_count=1)
+    repository.close()
+    segment = next((tmp_path / "repository" / "segments").glob("*.hl4s"))
+    sibling = tmp_path / "paper-segment-hardlink.hl4s"
+    sibling.hardlink_to(segment)
+
+    reopened = StorageRepository.open_existing(
+        tmp_path / "repository",
+        anchor=anchor,
+        config=config,
+    )
+    try:
+        with pytest.raises(RepositoryError) as caught:
+            reopened.full_audit()
+        assert caught.value.code is RepositoryErrorCode.SEGMENT_MISSING
+    finally:
+        reopened.close()
+        sibling.unlink()
+
+    final = StorageRepository.open_existing(
+        tmp_path / "repository",
+        anchor=anchor,
+        config=config,
+    )
+    assert final.full_audit().commits_read == 1
+    final.close()
+
+
 def test_orphan_successor_adoption_preserves_an_existing_overlay_suffix(
     tmp_path: Path,
 ) -> None:

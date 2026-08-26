@@ -29,6 +29,7 @@ from .canonical import canonical_json_bytes
 from .contracts import RawLakeId
 from .durability import (
     ImmutableTargetConflict,
+    atomic_rename_noreplace,
     atomic_write_mutable_cache,
     durable_publish_immutable,
     fsync_directory,
@@ -285,6 +286,8 @@ def _open_regular(path: Path) -> tuple[BinaryIO, _Fingerprint]:
             _is_link_or_reparse_point(path)
             or not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(named.st_mode)
+            or int(opened.st_nlink) != 1
+            or int(named.st_nlink) != 1
             or not os.path.samestat(opened, named)
         ):
             raise _error(
@@ -572,9 +575,9 @@ class RawStore:
             if not paths.root.parent.is_dir():
                 raise _error(RawStoreErrorCode.PATH_LAYOUT, "raw store parent is missing")
             try:
-                paths.root.mkdir()
-                paths.segments.mkdir()
-                paths.manifests.mkdir()
+                paths.root.mkdir(mode=0o700)
+                paths.segments.mkdir(mode=0o700)
+                paths.manifests.mkdir(mode=0o700)
                 fsync_directory(paths.root)
                 fsync_directory(paths.root.parent)
             except FileExistsError as error:
@@ -1012,7 +1015,11 @@ class RawStore:
         try:
             with source_stream:
                 trigger_fault(self._fault_hook, FaultPoint.BEFORE_RAW_SEGMENT_COPY)
-                with temporary.open("xb") as output:
+                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                for name in ("O_BINARY", "O_NOINHERIT", "O_NOFOLLOW"):
+                    flags |= int(getattr(os, name, 0))
+                descriptor_fd = os.open(temporary, flags, 0o600)
+                with os.fdopen(descriptor_fd, "wb") as output:
                     while True:
                         block = source_stream.read(_COPY_CHUNK_SIZE)
                         if not block:
@@ -1032,15 +1039,20 @@ class RawStore:
                     "raw staging segment changed during publication",
                 )
             self._verify_published_segment(temporary, descriptor)
+            trigger_fault(self._fault_hook, FaultPoint.BEFORE_RENAME)
+            trigger_fault(self._fault_hook, FaultPoint.BEFORE_EXCLUSIVE_PUBLISH)
             try:
-                os.link(temporary, target, follow_symlinks=False)
+                atomic_rename_noreplace(temporary, target)
             except FileExistsError:
                 self._verify_published_segment(target, descriptor)
+                temporary.unlink(missing_ok=True)
+            trigger_fault(self._fault_hook, FaultPoint.AFTER_EXCLUSIVE_PUBLISH)
+            trigger_fault(self._fault_hook, FaultPoint.AFTER_RENAME)
+            self._verify_published_segment(target, descriptor)
             fsync_directory(self._paths.segments)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-        temporary.unlink(missing_ok=True)
         artifact.path.unlink(missing_ok=True)
         return target
 

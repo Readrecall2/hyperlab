@@ -10,7 +10,10 @@ atomic replacement path and never become an authority by virtue of this helper.
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
+import stat
+import sys
 from ctypes import wintypes
 from dataclasses import dataclass
 from enum import StrEnum
@@ -66,9 +69,19 @@ def _read_verified_exact_target(
     expected: bytes,
     verifier: ArtifactVerifier | None,
 ) -> None:
-    if path.is_symlink() or not path.is_file():
+    try:
+        observed_stat = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ImmutableTargetConflict(
+            f"immutable target cannot be inspected safely: {path.name}"
+        ) from error
+    if path.is_symlink() or not stat.S_ISREG(observed_stat.st_mode):
         raise ImmutableTargetConflict(
             f"immutable target is not a regular file: {path.name}"
+        )
+    if observed_stat.st_nlink != 1:
+        raise ImmutableTargetConflict(
+            f"immutable target has a dangerous hardlink count: {path.name}"
         )
     observed = path.read_bytes()
     if observed != expected:
@@ -164,11 +177,15 @@ def _new_verified_temporary(
 ) -> Path:
     for _attempt in range(16):
         temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for name in ("O_BINARY", "O_NOINHERIT", "O_NOFOLLOW"):
+            flags |= int(getattr(os, name, 0))
         try:
-            stream = temporary.open("xb")
+            descriptor = os.open(temporary, flags, 0o600)
         except FileExistsError:
             continue
         try:
+            stream = os.fdopen(descriptor, "wb")
             with stream:
                 trigger_fault(fault_hook, FaultPoint.BEFORE_TEMP_WRITE)
                 written = stream.write(data)
@@ -189,6 +206,47 @@ def _new_verified_temporary(
     raise DurabilityError("could not allocate a fresh UUID temporary file")
 
 
+def atomic_rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically rename ``source`` without replacing an existing target."""
+
+    if os.name == "nt":
+        # MoveFileEx without MOVEFILE_REPLACE_EXISTING is the behavior exposed
+        # by os.rename on Windows.
+        os.rename(source, target)
+        return
+    if not sys.platform.startswith("linux"):
+        raise DurabilityError(
+            "exclusive immutable rename is implemented only for Linux and Windows"
+        )
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise DurabilityError("Linux libc does not expose renameat2")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_noreplace = 1
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(target),
+        rename_noreplace,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
 def durable_publish_immutable(
     target: Path,
     data: bytes,
@@ -198,9 +256,9 @@ def durable_publish_immutable(
 ) -> PublishedArtifact:
     """Publish immutable bytes exclusively, idempotently, and durably.
 
-    An :class:`InjectedCrash` intentionally leaves the fresh temporary file in
-    place.  Recovery can ignore or inspect that orphan without ever treating it
-    as published authority.
+    An :class:`InjectedCrash` before rename leaves the fresh temporary file in
+    place.  After rename the target has one link and no temporary alias.
+    Recovery never treats a temporary orphan as published authority.
     """
 
     if not isinstance(target, Path):
@@ -224,16 +282,17 @@ def durable_publish_immutable(
         trigger_fault(fault_hook, FaultPoint.BEFORE_RENAME)
         trigger_fault(fault_hook, FaultPoint.BEFORE_EXCLUSIVE_PUBLISH)
         try:
-            os.link(temporary, target)
+            atomic_rename_noreplace(temporary, target)
         except FileExistsError:
             _read_verified_exact_target(target, data, verifier)
             _directory_barrier(target.parent, fault_hook)
             temporary.unlink(missing_ok=True)
+            fsync_directory(target.parent)
             return PublishedArtifact(target, PublishDisposition.ALREADY_PRESENT)
         trigger_fault(fault_hook, FaultPoint.AFTER_EXCLUSIVE_PUBLISH)
         trigger_fault(fault_hook, FaultPoint.AFTER_RENAME)
+        _read_verified_exact_target(target, data, None)
         _directory_barrier(target.parent, fault_hook)
-        temporary.unlink(missing_ok=True)
         return PublishedArtifact(target, PublishDisposition.CREATED)
     except InjectedCrash:
         raise
@@ -256,6 +315,12 @@ def atomic_write_mutable_cache(
     if type(data) is not bytes:
         raise TypeError("mutable cache data must be exact bytes")
     _require_parent(target)
+    if target.exists():
+        observed = os.stat(target, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise DurabilityError(
+                f"refusing mutable cache replacement through unsafe target: {target}"
+            )
     existed = target.exists()
     temporary = _new_verified_temporary(
         target,
@@ -290,6 +355,7 @@ __all__ = [
     "ImmutableTargetConflict",
     "PublishDisposition",
     "PublishedArtifact",
+    "atomic_rename_noreplace",
     "atomic_write_mutable_cache",
     "durable_publish_immutable",
     "flush_and_fsync",

@@ -197,6 +197,10 @@ def _enumerate_tree(root: Path) -> tuple[tuple[str, ...], tuple[Path, ...]]:
                     raise CandidateTreeWitnessError(
                         f"candidate tree contains a non-regular entry: {candidate}"
                     )
+                if int(observed.st_nlink) != 1:
+                    raise CandidateTreeWitnessError(
+                        f"candidate tree contains a hardlinked file: {candidate}"
+                    )
                 if name == "PENDING" or name.endswith(
                     (".tmp", "-journal", "-shm", "-wal")
                 ):
@@ -229,7 +233,11 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     try:
         opened_before = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_before.st_mode) or _is_reparse(opened_before):
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or _is_reparse(opened_before)
+            or int(opened_before.st_nlink) != 1
+        ):
             raise CandidateTreeWitnessError(
                 f"candidate descriptor is not a regular file: {path}"
             )
@@ -247,6 +255,7 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
     if (
         not stat.S_ISREG(after.st_mode)
         or _is_reparse(after)
+        or int(after.st_nlink) != 1
         or len(
             {
                 _stat_identity(before),

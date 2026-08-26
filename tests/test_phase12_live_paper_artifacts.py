@@ -487,6 +487,7 @@ def test_multistrategy_release_code_manifest_binds_the_exact_reviewed_checkout()
         "requirements-runtime.lock",
         "scripts/certify_storage_v4_phase1b.py",
         "scripts/certify_storage_v4_phase1c.py",
+        "scripts/certify_storage_v4_phase1d_linux.py",
         "scripts/generate_phase12_live_paper_artifacts.py",
         *(
             path.relative_to(ROOT).as_posix()
@@ -784,6 +785,10 @@ def test_generator_rejects_an_early_release_file_changed_after_its_read(
         encoding="utf-8",
     )
     (repository / "scripts" / "certify_storage_v4_phase1c.py").write_text(
+        "CERTIFIER = True\n",
+        encoding="utf-8",
+    )
+    (repository / "scripts" / "certify_storage_v4_phase1d_linux.py").write_text(
         "CERTIFIER = True\n",
         encoding="utf-8",
     )

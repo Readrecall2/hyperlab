@@ -132,14 +132,30 @@ def test_injected_crash_leaves_safe_orphan_and_never_divergent_authority(
     assert target.exists() is published
     if published:
         assert target.read_bytes() == b"complete-bytes"
+        assert target.stat().st_nlink == 1
     orphans = tuple(tmp_path.glob(".crash.hl4.*.tmp"))
-    assert len(orphans) == 1
+    assert len(orphans) == (0 if published else 1)
 
     recovered = durable_publish_immutable(target, b"complete-bytes")
     assert recovered.disposition is (
         PublishDisposition.ALREADY_PRESENT if published else PublishDisposition.CREATED
     )
     assert target.read_bytes() == b"complete-bytes"
+
+
+def test_immutable_publication_refuses_an_existing_hardlinked_target(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.hl4"
+    authority.write_bytes(b"authenticated")
+    target = tmp_path / "artifact.hl4"
+    os.link(authority, target)
+
+    with pytest.raises(ImmutableTargetConflict, match="hardlink"):
+        durable_publish_immutable(target, b"authenticated")
+
+    assert authority.read_bytes() == b"authenticated"
+    assert target.stat().st_nlink == 2
 
 
 @pytest.mark.parametrize(

@@ -176,6 +176,7 @@ def _writer_lease_spec(
     if (
         _is_link_or_reparse_point(canonical_anchor)
         or not canonical_anchor.is_file()
+        or int(os.stat(canonical_anchor, follow_symlinks=False).st_nlink) != 1
     ):
         raise _anchor_error(
             AnchorErrorCode.WRITER_LEASE_FAILED,
@@ -295,6 +296,8 @@ def _acquire_local_writer_lease(
             _is_link_or_reparse_point(path)
             or not stat.S_ISREG(descriptor_stat.st_mode)
             or not stat.S_ISREG(path_stat.st_mode)
+            or int(descriptor_stat.st_nlink) != 1
+            or int(path_stat.st_nlink) != 1
             or not os.path.samestat(descriptor_stat, path_stat)
         ):
             raise _anchor_error(
@@ -324,6 +327,8 @@ def _acquire_local_writer_lease(
             _is_link_or_reparse_point(path)
             or not stat.S_ISREG(locked_stat.st_mode)
             or not stat.S_ISREG(locked_path_stat.st_mode)
+            or int(locked_stat.st_nlink) != 1
+            or int(locked_path_stat.st_nlink) != 1
             or not os.path.samestat(locked_stat, locked_path_stat)
         ):
             raise _anchor_error(
@@ -593,9 +598,12 @@ class LocalAnchor:
             )
         if not absolute.parent.is_dir():
             raise FileNotFoundError(f"anchor parent does not exist: {absolute.parent}")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for name in ("O_BINARY", "O_NOINHERIT", "O_NOFOLLOW"):
+            flags |= int(getattr(os, name, 0))
         try:
-            with absolute.open("xb"):
-                pass
+            descriptor = os.open(absolute, flags, 0o600)
+            os.close(descriptor)
         except FileExistsError as error:
             raise _anchor_error(
                 AnchorErrorCode.ALREADY_EXISTS,
@@ -663,7 +671,10 @@ class LocalAnchor:
             )
         if not absolute.exists():
             raise _anchor_error(AnchorErrorCode.MISSING, "local witness path is missing")
-        if not absolute.is_file():
+        if (
+            not absolute.is_file()
+            or int(os.stat(absolute, follow_symlinks=False).st_nlink) != 1
+        ):
             raise _anchor_error(
                 AnchorErrorCode.CORRUPT,
                 "local witness path is not a regular file",
@@ -698,7 +709,10 @@ class LocalAnchor:
             )
         if not absolute.exists():
             raise _anchor_error(AnchorErrorCode.MISSING, "local witness path is missing")
-        if not absolute.is_file():
+        if (
+            not absolute.is_file()
+            or int(os.stat(absolute, follow_symlinks=False).st_nlink) != 1
+        ):
             raise _anchor_error(
                 AnchorErrorCode.CORRUPT,
                 "local witness path is not a regular file",
@@ -717,7 +731,10 @@ class LocalAnchor:
             )
         if not self.path.exists():
             raise _anchor_error(AnchorErrorCode.MISSING, "local witness path is missing")
-        if not self.path.is_file():
+        if (
+            not self.path.is_file()
+            or int(os.stat(self.path, follow_symlinks=False).st_nlink) != 1
+        ):
             raise _anchor_error(
                 AnchorErrorCode.CORRUPT,
                 "local witness path is not a regular file",

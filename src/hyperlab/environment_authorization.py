@@ -514,6 +514,7 @@ _PAPER_RELEASE_CODE_FIXED_PATHS = (
     'requirements-runtime.lock',
     'scripts/certify_storage_v4_phase1b.py',
     'scripts/certify_storage_v4_phase1c.py',
+    'scripts/certify_storage_v4_phase1d_linux.py',
     'scripts/generate_phase12_live_paper_artifacts.py',
 )
 _PAPER_RELEASE_CODE_MANIFEST_KEYS = frozenset(

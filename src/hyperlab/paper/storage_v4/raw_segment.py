@@ -492,7 +492,11 @@ class RawSegmentWriter:
             raise TypeError("raw thresholds must be RawSegmentThresholds")
         self._fault_hook = fault_hook
         self._path = directory / f".raw-segment.{uuid4().hex}.tmp"
-        self._stream = self._path.open("xb")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        for name in ("O_BINARY", "O_NOINHERIT", "O_NOFOLLOW"):
+            flags |= int(getattr(os, name, 0))
+        descriptor = os.open(self._path, flags, 0o600)
+        self._stream = cast(BinaryIO, os.fdopen(descriptor, "wb"))
         self._records: list[RawRecordLocator] = []
         self._record_ids: set[str] = set()
         self._logical_bytes = 0

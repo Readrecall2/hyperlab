@@ -198,6 +198,23 @@ def test_anchor_writer_lease_rejects_symlink(
     assert linked.value.code is AnchorErrorCode.WRITER_LEASE_FAILED
 
 
+def test_anchor_and_writer_lease_refuse_a_hardlinked_anchor(tmp_path: Path) -> None:
+    anchor = LocalAnchor.create(tmp_path / "anchor.sqlite3", store_id=_STORE)
+    sibling = tmp_path / "anchor-hardlink.sqlite3"
+    sibling.hardlink_to(anchor.path)
+
+    with pytest.raises(AnchorError) as reopened:
+        LocalAnchor.open_existing(anchor.path, store_id=_STORE)
+    assert reopened.value.code is AnchorErrorCode.CORRUPT
+
+    with pytest.raises(AnchorError) as leased:
+        anchor.acquire_writer_lease()
+    assert leased.value.code is AnchorErrorCode.CORRUPT
+
+    sibling.unlink()
+    assert LocalAnchor.open_existing(anchor.path, store_id=_STORE).read() is None
+
+
 def test_anchor_writer_lease_rejects_corrupt_identity(tmp_path: Path) -> None:
     anchor = LocalAnchor.create(tmp_path / "anchor.sqlite3", store_id=_STORE)
     lease_path = anchor.writer_lease_path

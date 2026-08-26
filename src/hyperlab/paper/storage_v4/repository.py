@@ -184,6 +184,18 @@ def _is_link_or_reparse_point(path: Path) -> bool:
     return bool(attributes & reparse_mask)
 
 
+def _regular_single_link(path: Path) -> bool:
+    try:
+        observed = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        not _is_link_or_reparse_point(path)
+        and stat.S_ISREG(observed.st_mode)
+        and int(observed.st_nlink) == 1
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RepositoryPaths:
     root: Path
@@ -586,6 +598,8 @@ class _WriterLease:
             if (
                 not stat.S_ISREG(descriptor_stat.st_mode)
                 or not stat.S_ISREG(path_stat.st_mode)
+                or int(descriptor_stat.st_nlink) != 1
+                or int(path_stat.st_nlink) != 1
                 or not os.path.samestat(descriptor_stat, path_stat)
             ):
                 raise _repository_error(
@@ -699,16 +713,16 @@ class StorageRepository:
                     "repository root parent is missing",
                 )
             try:
-                paths.root.mkdir()
+                paths.root.mkdir(mode=0o700)
             except FileExistsError as error:
                 raise _repository_error(
                     RepositoryErrorCode.ALREADY_EXISTS,
                     "repository root was created concurrently",
                 ) from error
             writer_lease = _WriterLease.acquire(paths.writer_lease)
-            paths.segments.mkdir()
-            paths.checkpoints.mkdir()
-            paths.manifests.mkdir()
+            paths.segments.mkdir(mode=0o700)
+            paths.checkpoints.mkdir(mode=0o700)
+            paths.manifests.mkdir(mode=0o700)
             fsync_directory(paths.root)
             fsync_directory(paths.root.parent)
             overlay = SQLiteOverlay.create(
@@ -825,7 +839,7 @@ class StorageRepository:
                     RepositoryErrorCode.PATH_LAYOUT,
                     f"repository directory is invalid: {directory.name}",
                 )
-        if _is_link_or_reparse_point(paths.overlay) or not paths.overlay.is_file():
+        if not _regular_single_link(paths.overlay):
             raise _repository_error(
                 RepositoryErrorCode.PATH_LAYOUT,
                 "repository overlay is missing or not a regular file",
@@ -948,7 +962,7 @@ class StorageRepository:
         anchored: AnchorRecord,
     ) -> Manifest:
         path = paths.manifest_path(anchored.manifest_root)
-        if path.is_symlink() or not path.is_file():
+        if not _regular_single_link(path):
             raise _repository_error(
                 RepositoryErrorCode.AUTHORITY_MISSING,
                 "anchored manifest artifact is missing",
@@ -1040,7 +1054,7 @@ class StorageRepository:
                 "anchored manifest head has no complete checkpoint",
             )
         path = paths.checkpoint_path(checkpoint_root)
-        if path.is_symlink() or not path.is_file():
+        if not _regular_single_link(path):
             raise _repository_error(
                 RepositoryErrorCode.AUTHORITY_MISSING,
                 "anchored checkpoint artifact is missing",
@@ -1348,7 +1362,7 @@ class StorageRepository:
     def _read_manifest_recovery_hint(self, path: Path) -> _ManifestRecoveryHint:
         """Read only the bounded manifest prefix needed to find a direct successor."""
 
-        if _is_link_or_reparse_point(path) or not path.is_file():
+        if not _regular_single_link(path):
             raise _repository_error(
                 RepositoryErrorCode.MANIFEST_FORK,
                 "manifest namespace contains a non-regular artifact",
@@ -1752,7 +1766,7 @@ class StorageRepository:
     def _scan_manifest_namespace(self) -> tuple[Manifest, ...]:
         manifests: list[Manifest] = []
         for path in self._paths.manifests.glob(f"*{MANIFEST_SUFFIX}"):
-            if _is_link_or_reparse_point(path) or not path.is_file():
+            if not _regular_single_link(path):
                 raise _repository_error(
                     RepositoryErrorCode.MANIFEST_FORK,
                     "manifest namespace contains a non-regular artifact",
@@ -1840,7 +1854,7 @@ class StorageRepository:
         descriptor: SegmentDescriptor,
     ) -> SegmentArtifact:
         path = self._paths.segment_path(descriptor.physical_sha256)
-        if path.is_symlink() or not path.is_file():
+        if not _regular_single_link(path):
             raise _repository_error(
                 RepositoryErrorCode.SEGMENT_MISSING,
                 "manifest-declared segment is missing",

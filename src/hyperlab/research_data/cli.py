@@ -7,7 +7,14 @@ from typing import Annotated
 import typer
 
 from .envelope import Venue
-from .lighter_report import LIGHTER_GREEN, write_lighter_probe_report
+from .lighter_report import (
+    LIGHTER_GREEN,
+    LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN,
+    LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN,
+    LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS,
+    write_lighter_access_completion_report,
+    write_lighter_probe_report,
+)
 from .probe import ProbeConfig, run_public_probe
 
 research_data_app = typer.Typer(
@@ -35,6 +42,83 @@ def lighter_report(
     typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
     if report["verdict"] != LIGHTER_GREEN:
         raise typer.Exit(3)
+
+
+@research_data_app.command("lighter-access-completion")
+def lighter_access_completion(
+    output_root: Annotated[
+        Path,
+        typer.Option(
+            "--output-root",
+            help="Nouveau répertoire immuable du complément officiel WebSocket Lighter.",
+        ),
+    ],
+) -> None:
+    """Run the one-shot, two-handshake-max Lighter public WebSocket completion."""
+
+    if output_root.exists():
+        raise typer.BadParameter("--output-root doit être neuf")
+    resolved_output = output_root.absolute()
+    preflight = {
+        "average_duration": "NOT_ESTIMABLE_NO_PRIOR_SUCCESSFUL_COMPLETION",
+        "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+        "collection_max_duration_seconds": 600,
+        "completion_signal": (
+            "reports/lighter-official-public-access-completion-v1.json + verdict"
+        ),
+        "ctrl_c": (
+            "clôture les frames admises en état récupérable; aucune nouvelle tentative"
+        ),
+        "execution_location": f"Windows PowerShell local:{Path.cwd().absolute()}",
+        "handshake_sequence": [
+            "wss://mainnet.zklighter.elliot.ai/stream",
+            "wss://mainnet.zklighter.elliot.ai/stream?readonly=true IF_NORMAL_FAILS_BEFORE_COLLECTION",
+        ],
+        "market_index": 0,
+        "max_bytes": 64 * 1024 * 1024,
+        "max_frames": 5_000,
+        "max_segments": 4,
+        "maximum_wall_clock_seconds_including_terminalization": 615,
+        "monitoring": str(resolved_output / "reports" / "health.json"),
+        "output_root": str(resolved_output),
+        "prompt_behavior": "NO_PROMPT",
+        "proxy_policy": "DIRECT_ONLY_ENVIRONMENT_PROXY_DISABLED",
+        "retry_policy": "NO_AUTOMATIC_RETRY_OR_RECONNECT",
+    }
+    typer.echo(json.dumps(preflight, ensure_ascii=False, sort_keys=True))
+
+    def _progress(frame_count: int) -> None:
+        typer.echo(json.dumps({"frames": frame_count, "status": "RUNNING"}, sort_keys=True))
+
+    report = run_public_probe(
+        ProbeConfig(
+            output_root=resolved_output,
+            venue=Venue.LIGHTER,
+            feeds=("order_book", "ticker", "market_stats", "trades"),
+            instruments=("0",),
+            census_limit=0,
+            duration_seconds=600,
+            max_bytes=64 * 1024 * 1024,
+            max_segment_bytes=16 * 1024 * 1024,
+            rotation_seconds=150.0,
+            progress_interval_seconds=10.0,
+            max_frames=5_000,
+            max_segments=4,
+        ),
+        progress=_progress,
+    )
+    completion = write_lighter_access_completion_report(resolved_output)
+    typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    typer.echo(json.dumps(completion, ensure_ascii=False, sort_keys=True))
+    verdict = completion["verdict"]
+    if verdict in {
+        LIGHTER_OFFICIAL_WS_PUBLIC_ACCESS_GREEN,
+        LIGHTER_OFFICIAL_READONLY_WS_ACCESS_GREEN,
+    }:
+        return
+    if verdict == LIGHTER_PUBLIC_ACCESS_EXHAUSTED_OFFICIAL_PATHS:
+        raise typer.Exit(3)
+    raise typer.Exit(4)
 
 
 def _csv(value: str, *, label: str) -> tuple[str, ...]:

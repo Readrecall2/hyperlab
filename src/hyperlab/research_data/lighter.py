@@ -14,7 +14,14 @@ from .envelope import CaptureProvenance, PublicDataEnvelope, SessionEnvelopeFact
 
 LIGHTER_PUBLIC_HTTP_URL: Final = "https://mainnet.zklighter.elliot.ai/api/v1"
 LIGHTER_PUBLIC_WEBSOCKET_URL: Final = "wss://mainnet.zklighter.elliot.ai/stream"
-LIGHTER_METADATA_VERSION: Final = "lighter-official-public-api-2026-08-26-v1"
+LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL: Final = (
+    "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
+)
+LIGHTER_PUBLIC_WEBSOCKET_URLS: Final = (
+    LIGHTER_PUBLIC_WEBSOCKET_URL,
+    LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL,
+)
+LIGHTER_METADATA_VERSION: Final = "lighter-official-public-api-2026-08-26-v2"
 
 LIGHTER_DOCUMENTARY_CONTRACT: dict[str, CanonicalValue] = {
     "account_types": {
@@ -51,12 +58,22 @@ LIGHTER_DOCUMENTARY_CONTRACT: dict[str, CanonicalValue] = {
         },
         "public_rest": ["orderBooks", "orderBookDetails", "recentTrades"],
         "public_websocket": ["order_book", "ticker", "market_stats", "trade"],
+        "public_websocket_urls": list(LIGHTER_PUBLIC_WEBSOCKET_URLS),
+        "restricted_region_readonly_mode": "EXACT_QUERY_readonly=true",
+        "documented_example_market_indices": [0],
+        "websocket_subscription_formats": [
+            "order_book/{MARKET_INDEX}",
+            "ticker/{MARKET_INDEX}",
+            "market_stats/{MARKET_INDEX}",
+            "trade/{MARKET_INDEX}",
+        ],
     },
     "capture_date": "2026-08-26",
     "comparable_scenarios_ms": [100, 250, 500, 1000],
     "document_pages": [
         {
             "page_update_label_at_capture": "Updated 15 days ago",
+            "retrieved_on": "2026-08-26",
             "url": "https://apidocs.lighter.xyz/docs/websocket-reference",
         },
         {
@@ -92,7 +109,7 @@ LIGHTER_DOCUMENTARY_CONTRACT: dict[str, CanonicalValue] = {
         "SIGNER_OR_SIGNING_SDK",
         "SEND_TX_OR_SEND_TX_BATCH",
         "CREATE_CANCEL_MODIFY_ORDER",
-        "PROXY_OR_READONLY_REGION_BYPASS",
+        "PROXY_OR_UNDOCUMENTED_ACCESS_BYPASS",
     ],
     "metadata_version": LIGHTER_METADATA_VERSION,
     "rate_limits_documentary": {
@@ -346,10 +363,16 @@ class LighterPublicAdapter:
         )
 
     def websocket_subscriptions(
-        self, *, feeds: Sequence[str], market_indices: Sequence[int]
+        self,
+        *,
+        feeds: Sequence[str],
+        market_indices: Sequence[int],
+        websocket_url: str = LIGHTER_PUBLIC_WEBSOCKET_URL,
     ) -> tuple[PublicWebsocketSubscription, ...]:
         selected = set(feeds)
         self._validate_feeds(selected)
+        if websocket_url not in LIGHTER_PUBLIC_WEBSOCKET_URLS:
+            raise ValueError("Lighter WebSocket URL is not an exact documented public URL")
         if any(type(item) is not int or item < 0 or item > 65_535 for item in market_indices):
             raise ValueError("Lighter market indices must be within 0..65535")
         channel_names = {
@@ -360,7 +383,7 @@ class LighterPublicAdapter:
         }
         return tuple(
             PublicWebsocketSubscription(
-                url=LIGHTER_PUBLIC_WEBSOCKET_URL,
+                url=websocket_url,
                 payload={"channel": f"{channel_names[feed]}/{market_id}", "type": "subscribe"},
             )
             for market_id in market_indices
@@ -514,7 +537,9 @@ __all__ = [
     "LIGHTER_DOCUMENTARY_CONTRACT",
     "LIGHTER_METADATA_VERSION",
     "LIGHTER_PUBLIC_HTTP_URL",
+    "LIGHTER_PUBLIC_READONLY_WEBSOCKET_URL",
     "LIGHTER_PUBLIC_WEBSOCKET_URL",
+    "LIGHTER_PUBLIC_WEBSOCKET_URLS",
     "LighterMarketMetadata",
     "LighterPublicAdapter",
     "canonical_lighter_market",

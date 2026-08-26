@@ -104,6 +104,10 @@ Incentives use a separate ledger. `hypothetical_reward` is research-only,
 The V1 adapter permits only `GET /api/v1/orderBooks` plus the credential-free
 mainnet WebSocket subscriptions `order_book/{market}`, `ticker/{market}`,
 `market_stats/{market}` and `trade/{market}`. It uses no SDK. The documented
+exact `/stream` URL and its official `?readonly=true` read-only form are the
+only Lighter WebSocket URLs accepted. An explicit market index can start this
+public WebSocket path without a REST census; every unobserved metadata,
+precision, minimum, status, and fee field then remains unknown. The documented
 `begin_nonce == previous nonce` rule is enforced exactly for order-book state
 changes; API-server `offset` is preserved but never treated as a contiguous
 exchange sequence. Gap or offset regression freezes the market and closes the

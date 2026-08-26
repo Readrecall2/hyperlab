@@ -249,3 +249,8 @@ La collecte est mono-writer, append-only, manifestée, monitorable et
 reprenable. La reprise conserve `campaign_id`, configuration, univers, splits,
 holdout, frais et chaîne de segments; elle crée une nouvelle génération de
 session/reconnect visible et ne fabrique aucune séquence serveur.
+
+Le cockpit local de suivi est documenté dans
+[`H1_GHOST_OBSERVABILITY_DASHBOARD_V1.md`](H1_GHOST_OBSERVABILITY_DASHBOARD_V1.md).
+Il lit une seule racine explicitement configurée, conserve le holdout scellé et
+n'ajoute aucune commande de campagne.

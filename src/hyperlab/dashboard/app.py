@@ -3,17 +3,21 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
-from html import escape
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
-from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from hyperlab import __version__
+from hyperlab.dashboard.h1_dashboard import (
+    h1_fixture_names,
+    h1_fixture_snapshot,
+    h1_report_download,
+    h1_snapshot,
+)
+from hyperlab.dashboard.h1_page import H1_CSS, H1_JS, H1_PAGE
 from hyperlab.storage.sqlite import database_status
-from hyperlab.strategies.registry import STRATEGY_CATALOG
 
 if TYPE_CHECKING:
     from hyperlab.paper.store import PaperStore
@@ -26,6 +30,7 @@ _PAPER_STATUS_RUN_LIMIT = 50
 _RUNTIME_STATUS_MAX_AGE_SECONDS = 60.0
 _MAX_RUNTIME_STATUS_BYTES = 1024 * 1024
 _MAX_LATEST_REPORT_BYTES = 1024 * 1024
+_MAX_REPORT_DOWNLOAD_BYTES = 32 * 1024 * 1024
 _SAFE_REPORT_SUFFIXES = frozenset({".csv", ".html", ".json", ".md", ".parquet", ".pdf", ".txt", ".zip"})
 
 
@@ -326,6 +331,9 @@ def create_app(
     runtime_dir: Path | None = None,
     reports_dir: Path | None = None,
     paper_dir: Path | None = None,
+    h1_campaign_root: Path | None = None,
+    h1_policy_path: Path | None = Path("config/research/hyperliquid-h1-ghost-v1.json"),
+    h1_default_fixture: str = "PREPARED_NOT_STARTED",
 ) -> FastAPI:
     app = FastAPI(title="HyperLab Read-Only Dashboard", version=__version__)
     database = data_dir / "hyperlab.sqlite3"
@@ -335,6 +343,42 @@ def create_app(
     runtime_file = resolved_runtime_dir / "runtime_status.json"
     report_file = resolved_reports_dir / "latest_summary.json"
     paper_database = resolved_paper_dir / "paper.sqlite3"
+
+    if h1_default_fixture.upper() not in h1_fixture_names():
+        raise ValueError("unknown H1 dashboard fixture")
+
+    def h1_headers() -> dict[str, str]:
+        return {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-HyperLab-Mode": "readonly",
+            "X-HyperLab-Orders-Enabled": "false",
+        }
+
+    def h1_snapshot_response() -> JSONResponse:
+        payload, status_code = h1_snapshot(
+            h1_campaign_root,
+            policy_path=h1_policy_path,
+            default_fixture=h1_default_fixture,
+        )
+        return JSONResponse(payload, status_code=status_code, headers=h1_headers())
+
+    def h1_section_response(section: str) -> JSONResponse:
+        payload, status_code = h1_snapshot(
+            h1_campaign_root,
+            policy_path=h1_policy_path,
+            default_fixture=h1_default_fixture,
+        )
+        body = {
+            "schema_version": payload["schema_version"],
+            "mode": "readonly",
+            "orders_enabled": False,
+            "state": payload.get("state", {}),
+            section: payload.get(section, {} if section not in {"feeds", "incidents"} else []),
+        }
+        if section == "economics":
+            body["economic_evidence_status"] = payload["economic_evidence_status"]
+        return JSONResponse(body, status_code=status_code, headers=h1_headers())
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -400,6 +444,83 @@ def create_app(
             status["runtime"] = runtime
             status["runtime_status_stale"] = _runtime_status_is_stale(runtime)
         return JSONResponse(status)
+
+    @app.api_route("/api/h1/snapshot", methods=["GET", "HEAD"])
+    def api_h1_snapshot() -> JSONResponse:
+        """Return one bounded, same-head H1 campaign snapshot."""
+
+        return h1_snapshot_response()
+
+    @app.api_route("/api/h1/identity", methods=["GET", "HEAD"])
+    def api_h1_identity() -> JSONResponse:
+        return h1_section_response("identity")
+
+    @app.api_route("/api/h1/collection", methods=["GET", "HEAD"])
+    def api_h1_collection() -> JSONResponse:
+        return h1_section_response("collection")
+
+    @app.api_route("/api/h1/markets", methods=["GET", "HEAD"])
+    def api_h1_markets() -> JSONResponse:
+        return h1_section_response("feeds")
+
+    @app.api_route("/api/h1/strategy", methods=["GET", "HEAD"])
+    def api_h1_strategy() -> JSONResponse:
+        return h1_section_response("strategy")
+
+    @app.api_route("/api/h1/economics", methods=["GET", "HEAD"])
+    def api_h1_economics() -> JSONResponse:
+        return h1_section_response("economics")
+
+    @app.api_route("/api/h1/incidents", methods=["GET", "HEAD"])
+    def api_h1_incidents() -> JSONResponse:
+        return h1_section_response("incidents")
+
+    @app.api_route("/api/h1/fixtures/{fixture_name}", methods=["GET", "HEAD"])
+    def api_h1_fixture(fixture_name: str) -> JSONResponse:
+        """Expose one allowlisted, visibly synthetic UI fixture."""
+
+        try:
+            payload = h1_fixture_snapshot(fixture_name)
+        except KeyError:
+            return JSONResponse(
+                {
+                    "mode": "readonly",
+                    "orders_enabled": False,
+                    "status": "UNKNOWN_FIXTURE",
+                },
+                status_code=404,
+                headers=h1_headers(),
+            )
+        return JSONResponse(payload, headers=h1_headers())
+
+    @app.api_route("/api/h1/reports/{report_id}", methods=["GET", "HEAD"])
+    def api_h1_report_download(report_id: str) -> Response:
+        """Download one allowlisted final H1 report after canonical holdout opening."""
+
+        report = h1_report_download(
+            h1_campaign_root,
+            report_id,
+            policy_path=h1_policy_path,
+        )
+        if report is None:
+            return JSONResponse(
+                {
+                    "mode": "readonly",
+                    "orders_enabled": False,
+                    "status": "REPORT_NOT_AVAILABLE",
+                },
+                status_code=404,
+                headers=h1_headers(),
+            )
+        return Response(
+            content=report.value,
+            media_type="application/json",
+            headers={
+                **h1_headers(),
+                "Content-Disposition": f'attachment; filename="{report.filename}"',
+                "X-Content-SHA256": report.sha256,
+            },
+        )
 
     @app.get("/api/paper")
     def paper_status() -> JSONResponse:
@@ -534,89 +655,95 @@ def create_app(
             )
         return JSONResponse(report)
 
-    @app.get("/api/reports/{report_path:path}")
-    def download_report(report_path: str) -> FileResponse:
-        resolved = _resolve_report_download(resolved_reports_dir, report_path)
-        if resolved is None:
+    @app.api_route("/api/reports/latest", methods=["GET", "HEAD"])
+    def download_latest_report() -> Response:
+        """Download only the export named by the fixed public latest-summary contract."""
+
+        resolved_summary = _resolve_report_download(resolved_reports_dir, report_file.name)
+        if resolved_summary is None:
             raise HTTPException(status_code=404, detail="report not found")
-        return FileResponse(
-            resolved,
-            filename=resolved.name,
+        try:
+            if resolved_summary.stat().st_size > _MAX_LATEST_REPORT_BYTES:
+                raise ValueError("latest report summary exceeds its bounded size")
+            payload = json.loads(resolved_summary.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("latest report summary must be an object")
+            download_value = payload.get("download_path", report_file.name)
+            if not isinstance(download_value, str):
+                raise ValueError("latest report export identifier is invalid")
+            resolved = _resolve_report_download(resolved_reports_dir, download_value)
+            if resolved is None or resolved.is_symlink():
+                raise ValueError("latest report export is unavailable")
+            before = resolved.stat()
+            if before.st_size > _MAX_REPORT_DOWNLOAD_BYTES:
+                raise ValueError("latest report export exceeds its bounded size")
+            value = resolved.read_bytes()
+            after = resolved.stat()
+            if resolved.is_symlink() or (
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ino,
+            ) != (
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ino,
+            ) or len(value) != before.st_size:
+                return JSONResponse(
+                    {
+                        "mode": "readonly",
+                        "orders_enabled": False,
+                        "status": "HEAD_CHANGED_RETRY",
+                    },
+                    status_code=409,
+                    headers=h1_headers(),
+                )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=404, detail="report not found") from None
+        return Response(
+            value,
             media_type="application/octet-stream",
             headers={
                 "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{resolved.name}"',
                 "X-Content-Type-Options": "nosniff",
+                "X-HyperLab-Mode": "readonly",
+                "X-HyperLab-Orders-Enabled": "false",
             },
         )
 
-    @app.get("/", response_class=HTMLResponse)
-    def index() -> HTMLResponse:
-        try:
-            status = database_status(database)
-        except (OSError, sqlite3.Error, ValueError):
-            status = {"snapshot_count": 0, "last_observed_at_ms": None}
-        runtime = _runtime_summary(_read_runtime_status(runtime_file))
-        latest_report = "Aucun rapport copié sur Umbrel"
-        latest_report_link = ""
-        resolved_report = _resolve_report_download(
-            resolved_reports_dir,
-            report_file.name,
+    @app.api_route("/assets/h1-dashboard.css", methods=["GET", "HEAD"])
+    def h1_stylesheet() -> Response:
+        return Response(
+            H1_CSS,
+            media_type="text/css",
+            headers={"Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff"},
         )
-        if resolved_report is not None:
-            try:
-                if resolved_report.stat().st_size > _MAX_LATEST_REPORT_BYTES:
-                    raise ValueError("latest report summary is too large")
-                payload = json.loads(resolved_report.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("latest report summary must be an object")
-                latest_report = str(payload.get("title", "Rapport disponible"))
-                download_value = payload.get("download_path", report_file.name)
-                download_path = download_value if isinstance(download_value, str) else report_file.name
-                if _resolve_report_download(resolved_reports_dir, download_path) is None:
-                    raise ValueError("latest report download target is invalid")
-                download_url = quote(download_path, safe="/")
-                latest_report_link = (
-                    f' <a class="download" href="/api/reports/{download_url}">Télécharger</a>'
-                )
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                latest_report = "Rapport illisible"
 
-        cards = "".join(
-            f"""
-            <article class="card">
-              <div class="tier">{escape(str(entry["tier"]))}</div>
-              <h3>{escape(str(entry["label"]))}</h3>
-              <p>{escape(str(entry["summary"]))}</p>
-              <span class="badge">{escape(str(entry["status"]))}</span>
-            </article>
-            """
-            for entry in STRATEGY_CATALOG.values()
+    @app.api_route("/assets/h1-dashboard.js", methods=["GET", "HEAD"])
+    def h1_script() -> Response:
+        return Response(
+            H1_JS,
+            media_type="text/javascript",
+            headers={"Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff"},
         )
-        page_html = f"""<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HyperLab</title>
-<style>
-:root{{--bg:#07111f;--panel:#101e34;--panel2:#142844;--text:#f0f6ff;--muted:#9db1ca;--line:#284564;--green:#5ee0bd;--amber:#ffd276}}
-*{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at top,#17365e,#07111f 48%);color:var(--text);line-height:1.55}}
-main{{max-width:1180px;margin:auto;padding:42px 22px 70px}}.hero{{padding:30px;border:1px solid var(--line);border-radius:24px;background:linear-gradient(135deg,rgba(20,40,68,.96),rgba(9,20,36,.96));box-shadow:0 20px 80px #0006}}
-h1{{font-size:clamp(2.2rem,6vw,4.5rem);letter-spacing:-.05em;margin:4px 0 8px}}.lead,.muted{{color:var(--muted)}}.mode{{display:inline-flex;gap:8px;align-items:center;padding:8px 12px;border:1px solid #3e7d72;border-radius:99px;color:var(--green);font-weight:800;background:#5ee0bd12}}
-.stats{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:24px 0}}.stat,.card{{border:1px solid var(--line);background:linear-gradient(145deg,var(--panel),var(--panel2));border-radius:17px;padding:18px}}.stat span{{display:block;color:var(--muted);font-size:.82rem}}.stat strong{{font-size:1.18rem}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}.card h3{{margin:5px 0}}.tier{{color:var(--amber);font-size:.8rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}}.badge{{display:inline-block;padding:5px 9px;border-radius:8px;background:#ffffff0b;color:var(--muted);font-size:.78rem;border:1px solid var(--line)}}.download{{display:inline-block;margin-left:10px;padding:5px 9px;border:1px solid var(--green);border-radius:8px;color:var(--green);text-decoration:none;font-weight:700}}.warning{{margin:24px 0;padding:16px 18px;border-left:4px solid var(--amber);border-radius:10px;background:#ffd27612}}.runtime-detail{{padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:#07111f99}}code{{color:#d7e8ff}}@media(max-width:800px){{.stats,.grid{{grid-template-columns:1fr}}}}
-</style></head><body><main>
-<section class="hero"><div class="mode">● READ-ONLY — ORDRES IMPOSSIBLES</div><h1>HyperLab</h1><p class="lead">Collecte 24/24, laboratoire multi-stratégies et paper research pour Hyperliquid. Cette application Umbrel ne contient ni clé privée ni module d'exécution.</p></section>
-<h2>Santé du collecteur public</h2>
-<section class="stats">
-<div class="stat"><span>État runtime</span><strong>{escape(runtime["state"])}</strong></div>
-<div class="stat"><span>Connexions</span><strong>{escape(runtime["connection"])}</strong></div>
-<div class="stat"><span>Trous visibles</span><strong>{escape(runtime["gaps"])}</strong></div>
-<div class="stat"><span>Flux stale</span><strong>{escape(runtime["stale_count"])}</strong></div>
-</section>
-<p class="runtime-detail"><strong>Détail fraîcheur :</strong> {escape(runtime["stale_detail"])}<br><span class="muted">Statut runtime publié : {escape(runtime["updated_at"])}</span></p>
-<p class="muted">Compatibilité legacy SQLite : {status["snapshot_count"]} snapshot(s), dernière observation {_fmt_timestamp(status["last_observed_at_ms"])}. Ce compteur ne mesure pas les lignes Parquet du collecteur Phase 02.</p>
-<p class="muted">Dernier rapport : {escape(latest_report)}.{latest_report_link}</p>
-<div class="warning"><strong>Règle de sécurité :</strong> le dashboard et le collecteur sont publics/read-only. Un futur exécuteur Testnet restera un composant distinct et pourra être développé après sa readiness technique, sans attendre Gate D. Tout exécuteur Micro/Mainnet restera séparé et bloqué par les preuves économiques, opérationnelles et humaines applicables.</div>
-<h2>Catalogue de recherche</h2><section class="grid">{cards}</section>
-<p class="muted">Santé API locale : <code>/health</code> — état JSON : <code>/api/status</code></p>
-</main></body></html>"""
-        return HTMLResponse(page_html)
+
+    @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+    def index() -> HTMLResponse:
+        return HTMLResponse(
+            H1_PAGE,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; "
+                    "img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'"
+                ),
+                "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "X-HyperLab-Fixture-Label": "SYNTHETIC_FIXTURE_NOT_EVIDENCE",
+                "X-HyperLab-Mode": "readonly",
+                "X-HyperLab-Orders-Enabled": "false",
+            },
+        )
 
     return app

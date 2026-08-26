@@ -98,12 +98,12 @@ git -C $Repo bundle create $Bundle $Branch
 git -C $Repo bundle verify $Bundle
 $BundleHash = (Get-FileHash -LiteralPath $Bundle -Algorithm SHA256).Hash.ToLowerInvariant()
 "$BundleHash  $(Split-Path -Leaf $Bundle)" | Set-Content -LiteralPath $HashFile -Encoding ascii
-$RemoteBase = (& 'C:\Windows\System32\OpenSSH\ssh.exe' -o BatchMode=yes -o ConnectTimeout=10 -- $SshTarget 'printf %s "$HOME/hyperlab-phase1d"').Trim()
+$RemoteBase = (& 'C:\Windows\System32\OpenSSH\ssh.exe' -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -- $SshTarget 'printf %s "$HOME/hyperlab-phase1d"').Trim()
 if ($LASTEXITCODE -ne 0 -or -not $RemoteBase) { throw 'SSH BatchMode preflight failed' }
 $RemoteIncoming = "$RemoteBase/incoming/$Stamp-$Nonce"
-& 'C:\Windows\System32\OpenSSH\ssh.exe' -o BatchMode=yes -o ConnectTimeout=10 -- $SshTarget "install -d -m 0700 '$RemoteIncoming'"
+& 'C:\Windows\System32\OpenSSH\ssh.exe' -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -- $SshTarget "install -d -m 0700 '$RemoteIncoming'"
 if ($LASTEXITCODE -ne 0) { throw 'SSH BatchMode preflight failed' }
-& 'C:\Windows\System32\OpenSSH\scp.exe' -o BatchMode=yes -o ConnectTimeout=10 -- $Bundle $HashFile "${SshTarget}:$RemoteIncoming/"
+& 'C:\Windows\System32\OpenSSH\scp.exe' -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -- $Bundle $HashFile "${SshTarget}:$RemoteIncoming/"
 if ($LASTEXITCODE -ne 0) { throw 'SCP upload failed' }
 "SOURCE_COMMIT=$Commit"
 "REMOTE_INCOMING=$RemoteIncoming"

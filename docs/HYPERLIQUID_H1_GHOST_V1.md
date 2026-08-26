@@ -249,3 +249,8 @@ La collecte est mono-writer, append-only, manifestée, monitorable et
 reprenable. La reprise conserve `campaign_id`, configuration, univers, splits,
 holdout, frais et chaîne de segments; elle crée une nouvelle génération de
 session/reconnect visible et ne fabrique aucune séquence serveur.
+
+Le paquet opérateur Linux/systemd reproductible de la première campagne est
+documenté dans `docs/H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1.md`. Sa préparation
+reste locale et offline; son exécution VPS et le démarrage de la collecte sont
+exclusivement humains.

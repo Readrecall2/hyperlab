@@ -1,0 +1,24 @@
+{
+  "arm_deadline_utc": "2026-08-27T18:30:00Z",
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "campaign_slug": "h1-20260827t190000z-7b91d4e2",
+  "disk": {
+    "margin_bytes": 17179869184,
+    "maximum_raw_bytes": 137438953472,
+    "required_free_bytes": 154618822656
+  },
+  "fee_artifact_path": "config/paper/hyperliquid-tier0-fees-2026-08-16.json",
+  "fee_review_path": "config/paper/hyperliquid-tier0-fee-review-2026-08-26.json",
+  "fee_reviewed_at_utc": "2026-08-26T20:53:53Z",
+  "policy_config_path": "config/research/hyperliquid-h1-ghost-v1.json",
+  "remote": {
+    "campaign_root": "/home/hyperlab/hyperlab-h1/campaigns/h1-20260827t190000z-7b91d4e2",
+    "home_root": "/home/hyperlab/hyperlab-h1",
+    "incoming_root": "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t190000z-7b91d4e2",
+    "source_root": "/home/hyperlab/hyperlab-h1/sources/h1-20260827t190000z-7b91d4e2"
+  },
+  "requirements_lock_path": "requirements-runtime.lock",
+  "schema_version": 1,
+  "service_name": "hyperlab-h1-20260827t190000z-7b91d4e2.service",
+  "starts_at_utc": "2026-08-27T19:00:00Z"
+}

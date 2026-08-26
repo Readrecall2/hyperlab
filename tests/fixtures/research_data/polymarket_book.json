@@ -1,0 +1,1 @@
+{"asset_id":"fixture-token-yes","asks":[{"price":"0.44","size":"18"}],"bids":[{"price":"0.41","size":"12"}],"event_type":"book","fixture_label":"SYNTHETIC/FIXTURE","hash":"fixture-book-hash","market":"fixture-condition","timestamp":"1787688000000"}

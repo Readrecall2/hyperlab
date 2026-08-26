@@ -95,6 +95,31 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _baseline_witness_for_repository(
+    repository_root: Path,
+    tmp_path: Path,
+) -> tuple[Path, bytes, str]:
+    source = (repository_root / _BASELINE_PATH).read_bytes()
+    assert len(source) == _BASELINE_SIZE
+    assert _sha256(source) == _BASELINE_SHA256
+    payload = json.loads(source)
+    assert isinstance(payload, dict)
+    acquisition = payload["acquisition"]
+    assert isinstance(acquisition, dict)
+    acquisition["repository_root"] = str(repository_root)
+    code_identity = payload["acquired_verifier_global_identity"]
+    assert isinstance(code_identity, dict)
+    assert code_identity["sha256"] == _ACQUIRED_IDENTITY
+    code_identity["repository_root"] = str(repository_root)
+    identity_material = dict(code_identity)
+    del identity_material["sha256"]
+    code_identity["sha256"] = _sha256(canonical_json_bytes(identity_material))
+    relocated = canonical_json_bytes(payload)
+    path = (tmp_path / "phase1c-successor-baseline-byte-witness.json").resolve()
+    path.write_bytes(relocated)
+    return path, relocated, str(code_identity["sha256"])
+
+
 def _workload_manifest(commit_count: int) -> dict[str, object]:
     workload_sha256 = _sha256(f"workload-{commit_count}".encode())
     return {
@@ -301,6 +326,10 @@ class _Fixture:
 
 def _build_fixture(tmp_path: Path) -> _Fixture:
     repository_root = Path(__file__).resolve().parents[2]
+    baseline_path, baseline_bytes, baseline_identity = _baseline_witness_for_repository(
+        repository_root,
+        tmp_path,
+    )
     phase1c_root = (tmp_path / "phase1c").resolve()
     source_root = phase1c_root / "native-capacity-05"
     candidate_root = source_root / "capacity-cumulative"
@@ -369,9 +398,9 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
         workload_profile=_PROFILE,
         workload_seed=7,
         generator_version=_GENERATOR,
-        baseline_byte_witness_sha256=_BASELINE_SHA256,
-        baseline_byte_witness_size_bytes=_BASELINE_SIZE,
-        acquired_verifier_baseline_identity=_ACQUIRED_IDENTITY,
+        baseline_byte_witness_sha256=_sha256(baseline_bytes),
+        baseline_byte_witness_size_bytes=len(baseline_bytes),
+        acquired_verifier_baseline_identity=baseline_identity,
         acquired_verifier_file_count=138,
         baseline_commit=_BASELINE_COMMIT,
         producer_dependency_closure_sha256=_CLOSURE_SHA256,
@@ -380,7 +409,7 @@ def _build_fixture(tmp_path: Path) -> _Fixture:
     )
     config = Phase1CSuccessorConfig(
         repository_root=repository_root,
-        baseline_byte_witness_path=(repository_root / _BASELINE_PATH),
+        baseline_byte_witness_path=baseline_path,
         source_mission_root=source_root,
         capacity_candidate_root=candidate_root,
         boundary_certificate_root=boundary_root,
@@ -530,10 +559,10 @@ def test_reattest_publishes_receipt_only_with_exact_double_identity_and_accounti
     }
     assert payload["acquired_verifier_baseline"][
         "acquired_verifier_global_identity"
-    ]["sha256"] == _ACQUIRED_IDENTITY
+    ]["sha256"] == fixture.config.expectations.acquired_verifier_baseline_identity
     assert payload["current_final_verifier_identity"][
         "successor_verifier_code_identity"
-    ]["sha256"] != _ACQUIRED_IDENTITY
+    ]["sha256"] != fixture.config.expectations.acquired_verifier_baseline_identity
     assert payload["producer_dependency_closure"]["closure_sha256"] == (
         _CLOSURE_SHA256
     )

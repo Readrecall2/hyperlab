@@ -1,0 +1,1 @@
+{"channel":"trades","data":[{"coin":"BTC","hash":"0xfixture","px":"100.20","side":"B","sz":"0.25","tid":42,"time":1787688000001,"users":["0xfixture-a","0xfixture-b"]}],"fixture_label":"SYNTHETIC/FIXTURE"}

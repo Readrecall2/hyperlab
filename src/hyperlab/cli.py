@@ -82,6 +82,7 @@ from hyperlab.environment_authorization import (
     paper_release_identity_candidate as _paper_release_identity_candidate,
 )
 from hyperlab.models import BacktestResult, MarketPanel, StrategyOutput
+from hyperlab.research_data.cli import research_data_app
 from hyperlab.storage.sqlite import database_status, save_carry_snapshots
 from hyperlab.strategies.funding_basket import FundingBasketStrategy
 from hyperlab.strategies.market_making import InventoryAwareMarketMaker
@@ -135,6 +136,7 @@ paper_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(paper_app, name="paper")
+app.add_typer(research_data_app, name="research-data")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +183,8 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "7003c537e70eebd0dd08bfef077bf8e2790ce1ff82c46bd82cdc161fb1584ac0"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "807a6868bea30cc7c97648484f4c7699653cfc78dfd17c8f45d5c367d7a0b58c"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "f01849b1df76e015a0c839cc16c6edd8afbe0e7ea0d65cbb028ab8e2ea7bb4cb"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "063973cdcb57941f35630f25a44c3ee9584d9296a85d747d03a9c24249aeec24"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 

@@ -7,10 +7,10 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T21:00:00Z`;
-- operator arm deadline: `2026-08-27T20:30:00Z`;
-- unique slug: `h1-20260827t210000z-c0043345`;
-- service: `hyperlab-h1-20260827t210000z-c0043345.service`;
+- start: `2026-08-27T22:00:00Z`;
+- operator arm deadline: `2026-08-27T21:30:00Z`;
+- unique slug: `h1-20260827t220000z-e52a227b`;
+- service: `hyperlab-h1-20260827t220000z-e52a227b.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).
@@ -66,7 +66,8 @@ containing:
 - `campaign-seed/campaign-manifest.json` and its pin;
 - `campaign-seed/state/health.json` in `PREPARED_NOT_STARTED`.
 - the byte-pinned systemd unit, operator scripts, source/policy inventory, and
-  three shell-separated human blocks.
+  four shell-separated human blocks: V6 preservation/disable, V7 volume
+  preparation, Windows transfer, and V7 installation/arming.
 
 The handoff binds the final commit, bundle, launch plan, canonical policy hash,
 raw policy file, fee artifact, fee review, runtime lock, campaign manifest,
@@ -99,6 +100,18 @@ seconds, at most three starts per 30 minutes. The unit is never overwritten:
 installation uses a new temporary inode and an atomic hard-link that fails if
 the target already exists.
 
+The host-side `vps-preflight` remains the authoritative physical-volume check:
+it authenticates `/dev/sdb`, the exact ext4 mount and its read-write options,
+model/serial, capacity, source identity, inventory, manifest, NTP, paths and
+boundary before the unit is installed. The unit's distinct
+`service-preflight` runs inside `ProtectSystem=strict`; it does not reinterpret
+the expected read-only parent namespace as physical volume state. Instead it
+re-authenticates the handoff, commit, inventory, manifest, paths, deadline and
+public-only boundary, measures capacity from the campaign path, and proves the
+only authorized write surface with an exclusive bounded probe in that campaign
+root. Admission fsyncs the probe file and directory, removes only that probe,
+then fsyncs the directory again. Any failure prevents `ExecStart`.
+
 `monitor.sh` is read-only. It combines exact systemd state/MainPID identity,
 the last 30 journal lines, `state/health.json`, and a process-command check. A
 stale or forged PID, an active unit without admissible health, and a collector
@@ -107,9 +120,10 @@ that exits before health publication all fail closed.
 ## Human-only boundary
 
 Codex does not execute `vps-install.sh`, SSH, SCP, SFTP, systemd, or the H1
-collector. The exact volume-preparation Tabby block, Windows PowerShell transfer
-block, and installation/arming Tabby block are generated only after the final
-commit and artifact hashes exist. The first block validates the already-mounted
+collector. The V6 preservation/disable block is followed by the exact V7
+volume-preparation Tabby block, Windows PowerShell transfer block, and
+installation/arming Tabby block; all are generated only after the final commit
+and artifact hashes exist. The volume block validates the already-mounted
 volume and uses only `sudo install -d` to prepare its HyperLab base directories.
 The Windows block uses SFTP only to create the unique home incoming directory
 and SCP for transfer. The final Bash block revalidates the volume before any
@@ -132,3 +146,13 @@ and campaign-seed installation completed, then portable-identity verification
 failed before systemd installation. Its append-only receipt marks it
 `ABANDONED_AFTER_TRANSFER_BEFORE_SYSTEMD_PORTABLE_IDENTITY_MISMATCH` and records
 that no service, collector, or network collection started.
+
+The V6 slug `h1-20260827t210000z-c0043345` also remains byte-identical. Its
+external physical-volume preflight was green, but its systemd `ExecCondition`
+reused that host check inside `ProtectSystem=strict` and therefore saw the
+expected read-only parent namespace. `ExecStart` never ran, MainPID and restart
+count remained zero, health stayed `PREPARED_NOT_STARTED`, and no raw root was
+created. The append-only receipt records
+`SYSTEMD_EXEC_CONDITION_SANDBOX_FALSE_READ_ONLY_NO_EXECSTART_NO_COLLECTION`.
+V7 includes a separate fail-closed operator block that authenticates this exact
+state, disables V6, and preserves its unit and all three V6 roots.

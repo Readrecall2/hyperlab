@@ -1,0 +1,18 @@
+{
+  "abandonment_status": "SYSTEMD_EXEC_CONDITION_SANDBOX_FALSE_READ_ONLY_NO_EXECSTART_NO_COLLECTION",
+  "campaign_slug": "h1-20260827t210000z-c0043345",
+  "cause": "HOST_VOLUME_RW_BUT_PROTECTSYSTEM_STRICT_PARENT_VIEW_READ_ONLY_IN_EXEC_CONDITION",
+  "prepared_state": {
+    "manifest_sha256": null,
+    "raw_root_sha256": null,
+    "terminal_health": "PREPARED_NOT_STARTED"
+  },
+  "systemd_state": {
+    "active_state": "inactive",
+    "exec_main_status": 0,
+    "load_state": "loaded",
+    "main_pid": 0,
+    "n_restarts": 0,
+    "sub_state": "dead"
+  }
+}

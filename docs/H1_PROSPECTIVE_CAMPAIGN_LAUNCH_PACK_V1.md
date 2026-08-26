@@ -1,7 +1,7 @@
 # H1 Prospective Campaign Launch Pack V1
 
 Technical readiness target:
-`H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1_GREEN_VOLUME_READY_AWAITING_HUMAN_EXECUTION`.
+`H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1_GREEN_SYSTEMD_PREFLIGHT_AWAITING_HUMAN_EXECUTION`.
 
 Economic status remains `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`. Nothing in this
 pack demonstrates alpha, profitability, capacity, or permission for real
@@ -14,8 +14,8 @@ The pack stages the first prospective H1 observation window under the existing
 BTC/ETH/SOL/HYPE universe, all registered variants, train days 0–7, validation
 days 7–10, sealed holdout days 10–14, and every existing economic gate.
 
-The replacement campaign is armed for `2026-08-27T20:00:00Z`. Complete the human transfer
-and systemd installation no later than `2026-08-27T19:30:00Z`. Before the
+The V7 replacement campaign is armed for `2026-08-27T22:00:00Z`. Complete the human transfer
+and systemd installation no later than `2026-08-27T21:30:00Z`. Before the
 frozen start the service only waits locally; it does not open the public
 collector. A first launch after the frozen start is refused. A later restart is
 allowed only when the same authenticated raw root already exists.
@@ -57,11 +57,30 @@ or move prior data. It uses `sudo install -d` only for the owned `0700` volume
 base directories. A missing/read-only/different mount or insufficient capacity
 stops before campaign creation.
 
+The full host preflight and systemd `ExecCondition` are deliberately distinct.
+The host gate proves the physical mount/device/ext4/read-write/model/serial and
+all identities. Inside `ProtectSystem=strict`, the service gate re-authenticates
+handoff, commit, inventory, manifest, paths, deadline and the public-only
+boundary, but tests write access only in the sole `ReadWritePaths` campaign
+root. Its exclusive bounded probe fsyncs its file and containing directory,
+removes only that probe, and fsyncs the directory again. It measures remaining
+capacity through the campaign root. A missing permission, stale identity,
+missed deadline, active writer or failed fsync stops before `ExecStart`; neither
+the volume root nor source root is added to `ReadWritePaths`.
+
 The earlier V2 package `h1-20260827t190000z-7b91d4e2` remains byte-identical,
 was neither transferred nor launched, and is append-only marked
 `ABANDONED_BEFORE_TRANSFER_INSUFFICIENT_ROOT_DISK` with
 `NO_TRANSFER_NO_LAUNCH_NO_NETWORK_COLLECTION`. Its identity and paths are never
 reused.
+
+V6 `h1-20260827t210000z-c0043345` passed the physical-volume and identity gates,
+then its reused host preflight saw the intentionally read-only parent namespace
+created by `ProtectSystem=strict`. The unit remained loaded and enabled but
+inactive/dead with MainPID 0, NRestarts 0, initial health and no raw root;
+`ExecStart` and collection never occurred. V7 first authenticates those exact
+facts, disables V6 without deleting its unit or roots, and records
+`SYSTEMD_EXEC_CONDITION_SANDBOX_FALSE_READ_ONLY_NO_EXECSTART_NO_COLLECTION`.
 
 ## Runtime and observability
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -74,9 +75,9 @@ def _volume_snapshot() -> dict[str, object]:
 def test_launch_plan_freezes_unique_roots_times_and_full_disk_budget() -> None:
     plan = launch_pack.validate_plan(_plan())
     assert plan["boundary"] == "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-    assert plan["campaign_slug"] == "h1-20260827t210000z-c0043345"
-    assert plan["starts_at_utc"] == "2026-08-27T21:00:00Z"
-    assert plan["arm_deadline_utc"] == "2026-08-27T20:30:00Z"
+    assert plan["campaign_slug"] == "h1-20260827t220000z-e52a227b"
+    assert plan["starts_at_utc"] == "2026-08-27T22:00:00Z"
+    assert plan["arm_deadline_utc"] == "2026-08-27T21:30:00Z"
     disk = plan["disk"]
     assert isinstance(disk, dict)
     assert disk["maximum_raw_bytes"] == 128 * 1024**3
@@ -122,7 +123,7 @@ def test_incoming_path_validation_refuses_escape_or_reuse(path: str) -> None:
 
 
 def test_remote_path_validation_accepts_only_split_home_and_volume_roots() -> None:
-    slug = "h1-20260827t210000z-c0043345"
+    slug = "h1-20260827t220000z-e52a227b"
     assert launch_pack.validate_remote_path(
         f"/home/hyperlab/hyperlab-h1/incoming/{slug}", category="incoming", slug=slug
     )
@@ -239,6 +240,34 @@ def test_v5_portable_identity_failure_is_append_only_and_no_service_started() ->
             "TRANSFER_CLONE_BOOTSTRAP_IMPORT_PREFLIGHT_CAMPAIGN_SEED_ONLY_"
             "NO_SYSTEMD_NO_SERVICE_NO_NETWORK_COLLECTION"
         ),
+    }
+
+
+def test_v6_systemd_sandbox_failure_receipt_is_append_only_and_no_execstart() -> None:
+    receipt = json.loads(
+        (OPS / "h1-20260827t210000z-c0043345-abandonment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt == {
+        "abandonment_status": (
+            "SYSTEMD_EXEC_CONDITION_SANDBOX_FALSE_READ_ONLY_NO_EXECSTART_NO_COLLECTION"
+        ),
+        "campaign_slug": "h1-20260827t210000z-c0043345",
+        "cause": "HOST_VOLUME_RW_BUT_PROTECTSYSTEM_STRICT_PARENT_VIEW_READ_ONLY_IN_EXEC_CONDITION",
+        "prepared_state": {
+            "manifest_sha256": None,
+            "raw_root_sha256": None,
+            "terminal_health": "PREPARED_NOT_STARTED",
+        },
+        "systemd_state": {
+            "active_state": "inactive",
+            "exec_main_status": 0,
+            "load_state": "loaded",
+            "main_pid": 0,
+            "n_restarts": 0,
+            "sub_state": "dead",
+        },
     }
 
 
@@ -407,6 +436,106 @@ def test_first_launch_after_frozen_start_is_refused_but_resume_is_allowed() -> N
     assert launch_pack.preflight_snapshot(raw_exists=True, **base)["collection_mode"] == "RESUME"  # type: ignore[arg-type]
 
 
+def test_service_preflight_admits_strict_parent_ro_with_campaign_root_rw() -> None:
+    handoff = _handoff()
+    disk = handoff["disk"]
+    assert isinstance(disk, dict)
+    deadline = datetime.fromisoformat(
+        str(handoff["arm_deadline_utc"]).replace("Z", "+00:00")
+    )
+    result = launch_pack.service_preflight_snapshot(
+        handoff=handoff,
+        current_user="hyperlab",
+        now=deadline - timedelta(minutes=1),
+        ntp_synchronized=True,
+        available_bytes=int(disk["required_free_bytes"]),
+        raw_exists=False,
+        raw_stored_bytes=0,
+        writer_lock_available=True,
+        forbidden_environment=(),
+        campaign_root_writable=True,
+    )
+    assert result["status"] == "H1_SYSTEMD_SERVICE_PREFLIGHT_GREEN"
+    assert result["campaign_root_write_probe"] == (
+        "FSYNC_FILE_DIRECTORY_DELETE_FSYNC_GREEN"
+    )
+    assert "volume" not in result
+
+
+def test_service_preflight_refuses_non_writable_campaign_root_and_missed_deadline() -> None:
+    handoff = _handoff()
+    disk = handoff["disk"]
+    assert isinstance(disk, dict)
+    deadline = datetime.fromisoformat(
+        str(handoff["arm_deadline_utc"]).replace("Z", "+00:00")
+    )
+    arguments = {
+        "handoff": handoff,
+        "current_user": "hyperlab",
+        "now": deadline,
+        "ntp_synchronized": True,
+        "available_bytes": int(disk["required_free_bytes"]),
+        "raw_exists": False,
+        "raw_stored_bytes": 0,
+        "writer_lock_available": True,
+        "forbidden_environment": (),
+    }
+    with pytest.raises(launch_pack.LaunchPackError, match="CAMPAIGN_ROOT_NOT_WRITABLE"):
+        launch_pack.service_preflight_snapshot(
+            campaign_root_writable=False, **arguments  # type: ignore[arg-type]
+        )
+    with pytest.raises(launch_pack.LaunchPackError, match="ARM_DEADLINE_MISSED"):
+        launch_pack.service_preflight_snapshot(
+            campaign_root_writable=True,
+            **{**arguments, "now": deadline + timedelta(seconds=1)},  # type: ignore[arg-type]
+        )
+
+
+def test_campaign_write_probe_is_exclusive_fsynced_removed_and_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[object, ...]] = []
+    probe_path = tmp_path / launch_pack.SERVICE_WRITE_PROBE_NAME
+
+    def tracked_open(path: object, flags: int, mode: int = 0o777) -> int:
+        events.append(("open", Path(path), flags, mode))
+        return 10 if Path(path) == tmp_path else 11
+
+    def tracked_write(fd: int, value: bytes | memoryview) -> int:
+        events.append(("write", bytes(value)))
+        return len(value)
+
+    def tracked_fsync(fd: int) -> None:
+        events.append(("fsync", fd))
+
+    def tracked_unlink(path: object) -> None:
+        events.append(("unlink", Path(path)))
+
+    def tracked_close(fd: int) -> None:
+        events.append(("close", fd))
+
+    monkeypatch.setattr(launch_pack.os, "open", tracked_open)
+    monkeypatch.setattr(launch_pack.os, "write", tracked_write)
+    monkeypatch.setattr(launch_pack.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(launch_pack.os, "unlink", tracked_unlink)
+    monkeypatch.setattr(launch_pack.os, "close", tracked_close)
+    launch_pack._campaign_root_write_probe(tmp_path)
+    probe_open = next(event for event in events if event[0] == "open" and event[1] == probe_path)
+    assert int(probe_open[2]) & os.O_EXCL
+    assert ("write", launch_pack.SERVICE_WRITE_PROBE_BYTES) in events
+    assert len([event for event in events if event[0] == "fsync"]) == 3
+    assert ("unlink", probe_path) in events
+
+    def refused_open(path: object, flags: int, mode: int = 0o777) -> int:
+        if Path(path) == probe_path:
+            raise PermissionError("campaign root is read-only")
+        return 10
+
+    monkeypatch.setattr(launch_pack.os, "open", refused_open)
+    with pytest.raises(launch_pack.LaunchPackError, match="CAMPAIGN_ROOT_NOT_WRITABLE"):
+        launch_pack._campaign_root_write_probe(tmp_path)
+
+
 def test_canonical_h1_prepare_creates_new_portable_seed_without_network(tmp_path: Path) -> None:
     plan = launch_pack.validate_plan(_plan())
     inventory = launch_pack.build_inventory(ROOT, plan)
@@ -433,7 +562,8 @@ def test_systemd_render_is_persistent_bounded_hardened_and_graceful() -> None:
     unit = launch_pack.render_systemd_unit(_handoff())
     assert "User=hyperlab" in unit
     assert "After=network-online.target time-sync.target" in unit
-    assert "ExecCondition=" in unit and "vps-preflight" in unit
+    assert "ExecCondition=" in unit and "service-preflight" in unit
+    assert "vps-preflight" not in unit
     assert "ExecStart=/usr/bin/bash" in unit and "run_collector.sh" in unit
     assert "Restart=on-failure" in unit
     assert "RestartSec=60" in unit
@@ -449,6 +579,13 @@ def test_systemd_render_is_persistent_bounded_hardened_and_graceful() -> None:
     assert "RequiresMountsFor=/mnt/HC_Volume_106716684" in unit
     assert "ConditionPathIsMountPoint=/mnt/HC_Volume_106716684" in unit
     assert "ReadWritePaths=/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/" in unit
+    read_write_lines = [line for line in unit.splitlines() if line.startswith("ReadWritePaths=")]
+    assert read_write_lines == [
+        "ReadWritePaths=/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/"
+        "h1-20260827t220000z-e52a227b"
+    ]
+    assert "/mnt/HC_Volume_106716684/hyperlab-h1/sources/" not in read_write_lines[0]
+    assert "ExecCondition=" in unit.split("ExecStart=", maxsplit=1)[0]
     assert "ListenStream" not in unit and "ListenDatagram" not in unit
 
 
@@ -466,8 +603,8 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     }
     waiting_cmd = (
         "/usr/bin/bash /mnt/HC_Volume_106716684/hyperlab-h1/sources/"
-        "h1-20260827t210000z-c0043345/ops/h1_campaign/run_collector.sh "
-        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-c0043345/handoff.json"
+        "h1-20260827t220000z-e52a227b/ops/h1_campaign/run_collector.sh "
+        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t220000z-e52a227b/handoff.json"
     )
     armed = launch_pack.evaluate_monitor(
         active_state="active",
@@ -480,7 +617,7 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     assert armed["status"] == "H1_SERVICE_ARMED_PREPARED_NOT_STARTED"
     running_health = {**prepared_health, "terminal_health": "RUNNING"}
     collect_cmd = (
-        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-c0043345/.venv/bin/python "
+        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t220000z-e52a227b/.venv/bin/python "
         "-m hyperlab research-data h1-collect "
         f"--campaign-root {campaign} --config /home/hyperlab/config.json"
     )
@@ -529,6 +666,8 @@ def test_runtime_scripts_have_exact_public_collector_resume_and_no_private_route
     assert "/mnt/HC_Volume_106716684/hyperlab-h1/sources/" in bootstrap
     assert "/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/" in run_script
     assert "findmnt -rn -T" in installer
+    assert "vps-preflight --handoff" in installer
+    assert "service-preflight --handoff" not in installer
     assert "H1_ARM_DEADLINE_MISSED" in installer
     assert 'VOLUME_DEVICE=${VALUES[12]}' in installer
     assert 'VOLUME_FS=${VALUES[13]}' in installer
@@ -599,7 +738,7 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "findmnt -rn -T" in tabby
     assert "H1_VOLUME_DEVICE='/dev/sdb'" in tabby
     assert "H1_VOLUME_MOUNT='/mnt/HC_Volume_106716684'" in tabby
-    assert "H1_ARM_DEADLINE_UTC='2026-08-27T20:30:00Z'" in tabby
+    assert "H1_ARM_DEADLINE_UTC='2026-08-27T21:30:00Z'" in tabby
     assert "git clone --no-checkout" in tabby
     assert "checkout --detach" in tabby
     assert r"printf '%s  %s\n'" in tabby
@@ -619,6 +758,33 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
         token in volume
         for token in ("mkfs ", "fdisk ", "parted ", "umount ", "resize2fs ", "/etc/fstab")
     )
+
+
+def test_v6_disable_block_authenticates_inactive_state_and_preserves_all_artifacts() -> None:
+    block = launch_pack.render_v6_disable_block()
+    assert "LOCATION: Tabby/VPS - preserve and disable failed V6" in block
+    assert "fccfe59ab511ec41077926cdc627a39d03c4fe88" in block
+    assert "cef9aa76d859496e26b4f01acf37cac56f7ff504f6d742629e2b9232938e391d" in block
+    assert "92bce3e8aaf35914fe266d21532615dc6b9bf1929fa43e656308cd3585a1aade" in block
+    assert "b79f42b400ebee650430ed6c46df5f70cd55825f8d415031627f9683c0ce98d5" in block
+    for expected in (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "MainPID",
+        "NRestarts",
+        "ExecMainStatus",
+        "PREPARED_NOT_STARTED",
+        '"manifest_sha256": None',
+        '"raw_root_sha256": None',
+        '[[ ! -e "$V6_CAMPAIGN_ROOT/raw" ]]',
+    ):
+        assert expected in block
+    assert 'sudo systemctl disable "$V6_SERVICE"' in block
+    assert "H1_V6_SERVICE_DISABLED_PRESERVED_NO_EXECSTART_NO_COLLECTION" in block
+    assert "systemctl enable" not in block
+    assert "systemctl start" not in block
+    assert "rm " not in block and "rm\n" not in block
 
 
 def test_gnu_df_posix_format_never_combines_p_with_output() -> None:

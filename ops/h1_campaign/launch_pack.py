@@ -46,6 +46,8 @@ TERMINAL_HEALTH: Final = frozenset(
         "THRESHOLD_CANDIDATE_NOT_FINAL_RESUME_REQUIRED",
     }
 )
+SERVICE_WRITE_PROBE_NAME: Final = ".h1-systemd-admission-write-probe"
+SERVICE_WRITE_PROBE_BYTES: Final = b"H1_SYSTEMD_CAMPAIGN_ROOT_WRITE_PROBE_V1\n"
 
 
 class LaunchPackError(ValueError):
@@ -874,6 +876,96 @@ bash ops/h1_campaign/vps-install.sh "$H1_INCOMING_ROOT"
 """
 
 
+def render_v6_disable_block() -> str:
+    return r"""# LOCATION: Tabby/VPS - preserve and disable failed V6, Bash, logged in as hyperlab.
+# EXPECTED_DURATION: 1-3 minutes; MAXIMUM_DURATION: 10 minutes.
+# PROMPTS: sudo may request the hyperlab password once; no HyperLab prompt and no network collection.
+# MONITORING: every authoritative V6 state is printed before the single disable action.
+# CTRL+C: before sudo disable changes nothing; during disable, rerun this block to re-authenticate state.
+# TERMINAL_SIGNAL: H1_V6_SERVICE_DISABLED_PRESERVED_NO_EXECSTART_NO_COLLECTION.
+set -Eeuo pipefail
+umask 077
+
+fail() { printf 'H1_V6_DISABLE_REFUSED:%s\n' "$1" >&2; exit 4; }
+
+V6_COMMIT='fccfe59ab511ec41077926cdc627a39d03c4fe88'
+V6_SLUG='h1-20260827t210000z-c0043345'
+V6_SERVICE='hyperlab-h1-20260827t210000z-c0043345.service'
+V6_INCOMING_ROOT='/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-c0043345'
+V6_SOURCE_ROOT='/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-c0043345'
+V6_CAMPAIGN_ROOT='/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t210000z-c0043345'
+V6_UNIT='/etc/systemd/system/hyperlab-h1-20260827t210000z-c0043345.service'
+V6_UNIT_SHA256='cef9aa76d859496e26b4f01acf37cac56f7ff504f6d742629e2b9232938e391d'
+V6_HANDOFF_SHA256='92bce3e8aaf35914fe266d21532615dc6b9bf1929fa43e656308cd3585a1aade'
+V6_MANIFEST_SHA256='b79f42b400ebee650430ed6c46df5f70cd55825f8d415031627f9683c0ce98d5'
+
+[[ $(id -un) == hyperlab && $HOME == /home/hyperlab ]] || fail 'run as hyperlab with exact HOME'
+for path in "$V6_INCOMING_ROOT" "$V6_SOURCE_ROOT" "$V6_CAMPAIGN_ROOT"; do
+  [[ -d "$path" && ! -L "$path" ]] || fail "V6 path absent or symlink: $path"
+  [[ $(readlink -f -- "$path") == "$path" ]] || fail "V6 real path differs: $path"
+done
+[[ -f "$V6_UNIT" && ! -L "$V6_UNIT" ]] || fail 'V6 unit is absent or a symlink'
+[[ $(sha256sum "$V6_UNIT" | awk '{print $1}') == "$V6_UNIT_SHA256" ]] \
+  || fail 'V6 installed unit bytes differ'
+[[ $(sha256sum "$V6_INCOMING_ROOT/handoff.json" | awk '{print $1}') == "$V6_HANDOFF_SHA256" ]] \
+  || fail 'V6 handoff bytes differ'
+[[ $(sha256sum "$V6_CAMPAIGN_ROOT/campaign-manifest.json" | awk '{print $1}') == "$V6_MANIFEST_SHA256" ]] \
+  || fail 'V6 campaign manifest bytes differ'
+[[ $(git -C "$V6_SOURCE_ROOT" rev-parse HEAD) == "$V6_COMMIT" ]] || fail 'V6 source commit differs'
+[[ -z $(git -C "$V6_SOURCE_ROOT" status --porcelain) ]] || fail 'V6 source clone is not clean'
+[[ $(systemctl is-enabled "$V6_SERVICE" 2>/dev/null) == enabled ]] || fail 'V6 service is not enabled'
+
+declare -A V6_STATE=()
+while IFS='=' read -r key value; do
+  [[ -n $key ]] || fail 'V6 systemd state contains an empty key'
+  V6_STATE["$key"]=$value
+done < <(systemctl show "$V6_SERVICE" \
+  --property=LoadState --property=ActiveState --property=SubState \
+  --property=MainPID --property=NRestarts --property=ExecMainStatus \
+  --property=FragmentPath)
+(( ${#V6_STATE[@]} == 7 )) || fail 'V6 systemd state fields are incomplete'
+[[ ${V6_STATE[LoadState]} == loaded ]] || fail "V6 LoadState differs: ${V6_STATE[LoadState]}"
+[[ ${V6_STATE[ActiveState]} == inactive ]] || fail "V6 ActiveState differs: ${V6_STATE[ActiveState]}"
+[[ ${V6_STATE[SubState]} == dead ]] || fail "V6 SubState differs: ${V6_STATE[SubState]}"
+[[ ${V6_STATE[MainPID]} == 0 ]] || fail "V6 MainPID differs: ${V6_STATE[MainPID]}"
+[[ ${V6_STATE[NRestarts]} == 0 ]] || fail "V6 NRestarts differs: ${V6_STATE[NRestarts]}"
+[[ ${V6_STATE[ExecMainStatus]} == 0 ]] || fail "V6 ExecMainStatus differs: ${V6_STATE[ExecMainStatus]}"
+[[ ${V6_STATE[FragmentPath]} == "$V6_UNIT" ]] \
+  || fail "V6 FragmentPath differs: ${V6_STATE[FragmentPath]}"
+
+python3.12 -I - "$V6_CAMPAIGN_ROOT/state/health.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    health = json.load(handle)
+expected = {
+    "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+    "campaign_id": "h1-23766dff791a31065ba6561b",
+    "manifest_sha256": None,
+    "monitoring": "state/health.json",
+    "raw_root_sha256": None,
+    "terminal_health": "PREPARED_NOT_STARTED",
+}
+if health != expected:
+    raise SystemExit("H1_V6_DISABLE_REFUSED:V6 health differs from PREPARED_NOT_STARTED")
+PY
+[[ ! -e "$V6_CAMPAIGN_ROOT/raw" ]] || fail 'V6 raw root exists unexpectedly'
+
+printf 'H1_V6_IDENTITY_AND_INACTIVE_STATE_GREEN\n'
+sudo systemctl disable "$V6_SERVICE"
+V6_ENABLED_AFTER=$(systemctl is-enabled "$V6_SERVICE" 2>/dev/null || true)
+[[ $V6_ENABLED_AFTER == disabled ]] || fail "V6 service did not become disabled: $V6_ENABLED_AFTER"
+[[ -f "$V6_UNIT" ]] || fail 'V6 unit was removed unexpectedly'
+for path in "$V6_INCOMING_ROOT" "$V6_SOURCE_ROOT" "$V6_CAMPAIGN_ROOT"; do
+  [[ -d "$path" ]] || fail "V6 path was removed unexpectedly: $path"
+done
+[[ $(systemctl is-active "$V6_SERVICE" 2>/dev/null || true) == inactive ]] \
+  || fail 'V6 service is not inactive after disable'
+printf 'H1_V6_SERVICE_DISABLED_PRESERVED_NO_EXECSTART_NO_COLLECTION\n'
+"""
+
+
 def finalize_launch_pack(
     *,
     repo_root: Path,
@@ -987,6 +1079,7 @@ def finalize_launch_pack(
     windows_path = operator_root / "windows-powershell.txt"
     tabby_path = operator_root / "tabby-vps-bash.txt"
     volume_path = operator_root / "tabby-vps-volume-preparation.txt"
+    disable_v6_path = operator_root / "tabby-vps-disable-v6.txt"
     _write_exclusive(
         windows_path,
         render_windows_operator_block(handoff, output_root=output_root, repo_root=repo_root).encode(
@@ -995,6 +1088,7 @@ def finalize_launch_pack(
     )
     _write_exclusive(tabby_path, render_tabby_operator_block(handoff).encode("utf-8"))
     _write_exclusive(volume_path, render_volume_preparation_block(handoff).encode("utf-8"))
+    _write_exclusive(disable_v6_path, render_v6_disable_block().encode("utf-8"))
     launch_files = {
         bundle_path.name: sha256_file(bundle_path),
         "campaign-seed/campaign-manifest.json": sha256_file(manifest_path),
@@ -1005,6 +1099,7 @@ def finalize_launch_pack(
         "inventory/source-policy-readiness.json": sha256_file(inventory_path),
         "operator/tabby-vps-bash.txt": sha256_file(tabby_path),
         "operator/tabby-vps-volume-preparation.txt": sha256_file(volume_path),
+        "operator/tabby-vps-disable-v6.txt": sha256_file(disable_v6_path),
         "operator/windows-powershell.txt": sha256_file(windows_path),
         f"systemd/{handoff['service_name']}": sha256_file(systemd_path),
     }
@@ -1124,7 +1219,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=UTC
 UnsetEnvironment={' '.join(FORBIDDEN_ENVIRONMENT)}
-ExecCondition={source}/.venv/bin/python {source}/ops/h1_campaign/launch_pack.py vps-preflight --handoff {incoming}/handoff.json --mode start
+ExecCondition={source}/.venv/bin/python {source}/ops/h1_campaign/launch_pack.py service-preflight --handoff {incoming}/handoff.json
 ExecStart=/usr/bin/bash {source}/ops/h1_campaign/run_collector.sh {incoming}/handoff.json
 Restart=on-failure
 RestartSec=60
@@ -1275,6 +1370,99 @@ def preflight_snapshot(
     }
 
 
+def service_preflight_snapshot(
+    *,
+    handoff: Mapping[str, object],
+    current_user: str,
+    now: datetime,
+    ntp_synchronized: bool,
+    available_bytes: int,
+    raw_exists: bool,
+    raw_stored_bytes: int,
+    writer_lock_available: bool,
+    forbidden_environment: Sequence[str],
+    campaign_root_writable: bool,
+) -> dict[str, object]:
+    checked = validate_handoff(handoff)
+    if current_user != EXPECTED_USER:
+        raise LaunchPackError(f"H1_USER_REFUSED: expected={EXPECTED_USER} actual={current_user}")
+    if not ntp_synchronized:
+        raise LaunchPackError("H1_NTP_NOT_SYNCHRONIZED")
+    if forbidden_environment:
+        raise LaunchPackError(
+            "H1_PRIVATE_SURFACE_ENVIRONMENT_REFUSED:" + ",".join(sorted(forbidden_environment))
+        )
+    if not campaign_root_writable:
+        raise LaunchPackError("H1_CAMPAIGN_ROOT_NOT_WRITABLE")
+    if type(raw_stored_bytes) is not int or raw_stored_bytes < 0:
+        raise LaunchPackError("stored raw bytes must be a non-negative integer")
+    disk = checked["disk"]
+    assert isinstance(disk, dict)
+    remaining_raw_bytes = max(0, int(disk["maximum_raw_bytes"]) - raw_stored_bytes)
+    required_now = remaining_raw_bytes + int(disk["margin_bytes"])
+    capacity = assess_capacity(available_bytes, required_now)
+    capacity["remaining_raw_budget_bytes"] = remaining_raw_bytes
+    capacity["stored_raw_bytes"] = raw_stored_bytes
+    if not writer_lock_available:
+        raise LaunchPackError("H1_WRITER_ALREADY_ACTIVE")
+    if not raw_exists:
+        deadline = _parse_utc(checked["arm_deadline_utc"], label="arm_deadline_utc")
+        if now.astimezone(UTC) > deadline:
+            raise LaunchPackError("H1_ARM_DEADLINE_MISSED_WITHOUT_RAW_ROOT")
+    return {
+        "boundary": BOUNDARY,
+        "campaign_root_write_probe": "FSYNC_FILE_DIRECTORY_DELETE_FSYNC_GREEN",
+        "campaign_slug": checked["campaign_slug"],
+        "capacity": capacity,
+        "collection_mode": "RESUME" if raw_exists else "INITIAL",
+        "ntp_synchronized": True,
+        "status": "H1_SYSTEMD_SERVICE_PREFLIGHT_GREEN",
+    }
+
+
+def _campaign_root_write_probe(campaign_root: Path) -> None:
+    probe_path = campaign_root / SERVICE_WRITE_PROBE_NAME
+    directory_fd: int | None = None
+    probe_fd: int | None = None
+    created = False
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(campaign_root, directory_flags)
+        probe_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        probe_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        probe_fd = os.open(probe_path, probe_flags, 0o600)
+        created = True
+        view = memoryview(SERVICE_WRITE_PROBE_BYTES)
+        while view:
+            written = os.write(probe_fd, view)
+            if written <= 0:
+                raise OSError("campaign-root write probe made no progress")
+            view = view[written:]
+        os.fsync(probe_fd)
+        os.close(probe_fd)
+        probe_fd = None
+        os.fsync(directory_fd)
+        os.unlink(probe_path)
+        created = False
+        os.fsync(directory_fd)
+    except OSError as error:
+        if probe_fd is not None:
+            with suppress(OSError):
+                os.close(probe_fd)
+        if created:
+            with suppress(OSError):
+                os.unlink(probe_path)
+            if directory_fd is not None:
+                with suppress(OSError):
+                    os.fsync(directory_fd)
+        raise LaunchPackError("H1_CAMPAIGN_ROOT_NOT_WRITABLE") from error
+    finally:
+        if directory_fd is not None:
+            with suppress(OSError):
+                os.close(directory_fd)
+
+
 def _verify_repository_and_campaign(handoff_path: Path) -> tuple[dict[str, object], Path, Path]:
     handoff = validate_handoff(_load_object(handoff_path))
     remote = handoff["remote"]
@@ -1372,6 +1560,32 @@ def run_vps_preflight(handoff_path: Path) -> dict[str, object]:
             "source_device": source_device,
         },
     )
+
+
+def run_service_preflight(handoff_path: Path) -> dict[str, object]:
+    handoff, _source_root, campaign_root = _verify_repository_and_campaign(handoff_path)
+    pwd = importlib.import_module("pwd")
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        raise LaunchPackError("effective user lookup is unavailable")
+    current_user = str(pwd.getpwuid(int(geteuid())).pw_name)
+    forbidden = [name for name in FORBIDDEN_ENVIRONMENT if os.environ.get(name)]
+    raw_root = campaign_root / "raw"
+    disk = shutil.disk_usage(campaign_root)
+    snapshot = service_preflight_snapshot(
+        handoff=handoff,
+        current_user=current_user,
+        now=datetime.now(tz=UTC),
+        ntp_synchronized=_timedatectl_synchronized(),
+        available_bytes=disk.free,
+        raw_exists=raw_root.exists(),
+        raw_stored_bytes=_stored_segment_file_bytes(raw_root),
+        writer_lock_available=_writer_lock_is_available(raw_root),
+        forbidden_environment=forbidden,
+        campaign_root_writable=True,
+    )
+    _campaign_root_write_probe(campaign_root)
+    return snapshot
 
 
 def evaluate_monitor(
@@ -1501,6 +1715,8 @@ def _parser() -> argparse.ArgumentParser:
     preflight = subparsers.add_parser("vps-preflight")
     preflight.add_argument("--handoff", type=Path, required=True)
     preflight.add_argument("--mode", choices=("start",), required=True)
+    service_preflight = subparsers.add_parser("service-preflight")
+    service_preflight.add_argument("--handoff", type=Path, required=True)
     monitor = subparsers.add_parser("monitor-check")
     monitor.add_argument("--handoff", type=Path, required=True)
     inspect = subparsers.add_parser("inspect")
@@ -1531,6 +1747,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = {"output": str(arguments.output), "status": "H1_SYSTEMD_UNIT_RENDERED"}
         elif arguments.command == "vps-preflight":
             result = run_vps_preflight(arguments.handoff.resolve())
+        elif arguments.command == "service-preflight":
+            result = run_service_preflight(arguments.handoff.resolve())
         elif arguments.command == "monitor-check":
             result = run_monitor_check(arguments.handoff.resolve())
         elif arguments.command == "inspect":

@@ -506,6 +506,9 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "$RemoteIp = '5.223.60.130'" in windows
     assert "Test-NetConnection" in windows
     assert "sftp.exe" in windows and "scp.exe" in windows
+    assert "[System.IO.Path]::GetTempPath()" in windows
+    assert "Remove-Item -LiteralPath $SftpBatch" in windows
+    assert "Join-Path $ArtifactRoot '.sftp" not in windows
     for directory in ("inventory", "operator", "scripts", "systemd"):
         assert f"'{directory}'" in windows
     assert "H1_WINDOWS_TRANSFER_GREEN_NOT_LAUNCHED" in windows

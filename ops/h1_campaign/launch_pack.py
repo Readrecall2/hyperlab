@@ -688,14 +688,20 @@ if (-not (Test-Path -LiteralPath $SshKey -PathType Leaf)) {{ throw "SSH key is a
 $Reachability = Test-NetConnection -ComputerName $RemoteIp -Port 22 -InformationLevel Detailed
 if (-not $Reachability.TcpTestSucceeded) {{ throw 'TCP/22 is not reachable.' }}
 
-$SftpBatch = Join-Path $ArtifactRoot '.sftp-create-unique-incoming.txt'
-@(
-    '-mkdir hyperlab-h1'
-    '-mkdir hyperlab-h1/incoming'
-    "mkdir $RemoteIncomingRelative"
-) | Set-Content -LiteralPath $SftpBatch -Encoding ascii
-& sftp.exe -i $SshKey -b $SftpBatch "$RemoteUser@$RemoteIp"
-if ($LASTEXITCODE -ne 0) {{ throw 'SFTP unique incoming-root creation failed.' }}
+$SftpBatch = Join-Path ([System.IO.Path]::GetTempPath()) "h1-sftp-$CampaignSlug-$PID.txt"
+if (Test-Path -LiteralPath $SftpBatch) {{ throw "Temporary SFTP batch already exists: $SftpBatch" }}
+try {{
+    @(
+        '-mkdir hyperlab-h1'
+        '-mkdir hyperlab-h1/incoming'
+        "mkdir $RemoteIncomingRelative"
+    ) | Set-Content -LiteralPath $SftpBatch -Encoding ascii
+    & sftp.exe -i $SshKey -b $SftpBatch "$RemoteUser@$RemoteIp"
+    if ($LASTEXITCODE -ne 0) {{ throw 'SFTP unique incoming-root creation failed.' }}
+}}
+finally {{
+    if (Test-Path -LiteralPath $SftpBatch) {{ Remove-Item -LiteralPath $SftpBatch -Force }}
+}}
 
 $RemoteTarget = "${{RemoteUser}}@${{RemoteIp}}:${{RemoteIncomingRelative}}/"
 & scp.exe -i $SshKey $BundlePath $HandoffPath `

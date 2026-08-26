@@ -389,14 +389,32 @@ def test_streaming_audit_matches_exact_counts_hashes_market_gap_and_raw_bindings
         raw_reference_prefix_root=expected_reference_prefix,
     )
 
-    report = audit_native_frames(iter(native), emulator, expectations)
+    baseline = audit_native_frames(iter(native), emulator, expectations)
+    progress: list[dict[str, object]] = []
+    report = audit_native_frames(
+        iter(native),
+        emulator,
+        expectations,
+        progress=lambda payload: progress.append(dict(payload)),
+    )
 
+    assert report == baseline
     assert report.commit_count == 3
     assert report.raw_reference_count == 2
     assert report.market_gap_count == 1
     assert report.streams == streams
     assert report.raw_manifest_roots == (manifest_root,)
     assert report.final_prefix_root == expectations.final_prefix_root
+    assert [item["audit_event"] for item in progress] == ["STARTED", "COMPLETE"]
+    assert [item["audited_commits"] for item in progress] == [0, 3]
+    assert [item["audited_rows"] for item in progress] == [
+        0,
+        sum(item.row_count for item in streams),
+    ]
+    assert all(
+        item["audit_progress_authority"] == "NON_AUTHORITATIVE_OBSERVABILITY_ONLY"
+        for item in progress
+    )
 
 
 def test_streaming_audit_catches_prefix_and_manifest_divergence() -> None:

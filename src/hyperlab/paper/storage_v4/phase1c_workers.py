@@ -36,10 +36,23 @@ from .capacity_runner import (
 )
 from .golden_runner import GoldenNativeRunResult, OfflineGoldenNativeRunner
 from .phase1c_progress import Phase1CHeartbeatWindow
+from .phase1c_worker_result import (
+    DurableCumulativeWorkerResult,
+    Phase1CCumulativeWorkerQueueResult,
+    Phase1CWorkerReceiptAuthority,
+    Phase1CWorkerResultError,
+    attest_phase1c_cumulative_worker_queue_result,
+    persist_phase1c_cumulative_worker_receipt_authority,
+    persist_phase1c_cumulative_worker_result,
+    promote_phase1c_cumulative_worker_result,
+    require_phase1c_cumulative_worker_receipt_authority,
+    validate_phase1c_cumulative_worker_sidecars,
+)
 from .raw_segment import RawSegmentThresholds
 from .types import Hash32
 
 ProgressCallback = Callable[[Mapping[str, object]], None]
+DurableResultCallback = Callable[[DurableCumulativeWorkerResult], None]
 
 _MIN_HEARTBEAT_SECONDS = 30.0
 _MAX_HEARTBEAT_SECONDS = 60.0
@@ -270,6 +283,13 @@ class Phase1CCumulativeCapacityWorkerRequest:
             and type(self.raw_thresholds) is not RawSegmentThresholds
         ):
             raise _input_error("raw_thresholds must be RawSegmentThresholds or None")
+        try:
+            validate_phase1c_cumulative_worker_sidecars(
+                candidate_root=self.candidate_root,
+                resume_existing=self.resume_existing,
+            )
+        except Phase1CWorkerResultError as exc:
+            raise _input_error(str(exc)) from exc
 
 
 class _MessageKind(StrEnum):
@@ -444,7 +464,7 @@ def _cumulative_capacity_worker_entry(
     request: Phase1CCumulativeCapacityWorkerRequest,
     queue: _QueueLike,
 ) -> None:
-    def operation() -> CumulativeCapacityRunResult:
+    def operation() -> Phase1CCumulativeWorkerQueueResult:
         runner = OfflinePhase1CCapacityRunner(
             candidate_root=request.candidate_root,
             code_identity=request.code_identity,
@@ -460,14 +480,35 @@ def _cumulative_capacity_worker_entry(
             ),
         )
         if request.resume_existing:
-            return runner.resume_cumulative_capacity_workload(
+            result = runner.resume_cumulative_capacity_workload(
                 manifests=request.manifests,
             )
-        terminal = request.manifests[-1]
-        return runner.run_cumulative_capacity_workload(
-            manifests=request.manifests,
-            commits=iter_capacity_commits(terminal.config),
+        else:
+            terminal = request.manifests[-1]
+            result = runner.run_cumulative_capacity_workload(
+                manifests=request.manifests,
+                commits=iter_capacity_commits(terminal.config),
+            )
+        queue_result = persist_phase1c_cumulative_worker_result(
+            request,
+            result,
         )
+        _send_progress(
+            queue,
+            Phase1CWorkerKind.CAPACITY_CUMULATIVE,
+            {
+                **result.accounting.payload(),
+                "candidate_root": str(request.candidate_root),
+                "phase": "capacity_complete",
+                "receipt_path": str(queue_result.receipt.path),
+                "receipt_sha256": queue_result.receipt.sha256,
+                "receipt_size_bytes": queue_result.receipt.size_bytes,
+                "result_sha256": queue_result.receipt.result_sha256,
+                "status": "DURABLE_RECEIPT_UNPROMOTED",
+                "worker_result_event": "RECEIPT_DURABLE",
+            },
+        )
+        return queue_result
 
     _run_child(Phase1CWorkerKind.CAPACITY_CUMULATIVE, queue, operation)
 
@@ -714,13 +755,18 @@ def _parse_capacity_result(
     return value
 
 
-def _parse_cumulative_capacity_result(value: object) -> CumulativeCapacityRunResult:
-    if not isinstance(value, CumulativeCapacityRunResult):
+def _parse_cumulative_capacity_result(
+    value: object,
+    *,
+    request: Phase1CCumulativeCapacityWorkerRequest,
+) -> tuple[CumulativeCapacityRunResult, DurableCumulativeWorkerResult]:
+    try:
+        return attest_phase1c_cumulative_worker_queue_result(request, value)
+    except Phase1CWorkerResultError as exc:
         raise Phase1CWorkerError(
             Phase1CWorkerErrorCode.PROTOCOL_INVALID,
-            "CAPACITY_CUMULATIVE child returned a result of the wrong type",
-        )
-    return value
+            str(exc),
+        ) from exc
 
 
 def run_golden_native_worker(
@@ -789,6 +835,7 @@ def run_phase1c_cumulative_capacity_worker(
     request: Phase1CCumulativeCapacityWorkerRequest,
     *,
     progress: ProgressCallback | None = None,
+    durable_result_callback: DurableResultCallback | None = None,
     heartbeat_interval_seconds: float = 30.0,
     _context: _SpawnContext | None = None,
     _target: Callable[
@@ -804,13 +851,97 @@ def run_phase1c_cumulative_capacity_worker(
         raise _input_error(
             "request must be Phase1CCumulativeCapacityWorkerRequest"
         )
+    if durable_result_callback is not None and not callable(
+        durable_result_callback
+    ):
+        raise _input_error("durable_result_callback must be callable or None")
+    receipt_authority: Phase1CWorkerReceiptAuthority | None = None
+
+    def persist_receipt_authority_before_forwarding(
+        payload: Mapping[str, object],
+    ) -> None:
+        nonlocal receipt_authority
+        forwarded = dict(payload)
+        if forwarded.get("worker_result_event") == "RECEIPT_DURABLE":
+            if receipt_authority is not None:
+                raise Phase1CWorkerError(
+                    Phase1CWorkerErrorCode.PROTOCOL_INVALID,
+                    "cumulative worker emitted more than one durable receipt",
+                )
+            try:
+                receipt_authority = (
+                    persist_phase1c_cumulative_worker_receipt_authority(
+                        request,
+                        forwarded,
+                    )
+                )
+            except Phase1CWorkerResultError as exc:
+                raise Phase1CWorkerError(
+                    Phase1CWorkerErrorCode.PROTOCOL_INVALID,
+                    "cumulative worker receipt authority failed closed",
+                ) from exc
+            forwarded.update(
+                {
+                    "receipt_authority_path": str(receipt_authority.path),
+                    "receipt_authority_sha256": receipt_authority.sha256,
+                    "receipt_authority_size_bytes": receipt_authority.size_bytes,
+                }
+            )
+        if progress is not None:
+            progress(forwarded)
+
+    def parse(value: object) -> CumulativeCapacityRunResult:
+        result, durable = _parse_cumulative_capacity_result(
+            value,
+            request=request,
+        )
+        if receipt_authority is None:
+            raise Phase1CWorkerError(
+                Phase1CWorkerErrorCode.PROTOCOL_INVALID,
+                "cumulative worker result lacks a durable receipt authority",
+            )
+        try:
+            require_phase1c_cumulative_worker_receipt_authority(
+                receipt_authority,
+                durable,
+            )
+        except Phase1CWorkerResultError as exc:
+            raise Phase1CWorkerError(
+                Phase1CWorkerErrorCode.PROTOCOL_INVALID,
+                "cumulative worker receipt authority changed before promotion",
+            ) from exc
+        promoted = promote_phase1c_cumulative_worker_result(durable)
+        if promoted.promotion is None:
+            raise Phase1CWorkerError(
+                Phase1CWorkerErrorCode.PROTOCOL_INVALID,
+                "durable cumulative result lacks its promotion pin",
+            )
+        if progress is not None:
+            progress(
+                {
+                    **result.accounting.payload(),
+                    "candidate_root": str(request.candidate_root),
+                    "phase": "capacity_complete",
+                    "promotion_path": str(promoted.promotion.path),
+                    "promotion_sha256": promoted.promotion.sha256,
+                    "receipt_path": str(promoted.receipt.path),
+                    "receipt_sha256": promoted.receipt.sha256,
+                    "result_sha256": promoted.receipt.result_sha256,
+                    "status": "DURABLE_RESULT_PROMOTED",
+                    "worker_result_event": "RESULT_PROMOTED",
+                }
+            )
+        if durable_result_callback is not None:
+            durable_result_callback(promoted)
+        return result
+
     return _run_isolated_worker(
         request,
         candidate_root=request.candidate_root,
         worker_kind=Phase1CWorkerKind.CAPACITY_CUMULATIVE,
         target=_target,
-        result_parser=_parse_cumulative_capacity_result,
-        progress=progress,
+        result_parser=parse,
+        progress=persist_receipt_authority_before_forwarding,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         context=_context,
         monotonic_ns=_monotonic_ns,

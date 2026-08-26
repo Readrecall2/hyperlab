@@ -34,6 +34,11 @@ from .durability import (
     fsync_directory,
 )
 from .faults import FaultHook, FaultPoint, trigger_fault
+from .phase1c_progress import (
+    AUDIT_HEARTBEAT_MIN_SECONDS,
+    AuditProgressCallback,
+    BoundedAuditProgress,
+)
 from .raw_manifest import (
     RAW_MANIFEST_SUFFIX,
     RawManifest,
@@ -1569,7 +1574,12 @@ class RawStore:
             )
         return tuple(references)
 
-    def full_audit(self) -> RawAuditReport:
+    def full_audit(
+        self,
+        *,
+        progress: AuditProgressCallback | None = None,
+        heartbeat_interval_seconds: float = AUDIT_HEARTBEAT_MIN_SECONDS,
+    ) -> RawAuditReport:
         self._ensure_open()
         self._verify_paths(self._paths)
         if self._read_pending() is not None:
@@ -1584,7 +1594,15 @@ class RawStore:
                     "raw anchor is nonempty while the loaded store is at genesis",
                 )
             self._assert_exact_raw_namespaces(())
-            return RawAuditReport(0, 0, 0, 0, 0, 0)
+            audit_progress = BoundedAuditProgress(
+                phase="raw_full_audit",
+                progress=progress,
+                totals={"records": 0, "segments": 0},
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
+            report = RawAuditReport(0, 0, 0, 0, 0, 0)
+            audit_progress.complete({"records": 0, "segments": 0})
+            return report
         latest = self._manifest
         expected_anchor = AnchorRecord(
             store_id=self._config.store_id,
@@ -1596,13 +1614,22 @@ class RawStore:
                 RawStoreErrorCode.AUTHORITY_MISMATCH,
                 "raw anchor differs from the loaded audit authority",
             )
+        audit_progress = BoundedAuditProgress(
+            phase="raw_full_audit",
+            progress=progress,
+            totals={
+                "records": latest.total_record_count,
+                "segments": len(latest.segments),
+            },
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
         chain = self._anchored_chain()
         self._assert_exact_raw_namespaces(chain)
         records = 0
         physical = 0
         logical = 0
         stored = 0
-        for descriptor in latest.segments:
+        for segment_index, descriptor in enumerate(latest.segments, start=1):
             path = self._paths.segment_path(descriptor.physical_sha256)
             if not path.exists():
                 raise _error(RawStoreErrorCode.SEGMENT_MISSING, "audited segment is missing")
@@ -1611,6 +1638,9 @@ class RawStore:
             physical += summary.physical_size
             logical += summary.logical_payload_bytes
             stored += summary.stored_payload_bytes
+            audit_progress.advance(
+                {"records": records, "segments": segment_index},
+            )
         self._assert_exact_raw_namespaces(chain)
         if self._read_pending() is not None:
             raise _error(
@@ -1622,7 +1652,7 @@ class RawStore:
                 RawStoreErrorCode.AUTHORITY_MISMATCH,
                 "raw anchor changed during full audit",
             )
-        return RawAuditReport(
+        report = RawAuditReport(
             manifests_read=len(chain),
             segments_read=len(latest.segments),
             records_read=records,
@@ -1630,6 +1660,10 @@ class RawStore:
             logical_payload_bytes=logical,
             stored_payload_bytes=stored,
         )
+        audit_progress.complete(
+            {"records": records, "segments": len(latest.segments)},
+        )
+        return report
 
     def _oldest_root(self) -> Hash32:
         if self._manifest is None:

@@ -22,6 +22,11 @@ from .capacity_adapter import (
     SYNTHETIC_CAPACITY_ROW_CONTRACT,
 )
 from .native_journal import NativeJournalError, rematerialize_native_row
+from .phase1c_progress import (
+    AUDIT_HEARTBEAT_MIN_SECONDS,
+    AuditProgressCallback,
+    BoundedAuditProgress,
+)
 from .raw_reference import RawReferenceResolverV2
 from .repository import StorageRepository
 from .types import CanonicalObject, CanonicalValue, RunId, StreamId
@@ -100,6 +105,8 @@ def compare_capacity_native_exact(
     *,
     run_id: RunId,
     include_tail: bool = False,
+    progress: AuditProgressCallback | None = None,
+    heartbeat_interval_seconds: float = AUDIT_HEARTBEAT_MIN_SECONDS,
 ) -> CapacityOracleReport:
     """Compare every reopened logical row against a fresh generator pass.
 
@@ -117,6 +124,15 @@ def compare_capacity_native_exact(
     if type(include_tail) is not bool:
         raise TypeError("include_tail must be an exact bool")
 
+    audit_progress = BoundedAuditProgress(
+        phase="capacity_oracle_full_audit",
+        progress=progress,
+        totals={
+            "commits": manifest.commit_count,
+            "rows": manifest.logical_row_count,
+        },
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
     expected_commits = iter_capacity_commits(manifest.config)
     actual_frames = (
         chain(
@@ -193,6 +209,10 @@ def compare_capacity_native_exact(
         market_gaps += sum(1 for row in expected.rows if row.code == "MARKET_GAP")
         expected_prefix = build_commit_logical(actual).prefix_root
         commits_total += 1
+        if commits_total % 256 == 0 or commits_total == manifest.commit_count:
+            audit_progress.advance(
+                {"commits": commits_total, "rows": rows_total}
+            )
 
     observed = hasher.finalize()
     if (
@@ -203,7 +223,7 @@ def compare_capacity_native_exact(
         or rows_total != manifest.logical_row_count
     ):
         raise CapacityOracleError("capacity workload digest or counts differ")
-    return CapacityOracleReport(
+    report = CapacityOracleReport(
         commit_count=commits_total,
         logical_row_count=rows_total,
         workload_sha256=observed.sha256,
@@ -218,6 +238,13 @@ def compare_capacity_native_exact(
             for stream in sorted(stream_counts)
         ),
     )
+    audit_progress.complete(
+        {
+            "commits": report.commit_count,
+            "rows": report.logical_row_count,
+        }
+    )
+    return report
 
 
 __all__ = [

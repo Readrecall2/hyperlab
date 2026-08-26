@@ -35,6 +35,11 @@ from .contracts import (
     RawReferenceResolutionError,
     rematerialize_compatibility_record,
 )
+from .phase1c_progress import (
+    AUDIT_HEARTBEAT_MIN_SECONDS,
+    AuditProgressCallback,
+    BoundedAuditProgress,
+)
 from .raw_reference import (
     RAW_REFERENCE_CONTRACT_MARKER_V2,
     RawReferenceResolverV2,
@@ -726,6 +731,9 @@ def audit_native_frames(
     frames: Iterable[CommitFrame],
     resolver: RawReferenceResolverV2,
     expectations: NativeAuditExpectations,
+    *,
+    progress: AuditProgressCallback | None = None,
+    heartbeat_interval_seconds: float = AUDIT_HEARTBEAT_MIN_SECONDS,
 ) -> NativeAuditReport:
     """Exhaustively audit frames while retaining only counters and digests."""
 
@@ -734,6 +742,15 @@ def audit_native_frames(
             NativeJournalErrorCode.TYPE_INVALID,
             "native audit requires a frame iterable and NativeAuditExpectations",
         )
+    audit_progress = BoundedAuditProgress(
+        phase="native_full_audit",
+        progress=progress,
+        totals={
+            "commits": expectations.commit_count,
+            "rows": sum(item.row_count for item in expectations.streams),
+        },
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
     expected_sequence = 1
     previous_prefix = expectations.start_prefix_root
     counts: dict[StreamId, int] = {}
@@ -745,6 +762,7 @@ def audit_native_frames(
     allowed_manifest_roots = set(expectations.raw_manifest_roots)
     raw_last_record_id: str | None = None
     raw_reference_prefix = native_raw_reference_prefix_seed()
+    rows_audited = 0
     # Exact duplicate detection retains fixed-size identities, never rows or payload bytes.
     seen_reference_ids: set[Hash32] = set()
 
@@ -810,9 +828,15 @@ def audit_native_frames(
                 )
                 raw_reference_count += 1
                 raw_last_record_id = reference.record_id
+            rows_audited += 1
 
         previous_prefix = build_commit_logical(frame).prefix_root
         expected_sequence += 1
+        audited_commits = expected_sequence - 1
+        if audited_commits % 256 == 0 or audited_commits == expectations.commit_count:
+            audit_progress.advance(
+                {"commits": audited_commits, "rows": rows_audited}
+            )
 
     commit_count = expected_sequence - 1
     observed_streams = tuple(
@@ -856,6 +880,12 @@ def audit_native_frames(
             NativeJournalErrorCode.PREFIX_DIVERGENCE,
             "raw reference prefix root differs",
         )
+    audit_progress.complete(
+        {
+            "commits": report.commit_count,
+            "rows": sum(item.row_count for item in report.streams),
+        }
+    )
     return report
 
 

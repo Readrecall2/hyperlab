@@ -346,15 +346,34 @@ def test_adapter_batches_are_accepted_by_writer_across_repeated_seals(tmp_path: 
         anchor=paper_anchor,
         config=paper_config,
     )
-    oracle = compare_capacity_native_exact(
+    baseline = compare_capacity_native_exact(
         reopened_paper,
         DiskRawResolver(reopened_raw),
         workload_manifest,
         run_id=_RUN,
     )
+    progress: list[dict[str, object]] = []
+    oracle = compare_capacity_native_exact(
+        reopened_paper,
+        DiskRawResolver(reopened_raw),
+        workload_manifest,
+        run_id=_RUN,
+        progress=lambda payload: progress.append(dict(payload)),
+    )
+    assert oracle == baseline
     assert oracle.commit_count == 4
     assert oracle.logical_row_count == workload_manifest.logical_row_count
     assert oracle.workload_sha256 == workload_manifest.workload_sha256
     assert oracle.market_gap_count == workload_config.market_gap_count
+    assert [item["audit_event"] for item in progress] == ["STARTED", "COMPLETE"]
+    assert [item["audited_commits"] for item in progress] == [0, 4]
+    assert [item["audited_rows"] for item in progress] == [
+        0,
+        workload_manifest.logical_row_count,
+    ]
+    assert all(
+        item["audit_progress_authority"] == "NON_AUTHORITATIVE_OBSERVABILITY_ONLY"
+        for item in progress
+    )
     reopened_paper.close()
     reopened_raw.close()

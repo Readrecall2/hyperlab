@@ -1,16 +1,28 @@
-"""Deterministic, fail-closed Phase 1C heartbeat progress windows.
+"""Deterministic heartbeat windows and bounded audit progress for Phase 1C.
 
 This module is deliberately stdlib-only.  It normalizes the latest completed
 workload boundary and derives recent throughput only from two observations of
 the same immutable workload identity.  A heartbeat never infers descendant
 process activity or a stagnation verdict from missing counters.
+
+Exhaustive-audit progress is operational telemetry only.  It is never an
+integrity input, evidence field, or certification verdict.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
+from time import monotonic_ns, time_ns
+
+AUDIT_HEARTBEAT_MIN_SECONDS = 30.0
+AUDIT_HEARTBEAT_MAX_SECONDS = 60.0
+AUDIT_PROGRESS_CONTRACT = "PHASE1C_BOUNDED_AUDIT_PROGRESS_V1"
+AUDIT_PROGRESS_AUTHORITY = "NON_AUTHORITATIVE_OBSERVABILITY_ONLY"
+
+AuditProgressCallback = Callable[[Mapping[str, object]], None]
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _NO_ACTIVE_WORKLOAD = "UNAVAILABLE_NO_ACTIVE_WORKLOAD_PROGRESS"
@@ -20,6 +32,22 @@ _INVALID_SEGMENT_COUNTERS = (
 )
 _SEGMENT_COUNTER_REGRESSION = "UNAVAILABLE_SEGMENT_OR_CHECKPOINT_COUNTER_REGRESSION"
 _INSUFFICIENT_WINDOW = "UNAVAILABLE_INSUFFICIENT_HEARTBEAT_WINDOW"
+_AUDIT_COUNTER_NAMES = frozenset(
+    {"bytes", "commits", "files", "records", "rows", "segments"}
+)
+_AUDIT_RESERVED_KEYS = frozenset(
+    {
+        "audit_event",
+        "audit_progress_authority",
+        "audit_progress_contract",
+        "heartbeat_interval_seconds",
+        "heartbeat_sequence",
+        "phase",
+        "phase_elapsed_ns",
+        "phase_started_at_unix_ns",
+        "status",
+    }
+)
 
 
 def _text(value: object) -> str | None:
@@ -54,6 +82,176 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     if numerator < 0 or denominator <= 0:
         raise ValueError("ceiling division requires non-negative/positive operands")
     return (numerator + denominator - 1) // denominator
+
+
+def _exact_audit_counter(value: object, *, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a non-negative exact integer")
+    return value
+
+
+class BoundedAuditProgress:
+    """Emit STARTED, time-spaced heartbeat, and COMPLETE audit snapshots."""
+
+    __slots__ = (
+        "_callback",
+        "_completed",
+        "_heartbeat_interval_ns",
+        "_heartbeat_sequence",
+        "_last_heartbeat_ns",
+        "_last_observed_ns",
+        "_phase",
+        "_phase_started_at_unix_ns",
+        "_phase_started_ns",
+        "_totals",
+    )
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        progress: AuditProgressCallback | None,
+        totals: Mapping[str, int],
+        heartbeat_interval_seconds: float = AUDIT_HEARTBEAT_MIN_SECONDS,
+        initial: Mapping[str, object] | None = None,
+    ) -> None:
+        if type(phase) is not str or not phase:
+            raise ValueError("audit progress phase must be a non-empty exact string")
+        if progress is not None and not callable(progress):
+            raise TypeError("audit progress callback must be callable or None")
+        if (
+            type(heartbeat_interval_seconds) not in (int, float)
+            or not math.isfinite(float(heartbeat_interval_seconds))
+            or not AUDIT_HEARTBEAT_MIN_SECONDS
+            <= float(heartbeat_interval_seconds)
+            <= AUDIT_HEARTBEAT_MAX_SECONDS
+        ):
+            raise ValueError("audit heartbeat must be between 30 and 60 seconds")
+        normalized_totals: dict[str, int] = {}
+        for name, value in totals.items():
+            if type(name) is not str or name not in _AUDIT_COUNTER_NAMES:
+                raise ValueError(f"unsupported audit progress counter: {name!r}")
+            normalized_totals[name] = _exact_audit_counter(value, label=f"{name}_total")
+        self._phase = phase
+        self._callback = progress
+        self._totals = normalized_totals
+        self._completed = dict.fromkeys(normalized_totals, 0)
+        self._heartbeat_interval_ns = int(float(heartbeat_interval_seconds) * _NANOSECONDS_PER_SECOND)
+        self._heartbeat_sequence = 0
+        self._phase_started_ns = monotonic_ns()
+        self._phase_started_at_unix_ns = time_ns()
+        self._last_observed_ns = self._phase_started_ns
+        self._last_heartbeat_ns = self._phase_started_ns
+        self._publish(
+            audit_event="STARTED",
+            status="RUNNING",
+            observed_ns=self._phase_started_ns,
+            extra=initial,
+        )
+
+    def advance(
+        self,
+        completed: Mapping[str, int],
+        *,
+        extra: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._callback is None:
+            return
+        self._update(completed)
+        observed_ns = self._observed_ns()
+        if observed_ns - self._last_heartbeat_ns < self._heartbeat_interval_ns:
+            return
+        self._publish(
+            audit_event="HEARTBEAT",
+            status="RUNNING",
+            observed_ns=observed_ns,
+            extra=extra,
+        )
+        self._last_heartbeat_ns = observed_ns
+
+    def complete(
+        self,
+        completed: Mapping[str, int],
+        *,
+        extra: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._callback is None:
+            return
+        self._update(completed)
+        incomplete = [
+            name
+            for name, total in self._totals.items()
+            if self._completed[name] != total
+        ]
+        if incomplete:
+            raise ValueError(
+                "audit progress COMPLETE requires exact totals: "
+                + ", ".join(incomplete)
+            )
+        self._publish(
+            audit_event="COMPLETE",
+            status="COMPLETE",
+            observed_ns=self._observed_ns(),
+            extra=extra,
+        )
+
+    def _observed_ns(self) -> int:
+        observed_ns = monotonic_ns()
+        if observed_ns < self._last_observed_ns:
+            observed_ns = self._last_observed_ns
+        self._last_observed_ns = observed_ns
+        return observed_ns
+
+    def _update(self, completed: Mapping[str, int]) -> None:
+        for name, value in completed.items():
+            if name not in self._totals:
+                raise ValueError(f"unconfigured audit progress counter: {name!r}")
+            normalized = _exact_audit_counter(value, label=f"audited_{name}")
+            if normalized < self._completed[name]:
+                raise ValueError(f"audited_{name} regressed")
+            if normalized > self._totals[name]:
+                raise ValueError(f"audited_{name} exceeds {name}_total")
+            self._completed[name] = normalized
+
+    def _publish(
+        self,
+        *,
+        audit_event: str,
+        status: str,
+        observed_ns: int,
+        extra: Mapping[str, object] | None,
+    ) -> None:
+        callback = self._callback
+        if callback is None:
+            return
+        payload: dict[str, object] = {
+            "audit_event": audit_event,
+            "audit_progress_authority": AUDIT_PROGRESS_AUTHORITY,
+            "audit_progress_contract": AUDIT_PROGRESS_CONTRACT,
+            "heartbeat_interval_seconds": self._heartbeat_interval_ns / _NANOSECONDS_PER_SECOND,
+            "heartbeat_sequence": self._heartbeat_sequence,
+            "phase": self._phase,
+            "phase_elapsed_ns": max(0, observed_ns - self._phase_started_ns),
+            "phase_started_at_unix_ns": self._phase_started_at_unix_ns,
+            "status": status,
+        }
+        for name, total in self._totals.items():
+            payload[f"audited_{name}"] = self._completed[name]
+            payload[f"{name}_total"] = total
+        if extra is not None:
+            collisions = set(extra).intersection(payload).union(set(extra).intersection(_AUDIT_RESERVED_KEYS))
+            if collisions:
+                raise ValueError(
+                    "audit progress extras collide with reserved fields: "
+                    + ", ".join(sorted(collisions))
+                )
+            payload.update(extra)
+        self._heartbeat_sequence += 1
+        try:
+            callback(payload)
+        except Exception:
+            self._callback = None
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,4 +542,13 @@ class Phase1CHeartbeatWindow:
         return normalized
 
 
-__all__ = ["HeartbeatCounterSample", "Phase1CHeartbeatWindow"]
+__all__ = [
+    "AUDIT_HEARTBEAT_MAX_SECONDS",
+    "AUDIT_HEARTBEAT_MIN_SECONDS",
+    "AUDIT_PROGRESS_AUTHORITY",
+    "AUDIT_PROGRESS_CONTRACT",
+    "AuditProgressCallback",
+    "BoundedAuditProgress",
+    "HeartbeatCounterSample",
+    "Phase1CHeartbeatWindow",
+]

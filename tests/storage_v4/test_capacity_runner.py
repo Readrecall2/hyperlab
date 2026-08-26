@@ -356,6 +356,26 @@ def test_runner_streams_repeated_seals_reopens_audits_and_censuses(
         item["bytes_written_status"] == "UNAVAILABLE_WRITE_BYTE_PROBE"
         for item in ingest_progress
     )
+    for audit_phase in (
+        "raw_full_audit",
+        "paper_full_audit",
+        "native_full_audit",
+        "capacity_oracle_full_audit",
+    ):
+        audit_events = [item for item in progress if item["phase"] == audit_phase]
+        assert audit_events[0]["audit_event"] == "STARTED"
+        assert audit_events[-1]["audit_event"] == "COMPLETE"
+        assert [item["heartbeat_sequence"] for item in audit_events] == list(
+            range(len(audit_events))
+        )
+        assert all(
+            item["audit_progress_authority"]
+            == "NON_AUTHORITATIVE_OBSERVABILITY_ONLY"
+            for item in audit_events
+        )
+        assert [
+            int(item["phase_elapsed_ns"]) for item in audit_events
+        ] == sorted(int(item["phase_elapsed_ns"]) for item in audit_events)
     assert progress[-1]["phase"] == "capacity_complete"
     assert progress[-1]["commits_completed"] == 5
     assert progress[-1]["logical_rows_completed"] == result.manifest.logical_row_count

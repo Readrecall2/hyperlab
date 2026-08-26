@@ -50,6 +50,10 @@ from hyperlab.paper.storage_v4.phase1c_preflight import (
     Phase1CPreflightConfig,
 )
 from hyperlab.paper.storage_v4.phase1c_progress import Phase1CHeartbeatWindow
+from hyperlab.paper.storage_v4.phase1c_worker_result import (
+    Phase1CCumulativeWorkerClosureResult,
+    close_phase1c_cumulative_worker_result_from_authority,
+)
 
 GOLDEN_CERTIFICATION_ROOT = Path(
     r"C:\Dev\hyperlab-offline-validation\e45f5569\golden-v3"
@@ -212,6 +216,7 @@ TARGETED_TEST_PATHS = (
     "tests/storage_v4/test_phase1c_pipeline.py",
     "tests/storage_v4/test_phase1c_preflight.py",
     "tests/storage_v4/test_phase1c_progress.py",
+    "tests/storage_v4/test_phase1c_worker_result_resume.py",
     "tests/storage_v4/test_phase1c_workers.py",
     "tests/storage_v4/test_phase1c_workloads.py",
     "tests/storage_v4/test_raw_manifest.py",
@@ -343,6 +348,30 @@ def _validate_cumulative_resume_candidate_root(value: Path | None) -> Path | Non
     return resolved
 
 
+def _validate_closure_only_request(
+    *,
+    candidate_root: Path | None,
+    receipt_sha256: str | None,
+    resume_candidate_root: Path | None,
+) -> tuple[Path, str] | None:
+    if candidate_root is None and receipt_sha256 is None:
+        return None
+    if candidate_root is None or receipt_sha256 is None:
+        raise ValueError(
+            "closure-only candidate root and external receipt SHA-256 are required together"
+        )
+    if resume_candidate_root is not None:
+        raise ValueError("closure-only and cumulative ingestion resume are mutually exclusive")
+    resolved = _validate_cumulative_resume_candidate_root(candidate_root)
+    if resolved is None:
+        raise ValueError("closure-only candidate root is missing")
+    if re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None:
+        raise ValueError(
+            "closure-only receipt SHA-256 must be 64 lowercase hexadecimal characters"
+        )
+    return resolved, receipt_sha256
+
+
 def _is_controlled_subprocess_environment_key(name: str) -> bool:
     normalized = name.upper()
     return (
@@ -425,6 +454,24 @@ def _parser() -> argparse.ArgumentParser:
             "absolute existing .../<mission>/capacity-cumulative root under the "
             "fixed Phase 1C parent; reattest its sealed boundary and ingest only "
             "the remaining suffix"
+        ),
+    )
+    parser.add_argument(
+        "--closure-only-cumulative-candidate-root",
+        type=Path,
+        default=None,
+        help=(
+            "absolute terminal .../<mission>/capacity-cumulative root; reconstruct "
+            "and promote only its externally pinned durable worker result without "
+            "running tests, preflight, workers, generators, or ingestion"
+        ),
+    )
+    parser.add_argument(
+        "--closure-only-receipt-sha256",
+        default=None,
+        help=(
+            "external SHA-256 pin recorded durably before parent-side promotion; "
+            "required with --closure-only-cumulative-candidate-root"
         ),
     )
     return parser
@@ -1195,7 +1242,10 @@ def _closure_commands(repository_root: Path, global_basetemp: Path) -> tuple[tup
         ),
         ("RUFF_GLOBAL_FINAL", (python, "-m", "ruff", "check", ".")),
         ("MYPY_HYPERLAB_FINAL", (python, "-m", "mypy", "src/hyperlab")),
-        ("GIT_DIFF_CHECK_FINAL", ("git", "diff", "--check")),
+        (
+            "GIT_DIFF_CHECK_FINAL",
+            ("git", "-c", "core.whitespace=cr-at-eol", "diff", "--check"),
+        ),
     )
 
 
@@ -1274,9 +1324,49 @@ def _progress(payload: Mapping[str, object]) -> None:
     _emit(payload)
 
 
+def _cumulative_orphan_closure_payload(
+    result: Phase1CCumulativeWorkerClosureResult,
+) -> dict[str, object]:
+    if not isinstance(result, Phase1CCumulativeWorkerClosureResult):
+        raise TypeError("closure-only result has the wrong type")
+    promotion = result.durable.promotion
+    if promotion is None:
+        raise Phase1CCertificationError("closure-only result lacks durable promotion")
+    return {
+        "accounting": result.accounting.payload(),
+        "candidate_root": str(result.candidate_root),
+        "closure_scope": (
+            "CUMULATIVE_WORKER_RESULT_ONLY; EXCLUDES_GOLDEN_TAIL_ADVERSARIAL_"
+            "AND_GLOBAL_PHASE1C_PUBLICATION"
+        ),
+        "promotion_path": str(promotion.path),
+        "promotion_sha256": promotion.sha256,
+        "receipt_authority_path": str(result.authority.path),
+        "receipt_authority_sha256": result.authority.sha256,
+        "receipt_sha256": result.authority.receipt.sha256,
+        "status": "STORAGE_V4_PHASE_1C_CUMULATIVE_ORPHAN_CLOSURE_READY",
+        "worker_result": result.payload(),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     namespace = _parser().parse_args(argv)
     try:
+        closure_only = _validate_closure_only_request(
+            candidate_root=namespace.closure_only_cumulative_candidate_root,
+            receipt_sha256=namespace.closure_only_receipt_sha256,
+            resume_candidate_root=namespace.resume_cumulative_candidate_root,
+        )
+        if closure_only is not None:
+            candidate_root, expected_receipt_sha256 = closure_only
+            closure_result = (
+                close_phase1c_cumulative_worker_result_from_authority(
+                    candidate_root,
+                    expected_receipt_sha256=expected_receipt_sha256,
+                )
+            )
+            _emit(_cumulative_orphan_closure_payload(closure_result))
+            return 0
         heartbeat_seconds = _validate_heartbeat(namespace.heartbeat_seconds)
         minimum_free_bytes = _validate_minimum_free_bytes(namespace.minimum_free_bytes)
         repository_root = _repository_root()

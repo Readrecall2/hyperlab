@@ -67,6 +67,7 @@ from .phase1c_preflight import (
     run_phase1c_preflight,
     verify_phase1c_postflight,
 )
+from .phase1c_worker_result import DurableCumulativeWorkerResult
 from .phase1c_workers import (
     Phase1CCumulativeCapacityWorkerRequest,
     run_phase1c_cumulative_capacity_worker,
@@ -122,6 +123,9 @@ _CODE_FIXED_PATHS = (
     "pyproject.toml",
     "requirements-runtime.lock",
     "scripts/certify_storage_v4_phase1c.py",
+    "scripts/capture_phase1c_successor_baseline.py",
+    "scripts/certify_storage_v4_phase1c_successor.py",
+    "scripts/generate_phase05_paper_evidence.py",
     "scripts/generate_phase12_live_paper_artifacts.py",
 )
 
@@ -848,6 +852,7 @@ class Phase1CMeasurementBundle:
     adversarial_evidence: OfflineCapacityRunEvidence
     cumulative_capacity: CumulativeCapacityRunResult
     accounting: Phase1CCommitAccounting
+    durable_cumulative_capacity: DurableCumulativeWorkerResult | None = None
 
     @property
     def capacity_boundaries(self) -> dict[int, CumulativeCapacityBoundaryResult]:
@@ -1599,6 +1604,11 @@ def _authority_table(
 ) -> dict[str, object]:
     tree_by_label = dict(trees)
     boundaries = bundle.capacity_boundaries
+    durable_worker_result = bundle.durable_cumulative_capacity
+    if durable_worker_result is None or durable_worker_result.promotion is None:
+        raise Phase1CCertificationError(
+            "cumulative worker result lacks durable promoted authority"
+        )
     capacities = {
         str(level): {
             "authority": boundaries[level].evidence.payload()["authority"],
@@ -1624,6 +1634,7 @@ def _authority_table(
             "tree": tree_by_label["ADVERSARIAL_STORAGE"].payload(),
         },
         "capacity_levels": capacities,
+        "capacity_worker_result": durable_worker_result.authority_payload(),
         "capacity_shared_terminal_tree": tree_by_label[
             "CAPACITY_CUMULATIVE"
         ].payload(),
@@ -1791,6 +1802,18 @@ def run_phase1c_measurements(
         if config.cumulative_resume_candidate_root is None
         else config.cumulative_resume_candidate_root
     )
+    durable_cumulative_capacity: DurableCumulativeWorkerResult | None = None
+
+    def capture_durable_cumulative_result(
+        value: DurableCumulativeWorkerResult,
+    ) -> None:
+        nonlocal durable_cumulative_capacity
+        if durable_cumulative_capacity is not None:
+            raise Phase1CCertificationError(
+                "cumulative worker returned more than one durable result"
+            )
+        durable_cumulative_capacity = value
+
     cumulative_capacity = run_phase1c_cumulative_capacity_worker(
         Phase1CCumulativeCapacityWorkerRequest(
             manifests=workloads.golden_shaped_manifests,
@@ -1801,8 +1824,16 @@ def run_phase1c_measurements(
             resume_existing=config.cumulative_resume_candidate_root is not None,
         ),
         progress=progress,
+        durable_result_callback=capture_durable_cumulative_result,
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
     )
+    if (
+        durable_cumulative_capacity is None
+        or durable_cumulative_capacity.promotion is None
+    ):
+        raise Phase1CCertificationError(
+            "cumulative worker completed without durable promoted authority"
+        )
     _validate_cumulative_capacity_result(
         workloads,
         cumulative_capacity,
@@ -1836,6 +1867,7 @@ def run_phase1c_measurements(
         adversarial_evidence=adversarial_evidence,
         cumulative_capacity=cumulative_capacity,
         accounting=accounting,
+        durable_cumulative_capacity=durable_cumulative_capacity,
     )
 
 

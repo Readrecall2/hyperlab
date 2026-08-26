@@ -84,6 +84,11 @@ from .overlay import (
     OverlayThresholds,
     SQLiteOverlay,
 )
+from .phase1c_progress import (
+    AUDIT_HEARTBEAT_MIN_SECONDS,
+    AuditProgressCallback,
+    BoundedAuditProgress,
+)
 from .segment import (
     CodecProfile,
     SegmentArtifact,
@@ -1858,7 +1863,12 @@ class StorageRepository:
             )
         return segment
 
-    def full_audit(self) -> AuditReport:
+    def full_audit(
+        self,
+        *,
+        progress: AuditProgressCallback | None = None,
+        heartbeat_interval_seconds: float = AUDIT_HEARTBEAT_MIN_SECONDS,
+    ) -> AuditReport:
         """Read and authenticate every manifest, checkpoint, and segment."""
 
         self._ensure_open()
@@ -1868,6 +1878,18 @@ class StorageRepository:
                 RepositoryErrorCode.AUTHORITY_EMPTY,
                 "full audit requires at least one anchored seal",
             )
+        audit_progress = BoundedAuditProgress(
+            phase="paper_full_audit",
+            progress=progress,
+            totals={
+                "commits": self._checkpoint.historical_commit_count,
+                "rows": sum(
+                    count for _, count in self._checkpoint.cumulative_stream_counts
+                ),
+                "segments": len(self._manifest.segments),
+            },
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
         chain = self._load_manifest_chain(self._manifest)
         self._assert_no_manifest_forks()
         checkpoints = tuple(
@@ -1885,7 +1907,7 @@ class StorageRepository:
         rows = 0
         physical_bytes = 0
         observed_counts: tuple[CumulativeStreamCount, ...] = ()
-        for descriptor in self._manifest.segments:
+        for segment_index, descriptor in enumerate(self._manifest.segments, start=1):
             segment = self._read_segment_descriptor(descriptor)
             commits = _checked_add(
                 commits,
@@ -1906,6 +1928,13 @@ class StorageRepository:
                 observed_counts,
                 segment.counts_by_stream,
             )
+            audit_progress.advance(
+                {
+                    "commits": commits,
+                    "rows": rows,
+                    "segments": segment_index,
+                }
+            )
         if (
             commits != self._checkpoint.historical_commit_count
             or observed_counts != self._checkpoint.cumulative_stream_counts
@@ -1918,7 +1947,7 @@ class StorageRepository:
         checkpoint_root = self._manifest.segments[-1].checkpoint_root
         if checkpoint_root is None:
             raise AssertionError("latest manifest checkpoint was already verified")
-        return AuditReport(
+        report = AuditReport(
             integrity_status=AuditIntegrityStatus.FULL_HISTORY_AUTHENTICATED,
             manifest_generation=self._manifest.generation,
             manifest_root=self._manifest.identity.root,
@@ -1932,6 +1961,14 @@ class StorageRepository:
             cumulative_stream_counts=observed_counts,
             checkpoint_state_witnesses=checkpoint_state_witnesses,
         )
+        audit_progress.complete(
+            {
+                "commits": commits,
+                "rows": rows,
+                "segments": len(self._manifest.segments),
+            }
+        )
+        return report
 
     def iter_historical_frames(self) -> Iterator[CommitFrame]:
         """Yield all authenticated historical frames in commit order."""

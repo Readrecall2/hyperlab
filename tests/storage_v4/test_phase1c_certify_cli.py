@@ -231,6 +231,40 @@ def test_cumulative_resume_root_is_existing_canonical_phase1c_child(
         cli._validate_cumulative_resume_candidate_root(outside)
 
 
+def test_closure_only_request_requires_external_pin_and_excludes_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed_parent = tmp_path / "storage-v4-phase1c"
+    candidate_root = allowed_parent / "native-capacity-test" / "capacity-cumulative"
+    candidate_root.mkdir(parents=True)
+    monkeypatch.setattr(cli, "PHASE1C_ALLOWED_PARENT", allowed_parent)
+
+    assert cli._validate_closure_only_request(
+        candidate_root=candidate_root,
+        receipt_sha256="a" * 64,
+        resume_candidate_root=None,
+    ) == (candidate_root.resolve(strict=True), "a" * 64)
+    with pytest.raises(ValueError, match="required together"):
+        cli._validate_closure_only_request(
+            candidate_root=candidate_root,
+            receipt_sha256=None,
+            resume_candidate_root=None,
+        )
+    with pytest.raises(ValueError, match="lowercase hexadecimal"):
+        cli._validate_closure_only_request(
+            candidate_root=candidate_root,
+            receipt_sha256="A" * 64,
+            resume_candidate_root=None,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli._validate_closure_only_request(
+            candidate_root=candidate_root,
+            receipt_sha256="a" * 64,
+            resume_candidate_root=candidate_root,
+        )
+
+
 def test_streamed_command_hashes_combined_output_without_shell_or_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,6 +458,10 @@ def test_targeted_tests_hash_sources_before_and_after_and_clean_basetemp(
     assert output_log_path.read_bytes() == b"synthetic output\n"
     assert tuple(path for path, _digest in witness.source_files) == cli.TARGETED_TEST_PATHS
     assert "tests/storage_v4/test_phase1c_progress.py" in cli.TARGETED_TEST_PATHS
+    assert (
+        "tests/storage_v4/test_phase1c_worker_result_resume.py"
+        in cli.TARGETED_TEST_PATHS
+    )
     required_global_paths = (
         "tests/test_paper_operator_cli_phase12_live.py",
         "tests/test_paper_runtime_candidate_identity.py",
@@ -544,7 +582,13 @@ def test_closure_runs_exact_order_once_and_proves_pinned_v9(
     )
     assert commands[4][1:] == ("scripts/generate_phase05_paper_evidence.py",)
     assert commands[5][1:] == ("scripts/generate_phase05_paper_evidence.py", "--check")
-    assert commands[-1] == ("git", "diff", "--check")
+    assert commands[-1] == (
+        "git",
+        "-c",
+        "core.whitespace=cr-at-eol",
+        "diff",
+        "--check",
+    )
     assert closure.payload()["global_pytest_runs"] == 1
     assert closure.v9.size_bytes == v9.stat().st_size
     assert closure.v9.before_sha256 == closure.v9.after_sha256
@@ -681,6 +725,68 @@ def test_main_binds_imported_golden_and_cumulative_accounting_without_workload(
     )
     assert config.cumulative_resume_candidate_root == resume_root.resolve(strict=True)
     assert config.historical_attempt_ingestion == cli.HISTORICAL_ATTEMPT_INGESTION
+
+
+def test_main_closure_only_skips_tests_preflight_workers_and_ingestion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    allowed_parent = tmp_path / "storage-v4-phase1c"
+    candidate_root = allowed_parent / "native-capacity-test" / "capacity-cumulative"
+    candidate_root.mkdir(parents=True)
+    expected_receipt_sha256 = "a" * 64
+    fake_result = object.__new__(cli.Phase1CCumulativeWorkerClosureResult)
+    captured: dict[str, object] = {}
+
+    def bomb(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("closure-only must bypass normal certification work")
+
+    def close(root: Path, *, expected_receipt_sha256: str) -> object:
+        captured["candidate_root"] = root
+        captured["receipt_sha256"] = expected_receipt_sha256
+        return fake_result
+
+    monkeypatch.setattr(cli, "PHASE1C_ALLOWED_PARENT", allowed_parent)
+    monkeypatch.setattr(cli, "_validate_heartbeat", bomb)
+    monkeypatch.setattr(cli, "_run_targeted_tests", bomb)
+    monkeypatch.setattr(cli, "_build_preflight_config", bomb)
+    monkeypatch.setattr(cli, "run_phase1c_certification", bomb)
+    monkeypatch.setattr(
+        cli,
+        "close_phase1c_cumulative_worker_result_from_authority",
+        close,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_cumulative_orphan_closure_payload",
+        lambda result: {
+            "closure_scope": "CUMULATIVE_WORKER_RESULT_ONLY",
+            "result_is_typed": isinstance(
+                result,
+                cli.Phase1CCumulativeWorkerClosureResult,
+            ),
+            "status": "STORAGE_V4_PHASE_1C_CUMULATIVE_ORPHAN_CLOSURE_READY",
+        },
+    )
+
+    assert cli.main(
+        [
+            "--closure-only-cumulative-candidate-root",
+            str(candidate_root),
+            "--closure-only-receipt-sha256",
+            expected_receipt_sha256,
+        ]
+    ) == 0
+    assert captured == {
+        "candidate_root": candidate_root.resolve(strict=True),
+        "receipt_sha256": expected_receipt_sha256,
+    }
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["status"] == (
+        "STORAGE_V4_PHASE_1C_CUMULATIVE_ORPHAN_CLOSURE_READY"
+    )
+    assert emitted["result_is_typed"] is True
 
 
 def test_progress_emits_canonical_json(capsys: pytest.CaptureFixture[str]) -> None:

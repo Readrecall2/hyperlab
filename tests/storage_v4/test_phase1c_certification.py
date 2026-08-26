@@ -65,7 +65,10 @@ def _write_minimal_repository(root: Path) -> None:
     files = {
         "pyproject.toml": b"[project]\nname = 'phase1c-test'\n",
         "requirements-runtime.lock": b"runtime==1\n",
+        "scripts/capture_phase1c_successor_baseline.py": b"# capture\n",
         "scripts/certify_storage_v4_phase1c.py": b"# certifier\n",
+        "scripts/certify_storage_v4_phase1c_successor.py": b"# successor\n",
+        "scripts/generate_phase05_paper_evidence.py": b"# phase05 generator\n",
         "scripts/generate_phase12_live_paper_artifacts.py": b"# generator\n",
         "src/hyperlab/__init__.py": b"# package\n",
         "src/hyperlab/nested.py": b"VALUE = 1\n",
@@ -194,7 +197,10 @@ def test_code_identity_is_stable_canonical_and_detects_source_drift(
     assert tuple(path for path, _size, _digest in first.files) == (
         "pyproject.toml",
         "requirements-runtime.lock",
+        "scripts/capture_phase1c_successor_baseline.py",
         "scripts/certify_storage_v4_phase1c.py",
+        "scripts/certify_storage_v4_phase1c_successor.py",
+        "scripts/generate_phase05_paper_evidence.py",
         "scripts/generate_phase12_live_paper_artifacts.py",
         "src/hyperlab/__init__.py",
         "src/hyperlab/nested.py",

@@ -66,6 +66,7 @@ from hyperlab.paper.storage_v4.phase1c_pipeline import (
     Phase1CWriter,
     inspect_phase1c_alignment,
 )
+from hyperlab.paper.storage_v4.phase1c_progress import BoundedAuditProgress
 from hyperlab.paper.storage_v4.raw_reference import RawSegmentRef
 from hyperlab.paper.storage_v4.raw_segment import (
     RawSegmentThresholds,
@@ -330,7 +331,7 @@ def _transient_bytes(root: Path) -> int:
         with os.scandir(directory) as entries:
             for entry in entries:
                 path = Path(entry.path)
-                entry_stat = entry.stat(follow_symlinks=False)
+                entry_stat = os.lstat(path)
                 if entry.is_symlink() or _is_link_or_reparse_point(path):
                     raise _error(
                         OfflineCapacityRunnerErrorCode.PATH_INVALID,
@@ -1416,26 +1417,38 @@ class OfflinePhase1CCapacityRunner:
 
                     startup_trace_recorder.stop_observing()
                     audit_started = time.perf_counter_ns()
-                    emit_snapshot(
-                        {
+
+                    def emit_audit_progress(payload: Mapping[str, object]) -> None:
+                        boundary_payload: dict[str, object] = {
                             "boundary_commit_count": manifest.commit_count,
-                            "phase": "capacity_full_audit",
-                            "status": "RUNNING",
                         }
+                        boundary_payload.update(payload)
+                        emit_snapshot(boundary_payload)
+
+                    audit_progress = BoundedAuditProgress(
+                        phase="capacity_full_audit",
+                        progress=emit_audit_progress,
+                        totals={},
                     )
-                    raw_audit = reopened_raw.full_audit()
-                    paper_audit = reopened_paper.full_audit()
+                    raw_audit = reopened_raw.full_audit(
+                        progress=emit_audit_progress,
+                    )
+                    paper_audit = reopened_paper.full_audit(
+                        progress=emit_audit_progress,
+                    )
                     resolver = DiskRawResolver(reopened_raw)
                     native_audit = audit_native_frames(
                         reopened_paper.iter_historical_frames(),
                         resolver,
                         terminal_seal.expectations,
+                        progress=emit_audit_progress,
                     )
                     oracle = compare_capacity_native_exact(
                         reopened_paper,
                         resolver,
                         manifest,
                         run_id=paper_config.run_id,
+                        progress=emit_audit_progress,
                     )
                     full_history_audit_ns = time.perf_counter_ns() - audit_started
                     if (
@@ -1456,6 +1469,10 @@ class OfflinePhase1CCapacityRunner:
                             OfflineCapacityRunnerErrorCode.INTEGRITY_DIVERGENCE,
                             "boundary raw, Paper, native, or workload audit diverged",
                         )
+                    audit_progress.complete(
+                        {},
+                        extra={"full_history_audit_ns": full_history_audit_ns},
+                    )
                     certification = Phase1CCertificationReport(
                         raw_startup=raw_startup,
                         paper_startup=paper_startup,
@@ -2624,22 +2641,26 @@ class OfflinePhase1CCapacityRunner:
 
                     startup_trace_recorder.stop_observing()
                     audit_started = time.perf_counter_ns()
-                    emit_snapshot(
-                        {"phase": "capacity_full_audit", "status": "RUNNING"}
+                    audit_progress = BoundedAuditProgress(
+                        phase="capacity_full_audit",
+                        progress=emit_snapshot,
+                        totals={},
                     )
-                    raw_audit = reopened_raw.full_audit()
-                    paper_audit = reopened_paper.full_audit()
+                    raw_audit = reopened_raw.full_audit(progress=emit_snapshot)
+                    paper_audit = reopened_paper.full_audit(progress=emit_snapshot)
                     resolver = DiskRawResolver(reopened_raw)
                     native_audit = audit_native_frames(
                         reopened_paper.iter_historical_frames(),
                         resolver,
                         terminal_seal.expectations,
+                        progress=emit_snapshot,
                     )
                     oracle = compare_capacity_native_exact(
                         reopened_paper,
                         resolver,
                         manifest,
                         run_id=paper_config.run_id,
+                        progress=emit_snapshot,
                     )
                     full_history_audit_ns = time.perf_counter_ns() - audit_started
                     if (
@@ -2660,6 +2681,10 @@ class OfflinePhase1CCapacityRunner:
                             OfflineCapacityRunnerErrorCode.INTEGRITY_DIVERGENCE,
                             "exhaustive raw, Paper, native, or workload audit diverged",
                         )
+                    audit_progress.complete(
+                        {},
+                        extra={"full_history_audit_ns": full_history_audit_ns},
+                    )
                     certification = Phase1CCertificationReport(
                         raw_startup=raw_startup,
                         paper_startup=paper_startup,

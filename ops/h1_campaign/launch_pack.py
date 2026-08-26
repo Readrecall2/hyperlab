@@ -514,7 +514,7 @@ def render_tabby_operator_block(handoff: Mapping[str, object]) -> str:
     campaign = str(remote["campaign_root"])
     service = str(checked["service_name"])
     bundle_name = str(bundle["filename"])
-    return f"""# LOCATION: Tabby - VPS, Bash, logged in as hyperlab.
+    return rf"""# LOCATION: Tabby - VPS, Bash, logged in as hyperlab.
 # EXPECTED_DURATION: 10-25 minutes to arm; MAXIMUM_DURATION: 45 minutes.
 # PROMPTS: sudo may request the hyperlab password; pip is non-interactive and bounded.
 # MONITORING: command output, then the exact second-Tabby watch command printed at the end.
@@ -565,9 +565,9 @@ cd "$H1_SOURCE_ROOT"
 bash ops/h1_campaign/vps-install.sh "$H1_INCOMING_ROOT"
 
 # POINT STATUS (read-only):
-# bash '{source}/ops/h1_campaign/monitor.sh' '{incoming}'/handoff.json
+# bash '{source}/ops/h1_campaign/monitor.sh' '{incoming}/handoff.json'
 # SECOND TABBY TAB (continuous, read-only):
-# watch -n 10 -- bash '{source}/ops/h1_campaign/monitor.sh' '{incoming}'/handoff.json
+# watch -n 10 -- bash '{source}/ops/h1_campaign/monitor.sh' '{incoming}/handoff.json'
 # GRACEFUL STOP (SIGINT -> authenticated tail -> INTERRUPTED_RECOVERABLE):
 # sudo systemctl stop '{service}'
 # RESUME THE SAME CAMPAIGN MANIFEST AND RAW CHAIN:

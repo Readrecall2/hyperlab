@@ -387,6 +387,8 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "df -PB1" in tabby
     assert "git clone --no-checkout" in tabby
     assert "checkout --detach" in tabby
+    assert r"printf '%s  %s\n'" in tabby
+    assert "\\\n  \"$HOME/hyperlab-h1/sources\"" in tabby
     assert "watch -n 10" in tabby
     assert "sudo systemctl stop" in tabby and "sudo systemctl start" in tabby
     assert "Test-NetConnection" not in tabby

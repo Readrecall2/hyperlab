@@ -44,15 +44,20 @@ _PUBLIC_HTTP_HOSTS = {
     "data-api.polymarket.com",
     "external-api.kalshi.com",
     "gamma-api.polymarket.com",
+    "mainnet.zklighter.elliot.ai",
 }
 _PUBLIC_WEBSOCKET_HOSTS = {
     "api.hyperliquid.xyz",
+    "mainnet.zklighter.elliot.ai",
     "ws-subscriptions-clob.polymarket.com",
 }
 _PUBLIC_WEBSOCKET_URLS = {
     HYPERLIQUID_PUBLIC_WEBSOCKET_URL,
     POLYMARKET_PUBLIC_WEBSOCKET_URL,
+    "wss://mainnet.zklighter.elliot.ai/stream",
 }
+_LIGHTER_PUBLIC_HTTP_PATH = "/api/v1/orderBooks"
+_LIGHTER_PUBLIC_CHANNEL = re.compile(r"^(?:order_book|ticker|market_stats|trade)/[0-9]+$")
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}$")
 
 
@@ -131,6 +136,13 @@ class PublicHttpRequest:
             raise ValueError("private/account/order route is forbidden")
         if self.method == "POST" and self.url != HYPERLIQUID_PUBLIC_HTTP_URL:
             raise ValueError("POST is restricted to the public Hyperliquid info surface")
+        if parsed.hostname == "mainnet.zklighter.elliot.ai" and (
+            self.method != "GET"
+            or parsed.path != _LIGHTER_PUBLIC_HTTP_PATH
+            or self.json_body is not None
+            or set(dict(self.query)) - {"filter", "market_id"}
+        ):
+            raise ValueError("Lighter HTTP is restricted to documented public market metadata")
         if self.method == "GET" and self.json_body is not None:
             raise ValueError("GET public requests cannot carry a JSON body")
         if any(type(key) is not str or not key or type(value) is not str for key, value in self.query):
@@ -161,6 +173,13 @@ class PublicWebsocketSubscription:
         forbidden_markers = ('"user"', '"orders"', '"fills"', '"twapstates"')
         if any(marker in serialized for marker in forbidden_markers):
             raise ValueError("credentialed or user-scoped WebSocket subscription is forbidden")
+        if parsed.hostname == "mainnet.zklighter.elliot.ai" and (
+            set(self.payload) != {"channel", "type"}
+            or self.payload.get("type") != "subscribe"
+            or type(self.payload.get("channel")) is not str
+            or _LIGHTER_PUBLIC_CHANNEL.fullmatch(cast(str, self.payload["channel"])) is None
+        ):
+            raise ValueError("Lighter WebSocket subscription is not an allowlisted public channel")
 
 
 def canonical_hyperliquid_instrument(coin: str) -> str:
@@ -742,7 +761,10 @@ class KalshiPublicAdapter:
 
 
 def all_public_route_specs() -> tuple[PublicHttpRequest | PublicWebsocketSubscription, ...]:
+    from .lighter import LighterPublicAdapter
+
     hyperliquid = HyperliquidPublicAdapter()
+    lighter = LighterPublicAdapter()
     polymarket = PolymarketPublicAdapter()
     kalshi = KalshiPublicAdapter()
     return (
@@ -750,6 +772,11 @@ def all_public_route_specs() -> tuple[PublicHttpRequest | PublicWebsocketSubscri
         *hyperliquid.websocket_subscriptions(
             feeds=("bbo", "l2_book", "trades", "all_mids", "active_asset_context"),
             instruments=("BTC",),
+        ),
+        *lighter.public_http_requests(feeds=("metadata",), market_indices=(0,)),
+        *lighter.websocket_subscriptions(
+            feeds=("order_book", "ticker", "market_stats", "trades"),
+            market_indices=(0,),
         ),
         polymarket.market_census_request(limit=1),
         polymarket.event_census_request(limit=1),

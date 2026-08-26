@@ -1,0 +1,1 @@
+{"channel":"order_book:0","fixture_label":"SYNTHETIC/FIXTURE","last_updated_at":1774884082309144,"offset":100,"order_book":{"asks":[{"price":"2064.54","size":"0.3285"}],"begin_nonce":900,"bids":[{"price":"2064.30","size":"1.0392"}],"code":0,"last_updated_at":1774884082309144,"nonce":918,"offset":100},"timestamp":1774884082326,"type":"subscribed/order_book"}

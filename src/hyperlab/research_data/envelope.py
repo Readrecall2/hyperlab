@@ -19,6 +19,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 class Venue(StrEnum):
     HYPERLIQUID = "hyperliquid"
+    LIGHTER = "lighter"
     POLYMARKET = "polymarket"
     KALSHI = "kalshi"
 
@@ -411,7 +412,18 @@ class SessionEnvelopeFactory:
         source_cursor: str | None = None,
         source_event_id: str | None = None,
         provenance: CaptureProvenance | None = None,
+        infer_source_sequence_continuity: bool = True,
+        explicit_gap_detected: bool = False,
+        explicit_gap_reason: str | None = None,
     ) -> PublicDataEnvelope:
+        if type(infer_source_sequence_continuity) is not bool:
+            raise TypeError("source sequence continuity mode must be a boolean")
+        if type(explicit_gap_detected) is not bool:
+            raise TypeError("explicit gap state must be a boolean")
+        if explicit_gap_detected and explicit_gap_reason is None:
+            raise ValueError("an explicit gap requires an explicit reason")
+        if not explicit_gap_detected and explicit_gap_reason is not None:
+            raise ValueError("an explicit gap reason requires an explicit gap")
         if self._last_monotonic_ns is not None and receive_monotonic_ns < self._last_monotonic_ns:
             raise ValueError("receive monotonic time regressed within the collector")
         self._last_monotonic_ns = receive_monotonic_ns
@@ -434,10 +446,10 @@ class SessionEnvelopeFactory:
             while len(self._seen_order) > self._dedup_capacity:
                 self._seen.remove(self._seen_order.popleft())
 
-        gap = False
-        reason: str | None = None
+        gap = explicit_gap_detected
+        reason: str | None = explicit_gap_reason
         sequence_key = (feed_type, instrument_id or market_id or "")
-        if type(source_sequence) is int:
+        if infer_source_sequence_continuity and type(source_sequence) is int:
             previous = self._last_source_sequence.get(sequence_key)
             if previous is not None and source_sequence > previous + 1:
                 gap = True
@@ -448,7 +460,7 @@ class SessionEnvelopeFactory:
             self._last_source_sequence[sequence_key] = source_sequence
         if duplicate:
             reason = "DUPLICATE_SOURCE_EVENT"
-        elif self._reconnect_pending:
+        elif self._reconnect_pending and reason is None:
             reason = "RECONNECT_BOUNDARY"
 
         state = GapDuplicateReconnectState(

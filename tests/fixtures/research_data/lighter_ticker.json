@@ -1,0 +1,1 @@
+{"channel":"ticker:0","fixture_label":"SYNTHETIC/FIXTURE","last_updated_at":1774883844921166,"nonce":9182249734,"ticker":{"a":{"price":"2064.48","size":"0.4950"},"b":{"price":"2064.30","size":"1.0392"},"last_updated_at":1774883844921166,"s":"ETH"},"timestamp":1774883844933,"type":"update/ticker"}

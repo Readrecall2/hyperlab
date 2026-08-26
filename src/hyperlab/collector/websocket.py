@@ -29,14 +29,23 @@ def _close_rejected_connection(connection: Any) -> None:
         connection.close()
 
 
-def _open_public_websocket(url: str, timeout_seconds: float) -> Any:
+def _open_public_websocket(
+    url: str,
+    timeout_seconds: float,
+    *,
+    allow_environment_proxy: bool = True,
+) -> Any:
     import websocket
 
+    if type(allow_environment_proxy) is not bool:
+        raise TypeError("environment proxy policy must be a boolean")
+    proxy_options = {} if allow_environment_proxy else {"http_no_proxy": ["*"]}
     connection = websocket.create_connection(
         url,
         timeout=timeout_seconds,
         enable_multithread=True,
         redirect_limit=PUBLIC_WEBSOCKET_REDIRECT_LIMIT,
+        **proxy_options,
     )
     getstatus = getattr(connection, "getstatus", None)
     if not callable(getstatus):
@@ -516,11 +525,14 @@ class UrlWebsocketClientFactory:
         venue: str | None = None,
         socket_role: str | None = None,
         reader_name: str | None = None,
+        allow_environment_proxy: bool = True,
     ) -> None:
         if not url.startswith("wss://"):
             raise ValueError("public websocket URL must use wss")
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be positive")
+        if type(allow_environment_proxy) is not bool:
+            raise TypeError("environment proxy policy must be a boolean")
         self.url = url
         self.queue_capacity = queue_capacity
         self._clock = clock
@@ -528,6 +540,7 @@ class UrlWebsocketClientFactory:
         self._venue = venue
         self._socket_role = socket_role
         self._reader_name = reader_name
+        self._allow_environment_proxy = allow_environment_proxy
 
     def _connect(
         self,
@@ -538,7 +551,11 @@ class UrlWebsocketClientFactory:
     ) -> WebsocketClientSocket:
         if network != "public":
             raise ValueError("URL websocket factory only supports the public network label")
-        connection = _open_public_websocket(self.url, timeout_seconds)
+        connection = _open_public_websocket(
+            self.url,
+            timeout_seconds,
+            allow_environment_proxy=self._allow_environment_proxy,
+        )
         return WebsocketClientSocket(
             connection,
             queue_capacity=self.queue_capacity,

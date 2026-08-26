@@ -99,6 +99,21 @@ Incentives use a separate ledger. `hypothetical_reward` is research-only,
 `realizable_reward` stays unpresumed, and primary economics always uses
 `reward=0`.
 
+### Lighter
+
+The V1 adapter permits only `GET /api/v1/orderBooks` plus the credential-free
+mainnet WebSocket subscriptions `order_book/{market}`, `ticker/{market}`,
+`market_stats/{market}` and `trade/{market}`. It uses no SDK. The documented
+`begin_nonce == previous nonce` rule is enforced exactly for order-book state
+changes; API-server `offset` is preserved but never treated as a contiguous
+exchange sequence. Gap or offset regression freezes the market and closes the
+captured prefix fail-closed. Reconnects create explicit connection epochs.
+
+Account types, fees and order delays are frozen as documentary scenarios only.
+The comparable 100/250/500/1000 ms bands are versioned Ghost scenarios, not
+observed tier latency. See `docs/LIGHTER_PUBLIC_PROBE_V1.md` and
+`config/lighter-public-contract-v1.json`.
+
 ## Semantic catalogue and K4 scanner
 
 The catalogue represents equivalent markets, mutual exclusion, exhaustive

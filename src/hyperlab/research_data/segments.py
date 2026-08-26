@@ -688,6 +688,25 @@ class ResearchSegmentWriter:
     def stored_segment_bytes(self) -> int:
         return sum(item.stored_bytes for item in self._segments)
 
+    @property
+    def pending_frame_count(self) -> int:
+        return len(self._frames)
+
+    def would_rotate(self, envelope: PublicDataEnvelope) -> bool:
+        """Return whether admitting this envelope would first publish the current tail."""
+
+        frame_size = len(envelope.canonical_bytes()) + 40
+        if frame_size + 92 > self.max_segment_bytes:
+            raise ResearchDataCapacityError("one frame exceeds max_segment_bytes")
+        return bool(self._frames) and (
+            self._frame_bytes + frame_size + 92 > self.max_segment_bytes
+            or (
+                self._segment_started_monotonic_ns is not None
+                and envelope.receive_monotonic_ns - self._segment_started_monotonic_ns
+                >= self.rotation_ns
+            )
+        )
+
     def _fault(self, point: str) -> None:
         if self._fault_injector is not None:
             self._fault_injector(point)
@@ -829,15 +848,7 @@ class ResearchSegmentWriter:
         ):
             raise ValueError("writer monotonic receive time regressed within a session")
         frame_size = len(envelope.canonical_bytes()) + 40
-        if frame_size + 92 > self.max_segment_bytes:
-            raise ResearchDataCapacityError("one frame exceeds max_segment_bytes")
-        should_rotate = bool(self._frames) and (
-            self._frame_bytes + frame_size + 92 > self.max_segment_bytes
-            or (
-                self._segment_started_monotonic_ns is not None
-                and envelope.receive_monotonic_ns - self._segment_started_monotonic_ns >= self.rotation_ns
-            )
-        )
+        should_rotate = self.would_rotate(envelope)
         if should_rotate:
             self.flush()
         if not self.can_accept(envelope):

@@ -23,6 +23,13 @@ The frame also binds venue/feed, canonical instrument or market, source time,
 source sequence/cursor/event ID when actually provided, collector/session,
 source-metadata version, and capture provenance.
 
+For Lighter order-book frames, `source_sequence` is the exact documented
+matching-engine `nonce`; `source_cursor` carries exact `begin_nonce` and
+API-server `offset`. Generic `+1` sequence inference is disabled because the
+documented rule is `current.begin_nonce == previous.nonce`. No nonce or offset
+is invented. A continuity break is preserved as a final gap frame and freezes
+the captured prefix.
+
 ## Segment
 
 Suffix: `.rdpseg`. Codec profile: `zlib-fixed-raw-v1` (level 9, raw DEFLATE,

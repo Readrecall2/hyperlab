@@ -1,0 +1,81 @@
+
+{
+  "account_types": {
+    "plus": {
+      "documented_maker_cancel_latency_ms": 200,
+      "documented_maker_taker_fee_bps": "0.5",
+      "documented_taker_latency_ms": 300
+    },
+    "premium": {
+      "documented_maker_cancel_latency_ms": 0,
+      "tiers": [
+        {"lit": 0, "maker_fee_percent": "0.0040", "taker_fee_percent": "0.0280", "taker_latency_ms": 200},
+        {"lit": 1000, "maker_fee_percent": "0.0039", "taker_fee_percent": "0.0273", "taker_latency_ms": 195},
+        {"lit": 3000, "maker_fee_percent": "0.0038", "taker_fee_percent": "0.0266", "taker_latency_ms": 190},
+        {"lit": 10000, "maker_fee_percent": "0.0036", "taker_fee_percent": "0.0252", "taker_latency_ms": 180},
+        {"lit": 30000, "maker_fee_percent": "0.0034", "taker_fee_percent": "0.0238", "taker_latency_ms": 170},
+        {"lit": 100000, "maker_fee_percent": "0.0032", "taker_fee_percent": "0.0224", "taker_latency_ms": 160},
+        {"lit": 300000, "maker_fee_percent": "0.0030", "taker_fee_percent": "0.0210", "taker_latency_ms": 150},
+        {"lit": 500000, "maker_fee_percent": "0.0028", "taker_fee_percent": "0.0196", "taker_latency_ms": 140}
+      ]
+    },
+    "standard": {
+      "documented_maker_cancel_latency_ms": 200,
+      "documented_maker_fee_percent": "0",
+      "documented_taker_fee_percent": "0",
+      "documented_taker_latency_ms": 300
+    }
+  },
+  "capabilities": {
+    "order_book": {
+      "continuity": "CURRENT_BEGIN_NONCE_EQUALS_PREVIOUS_NONCE",
+      "documented_batch_interval_ms": 50,
+      "offset_semantics": "API_SERVER_CURSOR_INCREASES_BUT_NEED_NOT_BE_CONTIGUOUS"
+    },
+    "public_rest": ["orderBooks", "orderBookDetails", "recentTrades"],
+    "public_websocket": ["order_book", "ticker", "market_stats", "trade"]
+  },
+  "capture_date": "2026-08-26",
+  "comparable_scenarios_ms": [100, 250, 500, 1000],
+  "document_pages": [
+    {"page_update_label_at_capture": "Updated 15 days ago", "url": "https://apidocs.lighter.xyz/docs/websocket-reference"},
+    {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/orderbooks"},
+    {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/orderbookdetails"},
+    {"page_update_label_at_capture": "Updated 3 months ago", "url": "https://apidocs.lighter.xyz/reference/recenttrades"},
+    {"page_update_label_at_capture": "Updated about 2 hours ago", "url": "https://apidocs.lighter.xyz/docs/account-types"},
+    {"page_update_label_at_capture": "Updated about 1 hour ago", "url": "https://apidocs.lighter.xyz/docs/rate-limits"},
+    {"page_update_label_at_capture": "current page retrieved 2026-08-26", "url": "https://docs.lighter.xyz/trading/trading-fees"}
+  ],
+  "forbidden_surfaces": [
+    "API_KEY",
+    "ACCOUNT_CHANNEL",
+    "AUTH_TOKEN",
+    "PRIVATE_ORDER_POSITION_CHANNEL",
+    "SIGNER_OR_SIGNING_SDK",
+    "SEND_TX_OR_SEND_TX_BATCH",
+    "CREATE_CANCEL_MODIFY_ORDER",
+    "PROXY_OR_READONLY_REGION_BYPASS"
+  ],
+  "metadata_version": "lighter-official-public-api-2026-08-26-v1",
+  "rate_limits_documentary": {
+    "standard_rest_requests_per_rolling_minute": 60,
+    "websocket_connections_per_ip": 255,
+    "websocket_max_client_messages_per_minute": 200,
+    "websocket_max_inflight_messages": 50,
+    "websocket_subscriptions_per_connection": 500
+  },
+  "scenario_classification": "VERSIONED_HYPOTHETICAL_NOT_ACCOUNT_OBSERVATION",
+  "schemas": {
+    "market_stats_websocket_required": ["channel", "market_stats.market_id", "timestamp"],
+    "order_book_websocket_required": ["channel", "order_book.asks", "order_book.begin_nonce", "order_book.bids", "order_book.code", "order_book.last_updated_at", "order_book.nonce", "order_book.offset"],
+    "order_books_http_market_required": ["maker_fee", "market_id", "market_type", "min_base_amount", "min_quote_amount", "status", "supported_price_decimals", "supported_quote_decimals", "supported_size_decimals", "symbol", "taker_fee"],
+    "ticker_websocket_required": ["channel", "last_updated_at", "nonce", "ticker"],
+    "trade_websocket_required": ["channel", "liquidation_trades", "nonce", "trades"]
+  },
+  "schema_version": 1,
+  "scope": "DOCUMENTARY_NOT_OBSERVED_ACCOUNT_ACCESS",
+  "timestamp_interpretation": {
+    "last_updated_at": "DOCUMENTED_EXAMPLES_INTERPRETED_AS_UNIX_MICROSECONDS",
+    "timestamp": "DOCUMENTED_EXAMPLES_INTERPRETED_AS_UNIX_MILLISECONDS"
+  }
+}

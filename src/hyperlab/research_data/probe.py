@@ -27,6 +27,13 @@ from .adapters import (
 )
 from .canonical import CanonicalValue, canonical_json_bytes
 from .envelope import CaptureProvenance, SessionEnvelopeFactory, Venue
+from .lighter import (
+    LIGHTER_METADATA_VERSION,
+    LIGHTER_PUBLIC_HTTP_URL,
+    LIGHTER_PUBLIC_WEBSOCKET_URL,
+    LighterPublicAdapter,
+    lighter_market_census,
+)
 from .segments import (
     SEGMENT_SUFFIX,
     ManifestRecord,
@@ -63,6 +70,8 @@ class ProbeConfig:
     rotation_seconds: float
     progress_interval_seconds: float
     collection_id: str | None = None
+    max_frames: int = 50_000
+    max_segments: int = 100
 
     def __post_init__(self) -> None:
         if not self.feeds:
@@ -79,16 +88,24 @@ class ProbeConfig:
             raise ValueError("explicit instruments/markets or a bounded census is required")
         if self.census_limit < 0 or self.census_limit > 100:
             raise ValueError("probe census limit must be within 0..100")
-        if self.duration_seconds <= 0 or self.duration_seconds > 300:
-            raise ValueError("probe duration must be within 1..300 seconds")
+        duration_limit = 600 if self.venue is Venue.LIGHTER else 300
+        if self.duration_seconds <= 0 or self.duration_seconds > duration_limit:
+            raise ValueError(
+                f"{self.venue.value} probe duration must be within 1..{duration_limit} seconds"
+            )
         if self.max_bytes < 4_096 or self.max_segment_bytes < 1_024:
             raise ValueError("probe and segment byte bounds are too small")
         if self.max_segment_bytes > self.max_bytes:
             raise ValueError("segment byte bound cannot exceed total byte bound")
         if self.rotation_seconds <= 0 or self.progress_interval_seconds <= 0:
             raise ValueError("probe rotation and progress intervals must be positive")
+        if self.max_frames <= 0 or self.max_frames > 50_000:
+            raise ValueError("probe frame bound must be within 1..50000")
+        if self.max_segments <= 0 or self.max_segments > 100:
+            raise ValueError("probe segment bound must be within 1..100")
         supported = {
             Venue.HYPERLIQUID: HyperliquidPublicAdapter.supported_feeds,
+            Venue.LIGHTER: LighterPublicAdapter.supported_feeds,
             Venue.POLYMARKET: PolymarketPublicAdapter.supported_feeds,
             Venue.KALSHI: KalshiPublicAdapter.supported_feeds,
         }[self.venue]
@@ -166,6 +183,12 @@ class _Counters:
         factory.begin_reconnect()
 
 
+class _ProbeBoundaryReached(RuntimeError):
+    def __init__(self, terminal_health: str) -> None:
+        super().__init__(terminal_health)
+        self.terminal_health = terminal_health
+
+
 def _atomic_json(path: Path, body: Mapping[str, object]) -> None:
     value = canonical_json_bytes(body)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -238,9 +261,39 @@ def _default_http_session() -> HttpSession:
     return cast(HttpSession, session)
 
 
+def _default_lighter_http_session() -> HttpSession:
+    import requests
+
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({"User-Agent": "HyperLab-Lighter-Public-Probe-V1-DIRECT-ONLY"})
+    return cast(HttpSession, session)
+
+
 def _append(writer: ResearchSegmentWriter, counters: _Counters, envelope: Any) -> None:
     writer.append(envelope)
     counters.observe(envelope)
+
+
+def _append_lighter_bounded(
+    writer: ResearchSegmentWriter,
+    counters: _Counters,
+    envelope: Any,
+    config: ProbeConfig,
+) -> None:
+    if writer.segment_count >= config.max_segments:
+        raise _ProbeBoundaryReached("MAX_SEGMENTS_REACHED")
+    if (
+        writer.segment_count == config.max_segments - 1
+        and writer.would_rotate(envelope)
+    ):
+        writer.flush()
+        raise _ProbeBoundaryReached("MAX_SEGMENTS_REACHED")
+    _append(writer, counters, envelope)
+    if envelope.state.gap_detected:
+        raise _ProbeBoundaryReached("CONTINUITY_BROKEN_FROZEN")
+    if writer.frame_count >= config.max_frames:
+        raise _ProbeBoundaryReached("MAX_FRAMES_REACHED")
 
 
 def _raw_json(value: object) -> bytes:
@@ -507,6 +560,176 @@ def _hyperliquid_probe(
     if not connected_once and last_connection_error is not None and not stop_requested():
         raise ConnectionError("Hyperliquid public WebSocket never connected") from last_connection_error
     return adapter.unavailable_public_global_labels
+
+
+def _lighter_probe(
+    config: ProbeConfig,
+    *,
+    factory: SessionEnvelopeFactory,
+    writer: ResearchSegmentWriter,
+    counters: _Counters,
+    deadline: float,
+    stop_requested: Callable[[], bool],
+    progress: Callable[[int], None],
+    session: HttpSession,
+) -> tuple[str, ...]:
+    import websocket
+
+    from hyperlab.collector.websocket import UrlWebsocketClientFactory
+
+    adapter = LighterPublicAdapter()
+    http_provenance = CaptureProvenance(
+        factory.provenance.collection_id,
+        f"{LIGHTER_PUBLIC_HTTP_URL}/orderBooks",
+        "PUBLIC_HTTP",
+    )
+    ws_provenance = CaptureProvenance(
+        factory.provenance.collection_id,
+        LIGHTER_PUBLIC_WEBSOCKET_URL,
+        "PUBLIC_WEBSOCKET",
+    )
+    metadata_requests = adapter.public_http_requests(
+        feeds=config.feeds,
+        market_indices=(),
+    )
+    market_indices: tuple[int, ...]
+    if metadata_requests:
+        raw_metadata = _execute_http(
+            session,
+            metadata_requests[0],
+            deadline=deadline,
+            max_response_bytes=_http_response_bound(config),
+        )
+        catalog = lighter_market_census(raw_metadata, limit=100)
+        metadata_envelope = adapter.envelope_from_http(
+            raw_metadata,
+            factory=factory,
+            receive_timestamp_utc_ns=time.time_ns(),
+            receive_monotonic_ns=time.monotonic_ns(),
+            provenance=http_provenance,
+        )
+        _append_lighter_bounded(writer, counters, metadata_envelope, config)
+        by_id = {item.market_id: item for item in catalog}
+        if config.instruments:
+            try:
+                market_indices = tuple(int(item) for item in config.instruments)
+            except ValueError as error:
+                raise ValueError("Lighter instruments must be decimal market indices") from error
+            missing = sorted(set(market_indices) - set(by_id))
+            if missing:
+                raise ValueError(f"Lighter metadata omitted requested market indices: {missing}")
+        else:
+            active = tuple(item.market_id for item in catalog if item.status.lower() == "active")
+            market_indices = active[: config.census_limit]
+            if not market_indices:
+                raise LookupError("Lighter metadata exposed no active public market in census")
+    else:
+        if not config.instruments:
+            raise ValueError("Lighter census requires the public metadata feed")
+        try:
+            market_indices = tuple(int(item) for item in config.instruments)
+        except ValueError as error:
+            raise ValueError("Lighter instruments must be decimal market indices") from error
+
+    subscriptions = adapter.websocket_subscriptions(
+        feeds=config.feeds,
+        market_indices=market_indices,
+    )
+    if not subscriptions:
+        return ("LIGHTER_WEBSOCKET_NOT_REQUESTED",)
+    connector = UrlWebsocketClientFactory(
+        LIGHTER_PUBLIC_WEBSOCKET_URL,
+        queue_capacity=1_024,
+        venue="lighter",
+        socket_role="lighter-public-probe-v1",
+        allow_environment_proxy=False,
+    )
+    delays = (0.25, 0.5, 1.0, 2.0, 4.0)
+    attempt = 0
+    connected_once = False
+    last_connection_error: BaseException | None = None
+    last_ping = time.monotonic()
+    last_progress = last_ping
+    socket: Any = None
+    try:
+        while time.monotonic() < deadline and not stop_requested():
+            if socket is None:
+                try:
+                    socket = connector.connect(
+                        "public", max(0.05, min(10.0, deadline - time.monotonic()))
+                    )
+                    for subscription in subscriptions:
+                        socket.send_json(dict(subscription.payload))
+                    attempt = 0
+                    last_connection_error = None
+                    connected_once = True
+                except (
+                    ConnectionError,
+                    OSError,
+                    TimeoutError,
+                    websocket.WebSocketException,
+                ) as caught:
+                    last_connection_error = caught
+                    if socket is not None:
+                        socket.close()
+                        socket = None
+                    if time.monotonic() >= deadline:
+                        raise ConnectionError(
+                            "Lighter public WebSocket remained unavailable"
+                        ) from caught
+                    time.sleep(min(delays[min(attempt, len(delays) - 1)], max(deadline - time.monotonic(), 0)))
+                    attempt += 1
+                    continue
+            try:
+                received = socket.receive(timeout_seconds=1.0)
+                snapshot = socket.telemetry_snapshot()
+                counters.queue_high_water = max(
+                    counters.queue_high_water, int(snapshot.get("queue_high_water", 0))
+                )
+                now = time.monotonic()
+                if received is not None:
+                    raw_message = received.raw_message.encode("utf-8")
+                    if len(raw_message) > _http_response_bound(config):
+                        raise ResearchDataCapacityError(
+                            "public WebSocket frame exceeds its raw byte bound"
+                        )
+                    envelope = adapter.envelope_from_websocket(
+                        raw_message,
+                        factory=factory,
+                        receive_timestamp_utc_ns=_datetime_to_ns(received.received_time),
+                        receive_monotonic_ns=(
+                            time.monotonic_ns()
+                            if received.received_monotonic_ns is None
+                            else received.received_monotonic_ns
+                        ),
+                        provenance=ws_provenance,
+                    )
+                    _append_lighter_bounded(writer, counters, envelope, config)
+                if now - last_ping >= 60.0:
+                    socket.send_json({"type": "ping"})
+                    last_ping = now
+                if now - last_progress >= config.progress_interval_seconds:
+                    progress(writer.frame_count)
+                    last_progress = now
+            except BufferError:
+                snapshot = socket.telemetry_snapshot()
+                counters.queue_high_water = max(
+                    counters.queue_high_water, int(snapshot.get("queue_high_water", 0))
+                )
+                raise
+            except (ConnectionError, OSError, TimeoutError, websocket.WebSocketException):
+                socket.close()
+                socket = None
+                counters.begin_reconnect(factory)
+                adapter.begin_connection_epoch()
+    finally:
+        if socket is not None:
+            socket.close()
+    if not connected_once and last_connection_error is not None and not stop_requested():
+        raise ConnectionError("Lighter public WebSocket never connected") from last_connection_error
+    if not stop_requested() and time.monotonic() >= deadline:
+        raise _ProbeBoundaryReached("MAX_DURATION_REACHED")
+    return ()
 
 
 def _polymarket_probe(
@@ -936,11 +1159,13 @@ def run_public_probe(
     collection_id = config.collection_id or f"rdp-{config.venue.value}-{uuid4().hex}"
     source_versions = {
         Venue.HYPERLIQUID: HYPERLIQUID_METADATA_VERSION,
+        Venue.LIGHTER: LIGHTER_METADATA_VERSION,
         Venue.POLYMARKET: POLYMARKET_METADATA_VERSION,
         Venue.KALSHI: KALSHI_METADATA_VERSION,
     }
     source_urls = {
         Venue.HYPERLIQUID: HYPERLIQUID_PUBLIC_HTTP_URL,
+        Venue.LIGHTER: LIGHTER_PUBLIC_HTTP_URL,
         Venue.POLYMARKET: POLYMARKET_GAMMA_PUBLIC_URL,
         Venue.KALSHI: KALSHI_PUBLIC_HTTP_URL,
     }
@@ -961,7 +1186,12 @@ def run_public_probe(
     error: str | None = None
     limitations: tuple[str, ...] = ()
     manifest: ManifestRecord | None = None
-    session = http_session_factory()
+    selected_http_session_factory = (
+        _default_lighter_http_session
+        if config.venue is Venue.LIGHTER and http_session_factory is _default_http_session
+        else http_session_factory
+    )
+    session = selected_http_session_factory()
     writer = ResearchSegmentWriter(
         raw_root,
         collection_id=collection_id,
@@ -983,6 +1213,8 @@ def run_public_probe(
             "gaps": counters.gaps,
             "limitations": [],
             "manifest_sha256": None,
+            "max_frames": config.max_frames,
+            "max_segments": config.max_segments,
             "queue_high_water": counters.queue_high_water,
             "reconnects": counters.reconnects,
             "requested_duration_seconds": config.duration_seconds,
@@ -998,10 +1230,44 @@ def run_public_probe(
         progress(frame_count)
 
     publish_running(0)
+    _atomic_json(
+        reports_root / "probe-config.json",
+        {
+            "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+            "census_limit": config.census_limit,
+            "duration_seconds": config.duration_seconds,
+            "feeds": list(config.feeds),
+            "instruments": list(config.instruments),
+            "max_bytes": config.max_bytes,
+            "max_frames": config.max_frames,
+            "max_segment_bytes": config.max_segment_bytes,
+            "max_segments": config.max_segments,
+            "progress_interval_seconds": str(config.progress_interval_seconds),
+            "proxy_policy": (
+                "DIRECT_ONLY_ENVIRONMENT_PROXY_DISABLED"
+                if config.venue is Venue.LIGHTER
+                else "VENUE_DEFAULT"
+            ),
+            "rotation_seconds": str(config.rotation_seconds),
+            "schema_version": 1,
+            "venue": config.venue.value,
+        },
+    )
     try:
         deadline = started + config.duration_seconds
         if config.venue is Venue.HYPERLIQUID:
             limitations = _hyperliquid_probe(
+                config,
+                factory=factory,
+                writer=writer,
+                counters=counters,
+                deadline=deadline,
+                stop_requested=stop_requested,
+                progress=publish_running,
+                session=session,
+            )
+        elif config.venue is Venue.LIGHTER:
+            limitations = _lighter_probe(
                 config,
                 factory=factory,
                 writer=writer,
@@ -1038,6 +1304,9 @@ def run_public_probe(
         manifest = writer.close()
     except KeyboardInterrupt:
         terminal = "INTERRUPTED_RECOVERABLE"
+        manifest = writer.close()
+    except _ProbeBoundaryReached as caught:
+        terminal = caught.terminal_health
         manifest = writer.close()
     except ResearchDataCapacityError as caught:
         terminal = "MAX_BYTES_REACHED"

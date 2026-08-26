@@ -7,6 +7,7 @@ from typing import Annotated
 import typer
 
 from .envelope import Venue
+from .lighter_report import LIGHTER_GREEN, write_lighter_probe_report
 from .probe import ProbeConfig, run_public_probe
 
 research_data_app = typer.Typer(
@@ -14,6 +15,26 @@ research_data_app = typer.Typer(
     help="Collecte locale bornée PUBLIC_DATA_ONLY et outils offline du Research Data Plane V1.",
     no_args_is_help=True,
 )
+
+
+@research_data_app.command("lighter-report")
+def lighter_report(
+    output_root: Annotated[
+        Path,
+        typer.Option(
+            "--output-root",
+            help="Sortie existante d'un probe Lighter; vérification strictement offline.",
+        ),
+    ],
+) -> None:
+    """Authenticate one Lighter manifest and publish its deterministic bounded report."""
+
+    if not output_root.is_dir():
+        raise typer.BadParameter("--output-root doit être un probe Lighter existant")
+    report = write_lighter_probe_report(output_root.absolute())
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    if report["verdict"] != LIGHTER_GREEN:
+        raise typer.Exit(3)
 
 
 def _csv(value: str, *, label: str) -> tuple[str, ...]:
@@ -47,8 +68,8 @@ def probe(
         typer.Option(
             "--duration-seconds",
             min=120,
-            max=300,
-            help="Durée obligatoire d'un probe public: 120 à 300 secondes.",
+            max=600,
+            help="Durée: Lighter 120-600 s; autres venues 120-300 s.",
         ),
     ],
     instruments: Annotated[
@@ -89,6 +110,18 @@ def probe(
             "--progress-interval", min=1.0, help="Intervalle d'observabilité console."
         ),
     ] = 10.0,
+    max_frames: Annotated[
+        int,
+        typer.Option(
+            "--max-frames", min=1, max=50_000, help="Borne stricte de frames admises."
+        ),
+    ] = 5_000,
+    max_segments: Annotated[
+        int,
+        typer.Option(
+            "--max-segments", min=1, max=100, help="Borne stricte de segments publiés."
+        ),
+    ] = 4,
 ) -> None:
     """Probe. Exit: 0 complete, 3 unavailable, 4 invalid, 5 backpressure, 130 interrupted."""
 
@@ -112,11 +145,19 @@ def probe(
         "feeds": list(selected_feeds),
         "instruments": list(selected_instruments),
         "census_limit": census_limit,
-        "max_duration_seconds": duration_seconds + 15,
+        "collection_max_duration_seconds": duration_seconds,
+        "terminalization_allowance_seconds": 15,
         "max_bytes": max_bytes,
+        "max_frames": max_frames,
+        "max_segments": max_segments,
         "monitoring": str(resolved_output / "reports" / "health.json"),
         "output_root": str(resolved_output),
         "prompt_behavior": "NO_PROMPT",
+        "proxy_policy": (
+            "DIRECT_ONLY_ENVIRONMENT_PROXY_DISABLED"
+            if venue is Venue.LIGHTER
+            else "VENUE_DEFAULT"
+        ),
         "segment_bytes": segment_bytes,
         "rotation_seconds": rotation_seconds,
         "venue": venue.value,
@@ -150,6 +191,8 @@ def probe(
             max_segment_bytes=segment_bytes,
             rotation_seconds=rotation_seconds,
             progress_interval_seconds=progress_interval,
+            max_frames=max_frames,
+            max_segments=max_segments,
         )
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error

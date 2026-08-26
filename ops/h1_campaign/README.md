@@ -7,10 +7,10 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T20:00:00Z`;
-- operator arm deadline: `2026-08-27T19:30:00Z`;
-- unique slug: `h1-20260827t200000z-21fa9dba`;
-- service: `hyperlab-h1-20260827t200000z-21fa9dba.service`;
+- start: `2026-08-27T18:00:00Z`;
+- operator arm deadline: `2026-08-27T17:30:00Z`;
+- unique slug: `h1-20260827t180000z-a007df56`;
+- service: `hyperlab-h1-20260827t180000z-a007df56.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).
@@ -30,11 +30,14 @@ at `/mnt/HC_Volume_106716684`, with Hetzner model `Volume` and stable serial
 roots are unique leaves under `/mnt/HC_Volume_106716684/hyperlab-h1`. Symlinks,
 a different `findmnt` target/source/filesystem, read-only options, insufficient
 free bytes, and pre-existing campaign leaves all refuse admission.
+Free bytes are read from column four of portable `df -PB1` output. The GNU
+coreutils-incompatible combination of `-P` with `--output` is forbidden by a
+source-and-render regression test.
 
 ## Fee review
 
-`config/paper/hyperliquid-tier0-fee-review-2026-08-26.json` records the official
-public Hyperliquid fee page retrieved at `2026-08-26T20:53:53Z`. Tier-0 base
+`config/paper/hyperliquid-tier0-fee-review-2026-08-26T223048Z.json` records the
+official public Hyperliquid fee page retrieved at `2026-08-26T22:30:48Z`. Tier-0 base
 perpetual fees remain maker 1.5 bps and taker 4.5 bps, so the historical fee
 artifact and preregistered H1 policy remain unchanged. This is a point-in-time
 technical cost input, not economic evidence.
@@ -109,3 +112,9 @@ The V2 slug `h1-20260827t190000z-7b91d4e2` remains byte-identical and was never
 transferred or launched. Its append-only receipt marks it
 `ABANDONED_BEFORE_TRANSFER_INSUFFICIENT_ROOT_DISK`; it is not reused by this
 continuation.
+
+The V4 slug `h1-20260827t200000z-21fa9dba` also remains byte-identical. Human
+execution stopped before `sudo install` because GNU `df` rejects `-P` combined
+with `--output`. Its append-only receipt marks it
+`ABANDONED_BEFORE_VOLUME_PREPARATION_DF_OPTION_INCOMPATIBILITY` and records
+`NO_DIRECTORY_PREPARATION_NO_TRANSFER_NO_SERVICE_NO_NETWORK_COLLECTION`.

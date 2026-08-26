@@ -1,7 +1,7 @@
 {
-  "arm_deadline_utc": "2026-08-27T19:30:00Z",
+  "arm_deadline_utc": "2026-08-27T17:30:00Z",
   "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
-  "campaign_slug": "h1-20260827t200000z-21fa9dba",
+  "campaign_slug": "h1-20260827t180000z-a007df56",
   "disk": {
     "incoming_staging_max_bytes": 67108864,
     "margin_bytes": 17179869184,
@@ -9,20 +9,20 @@
     "required_free_bytes": 154618822656
   },
   "fee_artifact_path": "config/paper/hyperliquid-tier0-fees-2026-08-16.json",
-  "fee_review_path": "config/paper/hyperliquid-tier0-fee-review-2026-08-26.json",
-  "fee_reviewed_at_utc": "2026-08-26T20:53:53Z",
+  "fee_review_path": "config/paper/hyperliquid-tier0-fee-review-2026-08-26T223048Z.json",
+  "fee_reviewed_at_utc": "2026-08-26T22:30:48Z",
   "policy_config_path": "config/research/hyperliquid-h1-ghost-v1.json",
   "remote": {
-    "campaign_root": "/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t200000z-21fa9dba",
+    "campaign_root": "/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t180000z-a007df56",
     "home_root": "/home/hyperlab/hyperlab-h1",
-    "incoming_root": "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t200000z-21fa9dba",
-    "source_root": "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t200000z-21fa9dba",
+    "incoming_root": "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t180000z-a007df56",
+    "source_root": "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t180000z-a007df56",
     "volume_root": "/mnt/HC_Volume_106716684/hyperlab-h1"
   },
   "requirements_lock_path": "requirements-runtime.lock",
   "schema_version": 1,
-  "service_name": "hyperlab-h1-20260827t200000z-21fa9dba.service",
-  "starts_at_utc": "2026-08-27T20:00:00Z",
+  "service_name": "hyperlab-h1-20260827t180000z-a007df56.service",
+  "starts_at_utc": "2026-08-27T18:00:00Z",
   "volume": {
     "device": "/dev/sdb",
     "filesystem": "ext4",

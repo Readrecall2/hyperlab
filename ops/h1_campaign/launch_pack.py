@@ -607,7 +607,7 @@ fi
 [[ -z $H1_FOUND_MODEL || $H1_FOUND_MODEL == "$H1_EXPECTED_MODEL" ]] \
   || fail "stable model differs: $H1_FOUND_MODEL"
 
-H1_AVAILABLE_BYTES=$(df -PB1 --output=avail "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, ""); print}}')
+H1_AVAILABLE_BYTES=$(df -PB1 "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, "", $4); print $4}}')
 [[ $H1_AVAILABLE_BYTES =~ ^[0-9]+$ ]] || fail 'cannot measure volume free bytes'
 (( H1_AVAILABLE_BYTES >= H1_REQUIRED_FREE_BYTES )) \
   || fail "H1_DISK_CAPACITY_INSUFFICIENT available=$H1_AVAILABLE_BYTES required=$H1_REQUIRED_FREE_BYTES"
@@ -816,7 +816,7 @@ for path in "$H1_VOLUME_ROOT" "$H1_VOLUME_ROOT/sources" "$H1_VOLUME_ROOT/campaig
 done
 [[ $(readlink -m -- "$H1_SOURCE_ROOT") == "$H1_SOURCE_ROOT" ]]
 [[ $(readlink -m -- "$H1_CAMPAIGN_ROOT") == "$H1_CAMPAIGN_ROOT" ]]
-AVAILABLE_BYTES=$(df -PB1 --output=avail "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, ""); print}}')
+AVAILABLE_BYTES=$(df -PB1 "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, "", $4); print $4}}')
 [[ $AVAILABLE_BYTES =~ ^[0-9]+$ ]]
 (( AVAILABLE_BYTES >= H1_REQUIRED_FREE_BYTES )) || {{
   printf 'H1_DISK_CAPACITY_INSUFFICIENT available=%s required=%s\n' \

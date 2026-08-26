@@ -1,0 +1,57 @@
+{
+  "artifact_id": "hyperliquid-public-tier0-fee-review",
+  "artifact_version": 1,
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "comparison": {
+    "historical_fee_artifact_path": "config/paper/hyperliquid-tier0-fees-2026-08-16.json",
+    "historical_fee_artifact_sha256": "b01bc3787fc4d1f45e7f138e0803966d0dd4ca2595dbc0fedbb631ad74c9fb26",
+    "maker_fee_bps_unchanged": true,
+    "policy_change_required": false,
+    "taker_fee_bps_unchanged": true,
+    "verdict": "HYPERLIQUID_TIER0_FEES_UNCHANGED_POINT_IN_TIME_REVIEWED"
+  },
+  "economic_eligibility": false,
+  "official_source": {
+    "capture_kind": "DECODED_UTF8_MARKDOWN_CONTENT_RECEIPT",
+    "content_length_bytes": 12174,
+    "content_sha256": "75e55504b1b887a89e1668a9544d09b013242747bcc29f8648a5410142a71258",
+    "http_status": 200,
+    "media_type": "text/markdown; charset=utf-8",
+    "publisher": "Hyperliquid",
+    "request_accept": "text/markdown",
+    "retrieval_client": "HyperLab-H1-Fee-Review/1.0",
+    "retrieved_at_utc": "2026-08-26T22:30:48Z",
+    "source_url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees"
+  },
+  "policy": {
+    "account_or_private_data_used": false,
+    "aligned_quote_discount_assumed": false,
+    "hip3_or_growth_mode_products_in_scope": false,
+    "maker_rebate_assumed": false,
+    "referral_discount_assumed": false,
+    "staking_discount_assumed": false,
+    "tier": "public tier 0",
+    "volume_discount_assumed": false
+  },
+  "reviewed_at_utc": "2026-08-26T22:30:48Z",
+  "scope": "OFFICIAL_PUBLIC_FEES_ONLY",
+  "structured_extract": {
+    "perps": {
+      "maker_fee_bps": "1.5",
+      "maker_fee_percent": "0.015",
+      "product_scope": "standard perpetuals",
+      "table_locator": "Perps fee tiers / Tier 0 / Base rate",
+      "taker_fee_bps": "4.5",
+      "taker_fee_percent": "0.045"
+    },
+    "spot": {
+      "maker_fee_bps": "4.0",
+      "maker_fee_percent": "0.040",
+      "product_scope": "standard spot",
+      "table_locator": "Spot fee tiers / Tier 0 / Base rate",
+      "taker_fee_bps": "7.0",
+      "taker_fee_percent": "0.070"
+    }
+  },
+  "structured_extract_canonical_sha256": "88b86e7d41f058489a9f7be40edcf15542507883bf4fa46ce9b848a91cb771f8"
+}

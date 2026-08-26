@@ -129,7 +129,7 @@ fi
 [[ -z $FOUND_MODEL || $FOUND_MODEL == "$VOLUME_MODEL" ]] \
   || fail "stable model differs: $FOUND_MODEL"
 
-AVAILABLE_BYTES=$(df -PB1 --output=avail "$VOLUME_MOUNT" | awk 'NR == 2 {gsub(/[[:space:]]/, ""); print}')
+AVAILABLE_BYTES=$(df -PB1 "$VOLUME_MOUNT" | awk 'NR == 2 {gsub(/[[:space:]]/, "", $4); print $4}')
 [[ $AVAILABLE_BYTES =~ ^[0-9]+$ ]] || fail 'cannot measure volume free bytes'
 (( AVAILABLE_BYTES >= REQUIRED_FREE_BYTES )) \
   || fail "H1_DISK_CAPACITY_INSUFFICIENT available=$AVAILABLE_BYTES required=$REQUIRED_FREE_BYTES"

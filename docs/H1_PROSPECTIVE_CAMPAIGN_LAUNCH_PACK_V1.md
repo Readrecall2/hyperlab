@@ -14,8 +14,8 @@ The pack stages the first prospective H1 observation window under the existing
 BTC/ETH/SOL/HYPE universe, all registered variants, train days 0–7, validation
 days 7–10, sealed holdout days 10–14, and every existing economic gate.
 
-The V7 replacement campaign is armed for `2026-08-27T22:00:00Z`. Complete the human transfer
-and systemd installation no later than `2026-08-27T21:30:00Z`. Before the
+The V7 replacement campaign is armed for `2026-08-27T21:00:00Z`. Complete the human transfer
+and systemd installation no later than `2026-08-27T20:30:00Z`. Before the
 frozen start the service only waits locally; it does not open the public
 collector. A first launch after the frozen start is refused. A later restart is
 allowed only when the same authenticated raw root already exists.

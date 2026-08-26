@@ -7,10 +7,10 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T22:00:00Z`;
-- operator arm deadline: `2026-08-27T21:30:00Z`;
-- unique slug: `h1-20260827t220000z-e52a227b`;
-- service: `hyperlab-h1-20260827t220000z-e52a227b.service`;
+- start: `2026-08-27T21:00:00Z`;
+- operator arm deadline: `2026-08-27T20:30:00Z`;
+- unique slug: `h1-20260827t210000z-e52a227b`;
+- service: `hyperlab-h1-20260827t210000z-e52a227b.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).

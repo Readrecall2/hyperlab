@@ -75,9 +75,9 @@ def _volume_snapshot() -> dict[str, object]:
 def test_launch_plan_freezes_unique_roots_times_and_full_disk_budget() -> None:
     plan = launch_pack.validate_plan(_plan())
     assert plan["boundary"] == "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-    assert plan["campaign_slug"] == "h1-20260827t220000z-e52a227b"
-    assert plan["starts_at_utc"] == "2026-08-27T22:00:00Z"
-    assert plan["arm_deadline_utc"] == "2026-08-27T21:30:00Z"
+    assert plan["campaign_slug"] == "h1-20260827t210000z-e52a227b"
+    assert plan["starts_at_utc"] == "2026-08-27T21:00:00Z"
+    assert plan["arm_deadline_utc"] == "2026-08-27T20:30:00Z"
     disk = plan["disk"]
     assert isinstance(disk, dict)
     assert disk["maximum_raw_bytes"] == 128 * 1024**3
@@ -123,7 +123,7 @@ def test_incoming_path_validation_refuses_escape_or_reuse(path: str) -> None:
 
 
 def test_remote_path_validation_accepts_only_split_home_and_volume_roots() -> None:
-    slug = "h1-20260827t220000z-e52a227b"
+    slug = "h1-20260827t210000z-e52a227b"
     assert launch_pack.validate_remote_path(
         f"/home/hyperlab/hyperlab-h1/incoming/{slug}", category="incoming", slug=slug
     )
@@ -582,7 +582,7 @@ def test_systemd_render_is_persistent_bounded_hardened_and_graceful() -> None:
     read_write_lines = [line for line in unit.splitlines() if line.startswith("ReadWritePaths=")]
     assert read_write_lines == [
         "ReadWritePaths=/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/"
-        "h1-20260827t220000z-e52a227b"
+        "h1-20260827t210000z-e52a227b"
     ]
     assert "/mnt/HC_Volume_106716684/hyperlab-h1/sources/" not in read_write_lines[0]
     assert "ExecCondition=" in unit.split("ExecStart=", maxsplit=1)[0]
@@ -603,8 +603,8 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     }
     waiting_cmd = (
         "/usr/bin/bash /mnt/HC_Volume_106716684/hyperlab-h1/sources/"
-        "h1-20260827t220000z-e52a227b/ops/h1_campaign/run_collector.sh "
-        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t220000z-e52a227b/handoff.json"
+        "h1-20260827t210000z-e52a227b/ops/h1_campaign/run_collector.sh "
+        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-e52a227b/handoff.json"
     )
     armed = launch_pack.evaluate_monitor(
         active_state="active",
@@ -617,7 +617,7 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     assert armed["status"] == "H1_SERVICE_ARMED_PREPARED_NOT_STARTED"
     running_health = {**prepared_health, "terminal_health": "RUNNING"}
     collect_cmd = (
-        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t220000z-e52a227b/.venv/bin/python "
+        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-e52a227b/.venv/bin/python "
         "-m hyperlab research-data h1-collect "
         f"--campaign-root {campaign} --config /home/hyperlab/config.json"
     )
@@ -738,7 +738,7 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "findmnt -rn -T" in tabby
     assert "H1_VOLUME_DEVICE='/dev/sdb'" in tabby
     assert "H1_VOLUME_MOUNT='/mnt/HC_Volume_106716684'" in tabby
-    assert "H1_ARM_DEADLINE_UTC='2026-08-27T21:30:00Z'" in tabby
+    assert "H1_ARM_DEADLINE_UTC='2026-08-27T20:30:00Z'" in tabby
     assert "git clone --no-checkout" in tabby
     assert "checkout --detach" in tabby
     assert r"printf '%s  %s\n'" in tabby

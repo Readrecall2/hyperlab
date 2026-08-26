@@ -322,3 +322,38 @@ def test_maker_flow_at_gap_is_never_counted_as_a_fill() -> None:
         "PESSIMISTIC": "0",
         "SENSITIVITY": "0",
     }
+
+
+def test_inventory_gate_uses_only_causally_known_prior_maker_fills() -> None:
+    body = _body()
+    model = body["model"]
+    assert isinstance(model, dict)
+    model["risk"] = {
+        "max_abs_inventory_notional": "300",
+        "one_active_maker_per_instrument": True,
+    }
+    first = _order("maker-1", 110, "BUY", "2", "99")
+    first["time_in_force"] = "ALO"
+    first["cancel_request_ns"] = 200
+    second = _order("maker-2", 140, "BUY", "2", "99")
+    second["time_in_force"] = "ALO"
+    second["cancel_request_ns"] = 220
+    trade = {
+        "aggressor_side": "SELL",
+        "event_id": "inventory-fill",
+        "instrument_id": "HL:BTC:perp",
+        "kind": "TRADE",
+        "price": "99",
+        "quantity": "10",
+        "receive_ns": 130,
+        "source_ns": 125,
+        "venue": "hyperliquid",
+    }
+    body["events"] = [_book(100), first, trade, second]
+
+    report = GhostReplay(GhostFixture.from_bytes(canonical_json_bytes(body))).run()
+
+    assert report.orders[0].status == "FILLED"
+    assert report.orders[0].fill_timestamp_ns == 130
+    assert report.orders[1].status == "NO_TRADE"
+    assert report.orders[1].reason == "INVENTORY_LIMIT"

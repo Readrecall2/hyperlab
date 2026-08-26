@@ -20,6 +20,7 @@ from .adapters import (
     GhostEnvelopeAdapter,
 )
 from .models import (
+    AUTHENTICATED_PUBLIC_RESEARCH_LABEL,
     BOUNDARY,
     MODEL_VERSION,
     BookLevel,
@@ -29,6 +30,7 @@ from .models import (
     ExecutableBook,
     ExecutionMechanismVersion,
     ExposureReport,
+    FillReport,
     GhostReport,
     GroupReport,
     InstrumentGridVersion,
@@ -89,9 +91,22 @@ def _event_time(event: Mapping[str, object]) -> int:
 class GhostFixture:
     body: dict[str, CanonicalValue]
     fixture_sha256: str
+    synthetic: bool
 
     @classmethod
     def from_bytes(cls, value: bytes) -> GhostFixture:
+        return cls._from_bytes(value, authenticated_public=False)
+
+    @classmethod
+    def from_authenticated_public_bytes(cls, value: bytes) -> GhostFixture:
+        """Admit a derived scenario only through an authenticated Research adapter."""
+
+        return cls._from_bytes(value, authenticated_public=True)
+
+    @classmethod
+    def _from_bytes(
+        cls, value: bytes, *, authenticated_public: bool
+    ) -> GhostFixture:
         stripped = value.rstrip(b"\r\n")
         if value[len(stripped) :] not in {b"", b"\n", b"\r\n"}:
             raise ValueError("fixture may contain at most one terminal newline")
@@ -112,7 +127,16 @@ class GhostFixture:
             raise ValueError("unsupported ghost fixture schema")
         if decoded["boundary"] != BOUNDARY:
             raise ValueError("ghost fixture boundary is not research-only")
-        if decoded["fixture_label"] != SYNTHETIC_FIXTURE_LABEL:
+        expected_label = (
+            AUTHENTICATED_PUBLIC_RESEARCH_LABEL
+            if authenticated_public
+            else SYNTHETIC_FIXTURE_LABEL
+        )
+        if decoded["fixture_label"] != expected_label:
+            if authenticated_public:
+                raise ValueError(
+                    "public ghost scenario requires AUTHENTICATED_PUBLIC_RESEARCH provenance"
+                )
             raise ValueError("synthetic fixtures require visible SYNTHETIC/FIXTURE provenance")
         events = _sequence(decoded["events"], label="events")
         if not events:
@@ -123,6 +147,7 @@ class GhostFixture:
         return cls(
             body=decoded,
             fixture_sha256=hashlib.sha256(stripped).hexdigest(),
+            synthetic=not authenticated_public,
         )
 
     @property
@@ -154,6 +179,8 @@ class _Config:
     stale_after_ns: int
     multi_leg_timeout_ns: int
     closeout_model_id: str
+    max_abs_inventory_notional: Decimal | None
+    one_active_maker_per_instrument: bool
     config_sha256: str
 
     @classmethod
@@ -169,7 +196,8 @@ class _Config:
             "mechanisms",
             "stale_after_ns",
         }
-        if set(value) != expected or value["model_version"] != MODEL_VERSION:
+        allowed = {frozenset(expected), frozenset(expected | {"risk"})}
+        if frozenset(value) not in allowed or value["model_version"] != MODEL_VERSION:
             raise ValueError("ghost model fields or model version are invalid")
         latency = _mapping(value["latency"], label="latency")
         queue = _mapping(value["queue"], label="queue")
@@ -211,6 +239,24 @@ class _Config:
         )
         if not grids or not costs or not mechanisms:
             raise ValueError("grid, cost, and mechanism versions are mandatory")
+        risk = None if "risk" not in value else _mapping(value["risk"], label="risk")
+        if risk is not None and set(risk) != {
+            "max_abs_inventory_notional",
+            "one_active_maker_per_instrument",
+        }:
+            raise ValueError("ghost risk fields are invalid")
+        max_inventory = (
+            None
+            if risk is None
+            else exact_decimal(
+                risk.get("max_abs_inventory_notional"),
+                label="maximum inventory notional",
+                positive=True,
+            )
+        )
+        one_active = False if risk is None else risk.get(
+            "one_active_maker_per_instrument"
+        ) is True
         return cls(
             latency=latency_model,
             queue=queue_model,
@@ -224,6 +270,8 @@ class _Config:
             closeout_model_id=cast(
                 str, _text(closeout.get("model_id"), label="closeout model id")
             ),
+            max_abs_inventory_notional=max_inventory,
+            one_active_maker_per_instrument=one_active,
             config_sha256=hashlib.sha256(canonical_json_bytes(value)).hexdigest(),
         )
 
@@ -719,10 +767,28 @@ class GhostReplay:
         priority_generation: int,
         prior: Mapping[str, OrderReport],
         depth_state: dict[tuple[str, Side], tuple[BookLevel, ...]],
+        known_positions: Mapping[str, Decimal],
+        active_maker_until: Mapping[str, int],
     ) -> tuple[OrderReport, _Fill | None]:
         timeline = self.config.latency.timeline(order.decision_ns, order.cancel_request_ns)
         dependency_fill: Decimal | None = None
         quantity = order.quantity
+        inventory_key = f"{order.venue}|{order.instrument_id}"
+        if (
+            self.config.one_active_maker_per_instrument
+            and order.time_in_force.is_maker
+            and active_maker_until.get(inventory_key, -1) > order.decision_ns
+        ):
+            return (
+                self._no_trade(
+                    order,
+                    reason="ACTIVE_QUOTE_EXISTS",
+                    timeline=timeline,
+                    priority_generation=priority_generation,
+                    dependency_fill=None,
+                ),
+                None,
+            )
         if order.depends_on_order_id is not None:
             dependency = prior.get(order.depends_on_order_id)
             if dependency is None:
@@ -760,6 +826,22 @@ class GhostReplay:
                     self._no_trade(
                         order,
                         reason="DEPENDENCY_FILL_NOT_KNOWN_AT_DECISION",
+                        timeline=timeline,
+                        priority_generation=priority_generation,
+                        dependency_fill=dependency_fill,
+                    ),
+                    None,
+                )
+        if self.config.max_abs_inventory_notional is not None:
+            projected_position = known_positions.get(inventory_key, _ZERO) + (
+                order.side.sign * quantity
+            )
+            projected_notional = abs(projected_position) * order.limit_price
+            if projected_notional > self.config.max_abs_inventory_notional:
+                return (
+                    self._no_trade(
+                        order,
+                        reason="INVENTORY_LIMIT",
                         timeline=timeline,
                         priority_generation=priority_generation,
                         dependency_fill=dependency_fill,
@@ -1201,17 +1283,38 @@ class GhostReplay:
         fills: list[_Fill] = []
         prior: dict[str, OrderReport] = {}
         depth_state: dict[tuple[str, Side], tuple[BookLevel, ...]] = {}
+        active_maker_until: dict[str, int] = {}
         for priority, order in enumerate(self._orders, start=1):
+            uncertainty = self.config.latency.clock_uncertainty_ns
+            known_positions: dict[str, Decimal] = {}
+            for known_fill in fills:
+                if known_fill.timestamp_ns + uncertainty > order.decision_ns - uncertainty:
+                    continue
+                position_key = f"{known_fill.venue}|{known_fill.instrument_id}"
+                known_positions[position_key] = known_positions.get(
+                    position_key, _ZERO
+                ) + known_fill.side.sign * known_fill.quantity
             report, fill = self._execute_order(
                 order,
                 priority_generation=priority,
                 prior=prior,
                 depth_state=depth_state,
+                known_positions=known_positions,
+                active_maker_until=active_maker_until,
             )
             reports.append(report)
             prior[order.order_id] = report
             if fill is not None:
                 fills.append(fill)
+            if order.time_in_force.is_maker and report.admitted_quantity > 0:
+                active_key = f"{order.venue}|{order.instrument_id}"
+                if report.status == "FILLED" and report.fill_timestamp_ns is not None:
+                    active_maker_until[active_key] = report.fill_timestamp_ns
+                else:
+                    cancel_ack = report.timeline["cancel_ack_ns"]
+                    active_maker_until[active_key] = (
+                        2**63 - 1 if cancel_ack is None else cancel_ack
+                    )
 
         positions: dict[str, Decimal] = {}
         for fill in sorted(fills, key=lambda item: (item.timestamp_ns, item.order_id)):
@@ -1398,7 +1501,7 @@ class GhostReplay:
                 raw_manifest_sha256=self.raw_manifest_sha256,
                 raw_root_sha256=self.raw_root_sha256,
                 segment_sha256s=self.segment_sha256s,
-                synthetic=True,
+                synthetic=self.fixture.synthetic,
             ),
             model_version=MODEL_VERSION,
             latency_model_id=self.config.latency.model_id,
@@ -1410,13 +1513,33 @@ class GhostReplay:
             pnl=pnl,
             mechanism_version_ids=tuple(item.mechanism_id for item in self.config.mechanisms),
             closeout_model_id=self.config.closeout_model_id,
+            fills=tuple(
+                FillReport(
+                    order_id=item.order_id,
+                    venue=item.venue,
+                    instrument_id=item.instrument_id,
+                    side=item.side,
+                    quantity=item.quantity,
+                    price=item.notional / item.quantity,
+                    notional=item.notional,
+                    fee=item.fee,
+                    timestamp_ns=item.timestamp_ns,
+                    role=item.role,
+                    forced=item.forced,
+                )
+                for item in ordered_fills
+            ),
             exposure=exposure,
             no_trade_reasons=no_trade,
             observability=observability,
             limitations=(
                 "PNL_IS_REALIZED_GHOST_CASHFLOW_WITH_UNRESOLVED_EXPOSURE_SEPARATE",
                 "NO_STRATEGY_OR_EDGE_SELECTED",
-                "FIXTURE_MECHANISM_TEST_NOT_ECONOMIC_EVIDENCE",
+                (
+                    "FIXTURE_MECHANISM_TEST_NOT_ECONOMIC_EVIDENCE"
+                    if self.fixture.synthetic
+                    else "AUTHENTICATED_PUBLIC_PREFIX_NOT_ECONOMIC_EVIDENCE"
+                ),
                 "REBATE_AND_REWARD_ZERO_IN_PRIMARY_ECONOMICS",
                 "NO_PRIVATE_DATA_NO_ORDER_ROUTE",
                 f"CLOSEOUT_MODEL:{self.config.closeout_model_id}",

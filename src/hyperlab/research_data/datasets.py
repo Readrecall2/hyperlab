@@ -17,7 +17,7 @@ class ResearchState(StrEnum):
     NO_TRADE = "NO_TRADE"
 
 
-MARKOUT_HORIZONS_MS = (100, 500, 1_000, 5_000, 30_000)
+MARKOUT_HORIZONS_MS = (100, 500, 1_000, 5_000, 30_000, 120_000)
 
 
 @dataclass(frozen=True, slots=True)

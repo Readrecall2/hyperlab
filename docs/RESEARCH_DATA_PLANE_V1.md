@@ -141,12 +141,14 @@ It emits candidates only. It cannot send an order.
 ## H1/H3/H4 dataset contracts
 
 V1 freezes `BID_ONLY|ASK_ONLY|NO_QUOTE`, explicit no-trade state, action-delay
-bands, markouts at 100 ms, 500 ms, 1 s, 5 s and 30 s plus fill-to-close, causal
+bands, markouts at 100 ms, 500 ms, 1 s, 5 s, 30 s and 120 s plus fill-to-close, causal
 event windows, and matched-control keys. TWAP/liquidation/forced-flow labels are
 admitted only when a verified official public source event was observed no later
 than the dataset observation.
 
-No policy optimizer, tuner, or economic claim is included.
+Hyperliquid H1 Ghost V1 adds one pre-registered, interpretable one-sided policy
+and four frozen latency scenarios without adding an optimizer or economic
+claim. See `docs/HYPERLIQUID_H1_GHOST_V1.md`.
 
 ## Operator CLI
 

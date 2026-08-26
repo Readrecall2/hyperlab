@@ -1,0 +1,124 @@
+{
+  "action_policy": {
+    "ask_rule": "depth_imbalance_lte_negative_threshold_and_sell_flow_nonnegative_and_microprice_nonpositive",
+    "bid_rule": "depth_imbalance_gte_threshold_and_buy_flow_nonnegative_and_microprice_nonnegative",
+    "no_quote_is_explicit": true,
+    "quote_sides_at_once": 1
+  },
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "costs": {
+    "fee_artifact_observed_on": "2026-08-16",
+    "fee_artifact_path": "config/paper/hyperliquid-tier0-fees-2026-08-16.json",
+    "fee_artifact_sha256": "b01bc3787fc4d1f45e7f138e0803966d0dd4ca2595dbc0fedbb631ad74c9fb26",
+    "funding_policy": "NO_POSITION_ADMISSION_WITHIN_FUNDING_BOUNDARY_GUARD",
+    "maker_fee_bps": "1.5",
+    "privileged_tier_assumed": false,
+    "rebate_bps_primary": "0",
+    "taker_fee_bps": "4.5"
+  },
+  "economic_claim": "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE",
+  "economic_gates": {
+    "closeout_slippage_p99_bps_max": "25",
+    "inventory_notional_p99_usdc_max": "100",
+    "lcb95_net_per_fill_positive_at_latency_ms": 500,
+    "minimum_fills": 5000,
+    "minimum_markets": 3,
+    "minimum_regimes": 3,
+    "top_one_percent_net_contribution_max": "0.50"
+  },
+  "execution": {
+    "ack_latency_ms": 0,
+    "cancellation_ahead_credit": {
+      "conservative": "0.25",
+      "pessimistic_primary": "0",
+      "sensitivity_non_promotable": "0.50"
+    },
+    "latency_scenarios_ms": [100, 250, 500, 1000],
+    "primary_hurdle_latency_ms": 500,
+    "quote_notional_usdc": "50",
+    "quote_size_max_displayed_fraction": "0.10",
+    "time_in_force": "ALO",
+    "ttl_ms": 2000
+  },
+  "features": {
+    "book_depth_levels": 3,
+    "context_stale_after_ms": 5000,
+    "depth_imbalance_threshold": "0.20",
+    "funding_boundary_guard_ms": 1000,
+    "markout_max_lateness_ms": 250,
+    "minimum_depth_notional_each_side_usdc": "500",
+    "minimum_recent_trades": 1,
+    "spread_bps_max": "25",
+    "spread_bps_min": "0.5",
+    "stale_after_ms": 1500,
+    "trade_flow_lookback_ms": 5000,
+    "transformations": [
+      "top_n_depth_imbalance_exact_decimal",
+      "same_snapshot_microprice_tilt_bps_exact_decimal",
+      "receive_time_bounded_aggressor_flow_imbalance_exact_decimal",
+      "backward_looking_30_second_mid_return_regime"
+    ]
+  },
+  "policy_id": "hyperliquid-h1-one-sided-selective-maker-v1",
+  "risk": {
+    "forced_close": "LAST_FRESH_FINITE_EXECUTABLE_DEPTH",
+    "inventory_limit_notional_usdc": "100",
+    "kill_rules": [
+      "RAW_MANIFEST_AUTHENTICATION_FAILURE",
+      "SOURCE_GAP_OR_RECONNECT",
+      "BOOK_OR_CONTEXT_STALE",
+      "BBO_L2_DIVERGENCE",
+      "INSUFFICIENT_FINITE_DEPTH",
+      "POINT_IN_TIME_COST_UNRESOLVED",
+      "INVENTORY_LIMIT",
+      "UNRESOLVED_CLOSEOUT",
+      "RECONCILIATION_DIVERGENCE"
+    ],
+    "one_active_quote_per_instrument": true
+  },
+  "runner": {
+    "feeds": ["metadata", "bbo", "l2_book", "trades", "all_mids", "active_asset_context"],
+    "maximum_days": 14,
+    "maximum_raw_bytes": 137438953472,
+    "minimum_days": 7,
+    "progress_interval_seconds": 10,
+    "rotation_seconds": 300,
+    "segment_bytes": 33554432
+  },
+  "schema_version": 1,
+  "splits": {
+    "holdout": {"end_day": 14, "start_day": 10},
+    "policy": "FIXED_UTC_OFFSETS_FROM_CAMPAIGN_START_NO_PNL_DEPENDENCE",
+    "train": {"end_day": 7, "start_day": 0},
+    "validation": {"end_day": 10, "start_day": 7}
+  },
+  "status": "HYPERLIQUID_H1_GHOST_V1_PREREGISTERED",
+  "universe": {
+    "instruments": ["HL:BTC:perp", "HL:ETH:perp", "HL:SOL:perp", "HL:HYPE:perp"],
+    "selection_policy": "FIXED_LIQUID_PERP_IDENTITIES_BEFORE_PROSPECTIVE_OBSERVATION_NO_FUTURE_PNL",
+    "selection_uses_future_pnl": false
+  },
+  "variants": [
+    {
+      "depth_imbalance_threshold": "0.20",
+      "holdout_access": "SEALED",
+      "requires_trade_flow_confirmation": true,
+      "status": "PRIMARY_FROZEN_UNOBSERVED",
+      "variant_id": "imbalance-flow-confirm-v1"
+    },
+    {
+      "depth_imbalance_threshold": "0.10",
+      "holdout_access": "SEALED",
+      "requires_trade_flow_confirmation": false,
+      "status": "REGISTERED_UNOBSERVED",
+      "variant_id": "depth-only-loose-losing-registry-v1"
+    },
+    {
+      "depth_imbalance_threshold": "0.30",
+      "holdout_access": "SEALED",
+      "requires_trade_flow_confirmation": true,
+      "status": "REGISTERED_UNOBSERVED",
+      "variant_id": "imbalance-flow-strict-losing-registry-v1"
+    }
+  ]
+}

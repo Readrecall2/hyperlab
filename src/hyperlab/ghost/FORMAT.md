@@ -22,10 +22,13 @@ touch alone never fills. IOC and forced close consume finite levels in order and
 preserve unfilled residual inventory.
 
 Research manifests are opened by explicit SHA-256 through
-`ResearchSegmentReader`. The V1 manifest adapter intentionally accepts exactly
-one authenticated `ghost_fixture` envelope with visible
-`SYNTHETIC/FIXTURE` provenance. Future venue adapters may map immutable public
-envelopes to the same primitives without changing execution semantics.
+`ResearchSegmentReader`. The canonical fixture adapter intentionally accepts
+exactly one authenticated `ghost_fixture` envelope with visible
+`SYNTHETIC/FIXTURE` provenance. Hyperliquid H1 is the first venue adapter: it
+maps an authenticated public Research manifest to the same BOOK/TRADE/HEALTH/
+hypothetical-action primitives, while preserving the raw manifest/root and
+segment identities. It does not change execution semantics or admit a direct
+untrusted public-labelled fixture.
 
 PnL attribution always exposes spread, signal, fees, adverse selection,
 inventory, hedge, funding, opportunity cost, forced close, reward, and rebate.

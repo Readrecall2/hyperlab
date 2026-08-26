@@ -11,6 +11,7 @@ from hyperlab.research_data.canonical import CanonicalValue, canonical_json_byte
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 MODEL_VERSION = "BASE_REALISM_GHOST_V1"
+AUTHENTICATED_PUBLIC_RESEARCH_LABEL = "AUTHENTICATED_PUBLIC_RESEARCH"
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
 _ZERO = Decimal("0")
 _BPS = Decimal("10000")
@@ -495,6 +496,36 @@ class OrderReport:
 
 
 @dataclass(frozen=True, slots=True)
+class FillReport:
+    order_id: str
+    venue: str
+    instrument_id: str
+    side: Side
+    quantity: Decimal
+    price: Decimal
+    notional: Decimal
+    fee: Decimal
+    timestamp_ns: int
+    role: str
+    forced: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fee": self.fee,
+            "forced": self.forced,
+            "instrument_id": self.instrument_id,
+            "notional": self.notional,
+            "order_id": self.order_id,
+            "price": self.price,
+            "quantity": self.quantity,
+            "role": self.role,
+            "side": self.side.value,
+            "timestamp_ns": self.timestamp_ns,
+            "venue": self.venue,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GroupReport:
     group_id: str
     status: str
@@ -580,6 +611,7 @@ class GhostReport:
     cost_schedule_ids: tuple[str, ...]
     mechanism_version_ids: tuple[str, ...]
     closeout_model_id: str
+    fills: tuple[FillReport, ...]
     orders: tuple[OrderReport, ...]
     groups: tuple[GroupReport, ...]
     pnl: PnlReport
@@ -597,6 +629,7 @@ class GhostReport:
             "cost_schedule_ids": list(self.cost_schedule_ids),
             "economic_claim": self.economic_claim,
             "exposure": self.exposure.to_dict(),
+            "fills": [item.to_dict() for item in self.fills],
             "fixture_label": self.fixture_label,
             "grid_version_ids": list(self.grid_version_ids),
             "groups": [item.to_dict() for item in self.groups],
@@ -627,6 +660,7 @@ class GhostReport:
 
 
 __all__ = [
+    "AUTHENTICATED_PUBLIC_RESEARCH_LABEL",
     "BOUNDARY",
     "MODEL_VERSION",
     "BookLevel",
@@ -636,6 +670,7 @@ __all__ = [
     "ExecutableBook",
     "ExecutionMechanismVersion",
     "ExposureReport",
+    "FillReport",
     "GhostReport",
     "GroupReport",
     "InstrumentGridVersion",

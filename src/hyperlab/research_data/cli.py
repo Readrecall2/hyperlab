@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from .envelope import Venue
+from .h1_campaign import collect_h1_campaign, prepare_h1_campaign
 from .lighter_report import LIGHTER_GREEN, write_lighter_probe_report
 from .probe import ProbeConfig, run_public_probe
 
@@ -15,6 +17,131 @@ research_data_app = typer.Typer(
     help="Collecte locale bornée PUBLIC_DATA_ONLY et outils offline du Research Data Plane V1.",
     no_args_is_help=True,
 )
+
+
+def _utc_option(value: str, *, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise typer.BadParameter(f"{label} doit être ISO-8601 avec fuseau") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise typer.BadParameter(f"{label} doit inclure un fuseau")
+    return parsed.astimezone(UTC)
+
+
+@research_data_app.command("h1-prepare")
+def h1_prepare(
+    campaign_root: Annotated[
+        Path,
+        typer.Option("--campaign-root", help="Nouveau répertoire de campagne H1."),
+    ],
+    starts_at_utc: Annotated[
+        str,
+        typer.Option("--starts-at-utc", help="Début UTC ISO-8601 figé avant collecte."),
+    ],
+    fee_reviewed_at_utc: Annotated[
+        str,
+        typer.Option("--fee-reviewed-at-utc", help="Revue humaine UTC des frais publics."),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option("--config", help="Politique H1 préenregistrée."),
+    ] = Path("config/research/hyperliquid-h1-ghost-v1.json"),
+    fee_artifact: Annotated[
+        Path,
+        typer.Option("--fee-artifact", help="Artefact public tier-0 revu point-in-time."),
+    ] = Path("config/paper/hyperliquid-tier0-fees-2026-08-16.json"),
+) -> None:
+    """Fige une campagne prospective sans démarrer de transport."""
+
+    preflight = {
+        "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+        "completion_signal": "campaign-manifest.json + campaign-manifest.sha256",
+        "ctrl_c": "interruption avant publication laisse au plus un répertoire incomplet local",
+        "execution_location": f"Windows PowerShell local:{Path.cwd().absolute()}",
+        "expected_duration_seconds": 1,
+        "max_duration_seconds": 30,
+        "monitoring": str(campaign_root.absolute() / "state" / "health.json"),
+        "prompt_behavior": "NO_PROMPT",
+    }
+    typer.echo(json.dumps(preflight, ensure_ascii=False, sort_keys=True))
+    try:
+        result = prepare_h1_campaign(
+            campaign_root.absolute(),
+            config_path=config.absolute(),
+            fee_artifact_path=fee_artifact.absolute(),
+            starts_at_utc=_utc_option(starts_at_utc, label="--starts-at-utc"),
+            fee_reviewed_at_utc=_utc_option(
+                fee_reviewed_at_utc, label="--fee-reviewed-at-utc"
+            ),
+        )
+    except (FileExistsError, OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "campaign_id": result.campaign_id,
+                "manifest_sha256": result.manifest_sha256,
+                "status": "PREPARED_NOT_STARTED",
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@research_data_app.command("h1-collect")
+def h1_collect(
+    campaign_root: Annotated[
+        Path,
+        typer.Option("--campaign-root", help="Campagne H1 préalablement figée."),
+    ],
+    config: Annotated[
+        Path,
+        typer.Option("--config", help="Politique H1 exactement figée."),
+    ] = Path("config/research/hyperliquid-h1-ghost-v1.json"),
+    resume: Annotated[
+        bool,
+        typer.Option("--resume", help="Reprend explicitement une chaîne Research existante."),
+    ] = False,
+) -> None:
+    """Collecte publique H1 reprenable; aucune capacité privée ou d'exécution."""
+
+    preflight = {
+        "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+        "completion_signal": "state/health.json avec terminal_health final",
+        "ctrl_c": "clôture le tail authentifié; reprise explicite avec --resume",
+        "execution_location": f"Windows PowerShell local:{Path.cwd().absolute()}",
+        "expected_duration": "7-14 jours",
+        "max_duration": "14 jours plus finalisation bornée",
+        "monitoring": str(campaign_root.absolute() / "state" / "health.json"),
+        "prompt_behavior": "NO_PROMPT",
+    }
+    typer.echo(json.dumps(preflight, ensure_ascii=False, sort_keys=True))
+
+    def progress(health: object) -> None:
+        typer.echo(json.dumps(health, ensure_ascii=False, sort_keys=True))
+
+    try:
+        health = collect_h1_campaign(
+            campaign_root.absolute(),
+            config_path=config.absolute(),
+            resume=resume,
+            progress=progress,
+        )
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps(health, ensure_ascii=False, sort_keys=True))
+    terminal = health["terminal_health"]
+    if terminal == "INTERRUPTED_RECOVERABLE":
+        raise typer.Exit(130)
+    if terminal in {
+        "FINAL_THRESHOLD_REPLAY_INVALID_FAIL_CLOSED",
+        "MAX_BYTES_REACHED",
+        "PUBLIC_SOURCE_INVALID_FAIL_CLOSED",
+        "PUBLIC_SOURCE_UNAVAILABLE_RECOVERABLE",
+        "THRESHOLD_CANDIDATE_NOT_FINAL_RESUME_REQUIRED",
+    }:
+        raise typer.Exit(4)
 
 
 @research_data_app.command("lighter-report")

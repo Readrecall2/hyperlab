@@ -213,6 +213,7 @@ def test_kalshi_incentive_ledger_never_makes_primary_edge_positive() -> None:
 
 
 def test_h1_markouts_and_h3_h4_event_windows_are_causal() -> None:
+    assert MARKOUT_HORIZONS_MS == (100, 500, 1_000, 5_000, 30_000, 120_000)
     decision = 1_000_000_000
     markouts = tuple(
         MarkoutObservation(

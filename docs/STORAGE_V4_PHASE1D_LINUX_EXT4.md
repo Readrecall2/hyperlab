@@ -34,6 +34,20 @@ n'accepte aucun secret et ne touche aucun store préexistant. Le processus est
 détaché avec `nohup` et `setsid`; son PID, stdout, stderr, progression et bundle
 terminal restent sous le nouveau run root.
 
+Le premier lancement Linux antérieur à la correction de bootstrap a échoué
+avant l'entrée du certifieur : l'initialisation eager de `hyperlab.paper`
+importait pandas dans le venv sans pip. Il n'a publié aucun `COMPLETE.json` et
+ne constitue aucune preuve. Ce run et son clone ne doivent être ni réutilisés
+ni supprimés par cette procédure.
+
+Les façades publiques `hyperlab.paper` et `hyperlab.paper.storage_v4` chargent
+désormais leurs exports à la demande. Le launcher exécute, avant `nohup` et
+`setsid`, un import synchrone du point d'entrée Phase 1D avec user-site et
+écriture de bytecode désactivés. Un échec termine immédiatement avec le code
+68 et le message `no certifier process was launched`; aucun PID n'est publié.
+Il est interdit de compenser un échec par pip, le réseau ou
+`--system-site-packages`.
+
 Avant le lancement, annoncer à l'opérateur :
 
 - emplacement : Bash dans Tabby/VPS ;

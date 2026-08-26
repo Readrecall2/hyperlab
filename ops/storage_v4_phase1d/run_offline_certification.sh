@@ -47,6 +47,16 @@ python3 -m venv --without-pip "$VENV"
 PYTHON="$VENV/bin/python"
 [[ -x "$PYTHON" ]] || { echo "fresh offline Python venv was not created" >&2; exit 67; }
 
+PHASE1D_IMPORT_PREFLIGHT='from hyperlab.paper.storage_v4.phase1d_linux_certification import main; assert callable(main)'
+if ! env \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  PYTHONPATH="$REPOSITORY_ROOT/src" \
+  "$PYTHON" -c "$PHASE1D_IMPORT_PREFLIGHT"; then
+  echo "Phase 1D offline import preflight failed; no certifier process was launched" >&2
+  exit 68
+fi
+
 COMMAND=(
   "$PYTHON"
   "$REPOSITORY_ROOT/scripts/certify_storage_v4_phase1d_linux.py"
@@ -58,7 +68,11 @@ for service in "$@"; do
   COMMAND+=(--paper-service "$service")
 done
 
-nohup setsid env PYTHONPATH="$REPOSITORY_ROOT/src" "${COMMAND[@]}" \
+nohup setsid env \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  PYTHONPATH="$REPOSITORY_ROOT/src" \
+  "${COMMAND[@]}" \
   </dev/null >"$STDOUT_LOG" 2>"$STDERR_LOG" &
 CERTIFIER_PID=$!
 printf '%s\n' "$CERTIFIER_PID" >"$PID_FILE"

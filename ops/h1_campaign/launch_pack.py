@@ -17,6 +17,8 @@ from typing import Any, Final, NoReturn
 
 BOUNDARY: Final = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 HOME_ROOT: Final = PurePosixPath("/home/hyperlab/hyperlab-h1")
+VOLUME_MOUNT: Final = PurePosixPath("/mnt/HC_Volume_106716684")
+VOLUME_ROOT: Final = VOLUME_MOUNT / "hyperlab-h1"
 EXPECTED_USER: Final = "hyperlab"
 SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}$")
@@ -117,12 +119,20 @@ def _utc_text(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _remote_parent(category: str) -> PurePosixPath:
+    if category == "incoming":
+        return HOME_ROOT / category
+    if category in {"sources", "campaigns"}:
+        return VOLUME_ROOT / category
+    raise LaunchPackError(f"unsupported remote path category: {category}")
+
+
 def validate_remote_path(value: object, *, category: str, slug: str) -> str:
     text = _required_text(value, label=f"remote.{category}_root")
     path = PurePosixPath(text)
     if not path.is_absolute() or ".." in path.parts or "." in path.parts:
         raise LaunchPackError(f"remote {category} path is not canonical and absolute")
-    expected_parent = HOME_ROOT / category
+    expected_parent = _remote_parent(category)
     if path.parent != expected_parent or path.name != slug:
         raise LaunchPackError(
             f"remote {category} path must be the unique {expected_parent}/{slug} leaf"
@@ -141,7 +151,7 @@ def _path_beneath(path: PurePosixPath, parent: PurePosixPath) -> bool:
 def validate_handoff_remote_path(value: object, *, category: str) -> str:
     text = _required_text(value, label=f"remote.{category}_root")
     path = PurePosixPath(text)
-    expected_parent = HOME_ROOT / category
+    expected_parent = _remote_parent(category)
     if (
         not path.is_absolute()
         or ".." in path.parts
@@ -168,6 +178,7 @@ def validate_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "schema_version",
         "service_name",
         "starts_at_utc",
+        "volume",
     }
     if set(plan) != expected or plan.get("schema_version") != 1:
         raise LaunchPackError("launch plan fields or schema version differ from v1")
@@ -194,23 +205,34 @@ def validate_plan(plan: Mapping[str, object]) -> dict[str, object]:
     maximum = _required_int(disk.get("maximum_raw_bytes"), label="maximum_raw_bytes")
     margin = _required_int(disk.get("margin_bytes"), label="margin_bytes")
     required = _required_int(disk.get("required_free_bytes"), label="required_free_bytes")
+    staging_max = _required_int(
+        disk.get("incoming_staging_max_bytes"), label="incoming_staging_max_bytes"
+    )
     if required != maximum + margin:
         raise LaunchPackError("required disk bytes must equal raw ceiling plus explicit margin")
+    if staging_max > margin:
+        raise LaunchPackError("incoming staging ceiling must remain below the safety margin")
     remote = plan.get("remote")
     if not isinstance(remote, dict) or set(remote) != {
         "campaign_root",
         "home_root",
         "incoming_root",
         "source_root",
+        "volume_root",
     }:
         raise LaunchPackError("remote roots differ from the launch-plan schema")
     if remote.get("home_root") != str(HOME_ROOT):
         raise LaunchPackError("remote home root must be /home/hyperlab/hyperlab-h1")
+    if remote.get("volume_root") != str(VOLUME_ROOT):
+        raise LaunchPackError(f"remote volume root must be {VOLUME_ROOT}")
     for category in ("incoming", "sources", "campaigns"):
         key = {"incoming": "incoming_root", "sources": "source_root", "campaigns": "campaign_root"}[
             category
         ]
         validate_remote_path(remote.get(key), category=category, slug=slug)
+    volume = validate_volume_contract(plan.get("volume"))
+    if volume["mount_point"] != str(VOLUME_MOUNT):
+        raise LaunchPackError(f"volume mount must be {VOLUME_MOUNT}")
     for label in (
         "fee_artifact_path",
         "fee_review_path",
@@ -221,6 +243,89 @@ def validate_plan(plan: Mapping[str, object]) -> dict[str, object]:
         if relative.is_absolute() or ".." in relative.parts:
             raise LaunchPackError(f"{label} must be a repository-relative path")
     return dict(plan)
+
+
+def validate_volume_contract(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "device",
+        "filesystem",
+        "model",
+        "mount_point",
+        "observed_available_bytes",
+        "observed_mount_options",
+        "serial",
+    }:
+        raise LaunchPackError("volume contract fields differ")
+    if value.get("device") != "/dev/sdb":
+        raise LaunchPackError("volume device must be /dev/sdb")
+    if value.get("filesystem") != "ext4":
+        raise LaunchPackError("volume filesystem must be ext4")
+    if value.get("mount_point") != str(VOLUME_MOUNT):
+        raise LaunchPackError(f"volume mount point must be {VOLUME_MOUNT}")
+    if value.get("model") != "Volume" or value.get("serial") != "106716684":
+        raise LaunchPackError("volume model or serial differs from discovery evidence")
+    observed = _required_int(
+        value.get("observed_available_bytes"), label="observed_available_bytes"
+    )
+    options = value.get("observed_mount_options")
+    if options != ["rw", "relatime", "discard"]:
+        raise LaunchPackError("observed volume mount options differ from discovery evidence")
+    return {**value, "observed_available_bytes": observed}
+
+
+def validate_volume_snapshot(
+    *,
+    contract: Mapping[str, object],
+    mount_target: str,
+    source_device: str,
+    canonical_device: str,
+    filesystem: str,
+    mount_options: Sequence[str],
+    serial: str | None,
+    model: str | None,
+    available_bytes: int,
+    required_free_bytes: int,
+) -> dict[str, object]:
+    volume = validate_volume_contract(contract)
+    if mount_target != volume["mount_point"]:
+        raise LaunchPackError(
+            f"H1_VOLUME_MOUNT_REFUSED: expected={volume['mount_point']} actual={mount_target}"
+        )
+    if source_device != volume["device"] or canonical_device != volume["device"]:
+        raise LaunchPackError(
+            f"H1_VOLUME_DEVICE_REFUSED: expected={volume['device']} "
+            f"source={source_device} canonical={canonical_device}"
+        )
+    if filesystem != volume["filesystem"]:
+        raise LaunchPackError(
+            f"H1_VOLUME_FILESYSTEM_REFUSED: expected={volume['filesystem']} actual={filesystem}"
+        )
+    options = frozenset(mount_options)
+    if "rw" not in options or "ro" in options:
+        raise LaunchPackError("H1_VOLUME_READ_ONLY_REFUSED")
+    expected_serial = str(volume["serial"])
+    if serial and serial != expected_serial:
+        raise LaunchPackError(
+            f"H1_VOLUME_SERIAL_REFUSED: expected={expected_serial} actual={serial}"
+        )
+    expected_model = str(volume["model"])
+    if model and model != expected_model:
+        raise LaunchPackError(
+            f"H1_VOLUME_MODEL_REFUSED: expected={expected_model} actual={model}"
+        )
+    capacity = assess_capacity(available_bytes, required_free_bytes)
+    return {
+        "available_bytes": capacity["available_bytes"],
+        "canonical_device": canonical_device,
+        "filesystem": filesystem,
+        "model": model,
+        "mount_options": sorted(options),
+        "mount_target": mount_target,
+        "required_free_bytes": capacity["required_free_bytes"],
+        "serial": serial,
+        "source_device": source_device,
+        "status": "H1_VOLUME_RUNTIME_GREEN",
+    }
 
 
 def assess_capacity(available_bytes: int, required_free_bytes: int) -> dict[str, object]:
@@ -300,6 +405,30 @@ def _git_output(repo_root: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
     )
+    return completed.stdout.strip()
+
+
+def _command_output(*arguments: str) -> str:
+    completed = subprocess.run(
+        list(arguments),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise LaunchPackError(f"command refused or unavailable: {arguments[0]}")
+    return completed.stdout.strip()
+
+
+def _optional_command_output(*arguments: str) -> str | None:
+    completed = subprocess.run(
+        list(arguments),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
     return completed.stdout.strip()
 
 
@@ -417,7 +546,91 @@ def _handoff_body(
         "source_commit": source_commit,
         "starts_at_utc": plan["starts_at_utc"],
         "arm_deadline_utc": plan["arm_deadline_utc"],
+        "volume": plan["volume"],
     }
+
+
+def render_volume_preparation_block(handoff: Mapping[str, object]) -> str:
+    checked = validate_handoff(handoff)
+    remote = checked["remote"]
+    disk = checked["disk"]
+    volume = checked["volume"]
+    assert isinstance(remote, dict) and isinstance(disk, dict) and isinstance(volume, dict)
+    return rf"""# LOCATION: Tabby/VPS - unique volume preparation, Bash, logged in as hyperlab.
+# EXPECTED_DURATION: 1-3 minutes; MAXIMUM_DURATION: 10 minutes.
+# PROMPTS: sudo may request the hyperlab password once; no HyperLab prompt and no network collection.
+# MONITORING: read the fail-closed checks printed here; no second tab is required for this short step.
+# CTRL+C: stops only this directory-preparation step; no service or collector is started.
+# TERMINAL_SIGNAL: H1_VOLUME_PREPARATION_GREEN_NO_SERVICE_NO_COLLECTOR.
+set -Eeuo pipefail
+umask 077
+
+fail() {{ printf 'H1_VOLUME_PREPARATION_REFUSED:%s\n' "$1" >&2; exit 4; }}
+
+H1_VOLUME_DEVICE='{volume['device']}'
+H1_VOLUME_MOUNT='{volume['mount_point']}'
+H1_VOLUME_ROOT='{remote['volume_root']}'
+H1_SOURCE_ROOT='{remote['source_root']}'
+H1_CAMPAIGN_ROOT='{remote['campaign_root']}'
+H1_REQUIRED_FREE_BYTES='{disk['required_free_bytes']}'
+H1_EXPECTED_FS='{volume['filesystem']}'
+H1_EXPECTED_MODEL='{volume['model']}'
+H1_EXPECTED_SERIAL='{volume['serial']}'
+
+[[ $(id -un) == hyperlab && $HOME == /home/hyperlab ]] || fail 'run as hyperlab with exact HOME'
+for command_name in readlink findmnt df awk stat sudo install; do
+  command -v "$command_name" >/dev/null 2>&1 || fail "missing command: $command_name"
+done
+[[ -b "$H1_VOLUME_DEVICE" ]] || fail 'expected block device is absent'
+[[ $(readlink -f -- "$H1_VOLUME_DEVICE") == "$H1_VOLUME_DEVICE" ]] || fail 'device real path differs'
+[[ -d "$H1_VOLUME_MOUNT" && ! -L "$H1_VOLUME_MOUNT" ]] || fail 'exact volume mount path is absent or a symlink'
+[[ $(readlink -f -- "$H1_VOLUME_MOUNT") == "$H1_VOLUME_MOUNT" ]] || fail 'volume mount real path differs'
+
+H1_FOUND_TARGET=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o TARGET)
+H1_FOUND_SOURCE=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o SOURCE)
+H1_FOUND_FS=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o FSTYPE)
+H1_FOUND_OPTIONS=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o OPTIONS)
+[[ $H1_FOUND_TARGET == "$H1_VOLUME_MOUNT" ]] || fail "mount target differs: $H1_FOUND_TARGET"
+[[ $H1_FOUND_SOURCE == "$H1_VOLUME_DEVICE" ]] || fail "mount device differs: $H1_FOUND_SOURCE"
+[[ $H1_FOUND_FS == "$H1_EXPECTED_FS" ]] || fail "filesystem differs: $H1_FOUND_FS"
+case ",$H1_FOUND_OPTIONS," in *,rw,*) ;; *) fail "volume is not rw: $H1_FOUND_OPTIONS" ;; esac
+case ",$H1_FOUND_OPTIONS," in *,ro,*) fail "volume is read-only: $H1_FOUND_OPTIONS" ;; esac
+
+H1_FOUND_SERIAL=''
+H1_FOUND_MODEL=''
+if command -v lsblk >/dev/null 2>&1; then
+  H1_FOUND_SERIAL=$(lsblk -dn -o SERIAL "$H1_VOLUME_DEVICE" 2>/dev/null | awk '{{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}}') || H1_FOUND_SERIAL=''
+  H1_FOUND_MODEL=$(lsblk -dn -o MODEL "$H1_VOLUME_DEVICE" 2>/dev/null | awk '{{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}}') || H1_FOUND_MODEL=''
+fi
+[[ -z $H1_FOUND_SERIAL || $H1_FOUND_SERIAL == "$H1_EXPECTED_SERIAL" ]] \
+  || fail "stable serial differs: $H1_FOUND_SERIAL"
+[[ -z $H1_FOUND_MODEL || $H1_FOUND_MODEL == "$H1_EXPECTED_MODEL" ]] \
+  || fail "stable model differs: $H1_FOUND_MODEL"
+
+H1_AVAILABLE_BYTES=$(df -PB1 --output=avail "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, ""); print}}')
+[[ $H1_AVAILABLE_BYTES =~ ^[0-9]+$ ]] || fail 'cannot measure volume free bytes'
+(( H1_AVAILABLE_BYTES >= H1_REQUIRED_FREE_BYTES )) \
+  || fail "H1_DISK_CAPACITY_INSUFFICIENT available=$H1_AVAILABLE_BYTES required=$H1_REQUIRED_FREE_BYTES"
+[[ $(readlink -m -- "$H1_VOLUME_ROOT") == "$H1_VOLUME_ROOT" ]] || fail 'volume base root is not canonical'
+[[ ! -e "$H1_SOURCE_ROOT" && ! -e "$H1_CAMPAIGN_ROOT" ]] \
+  || fail 'new source or campaign leaf already exists'
+for path in "$H1_VOLUME_ROOT" "$H1_VOLUME_ROOT/sources" "$H1_VOLUME_ROOT/campaigns"; do
+  [[ ! -e "$path" || ! -L "$path" ]] || fail "symlink forbidden: $path"
+done
+
+sudo install -d -o hyperlab -g hyperlab -m 0700 \
+  "$H1_VOLUME_ROOT" "$H1_VOLUME_ROOT/sources" "$H1_VOLUME_ROOT/campaigns"
+for path in "$H1_VOLUME_ROOT" "$H1_VOLUME_ROOT/sources" "$H1_VOLUME_ROOT/campaigns"; do
+  [[ $(readlink -f -- "$path") == "$path" ]] || fail "real path differs: $path"
+  [[ $(stat -c '%U:%G:%a' "$path") == 'hyperlab:hyperlab:700' ]] \
+    || fail "ownership or mode differs: $path"
+done
+
+printf 'H1_VOLUME_DEVICE=%s\n' "$H1_FOUND_SOURCE"
+printf 'H1_VOLUME_FILESYSTEM=%s\n' "$H1_FOUND_FS"
+printf 'H1_VOLUME_AVAILABLE_BYTES=%s\n' "$H1_AVAILABLE_BYTES"
+printf 'H1_VOLUME_PREPARATION_GREEN_NO_SERVICE_NO_COLLECTOR\n'
+"""
 
 
 def render_windows_operator_block(
@@ -446,6 +659,7 @@ $SshKey = "$env:USERPROFILE\.ssh\hyperlab_hetzner"
 $RemoteUser = 'hyperlab'
 $RemoteIp = '5.223.60.130'
 $CampaignSlug = '{slug}'
+$ArmDeadlineUtc = [DateTimeOffset]::Parse('{checked['arm_deadline_utc']}')
 $RemoteIncomingRelative = "hyperlab-h1/incoming/$CampaignSlug"
 $BundlePath = Join-Path $ArtifactRoot '{bundle_name}'
 $HandoffPath = Join-Path $ArtifactRoot 'handoff.json'
@@ -460,6 +674,7 @@ function Assert-Sha256 {{
 
 if ((git -C $Worktree rev-parse HEAD) -ne $Commit) {{ throw 'Local HEAD differs.' }}
 if (git -C $Worktree status --porcelain) {{ throw 'Launch worktree is not clean.' }}
+if ([DateTimeOffset]::UtcNow -gt $ArmDeadlineUtc) {{ throw 'H1_ARM_DEADLINE_MISSED' }}
 Assert-Sha256 $BundlePath '{bundle['sha256']}'
 Assert-Sha256 $HandoffPath '{sha256_bytes(canonical_json_bytes(checked))}'
 Assert-Sha256 $ManifestPath '{files['campaign_manifest_sha256']}'
@@ -490,7 +705,10 @@ $RemoteTarget = "${{RemoteUser}}@${{RemoteIp}}:${{RemoteIncomingRelative}}/"
 if ($LASTEXITCODE -ne 0) {{ throw 'SCP file transfer failed.' }}
 & scp.exe -i $SshKey -r `
     (Join-Path $ArtifactRoot 'campaign-seed') `
+    (Join-Path $ArtifactRoot 'inventory') `
     (Join-Path $ArtifactRoot 'operator') `
+    (Join-Path $ArtifactRoot 'scripts') `
+    (Join-Path $ArtifactRoot 'systemd') `
     $RemoteTarget
 if ($LASTEXITCODE -ne 0) {{ throw 'SCP directory transfer failed.' }}
 Write-Output 'H1_WINDOWS_TRANSFER_GREEN_NOT_LAUNCHED'
@@ -503,11 +721,13 @@ def render_tabby_operator_block(handoff: Mapping[str, object]) -> str:
     files = checked["files"]
     remote = checked["remote"]
     disk = checked["disk"]
+    volume = checked["volume"]
     assert (
         isinstance(bundle, dict)
         and isinstance(files, dict)
         and isinstance(remote, dict)
         and isinstance(disk, dict)
+        and isinstance(volume, dict)
     )
     source = str(remote["source_root"])
     incoming = str(remote["incoming_root"])
@@ -518,8 +738,8 @@ def render_tabby_operator_block(handoff: Mapping[str, object]) -> str:
 # EXPECTED_DURATION: 10-25 minutes to arm; MAXIMUM_DURATION: 45 minutes.
 # PROMPTS: sudo may request the hyperlab password; pip is non-interactive and bounded.
 # MONITORING: command output, then the exact second-Tabby watch command printed at the end.
-# CTRL+C: before the terminal signal means no success; abandon partial new roots and inspect systemd.
-# TERMINAL_SIGNAL: H1_SERVICE_ARMED_OR_RUNNING_GREEN plus the four exact H1_* identity lines.
+# CTRL+C: stops this foreground block only; after enable, systemd persists and must be inspected separately.
+# TERMINAL_SIGNAL: H1_SERVICE_ARMED_OR_RUNNING_GREEN plus the exact H1_* identity lines.
 set -Eeuo pipefail
 umask 077
 
@@ -530,6 +750,14 @@ H1_CAMPAIGN_ROOT='{campaign}'
 H1_SERVICE='{service}'
 H1_BUNDLE="$H1_INCOMING_ROOT/{bundle_name}"
 H1_REQUIRED_FREE_BYTES='{disk['required_free_bytes']}'
+H1_INCOMING_STAGING_MAX_BYTES='{disk['incoming_staging_max_bytes']}'
+H1_ARM_DEADLINE_UTC='{checked['arm_deadline_utc']}'
+H1_VOLUME_DEVICE='{volume['device']}'
+H1_VOLUME_MOUNT='{volume['mount_point']}'
+H1_VOLUME_ROOT='{remote['volume_root']}'
+H1_VOLUME_FS='{volume['filesystem']}'
+H1_VOLUME_MODEL='{volume['model']}'
+H1_VOLUME_SERIAL='{volume['serial']}'
 
 [[ $(id -un) == hyperlab && $HOME == /home/hyperlab ]]
 case "$H1_INCOMING_ROOT" in
@@ -537,18 +765,52 @@ case "$H1_INCOMING_ROOT" in
   *) printf 'H1_INCOMING_PATH_REFUSED:%s\n' "$H1_INCOMING_ROOT" >&2; exit 4 ;;
 esac
 [[ $(readlink -f -- "$H1_INCOMING_ROOT") == "$H1_INCOMING_ROOT" ]]
+chmod 0700 "$HOME/hyperlab-h1" "$HOME/hyperlab-h1/incoming" "$H1_INCOMING_ROOT"
 cd "$H1_INCOMING_ROOT"
 printf '%s  %s\n' '{bundle['sha256']}' '{bundle_name}' | sha256sum -c -
 printf '%s  %s\n' '{sha256_bytes(canonical_json_bytes(checked))}' 'handoff.json' | sha256sum -c -
 printf '%s  %s\n' '{files['campaign_manifest_sha256']}' 'campaign-seed/campaign-manifest.json' | sha256sum -c -
 sha256sum -c launch-files.sha256
+[[ -z $(find "$H1_INCOMING_ROOT" -type l -print -quit) ]]
+[[ ! -d "$H1_INCOMING_ROOT/raw" ]]
+[[ -z $(find "$H1_INCOMING_ROOT" -type f -name '*.rdpseg' -print -quit) ]]
+INCOMING_BYTES=$(du -sb -- "$H1_INCOMING_ROOT" | awk '{{print $1}}')
+[[ $INCOMING_BYTES =~ ^[0-9]+$ ]]
+(( INCOMING_BYTES <= H1_INCOMING_STAGING_MAX_BYTES ))
 
 [[ $(timedatectl show --property=NTPSynchronized --value) == yes ]]
 [[ $(date -u +%Z) == UTC ]]
-mkdir -p "$HOME/hyperlab-h1/sources" "$HOME/hyperlab-h1/campaigns"
-chmod 0700 "$HOME/hyperlab-h1" "$HOME/hyperlab-h1/incoming" \
-  "$HOME/hyperlab-h1/sources" "$HOME/hyperlab-h1/campaigns" "$H1_INCOMING_ROOT"
-AVAILABLE_BYTES=$(df -PB1 "$HOME/hyperlab-h1" | awk 'NR == 2 {{print $4}}')
+ARM_DEADLINE_EPOCH=$(date -u -d "$H1_ARM_DEADLINE_UTC" +%s)
+(( $(date -u +%s) <= ARM_DEADLINE_EPOCH )) || {{ printf 'H1_ARM_DEADLINE_MISSED\n' >&2; exit 4; }}
+[[ -b "$H1_VOLUME_DEVICE" ]]
+[[ $(readlink -f -- "$H1_VOLUME_DEVICE") == "$H1_VOLUME_DEVICE" ]]
+[[ -d "$H1_VOLUME_MOUNT" && ! -L "$H1_VOLUME_MOUNT" ]]
+[[ $(readlink -f -- "$H1_VOLUME_MOUNT") == "$H1_VOLUME_MOUNT" ]]
+FOUND_TARGET=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o TARGET)
+FOUND_SOURCE=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o SOURCE)
+FOUND_FS=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o FSTYPE)
+FOUND_OPTIONS=$(findmnt -rn -T "$H1_VOLUME_MOUNT" -o OPTIONS)
+[[ $FOUND_TARGET == "$H1_VOLUME_MOUNT" ]]
+[[ $FOUND_SOURCE == "$H1_VOLUME_DEVICE" ]]
+[[ $FOUND_FS == "$H1_VOLUME_FS" ]]
+case ",$FOUND_OPTIONS," in *,rw,*) ;; *) printf 'H1_VOLUME_READ_ONLY_REFUSED\n' >&2; exit 4 ;; esac
+case ",$FOUND_OPTIONS," in *,ro,*) printf 'H1_VOLUME_READ_ONLY_REFUSED\n' >&2; exit 4 ;; esac
+FOUND_SERIAL=''
+FOUND_MODEL=''
+if command -v lsblk >/dev/null 2>&1; then
+  FOUND_SERIAL=$(lsblk -dn -o SERIAL "$H1_VOLUME_DEVICE" 2>/dev/null | awk '{{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}}') || FOUND_SERIAL=''
+  FOUND_MODEL=$(lsblk -dn -o MODEL "$H1_VOLUME_DEVICE" 2>/dev/null | awk '{{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}}') || FOUND_MODEL=''
+fi
+[[ -z $FOUND_SERIAL || $FOUND_SERIAL == "$H1_VOLUME_SERIAL" ]]
+[[ -z $FOUND_MODEL || $FOUND_MODEL == "$H1_VOLUME_MODEL" ]]
+for path in "$H1_VOLUME_ROOT" "$H1_VOLUME_ROOT/sources" "$H1_VOLUME_ROOT/campaigns"; do
+  [[ -d "$path" && ! -L "$path" ]]
+  [[ $(readlink -f -- "$path") == "$path" ]]
+  [[ $(stat -c '%U:%G:%a' "$path") == 'hyperlab:hyperlab:700' ]]
+done
+[[ $(readlink -m -- "$H1_SOURCE_ROOT") == "$H1_SOURCE_ROOT" ]]
+[[ $(readlink -m -- "$H1_CAMPAIGN_ROOT") == "$H1_CAMPAIGN_ROOT" ]]
+AVAILABLE_BYTES=$(df -PB1 --output=avail "$H1_VOLUME_MOUNT" | awk 'NR == 2 {{gsub(/[[:space:]]/, ""); print}}')
 [[ $AVAILABLE_BYTES =~ ^[0-9]+$ ]]
 (( AVAILABLE_BYTES >= H1_REQUIRED_FREE_BYTES )) || {{
   printf 'H1_DISK_CAPACITY_INSUFFICIENT available=%s required=%s\n' \
@@ -558,6 +820,7 @@ AVAILABLE_BYTES=$(df -PB1 "$HOME/hyperlab-h1" | awk 'NR == 2 {{print $4}}')
 [[ ! -e "$H1_SOURCE_ROOT" && ! -e "$H1_CAMPAIGN_ROOT" ]]
 git clone --no-checkout "$H1_BUNDLE" "$H1_SOURCE_ROOT"
 chmod 0700 "$H1_SOURCE_ROOT"
+[[ $(readlink -f -- "$H1_SOURCE_ROOT") == "$H1_SOURCE_ROOT" ]]
 git -C "$H1_SOURCE_ROOT" checkout --detach "$H1_COMMIT"
 [[ $(git -C "$H1_SOURCE_ROOT" rev-parse HEAD) == "$H1_COMMIT" ]]
 [[ -z $(git -C "$H1_SOURCE_ROOT" status --porcelain) ]]
@@ -610,9 +873,48 @@ def finalize_launch_pack(
     if seed_root.exists():
         raise FileExistsError("campaign seed root must be new")
     prepared = _prepare_campaign_seed(repo_root, plan, seed_root)
+    generated_operator_root = seed_root / "operator"
+    generated_operator_files = {
+        generated_operator_root / "tabby-vps-bash.txt",
+        generated_operator_root / "windows-powershell.txt",
+    }
+    if {path for path in generated_operator_root.iterdir()} != generated_operator_files:
+        raise LaunchPackError("canonical H1 preparation emitted unexpected operator files")
+    for path in sorted(generated_operator_files):
+        if path.is_symlink() or not path.is_file():
+            raise LaunchPackError("canonical H1 preparation operator artifact is unsafe")
+        path.unlink()
+    generated_operator_root.rmdir()
     manifest_path = seed_root / "campaign-manifest.json"
     pin_path = seed_root / "campaign-manifest.sha256"
     health_path = seed_root / "state" / "health.json"
+    script_names = (
+        "bootstrap-linux.sh",
+        "launch_pack.py",
+        "monitor.sh",
+        "run_collector.sh",
+        "vps-install.sh",
+    )
+    source_artifacts = {
+        f"ops/h1_campaign/{name}": sha256_file(repo_root / "ops/h1_campaign" / name)
+        for name in script_names
+    }
+    source_inventory = {
+        "boundary": BOUNDARY,
+        "inventory": inventory,
+        "launch_plan_path": "ops/h1_campaign/launch-plan-v1.json",
+        "launch_plan_sha256": sha256_file(repo_root / "ops/h1_campaign/launch-plan-v1.json"),
+        "source_artifacts": source_artifacts,
+        "source_commit": source_commit,
+    }
+    inventory_path = output_root / "inventory" / "source-policy-readiness.json"
+    _write_exclusive(inventory_path, canonical_json_bytes(source_inventory))
+    scripts_root = output_root / "scripts"
+    for name in script_names:
+        _write_exclusive(
+            scripts_root / name,
+            (repo_root / "ops/h1_campaign" / name).read_bytes(),
+        )
     handoff = _handoff_body(
         plan=plan,
         inventory=inventory,
@@ -624,6 +926,14 @@ def finalize_launch_pack(
         created_at=created,
         repo_root=repo_root,
     )
+    handoff_files = handoff["files"]
+    assert isinstance(handoff_files, dict)
+    handoff_files["source_inventory_sha256"] = sha256_file(inventory_path)
+    handoff_files["systemd_unit_sha256"] = "0" * 64
+    systemd_path = output_root / "systemd" / str(handoff["service_name"])
+    _write_exclusive(systemd_path, render_systemd_unit(handoff).encode("utf-8"))
+    handoff_files["systemd_unit_sha256"] = sha256_file(systemd_path)
+    validate_handoff(handoff)
     if handoff["campaign_id"] != prepared["campaign_id"]:
         raise LaunchPackError("prepared campaign identity changed during finalization")
     handoff_path = output_root / "handoff.json"
@@ -636,6 +946,7 @@ def finalize_launch_pack(
     operator_root = output_root / "operator"
     windows_path = operator_root / "windows-powershell.txt"
     tabby_path = operator_root / "tabby-vps-bash.txt"
+    volume_path = operator_root / "tabby-vps-volume-preparation.txt"
     _write_exclusive(
         windows_path,
         render_windows_operator_block(handoff, output_root=output_root, repo_root=repo_root).encode(
@@ -643,6 +954,7 @@ def finalize_launch_pack(
         ),
     )
     _write_exclusive(tabby_path, render_tabby_operator_block(handoff).encode("utf-8"))
+    _write_exclusive(volume_path, render_volume_preparation_block(handoff).encode("utf-8"))
     launch_files = {
         bundle_path.name: sha256_file(bundle_path),
         "campaign-seed/campaign-manifest.json": sha256_file(manifest_path),
@@ -650,9 +962,14 @@ def finalize_launch_pack(
         "campaign-seed/state/health.json": sha256_file(health_path),
         "handoff.json": handoff_sha,
         "handoff.sha256": sha256_file(output_root / "handoff.sha256"),
+        "inventory/source-policy-readiness.json": sha256_file(inventory_path),
         "operator/tabby-vps-bash.txt": sha256_file(tabby_path),
+        "operator/tabby-vps-volume-preparation.txt": sha256_file(volume_path),
         "operator/windows-powershell.txt": sha256_file(windows_path),
+        f"systemd/{handoff['service_name']}": sha256_file(systemd_path),
     }
+    for name in script_names:
+        launch_files[f"scripts/{name}"] = sha256_file(scripts_root / name)
     lines = [f"{digest}  {name}" for name, digest in sorted(launch_files.items())]
     _write_exclusive(
         output_root / "launch-files.sha256",
@@ -681,7 +998,11 @@ def validate_handoff(handoff: Mapping[str, object]) -> dict[str, object]:
     if service != f"hyperlab-{slug}.service":
         raise LaunchPackError("handoff service is not derived from campaign slug")
     remote = handoff.get("remote")
-    if not isinstance(remote, dict) or remote.get("home_root") != str(HOME_ROOT):
+    if (
+        not isinstance(remote, dict)
+        or remote.get("home_root") != str(HOME_ROOT)
+        or remote.get("volume_root") != str(VOLUME_ROOT)
+    ):
         raise LaunchPackError("handoff remote roots are absent")
     for category, key in (
         ("incoming", "incoming_root"),
@@ -697,8 +1018,19 @@ def validate_handoff(handoff: Mapping[str, object]) -> dict[str, object]:
     maximum = _required_int(disk.get("maximum_raw_bytes"), label="maximum_raw_bytes")
     margin = _required_int(disk.get("margin_bytes"), label="margin_bytes")
     required = _required_int(disk.get("required_free_bytes"), label="required_free_bytes")
+    staging_max = _required_int(
+        disk.get("incoming_staging_max_bytes"), label="incoming_staging_max_bytes"
+    )
     if required != maximum + margin:
         raise LaunchPackError("handoff disk budget is incoherent")
+    if staging_max > margin:
+        raise LaunchPackError("handoff incoming staging ceiling is unsafe")
+    volume = validate_volume_contract(handoff.get("volume"))
+    observed_available = _required_int(
+        volume.get("observed_available_bytes"), label="observed_available_bytes"
+    )
+    if observed_available < required:
+        raise LaunchPackError("discovered volume capacity does not cover the frozen H1 budget")
     reviewed = _parse_utc(handoff.get("fee_reviewed_at_utc"), label="fee_reviewed_at_utc")
     starts = _parse_utc(handoff.get("starts_at_utc"), label="starts_at_utc")
     if reviewed >= starts or starts - reviewed > timedelta(hours=24):
@@ -715,6 +1047,8 @@ def validate_handoff(handoff: Mapping[str, object]) -> dict[str, object]:
         ("policy_config_sha256", inventory.get("policy_config_sha256")),
         ("requirements_lock_sha256", inventory.get("requirements_lock_sha256")),
         ("campaign_manifest_sha256", files.get("campaign_manifest_sha256")),
+        ("source_inventory_sha256", files.get("source_inventory_sha256")),
+        ("systemd_unit_sha256", files.get("systemd_unit_sha256")),
     ):
         _required_sha256(value, label=label)
     return dict(handoff)
@@ -733,6 +1067,8 @@ Description=HyperLab H1 prospective public Ghost campaign {checked['campaign_slu
 Documentation=file:{source}/docs/H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1.md
 Wants=network-online.target
 After=network-online.target time-sync.target
+RequiresMountsFor={VOLUME_MOUNT}
+ConditionPathIsMountPoint={VOLUME_MOUNT}
 StartLimitIntervalSec=1800
 StartLimitBurst=3
 
@@ -788,17 +1124,27 @@ WantedBy=multi-user.target
 
 
 def _assert_safe_real_path(path: Path, allowed_parent: Path, *, must_exist: bool) -> None:
+    if not path.is_absolute() or not allowed_parent.is_absolute():
+        raise LaunchPackError(f"authoritative path must be absolute: {path}")
     resolved_parent = allowed_parent.resolve(strict=True)
+    if resolved_parent != allowed_parent or allowed_parent.is_symlink():
+        raise LaunchPackError(f"authoritative parent is not an exact real path: {allowed_parent}")
+    try:
+        relative = path.relative_to(allowed_parent)
+    except ValueError as error:
+        raise LaunchPackError(f"path leaves allowed root: {path}") from error
+    current = allowed_parent
+    for part in relative.parts:
+        current /= part
+        if current.exists() and current.is_symlink():
+            raise LaunchPackError(f"symlink forbidden in authoritative path: {current}")
     resolved = path.resolve(strict=must_exist)
     try:
         resolved.relative_to(resolved_parent)
     except ValueError as error:
         raise LaunchPackError(f"path leaves allowed root: {path}") from error
-    current = resolved_parent
-    for part in resolved.relative_to(resolved_parent).parts:
-        current /= part
-        if current.exists() and current.is_symlink():
-            raise LaunchPackError(f"symlink forbidden in authoritative path: {current}")
+    if resolved != path:
+        raise LaunchPackError(f"authoritative path is not byte-exact after readlink: {path}")
 
 
 def _timedatectl_synchronized() -> bool:
@@ -836,6 +1182,7 @@ def preflight_snapshot(
     raw_stored_bytes: int,
     writer_lock_available: bool,
     forbidden_environment: Sequence[str],
+    volume_snapshot: Mapping[str, object],
 ) -> dict[str, object]:
     checked = validate_handoff(handoff)
     if current_user != EXPECTED_USER:
@@ -852,6 +1199,23 @@ def preflight_snapshot(
     assert isinstance(disk, dict)
     remaining_raw_bytes = max(0, int(disk["maximum_raw_bytes"]) - raw_stored_bytes)
     required_now = remaining_raw_bytes + int(disk["margin_bytes"])
+    volume = checked["volume"]
+    assert isinstance(volume, dict)
+    mount_options_value = volume_snapshot.get("mount_options")
+    if isinstance(mount_options_value, str) or not isinstance(mount_options_value, Sequence):
+        raise LaunchPackError("H1_VOLUME_OPTIONS_REFUSED")
+    runtime_volume = validate_volume_snapshot(
+        contract=volume,
+        mount_target=str(volume_snapshot.get("mount_target", "")),
+        source_device=str(volume_snapshot.get("source_device", "")),
+        canonical_device=str(volume_snapshot.get("canonical_device", "")),
+        filesystem=str(volume_snapshot.get("filesystem", "")),
+        mount_options=tuple(str(item) for item in mount_options_value),
+        serial=(str(volume_snapshot["serial"]) if volume_snapshot.get("serial") else None),
+        model=(str(volume_snapshot["model"]) if volume_snapshot.get("model") else None),
+        available_bytes=available_bytes,
+        required_free_bytes=required_now,
+    )
     capacity = assess_capacity(available_bytes, required_now)
     capacity["remaining_raw_budget_bytes"] = remaining_raw_bytes
     capacity["stored_raw_bytes"] = raw_stored_bytes
@@ -867,6 +1231,7 @@ def preflight_snapshot(
         "collection_mode": "RESUME" if raw_exists else "INITIAL",
         "ntp_synchronized": True,
         "status": "H1_VPS_PREFLIGHT_GREEN",
+        "volume": runtime_volume,
     }
 
 
@@ -877,8 +1242,9 @@ def _verify_repository_and_campaign(handoff_path: Path) -> tuple[dict[str, objec
     source_root = Path(str(remote["source_root"]))
     campaign_root = Path(str(remote["campaign_root"]))
     home_root = Path(str(remote["home_root"]))
-    _assert_safe_real_path(source_root, home_root / "sources", must_exist=True)
-    _assert_safe_real_path(campaign_root, home_root / "campaigns", must_exist=True)
+    volume_root = Path(str(remote["volume_root"]))
+    _assert_safe_real_path(source_root, volume_root / "sources", must_exist=True)
+    _assert_safe_real_path(campaign_root, volume_root / "campaigns", must_exist=True)
     _assert_safe_real_path(handoff_path, home_root / "incoming", must_exist=True)
     if _git_output(source_root, "rev-parse", "HEAD") != handoff["source_commit"]:
         raise LaunchPackError("VPS source HEAD differs from handoff commit")
@@ -930,7 +1296,19 @@ def run_vps_preflight(handoff_path: Path) -> dict[str, object]:
         raise LaunchPackError("effective user lookup is unavailable")
     current_user = str(pwd.getpwuid(int(geteuid())).pw_name)
     forbidden = [name for name in FORBIDDEN_ENVIRONMENT if os.environ.get(name)]
-    disk = shutil.disk_usage(str(HOME_ROOT))
+    volume = handoff["volume"]
+    assert isinstance(volume, dict)
+    mount_point = str(volume["mount_point"])
+    disk = shutil.disk_usage(mount_point)
+    mount_target = _command_output("findmnt", "-rn", "-T", mount_point, "-o", "TARGET")
+    source_device = _command_output("findmnt", "-rn", "-T", mount_point, "-o", "SOURCE")
+    filesystem = _command_output("findmnt", "-rn", "-T", mount_point, "-o", "FSTYPE")
+    mount_options = _command_output("findmnt", "-rn", "-T", mount_point, "-o", "OPTIONS").split(
+        ","
+    )
+    canonical_device = _command_output("readlink", "-f", str(volume["device"]))
+    serial = _optional_command_output("lsblk", "-dn", "-o", "SERIAL", str(volume["device"]))
+    model = _optional_command_output("lsblk", "-dn", "-o", "MODEL", str(volume["device"]))
     raw_root = campaign_root / "raw"
     return preflight_snapshot(
         handoff=handoff,
@@ -942,6 +1320,15 @@ def run_vps_preflight(handoff_path: Path) -> dict[str, object]:
         raw_stored_bytes=_stored_segment_file_bytes(raw_root),
         writer_lock_available=_writer_lock_is_available(raw_root),
         forbidden_environment=forbidden,
+        volume_snapshot={
+            "canonical_device": canonical_device,
+            "filesystem": filesystem,
+            "model": model,
+            "mount_options": mount_options,
+            "mount_target": mount_target,
+            "serial": serial,
+            "source_device": source_device,
+        },
     )
 
 

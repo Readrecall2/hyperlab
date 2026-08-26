@@ -32,13 +32,15 @@ CAMPAIGN_ROOT=${VALUES[1]}
 STARTS_AT_UTC=${VALUES[2]}
 
 case "$SOURCE_ROOT" in
-  "$HOME"/hyperlab-h1/sources/*) ;;
+  /mnt/HC_Volume_106716684/hyperlab-h1/sources/*) ;;
   *) fail 'source root leaves admitted tree' ;;
 esac
 case "$CAMPAIGN_ROOT" in
-  "$HOME"/hyperlab-h1/campaigns/*) ;;
+  /mnt/HC_Volume_106716684/hyperlab-h1/campaigns/*) ;;
   *) fail 'campaign root leaves admitted tree' ;;
 esac
+[[ $(readlink -f -- "$SOURCE_ROOT") == "$SOURCE_ROOT" ]] || fail 'source root real path differs'
+[[ $(readlink -f -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] || fail 'campaign root real path differs'
 
 VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 CONFIG="$SOURCE_ROOT/config/research/hyperliquid-h1-ghost-v1.json"

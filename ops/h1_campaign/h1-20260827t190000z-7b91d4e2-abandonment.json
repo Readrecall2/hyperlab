@@ -1,0 +1,7 @@
+{
+  "abandonment_status": "ABANDONED_BEFORE_TRANSFER_INSUFFICIENT_ROOT_DISK",
+  "available_root_bytes": 36332081152,
+  "capacity_verdict": "H1_DISK_CAPACITY_INSUFFICIENT",
+  "required_free_bytes": 154618822656,
+  "transfer_launch_collection": "NO_TRANSFER_NO_LAUNCH_NO_NETWORK_COLLECTION"
+}

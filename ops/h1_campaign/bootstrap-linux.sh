@@ -13,12 +13,13 @@ fi
 
 SOURCE_ROOT=$1
 case "$SOURCE_ROOT" in
-  "$HOME"/hyperlab-h1/sources/*) ;;
-  *) fail 'source root leaves $HOME/hyperlab-h1/sources' ;;
+  /mnt/HC_Volume_106716684/hyperlab-h1/sources/*) ;;
+  *) fail 'source root leaves the admitted H1 volume sources root' ;;
 esac
 
 [[ $(id -un) == hyperlab ]] || fail 'service user must be hyperlab'
 [[ $HOME == /home/hyperlab ]] || fail 'HOME must be /home/hyperlab'
+[[ $(readlink -f -- "$SOURCE_ROOT") == "$SOURCE_ROOT" ]] || fail 'source root real path differs'
 [[ -d "$SOURCE_ROOT/.git" ]] || fail 'source root is not a fresh Git clone'
 [[ ! -e "$SOURCE_ROOT/.venv" ]] || fail 'source virtual environment already exists'
 

@@ -1,8 +1,9 @@
 {
-  "arm_deadline_utc": "2026-08-27T18:30:00Z",
+  "arm_deadline_utc": "2026-08-27T19:30:00Z",
   "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
-  "campaign_slug": "h1-20260827t190000z-7b91d4e2",
+  "campaign_slug": "h1-20260827t200000z-21fa9dba",
   "disk": {
+    "incoming_staging_max_bytes": 67108864,
     "margin_bytes": 17179869184,
     "maximum_raw_bytes": 137438953472,
     "required_free_bytes": 154618822656
@@ -12,13 +13,27 @@
   "fee_reviewed_at_utc": "2026-08-26T20:53:53Z",
   "policy_config_path": "config/research/hyperliquid-h1-ghost-v1.json",
   "remote": {
-    "campaign_root": "/home/hyperlab/hyperlab-h1/campaigns/h1-20260827t190000z-7b91d4e2",
+    "campaign_root": "/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t200000z-21fa9dba",
     "home_root": "/home/hyperlab/hyperlab-h1",
-    "incoming_root": "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t190000z-7b91d4e2",
-    "source_root": "/home/hyperlab/hyperlab-h1/sources/h1-20260827t190000z-7b91d4e2"
+    "incoming_root": "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t200000z-21fa9dba",
+    "source_root": "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t200000z-21fa9dba",
+    "volume_root": "/mnt/HC_Volume_106716684/hyperlab-h1"
   },
   "requirements_lock_path": "requirements-runtime.lock",
   "schema_version": 1,
-  "service_name": "hyperlab-h1-20260827t190000z-7b91d4e2.service",
-  "starts_at_utc": "2026-08-27T19:00:00Z"
+  "service_name": "hyperlab-h1-20260827t200000z-21fa9dba.service",
+  "starts_at_utc": "2026-08-27T20:00:00Z",
+  "volume": {
+    "device": "/dev/sdb",
+    "filesystem": "ext4",
+    "model": "Volume",
+    "mount_point": "/mnt/HC_Volume_106716684",
+    "observed_available_bytes": 199487336448,
+    "observed_mount_options": [
+      "rw",
+      "relatime",
+      "discard"
+    ],
+    "serial": "106716684"
+  }
 }

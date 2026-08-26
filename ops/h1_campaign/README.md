@@ -7,18 +7,29 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T19:00:00Z`;
-- operator arm deadline: `2026-08-27T18:30:00Z`;
-- unique slug: `h1-20260827t190000z-7b91d4e2`;
-- service: `hyperlab-h1-20260827t190000z-7b91d4e2.service`;
+- start: `2026-08-27T20:00:00Z`;
+- operator arm deadline: `2026-08-27T19:30:00Z`;
+- unique slug: `h1-20260827t200000z-21fa9dba`;
+- service: `hyperlab-h1-20260827t200000z-21fa9dba.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).
+- discovered free bytes on the admitted volume: 199,487,336,448;
+- discovery margin above admission: 44,868,513,792 bytes;
+- lightweight home incoming ceiling: 67,108,864 bytes (64 MiB).
 
 The launch must not silently reduce the 7–14 day window or the 128 GiB raw
 ceiling. Insufficient free bytes stop the workflow before collection. On
 resume, admission requires the unconsumed raw budget plus the same 16 GiB
 margin.
+
+The exact authoritative volume contract is `/dev/sdb`, `ext4`, mounted read-write
+at `/mnt/HC_Volume_106716684`, with Hetzner model `Volume` and stable serial
+`106716684` when Linux exposes them. Incoming transfer remains under
+`/home/hyperlab/hyperlab-h1/incoming/<slug>`. The detached source and campaign
+roots are unique leaves under `/mnt/HC_Volume_106716684/hyperlab-h1`. Symlinks,
+a different `findmnt` target/source/filesystem, read-only options, insufficient
+free bytes, and pre-existing campaign leaves all refuse admission.
 
 ## Fee review
 
@@ -51,6 +62,8 @@ containing:
 - `launch-files.sha256`;
 - `campaign-seed/campaign-manifest.json` and its pin;
 - `campaign-seed/state/health.json` in `PREPARED_NOT_STARTED`.
+- the byte-pinned systemd unit, operator scripts, source/policy inventory, and
+  three shell-separated human blocks.
 
 The handoff binds the final commit, bundle, launch plan, canonical policy hash,
 raw policy file, fee artifact, fee review, runtime lock, campaign manifest,
@@ -61,7 +74,7 @@ between source identity and the canonical campaign manifest.
 ## Persistent service and recovery
 
 The rendered systemd unit runs as `hyperlab`, is read-only except for the one
-campaign root, exposes no port, drops all capabilities, unsets common secret
+campaign root on the admitted volume, exposes no port, drops all capabilities, unsets common secret
 variables, and permits only public IPv4/IPv6/Unix sockets. It waits locally
 until the frozen start, then `exec`s only:
 
@@ -84,7 +97,15 @@ that exits before health publication all fail closed.
 ## Human-only boundary
 
 Codex does not execute `vps-install.sh`, SSH, SCP, SFTP, systemd, or the H1
-collector. The exact Windows PowerShell and `Tabby - VPS` Bash blocks are
-generated in the final handoff report only after the final commit and artifact
-hashes exist. The Windows block uses SFTP only to create the unique incoming
-directory and SCP for transfer; the Tabby block is the only Bash block.
+collector. The exact volume-preparation Tabby block, Windows PowerShell transfer
+block, and installation/arming Tabby block are generated only after the final
+commit and artifact hashes exist. The first block validates the already-mounted
+volume and uses only `sudo install -d` to prepare its HyperLab base directories.
+The Windows block uses SFTP only to create the unique home incoming directory
+and SCP for transfer. The final Bash block revalidates the volume before any
+campaign root is created.
+
+The V2 slug `h1-20260827t190000z-7b91d4e2` remains byte-identical and was never
+transferred or launched. Its append-only receipt marks it
+`ABANDONED_BEFORE_TRANSFER_INSUFFICIENT_ROOT_DISK`; it is not reused by this
+continuation.

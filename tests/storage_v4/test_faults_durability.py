@@ -23,7 +23,7 @@ from hyperlab.paper.storage_v4.faults import (
 SYNTHETIC_STORAGE_V4_WORKLOAD = True
 
 
-def test_fault_points_cover_every_phase_1b_publication_boundary() -> None:
+def test_fault_points_cover_every_phase_1b_and_phase_1c_publication_boundary() -> None:
     expected = {
         f"{side}_{boundary}"
         for side in ("before", "after")
@@ -40,8 +40,19 @@ def test_fault_points_cover_every_phase_1b_publication_boundary() -> None:
             "current_publication",
             "anchor_publication",
             "overlay_transaction",
+            "raw_segment_publication",
+            "raw_manifest_publication",
+            "raw_anchor_publication",
         )
     }
+    expected.update(
+        {
+            "before_raw_segment_copy",
+            "after_raw_segment_copy",
+            "after_raw_before_paper_append",
+            "before_overlay_commit",
+        }
+    )
 
     assert {point.value for point in FaultPoint} == expected
 

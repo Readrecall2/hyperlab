@@ -70,6 +70,7 @@ _RELEASE_CODE_FIXED_PATHS = (
     "pyproject.toml",
     "requirements-runtime.lock",
     "scripts/certify_storage_v4_phase1b.py",
+    "scripts/certify_storage_v4_phase1c.py",
     "scripts/generate_phase12_live_paper_artifacts.py",
 )
 _CLI_DERIVED_BINDING_NAMES = (

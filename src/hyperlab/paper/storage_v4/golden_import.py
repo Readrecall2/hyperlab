@@ -390,6 +390,12 @@ class GoldenCommitAssembler:
     def __iter__(self) -> Iterator[AssembledGoldenCommit]:
         return self.iter_commits()
 
+    @property
+    def expectations(self) -> GoldenImportExpectations:
+        """Return the immutable certified cardinality and identity contract."""
+
+        return self._expectations
+
     def iter_commits(self) -> Iterator[AssembledGoldenCommit]:
         expected = self._expectations
         run_id = expected.run_id

@@ -70,6 +70,24 @@ def test_paper_package_has_no_network_wallet_signer_exchange_or_order_transport_
         "send_order",
     }
     allowed_public_source_imports = {
+        # Exact local SQLite file-URI decoding used by the bounded startup tracer.
+        # These symbols perform no network I/O; every other urllib import remains
+        # forbidden and the tracer rejects non-local URI authorities fail-closed.
+        (
+            "startup_trace.py",
+            "urllib.parse",
+            "unquote",
+        ),
+        (
+            "startup_trace.py",
+            "urllib.parse",
+            "urlsplit",
+        ),
+        (
+            "startup_trace.py",
+            "urllib.request",
+            "url2pathname",
+        ),
         (
             "collector_source.py",
             "hyperlab.api.public",

@@ -641,3 +641,93 @@ def test_advance_base_deletes_only_covered_rows_preserves_tail_and_is_idempotent
     assert reopened.append(fourth)
     assert reopened.frames() == (frames[2], fourth)
     reopened.close()
+
+
+def test_discard_unsealed_tail_is_exact_whole_tail_cas_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    overlay = _create(tmp_path / "discard.sqlite3")
+    frames = _append_chain(overlay, 11, 13, _ZERO)
+    before = overlay.verify_integrity()
+    expected_base = replace(
+        before,
+        tail_commit_count=0,
+        tail_row_count=0,
+        tail_bytes=0,
+        head_commit_sequence=before.base_commit_sequence,
+        head_prefix_root=before.base_prefix_root,
+    )
+
+    result = overlay.discard_unsealed_tail(expected_base=expected_base)
+
+    assert result.changed is True
+    assert result.before == before
+    assert result.after == expected_base
+    assert result.discarded_commit_count == len(frames)
+    assert result.discarded_row_count == sum(len(frame.rows) for frame in frames)
+    assert result.discarded_bytes == sum(
+        len(commit_frame_to_bytes(frame)) for frame in frames
+    )
+    assert overlay.frames() == ()
+    assert overlay.verify_integrity() == expected_base
+
+    repeated = overlay.discard_unsealed_tail(expected_base=expected_base)
+    assert repeated.changed is False
+    assert repeated.before == expected_base
+    assert repeated.after == expected_base
+    overlay.close()
+
+
+def test_discard_unsealed_tail_refuses_an_arbitrary_cutoff_without_mutation(
+    tmp_path: Path,
+) -> None:
+    overlay = _create(tmp_path / "discard-mismatch.sqlite3")
+    frames = _append_chain(overlay, 11, 13, _ZERO)
+    before = overlay.verify_integrity()
+    invented_cutoff = replace(
+        before,
+        base_manifest_generation=2,
+        base_manifest_root=Hash32(b"\x22" * 32),
+        base_commit_sequence=frames[0].commit_sequence,
+        base_prefix_root=build_commit_logical(frames[0]).prefix_root,
+        tail_commit_count=0,
+        tail_row_count=0,
+        tail_bytes=0,
+        head_commit_sequence=frames[0].commit_sequence,
+        head_prefix_root=build_commit_logical(frames[0]).prefix_root,
+    )
+
+    with pytest.raises(OverlayError) as failure:
+        overlay.discard_unsealed_tail(expected_base=invented_cutoff)
+
+    assert failure.value.code is OverlayErrorCode.EXPECTED_STATE_MISMATCH
+    assert overlay.verify_integrity() == before
+    assert overlay.frames() == tuple(frames)
+    overlay.close()
+
+
+def test_discard_unsealed_tail_rolls_back_before_commit(tmp_path: Path) -> None:
+    fault = _Fault()
+    overlay = _create(
+        tmp_path / "discard-fault.sqlite3",
+        fault_injector=fault,
+    )
+    frames = _append_chain(overlay, 11, 12, _ZERO)
+    before = overlay.verify_integrity()
+    expected_base = replace(
+        before,
+        tail_commit_count=0,
+        tail_row_count=0,
+        tail_bytes=0,
+        head_commit_sequence=before.base_commit_sequence,
+        head_prefix_root=before.base_prefix_root,
+    )
+    fault.point = FAULT_BEFORE_COMMIT
+
+    with pytest.raises(RuntimeError, match="before_commit"):
+        overlay.discard_unsealed_tail(expected_base=expected_base)
+
+    fault.point = None
+    assert overlay.verify_integrity() == before
+    assert overlay.frames() == tuple(frames)
+    overlay.close()

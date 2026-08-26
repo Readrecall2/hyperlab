@@ -39,7 +39,17 @@ class FaultPoint(StrEnum):
     AFTER_CURRENT_PUBLICATION = "after_current_publication"
     BEFORE_ANCHOR_PUBLICATION = "before_anchor_publication"
     AFTER_ANCHOR_PUBLICATION = "after_anchor_publication"
+    BEFORE_RAW_SEGMENT_PUBLICATION = "before_raw_segment_publication"
+    AFTER_RAW_SEGMENT_PUBLICATION = "after_raw_segment_publication"
+    BEFORE_RAW_SEGMENT_COPY = "before_raw_segment_copy"
+    AFTER_RAW_SEGMENT_COPY = "after_raw_segment_copy"
+    BEFORE_RAW_MANIFEST_PUBLICATION = "before_raw_manifest_publication"
+    AFTER_RAW_MANIFEST_PUBLICATION = "after_raw_manifest_publication"
+    BEFORE_RAW_ANCHOR_PUBLICATION = "before_raw_anchor_publication"
+    AFTER_RAW_ANCHOR_PUBLICATION = "after_raw_anchor_publication"
+    AFTER_RAW_BEFORE_PAPER_APPEND = "after_raw_before_paper_append"
     BEFORE_OVERLAY_TRANSACTION = "before_overlay_transaction"
+    BEFORE_OVERLAY_COMMIT = "before_overlay_commit"
     AFTER_OVERLAY_TRANSACTION = "after_overlay_transaction"
 
 

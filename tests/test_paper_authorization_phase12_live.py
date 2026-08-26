@@ -1029,6 +1029,10 @@ def test_authorization_manifest_rejects_early_file_changed_after_its_read(
         "CERTIFIER = True\n",
         encoding="utf-8",
     )
+    (repository / "scripts" / "certify_storage_v4_phase1c.py").write_text(
+        "CERTIFIER = True\n",
+        encoding="utf-8",
+    )
     (repository / "src" / "hyperlab" / "early.py").write_text(
         "EARLY = True\n",
         encoding="utf-8",

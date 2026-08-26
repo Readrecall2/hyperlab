@@ -46,6 +46,7 @@ class AnchorErrorCode(StrEnum):
     FORK = "ANCHOR_FORK"
     WRITER_LEASE_HELD = "ANCHOR_WRITER_LEASE_HELD"
     WRITER_LEASE_FAILED = "ANCHOR_WRITER_LEASE_FAILED"
+    READ_ONLY = "ANCHOR_READ_ONLY"
 
 
 class AnchorError(RuntimeError):
@@ -380,6 +381,39 @@ def _configure_connection(connection: sqlite3.Connection, *, initialize: bool) -
         )
 
 
+def _configure_read_only_connection(connection: sqlite3.Connection) -> None:
+    """Enable and prove SQLite's connection-scoped read-only guard."""
+
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.execute("PRAGMA query_only = ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        journal = connection.execute("PRAGMA journal_mode").fetchone()
+        synchronous = connection.execute("PRAGMA synchronous").fetchone()
+    except sqlite3.Error as error:
+        raise _anchor_error(
+            AnchorErrorCode.CORRUPT,
+            "local witness could not enable SQLite read-only validation",
+        ) from error
+    if query_only != (1,):
+        raise _anchor_error(
+            AnchorErrorCode.CORRUPT,
+            "local witness SQLite query_only guard is not active",
+        )
+    if journal is None or str(journal[0]).lower() != "delete":
+        raise _anchor_error(
+            AnchorErrorCode.CORRUPT,
+            "local witness is not in SQLite DELETE journal mode",
+        )
+    if synchronous is None or int(synchronous[0]) != 2:
+        raise _anchor_error(
+            AnchorErrorCode.CORRUPT,
+            "local witness is not in SQLite FULL synchronous mode",
+        )
+
+
 def _table_columns(
     connection: sqlite3.Connection,
     table: str,
@@ -503,12 +537,15 @@ class LocalAnchor:
     path: Path
     store_id: StoreId
     fault_hook: FaultHook = None
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             raise TypeError("local anchor path must be pathlib.Path")
         if type(self.store_id) is not StoreId:
             raise TypeError("local anchor store_id must be StoreId")
+        if type(self.read_only) is not bool:
+            raise TypeError("local anchor read_only must be an exact bool")
 
     @property
     def writer_lease_path(self) -> Path:
@@ -519,6 +556,12 @@ class LocalAnchor:
 
     def acquire_writer_lease(self) -> AnchorWriterLease:
         """Acquire one non-blocking writer lease without locking SQLite reads/CAS."""
+
+        if self.read_only:
+            raise _anchor_error(
+                AnchorErrorCode.READ_ONLY,
+                "read-only local witness cannot acquire writer authority",
+            )
 
         # Validate the witness before deriving writer authority. Repository
         # admission must still re-read the anchor after acquiring this lease.
@@ -630,6 +673,41 @@ class LocalAnchor:
             pass
         return anchor
 
+    @classmethod
+    def open_existing_read_only(
+        cls,
+        path: Path,
+        *,
+        store_id: StoreId,
+    ) -> LocalAnchor:
+        """Open an existing witness through ``mode=ro`` plus ``query_only``.
+
+        This path never creates a writer-lease sidecar and rejects both CAS and
+        writer-authority acquisition on the returned object.
+        """
+
+        if not isinstance(path, Path):
+            raise TypeError("local anchor path must be pathlib.Path")
+        if type(store_id) is not StoreId:
+            raise TypeError("local anchor store_id must be StoreId")
+        absolute = path.absolute()
+        if _is_link_or_reparse_point(path) or _is_link_or_reparse_point(absolute):
+            raise _anchor_error(
+                AnchorErrorCode.CORRUPT,
+                "refusing to open local witness through a link or reparse point",
+            )
+        if not absolute.exists():
+            raise _anchor_error(AnchorErrorCode.MISSING, "local witness path is missing")
+        if not absolute.is_file():
+            raise _anchor_error(
+                AnchorErrorCode.CORRUPT,
+                "local witness path is not a regular file",
+            )
+        anchor = cls(path=absolute, store_id=store_id, read_only=True)
+        with anchor._connection():
+            pass
+        return anchor
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         if _is_link_or_reparse_point(self.path):
@@ -644,7 +722,8 @@ class LocalAnchor:
                 AnchorErrorCode.CORRUPT,
                 "local witness path is not a regular file",
             )
-        uri = f"{self.path.as_uri()}?mode=rw"
+        mode = "ro" if self.read_only else "rw"
+        uri = f"{self.path.as_uri()}?mode={mode}"
         try:
             connection = sqlite3.connect(
                 uri,
@@ -655,11 +734,14 @@ class LocalAnchor:
         except sqlite3.Error as error:
             raise _anchor_error(
                 AnchorErrorCode.CORRUPT,
-                "local witness could not be opened read-write",
+                f"local witness could not be opened {mode}",
             ) from error
         try:
             try:
-                _configure_connection(connection, initialize=False)
+                if self.read_only:
+                    _configure_read_only_connection(connection)
+                else:
+                    _configure_connection(connection, initialize=False)
                 _validate_schema(connection, self.store_id)
                 yield connection
             except AnchorError:
@@ -717,6 +799,12 @@ class LocalAnchor:
         rollbacks.  Jumps to a later verified manifest generation remain valid
         because manifest-chain continuity is checked by the repository layer.
         """
+
+        if self.read_only:
+            raise _anchor_error(
+                AnchorErrorCode.READ_ONLY,
+                "read-only local witness cannot compare-and-swap authority",
+            )
 
         if expected is not None and type(expected) is not AnchorRecord:
             raise TypeError("anchor CAS expected value must be AnchorRecord or None")

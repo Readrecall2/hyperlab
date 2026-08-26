@@ -74,11 +74,13 @@ from .manifest import (
 )
 from .overlay import (
     FAULT_AFTER_COMMIT,
+    FAULT_BEFORE_COMMIT,
     FAULT_BEFORE_TRANSACTION,
     GENESIS_MANIFEST_GENERATION,
     GENESIS_MANIFEST_ROOT,
     OverlayIdentity,
     OverlayState,
+    OverlayTailDiscardResult,
     OverlayThresholds,
     SQLiteOverlay,
 )
@@ -533,6 +535,8 @@ def _overlay_fault_injector(
     def inject(point: str) -> None:
         if point == FAULT_BEFORE_TRANSACTION:
             trigger_fault(fault_hook, FaultPoint.BEFORE_OVERLAY_TRANSACTION)
+        elif point == FAULT_BEFORE_COMMIT:
+            trigger_fault(fault_hook, FaultPoint.BEFORE_OVERLAY_COMMIT)
         elif point == FAULT_AFTER_COMMIT:
             trigger_fault(fault_hook, FaultPoint.AFTER_OVERLAY_TRANSACTION)
 
@@ -863,6 +867,75 @@ class StorageRepository:
     def append(self, frame: CommitFrame) -> bool:
         self._ensure_open()
         return self._overlay.append(frame)
+
+    def discard_unsealed_tail(
+        self,
+        *,
+        expected_manifest_root: Hash32,
+        expected_checkpoint_root: Hash32,
+    ) -> OverlayTailDiscardResult:
+        """Discard the complete overlay tail at an exact published boundary."""
+
+        self._ensure_open()
+        if type(expected_manifest_root) is not Hash32:
+            raise TypeError("expected_manifest_root must be Hash32")
+        if type(expected_checkpoint_root) is not Hash32:
+            raise TypeError("expected_checkpoint_root must be Hash32")
+
+        anchored = self._anchor.read()
+        if anchored is None:
+            raise _repository_error(
+                RepositoryErrorCode.AUTHORITY_EMPTY,
+                "cannot discard an unsealed tail without published authority",
+            )
+        if anchored.manifest_root != expected_manifest_root:
+            raise _repository_error(
+                RepositoryErrorCode.AUTHORITY_MISMATCH,
+                "anchored manifest differs from discard authority",
+            )
+        manifest = self._read_manifest(self._paths, anchored)
+        self._verify_manifest_config(manifest, anchored, self._config)
+        checkpoint = self._read_checkpoint(self._paths, manifest, self._config)
+        if checkpoint.root != expected_checkpoint_root:
+            raise _repository_error(
+                RepositoryErrorCode.CHECKPOINT_MISMATCH,
+                "anchored checkpoint differs from discard authority",
+            )
+        self._assert_no_manifest_fork(manifest)
+
+        expected_anchor = AnchorRecord(
+            store_id=self._config.store_id,
+            generation=manifest.generation,
+            manifest_root=manifest.identity.root,
+        )
+        if self._anchor.read() != expected_anchor:
+            raise _repository_error(
+                RepositoryErrorCode.AUTHORITY_MISMATCH,
+                "external anchor changed during discard reattestation",
+            )
+        expected_base = OverlayState(
+            run_id=self._config.run_id,
+            base_manifest_generation=manifest.generation,
+            base_manifest_root=manifest.identity.root,
+            base_commit_sequence=manifest.head.commit_sequence,
+            base_prefix_root=manifest.head.prefix_root,
+            thresholds=self._config.thresholds,
+            tail_commit_count=0,
+            tail_row_count=0,
+            tail_bytes=0,
+            head_commit_sequence=manifest.head.commit_sequence,
+            head_prefix_root=manifest.head.prefix_root,
+        )
+        result = self._overlay.discard_unsealed_tail(expected_base=expected_base)
+        if self._anchor.read() != expected_anchor:
+            raise _repository_error(
+                RepositoryErrorCode.AUTHORITY_MISMATCH,
+                "external anchor changed during atomic tail discard",
+            )
+        self._manifest = manifest
+        self._checkpoint = checkpoint
+        self._validate_tail_attachment()
+        return result
 
     @staticmethod
     def _read_manifest(

@@ -411,6 +411,7 @@ def test_failed_open_releases_writer_lease(tmp_path: Path) -> None:
         FaultPoint.BEFORE_CURRENT_PUBLICATION,
         FaultPoint.AFTER_CURRENT_PUBLICATION,
         FaultPoint.BEFORE_OVERLAY_TRANSACTION,
+        FaultPoint.BEFORE_OVERLAY_COMMIT,
         FaultPoint.AFTER_OVERLAY_TRANSACTION,
     ],
 )
@@ -777,4 +778,62 @@ def test_full_audit_detects_same_generation_manifest_fork(tmp_path: Path) -> Non
     with pytest.raises(RepositoryError) as failure:
         repository.full_audit()
     assert failure.value.code == RepositoryErrorCode.MANIFEST_FORK
+    repository.close()
+
+
+def test_repository_discards_only_the_tail_after_exact_manifest_checkpoint_boundary(
+    tmp_path: Path,
+) -> None:
+    repository, _, _ = _new_repository(tmp_path)
+    _append(repository, 2)
+    sealed = _seal(repository, historical_count=2)
+    tail = _append(repository, 3)
+    before = repository.overlay_state
+
+    result = repository.discard_unsealed_tail(
+        expected_manifest_root=sealed.manifest.identity.root,
+        expected_checkpoint_root=sealed.checkpoint.root,
+    )
+
+    assert result.changed is True
+    assert result.before == before
+    assert result.discarded_commit_count == len(tail)
+    assert repository.overlay_state == result.after
+    assert repository.overlay_state.tail_commit_count == 0
+    assert repository.manifest == sealed.manifest
+    assert repository.checkpoint == sealed.checkpoint
+
+    repeated = repository.discard_unsealed_tail(
+        expected_manifest_root=sealed.manifest.identity.root,
+        expected_checkpoint_root=sealed.checkpoint.root,
+    )
+    assert repeated.changed is False
+    repository.close()
+
+
+def test_repository_discard_refuses_wrong_published_authority_without_mutation(
+    tmp_path: Path,
+) -> None:
+    repository, _, _ = _new_repository(tmp_path)
+    _append(repository, 1)
+    sealed = _seal(repository, historical_count=1)
+    tail = _append(repository, 2)
+    before = repository.overlay_state
+
+    with pytest.raises(RepositoryError) as manifest_failure:
+        repository.discard_unsealed_tail(
+            expected_manifest_root=_hash(91),
+            expected_checkpoint_root=sealed.checkpoint.root,
+        )
+    assert manifest_failure.value.code is RepositoryErrorCode.AUTHORITY_MISMATCH
+    assert repository.overlay_state == before
+
+    with pytest.raises(RepositoryError) as checkpoint_failure:
+        repository.discard_unsealed_tail(
+            expected_manifest_root=sealed.manifest.identity.root,
+            expected_checkpoint_root=_hash(92),
+        )
+    assert checkpoint_failure.value.code is RepositoryErrorCode.CHECKPOINT_MISMATCH
+    assert repository.overlay_state == before
+    assert repository.startup_report.tail_frames == tail
     repository.close()

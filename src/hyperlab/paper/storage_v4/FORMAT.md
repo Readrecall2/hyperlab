@@ -1,7 +1,8 @@
-# HyperLab Storage v4 immutable prototype format (protocol v1)
+# HyperLab Storage v4 immutable and native format (protocol v1)
 
 This document specifies the Phase 1A immutable binary core and the Phase 1B
-checkpointed engine and recovery contract. Unless a section explicitly describes
+checkpointed engine and recovery contract, plus the Phase 1C native raw-reference
+path and its offline certification tools. Unless a section explicitly describes
 SQLite or canonical JSON, all integers are unsigned, big-endian, and fixed-width
 (`u16`, `u32`, or `u64`). Text is strict UTF-8 and is prefixed by a `u32` byte
 length. Optional values use a one-byte tag: `0x00` means absent and `0x01` means
@@ -239,14 +240,16 @@ Checkpoint materialization is lazy and occurs only at an actual seal boundary.
 Ledger balances use exact integer-coefficient/decimal-exponent accumulation;
 there is no Decimal context precision or silent rounding ceiling.
 
-A native reference has exactly the keys `byte_length`, `byte_offset`,
+The Phase 1B prototype native-reference V1 envelope has exactly the keys
+`byte_length`, `byte_offset`,
 `contract`, `lake_id`, `mode`, `payload_sha256`, `physical_sha256`,
 `segment_identity`, `source_first_sequence`, `source_last_sequence`, and
 `stream_id`. Its contract is
 `hyperlab.storage_v4.raw_segment_reference.v1` and its mode is `V4_NATIVE`.
 Resolution authenticates the segment key, complete physical hash, nonempty
 in-bounds interval, payload hash, stream, and nonreversed source range before
-returning bytes.
+returning bytes. Phase 1C does not weaken or reinterpret this decoder; it uses the
+separate V2 envelope specified below.
 
 `DeterministicRawLakeEmulator` is an in-memory one-shot resolver for local tests.
 It rejects duplicate registration, physical aliases, bad bounds, and hash
@@ -463,8 +466,349 @@ directory-flush path; it does not certify Linux/ext4 durability. POSIX fsync cod
 likewise does not prove that a production Linux host was configured or tested.
 
 `V3_COMPATIBILITY_IMPORT` carries exact V3 canonical text, so its measured size
-is not V4-native capacity evidence. Durable raw-lake ingestion, representative
-`V4_NATIVE` capacity, long-run growth, compaction, an external/root-owned
-anchor, and Linux crash/power-loss evidence remain future work. This format makes
-no `0.20 GiB/h` claim, no throughput or storage-capacity certification, and no
-economic claim.
+is not V4-native capacity evidence. For the Phase 1B certification described
+above, durable raw-lake ingestion, representative `V4_NATIVE` capacity, long-run
+growth, compaction, an external/root-owned anchor, and Linux crash/power-loss
+evidence were outside scope. The Phase 1C contracts below are separate native
+implementation and offline-measurement surfaces; they do not retroactively turn
+Phase 1B compatibility size into capacity evidence or make an unconditional
+`0.20 GiB/h`, throughput, storage-capacity, or economic claim.
+
+## Phase 1C raw-reference V2
+
+The native Phase 1C reference contract is
+`hyperlab.storage_v4.raw_segment_reference.v2` with `format_version = 2` and
+`mode = V4_NATIVE`. It is a locator and authentication envelope, never a copy of
+the raw payload. Its exact canonical-object keys are:
+
+- authority and origin: `raw_store_id`, `lake_id`, `source_id`, `venue_id`;
+- segment authority: `segment_identity`, `segment_root`, `raw_manifest_root`,
+  `physical_sha256`;
+- record location: `record_id`, `byte_offset`, `stored_length`, `stored_sha256`;
+- replay payload: `logical_payload_length`, `logical_payload_sha256`;
+- provenance: `input_type`, `source_stream_id`, `source_first_sequence`,
+  `source_last_sequence`, `arrival_sequence`, `source_timestamp`, and
+  `received_timestamp`;
+- decoding: `codec_id`, `codec_version`;
+- discriminator fields: `contract`, `format_version`, and `mode`.
+
+All keys are mandatory; optional text values are represented by JSON null rather
+than an omitted key. Stored and logical lengths are positive `u64`-bounded exact
+integers, hashes are lowercase SHA-256, the stored interval cannot overflow, and
+the source range cannot be reversed. `RawSegmentRef` is an alias of the strict
+`RawSegmentReferenceV2` type. Parsing requires the exact key set and does not
+fall back to V1.
+
+Resolution authenticates the store/lake and the manifest generation that first
+published the segment descriptor, the logical segment identity and segment root,
+the whole-file physical SHA-256, the record locator and stored interval, both
+stored and logical payload hashes and lengths, metadata/provenance fields, and
+the declared codec before returning logical bytes. The in-memory
+`DeterministicRawLakeV2Emulator` is only a contract test double for raw codec V1;
+it proves neither filesystem durability nor external authority.
+
+## Native raw segments and chained manifests
+
+`RawSegmentWriter` streams strictly increasing arrival sequences into one fresh,
+bounded staging file. Record IDs are unique within a segment. Each record binds
+strict canonical metadata, stored bytes, logical bytes, their independent hashes
+and lengths, and the selected raw/zlib codec. Segment identity and the ordered
+segment root cover the complete record sequence. The footer and index permit a
+bounded reader to locate a record, while full-file SHA-256 supplies the physical
+content address. Admission is bounded by explicit record, logical-payload,
+physical-file, and single-payload limits; these are safety bounds, not throughput
+or production-capacity claims.
+
+Capacity accounting classifies the complete authenticated raw footer as
+metadata/index, not as immutable raw record bytes. Its exact physical size is
+`146 + 152 * record_count`: the fixed 146-byte footer envelope plus one
+152-byte locator/index entry per record. The `raw_segments` category subtracts
+that exact per-segment amount and `raw_index` adds it, so total physical bytes
+remain invariant.
+
+Published raw segments are named `<physical_sha256>.hl4r`. Raw manifests are
+strict canonical JSON plus one LF, use contract
+`hyperlab.storage_v4.raw_manifest.v1`, and are named `<manifest_root>.hl4rm`.
+Each manifest binds the raw store, lake and configuration identities, a monotone
+generation, its parent root, the complete cumulative tuple of segment
+descriptors, and cumulative record/logical/stored/physical byte counts. A valid
+transition is generation plus one, cites the exact parent, retains every prior
+descriptor byte for byte, and appends exactly one contiguous raw segment.
+
+The raw authority publication order is staged/verified segment, immutable
+content-addressed segment, authenticated `PENDING`, immutable manifest, monotone
+anchor compare-and-swap, removal of `PENDING`, then mutable `CURRENT` repair. On
+reopen, an exact direct successor can be adopted and a committed pending marker
+can be cleared; forks, rollback, replacement, aliases, unsafe links/reparse
+points, missing objects, and divergent bytes fail closed. `CURRENT` is a
+repairable cache only; it never grants authority.
+
+Normal raw-store startup opens the anchored current manifest and recovery
+metadata but reads zero historical segment payloads. Its parser work is
+`O(size(latest cumulative manifest))`, therefore `O(S)` descriptors for `S`
+segments, plus bounded recovery metadata. It is not constant in historical
+segment count. Full raw audit authenticates the chain and every segment/record
+and is `O(N)` in raw records and payload bytes. Because generation `g` repeats
+all `g` cumulative descriptors, parsing every generation performs
+`1 + ... + S = O(S^2)` aggregate descriptor work. The current
+`DiskRawResolver` chain authentication has the same cumulative-manifest
+`O(S^2)` aggregate bound when it must rebuild its authority map; this limitation
+is explicit rather than hidden by an `O(tail)` label.
+
+After authenticating the manifest chain, the disk resolver maps one descriptor
+per generation, locates records by binary search over the selected segment's
+ordered arrival index, and retains at most one verified segment summary. That
+cache bound is one segment summary, not one record: its locator tuple is bounded
+by the configured maximum records per segment. A changed previously verified
+file, an orphan reference, or a reference to a descriptor not newly published by
+the cited manifest is rejected.
+
+## Native journal, checkpoint binding, and raw-first pipeline
+
+The native checkpoint binding V2 wraps, but preserves exactly, the Paper adapter
+snapshot. It binds `raw_store_id`, `raw_lake_id`, `raw_config_identity`,
+`raw_generation`, `raw_manifest_root`, `raw_record_count`,
+`raw_last_record_id`, and the ordered `raw_reference_prefix_root`. Unbinding
+requires the exact adapter contract and optional expected binding; there is no
+silent downgrade or repair.
+
+Native inbox rows own ordinal zero and rematerialize through their V2 reference
+to exactly one strict canonical JSON object plus LF. The resolved record must
+belong to the outer run/commit/input identity and arrival sequence. Other rows
+remain direct Paper logical rows. Rechaining verifies source and native prefix
+continuity, forbids a raw record from being referenced by more than one commit,
+and requires the replacement payload to equal the certified compatibility
+payload byte for byte. Streaming audit checks commit/row counts, stream digests,
+final prefix, raw-reference count and ordered prefix, last record, and the allowed
+manifest roots against explicit `NativeAuditExpectations`.
+
+`Phase1CWriter` processes a caller-bounded batch in this causal order:
+
+1. validate source ownership, sequence and cursor continuity;
+2. stream and seal all required raw segment artifacts;
+3. durably publish raw segments/manifests and advance raw authority;
+4. inject the authenticated V2 references and rechain Paper commits;
+5. append those commits to the Paper overlay;
+6. at a requested seal, bind the raw authority into the Paper checkpoint and
+   publish the Paper checkpoint/manifest/anchor.
+
+Thus Paper never gains a reference before the corresponding raw authority is
+durable. A failure after raw publication but before Paper append yields the
+explicit `RAW_VALID_PAPER_ABSENT` or `RAW_VALID_PAPER_TAIL` state, not fabricated
+alignment. Once an append attempt crosses that boundary and fails, the writer is
+poisoned and refuses reuse; the incomplete candidate must be quarantined rather
+than relabelled complete.
+
+`inspect_phase1c_alignment` distinguishes empty, aligned, raw-ahead, raw-only,
+and invalid Paper-without-raw states. `certify_phase1c_reopen` first proves normal
+startup used the authenticated checkpoint plus exactly the expected bounded
+tail, with zero historical raw segments and zero historical Paper segments read.
+It then runs the separate exhaustive raw, Paper and native audits. Consequently
+the startup claim is limited to
+`O(latest manifest metadata + checkpoint + bounded tail)`; the certification
+audit remains offline `O(N)` and inherits the cumulative raw-manifest `O(S^2)`
+descriptor limitation described above.
+
+## Phase 1C crash and quarantine contract
+
+Deterministic fault points cover raw staging/copy, raw segment publication, raw
+manifest publication, raw anchor publication, the raw-before-Paper boundary,
+Paper segment/checkpoint/manifest/anchor publication, and `CURRENT`. Immutable
+files use flush, file fsync, verified non-overwriting publication, and directory
+fsync; mutable caches use atomic replacement and remain non-authoritative.
+
+Recovery accepts only a byte-identical existing object or the single exact
+authenticated successor allowed by its anchor/pending state. It rejects missing
+or truncated referenced raw segments, malformed or truncated checkpoint
+references, forks, duplicate record ownership, mismatched counters and prefix
+roots. A crash test can establish a recoverable or fail-closed state at the
+instrumented boundary; it is not a platform-independent proof for filesystem or
+hardware behavior that was not exercised.
+
+## Golden, capacity, bounded-tail, and evidence semantics
+
+`iter_golden_native_batches` and `OfflineGoldenNativeRunner` consume an already
+verified Golden V3 export. The raw record is the certified canonical inbox JSONL,
+explicitly labelled `CERTIFIED_CANONICAL_JSONL_NOT_ORIGINAL_WIRE`; Phase 1C does
+not claim to recover the exchange's original wire bytes. Exact differential
+comparison rematerializes the native store and compares every Golden logical
+stream, counts, digests, final prefix, checkpoint witness and required
+`MARKET_GAP` coverage. The runner uses fresh offline raw/Paper authorities and
+does not discover, replay, or mutate a live database.
+
+The canonical Phase 1C closure does not rerun that ingestion after a producer has
+reached its native Golden terminal result. It uses
+`reattest_golden_native_candidate` to open the producer's raw and Paper
+authorities strictly read-only, authenticate the raw segments, Paper segments,
+checkpoint, manifests, witness, candidate tree, producer logs and both producer
+and reattestor provenance, then repeat the exhaustive 13-stream differential.
+The resulting status is `GOLDEN_NATIVE_IMPORTED_REATTESTATION_V1`; it records
+zero ingested and zero prefix-reingested commits. Reobserved timings and resource
+fields carry `REATTESTED_NOT_RECOVERED_ORIGINAL`: they are not relabelled as the
+producer's original measurements, and the imported success does not relabel a
+previous interrupted mission root as complete.
+
+The capacity generator is deterministic and streaming. Its profiles are
+`GOLDEN_SHAPED`, `ADVERSARIAL_STORAGE`, and `BOUNDED_TAIL_RESTART`. Golden-shaped
+configuration records fact-derived counts and payload-size/cardinality bounds but
+remains synthetic; adversarial configuration makes declared size, cardinality,
+funding-burst and boundary cases observable. Every workload and report carries
+`SYNTHETIC_CAPACITY_WORKLOAD`, `NOT_ECONOMIC_EVIDENCE`, `NOT_ALPHA_EVIDENCE`,
+and `PAPER_ONLY` markers. The independent capacity oracle regenerates the frozen
+workload and compares reopened native commits, all logical streams, workload
+digest, prefix root and `MARKET_GAP` count exactly.
+
+`OfflinePhase1CCapacityRunner` owns one fresh candidate, streams bounded batches,
+performs repeated seals, reopens authorities, separates startup timing from
+offline exhaustive audit, performs independent raw-resolution passes, and
+reports raw authoritative bytes separately from incremental Paper bytes,
+anchors, replaceable `CURRENT` caches, and scratch. RSS and process write-byte
+fields are availability-qualified observations; an unavailable probe is not
+reported as zero. Scratch peak is an observation at instrumented transient
+growth boundaries, not a universal operating-system peak guarantee. Scaling and
+GiB/hour assessment are meaningful only with a frozen cadence/source span and
+the exact target provenance recorded before measurement.
+
+The canonical Golden-shaped capacity staircase is one deterministic streaming
+workload of 1,000,000 commits, not three independent ingestions. The 100,000,
+500,000 and 1,000,000 manifests have the same seed, profile and configuration and
+are exact prefix snapshots of the same terminal hash chain. At each frontier the
+runner durably publishes a chained canonical certificate binding the workload
+prefix, raw manifest, Paper manifest, checkpoint, measurement, exhaustive audit,
+startup evidence and byte census. All three certificates bind one candidate,
+store, stream and worker. Boundary reopen and audit time is excluded from the
+active ingestion wall/CPU interval so the scaling measurements remain comparable.
+No earlier prefix is regenerated, recopied or reingested; accounting must report
+exactly 1,000,000 generated and ingested capacity commits and zero prefix commits
+reingested.
+
+Interprocess resume starts only from the latest complete authenticated boundary.
+It reattests the raw segment chain, Paper segment chain, checkpoint, manifest,
+witness and provenance before admitting the next commit. A contiguous raw-only
+suffix may be reused while its unpublished Paper overlay/journal is reconstructed;
+the already certified prefix is neither replayed nor reingested. Ambiguous, forked,
+gapped or inconsistent published authority fails closed. The process-cut
+regression requires the resumed final chain to equal a continuous execution and
+records the exact audited prefix, reconstructed suffix and zero prefix
+reingestion.
+
+Every Phase 1C Golden, capacity, and bounded-tail normal reopen also emits an
+ordered `StartupFileAccessTrace`. During only the synchronous reopen/alignment
+scope, the tracer observes candidate-local requests through Python `os.open`,
+`Path.open`, and `sqlite3.connect`, then restores the exact original functions
+before any exhaustive audit or differential. Each event records its relative
+path, API, category, post-scope regular-file size, and post-scope SHA-256. The
+trace fails closed on a link/reparse traversal, an unclassified candidate path,
+or any raw/Paper historical segment path. Its successful contract therefore
+includes an explicit zero historical-segment-open count.
+
+This is bounded Python-level evidence, not a kernel, ETW, filesystem-filter, or
+SQLite VFS trace. A `sqlite3.connect` event proves the requested main database
+path, but does not enumerate SQLite's internal reads or `-journal`/`-wal`/`-shm`
+sidecars. Paths outside the fresh candidate are outside the trace. Hashes are
+taken after the bounded scope and after runner-owned handles close; they bind
+the persistent requested files, not the bytes observed at every internal read.
+
+`BoundedTailRestartMatrixRunner` creates independent on-disk cases for the
+configured tail sizes, independently reopens them, requires exactly the declared
+tail replay and no historical-segment replay, then subjects the complete
+checkpoint-plus-tail history to the native oracle and exhaustive audits. A tail
+matrix certifies only the tested bounds and configuration.
+
+`Phase1CEvidencePublisher` creates a fresh write-once evidence root. Canonical
+reports bind code/runtime/candidate and Golden source/pin/certification
+provenance, explicit semantic-gate result hashes, artifact dependencies and
+technical/synthetic markers. Capacity-level `COMPLETE` markers require their
+level's semantic prerequisites; the root `COMPLETE` additionally requires the
+entire dependency graph, all required levels, exact Golden provenance and one of
+the three authorized terminal verdicts. Failed gates may be recorded, but cannot
+be promoted to a successful completion marker. Publication durability and
+link/reparse defenses do not make a user-writable local evidence root an
+externally protected authority.
+
+### Phase 1C certification contract
+
+The canonical deterministic workload seed is `20260825`. One Golden-shaped
+capacity stream exposes authenticated frontiers at exactly 100,000, 500,000, and
+1,000,000 commits. Only the 1,000,000-commit frontier decides the terminal
+capacity verdict; the smaller frontiers and the Golden import are diagnostics.
+The adversarial workload remains a separate bounded 20,000-commit test and
+includes sparse 16 MiB maximum-payload probes at commits 1,866,
+4,592, 10,000, and 20,000. The bounded-tail workload contains 20,001 commits and
+tests independent restarts at tail sizes 0, 1, 100, 10,000, and 20,000. Production
+batches contain 10,000 commits, checkpoint after every batch, and publish
+manifest progress every 10,000 commits.
+
+The roadmap target is the strict relation `<0.20 GiB/h`. Missing that storage
+target is not an integrity failure: it produces the explicit characterized
+target-not-met terminal verdict when all integrity gates still pass. Cross-layout
+ratios remain non-like-for-like diagnostics and use four frozen physical
+denominators: original V3 source 2,014,072,832 bytes; Golden V3 export
+payload shards 2,456,283,751 bytes (`manifest.json` and `COMPLETE` excluded);
+Phase 1B compatibility store plus anchor 528,262,318 bytes; and Phase 1B
+compatibility segments 317,492,777 bytes.
+
+Canonical preflight requires an absent fresh mission root that is a direct child
+of the authorized existing parent, rejects link/reparse and input/output overlap,
+and requires at least 20 binary GiB free. Before creating the candidate it binds
+the complete Golden certification/export/pin authorities, the Phase 1B proof,
+and the roadmap target using their expected hashes, sizes, counts, and typed
+identities. Postflight re-verifies every external authority byte-for-byte. The
+candidate trees are witnessed around their read-only audits, compared with the
+publication witnesses, and rehashed again immediately before terminal
+publication; any drift fails closed.
+
+The imported Golden is reattested in place without mutation. The complete
+Golden-shaped staircase runs in exactly one spawned worker and one candidate;
+bounded tail and adversarial cases remain distinct targeted workloads. Persistent
+heartbeats are constrained to 30--60 seconds and the canonical CLI uses no total
+wall-clock timeout. Remote exceptions and abnormal child exits are structured
+failures. CPU time, peak RSS, and write-byte observations cover only the process
+scope explicitly named by each field; direct-child counters do not prove
+activity for an unobserved descendant tree, so missing descendant visibility
+must not be converted into a stagnation claim.
+
+Every active-workload heartbeat names the phase, workload/profile/identity,
+completed and expected commits and logical rows, elapsed and CPU time, peak RSS,
+process-scoped bytes written, and exact durable raw/Paper segment and checkpoint
+counts at the last completed boundary. Recent throughput is derived only from
+two monotonic observations of the same immutable workload identity. When it is
+calculable, the conservative ETA is the maximum of the recent and overall bounds
+for every incomplete commit or row dimension; missing windows or non-positive
+rates are reported as explicit unavailable statuses rather than estimates.
+
+The write-once root inventory is exactly `workload-manifest.json`,
+`native-layout-report.json`, `golden-native-report.json`, `capacity-100k.json`,
+`capacity-500k.json`, `capacity-1m.json`, `scaling-report.json`,
+`integrity-report.json`, `limitations.json`, and `measurements.jsonl`, plus the
+capacity-level and root `COMPLETE` hierarchy. Each report is canonical and binds
+its dependency hashes and semantic gates; `measurements.jsonl` is canonical
+JSONL. A terminal marker cannot precede the complete authenticated inventory.
+
+The canonical repository closure first binds the targeted Phase 1C test sources.
+It then runs V10 generate/check twice, Phase05 generate/check, verifies the pinned
+V9 bytes immediately before exactly one global pytest run with a fresh basetemp
+and cache provider disabled, then runs global Ruff, `mypy src/hyperlab`, and
+`git diff --check`, and verifies V9 again. Commands have no certifier wall timeout,
+run under a sanitized environment whose projection SHA-256 is recorded, and
+write persistent logs bound by path, size, and SHA-256. External authorities,
+candidate trees, code identity, runtime identity, command witnesses, logs, and
+V9 must all revalidate before the root `COMPLETE` file is exclusively published.
+
+## Phase 1C scope and remaining limitations
+
+Phase 1C is offline, public-data, `PAPER_ONLY` storage engineering. It introduces
+no private key, wallet, signer, credential, private API, venue order, cancel,
+mainnet, deployment, restart, or real-money path. Golden differential evidence is
+technical replay/integrity evidence. Synthetic capacity and tail workloads are
+mechanism/scale evidence. None of them is alpha evidence, economic validation,
+profitability evidence, or authorization to trade.
+
+The current native implementation also does not prove root-owned rollback
+authority, behavior on untested filesystems/hardware, production latency under
+concurrent runtime load, or unbounded scale. Normal startup still parses the
+latest cumulative raw manifest; exhaustive chain/resolver work has the explicit
+aggregate `O(S^2)` descriptor cost; the one-summary resolver cache is bounded by
+segment limits rather than constant bytes; and a completed capacity verdict is
+valid only for its frozen code/runtime/configuration, candidate hashes, workloads,
+platform observations and canonical target provenance.

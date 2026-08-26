@@ -58,6 +58,7 @@ class OverlayErrorCode(StrEnum):
     MANIFEST_ROLLBACK = "OVERLAY_MANIFEST_ROLLBACK"
     MANIFEST_CONFLICT = "OVERLAY_MANIFEST_CONFLICT"
     BASE_PREFIX_MISMATCH = "OVERLAY_BASE_PREFIX_MISMATCH"
+    READ_ONLY = "OVERLAY_READ_ONLY"
 
 
 class OverlayError(RuntimeError):
@@ -158,6 +159,19 @@ class OverlayState:
             self.tail_row_count >= self.thresholds.seal_rows
             or self.tail_bytes >= self.thresholds.seal_bytes
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayTailDiscardResult:
+    before: OverlayState
+    after: OverlayState
+    discarded_commit_count: int
+    discarded_row_count: int
+    discarded_bytes: int
+
+    @property
+    def changed(self) -> bool:
+        return self.discarded_commit_count != 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +413,24 @@ def _connect_rw(path: Path) -> sqlite3.Connection:
         ) from error
 
 
+def _connect_ro(path: Path) -> sqlite3.Connection:
+    if path.is_symlink() or not path.is_file():
+        raise OverlayError(
+            OverlayErrorCode.CORRUPT,
+            "refusing a non-regular or symbolic-link overlay path",
+            path=str(path),
+        )
+    uri = f"{path.absolute().as_uri()}?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None)
+    except sqlite3.Error as error:
+        raise OverlayError(
+            OverlayErrorCode.OPEN_FAILED,
+            "cannot open the existing overlay read-only",
+            path=str(path),
+        ) from error
+
+
 def _configure_durability(connection: sqlite3.Connection) -> DurabilitySettings:
     try:
         journal_row = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
@@ -425,6 +457,44 @@ def _configure_durability(connection: sqlite3.Connection) -> DurabilitySettings:
     return DurabilitySettings(journal_mode="delete", synchronous=2)
 
 
+def _configure_read_only(connection: sqlite3.Connection) -> DurabilitySettings:
+    """Enable query-only mode and verify the producer durability profile."""
+
+    try:
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        query_only_row = connection.execute("PRAGMA query_only").fetchone()
+        journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+        synchronous_row = connection.execute("PRAGMA synchronous").fetchone()
+    except sqlite3.Error as error:
+        raise OverlayError(
+            OverlayErrorCode.OPEN_FAILED,
+            "cannot configure the SQLite read-only guard",
+        ) from error
+    query_only_values = _row_tuple(query_only_row, label="query_only result")
+    journal_values = _row_tuple(journal_row, label="journal_mode result")
+    synchronous_values = _row_tuple(synchronous_row, label="synchronous result")
+    if query_only_values != (1,):
+        raise OverlayError(OverlayErrorCode.OPEN_FAILED, "SQLite refused query_only=ON")
+    if (
+        len(journal_values) != 1
+        or type(journal_values[0]) is not str
+        or journal_values[0].lower() != "delete"
+    ):
+        raise OverlayError(
+            OverlayErrorCode.OPEN_FAILED,
+            "read-only overlay is not in journal_mode=DELETE",
+        )
+    if len(synchronous_values) != 1 or synchronous_values[0] != 2:
+        raise OverlayError(
+            OverlayErrorCode.OPEN_FAILED,
+            "read-only overlay is not in synchronous=FULL",
+        )
+    return DurabilitySettings(journal_mode="delete", synchronous=2)
+
+
 class SQLiteOverlay:
     """Bounded, single-writer durable tail after an authenticated manifest base."""
 
@@ -434,11 +504,16 @@ class SQLiteOverlay:
         connection: sqlite3.Connection,
         identity: OverlayIdentity,
         fault_injector: FaultInjector | None,
+        *,
+        read_only: bool = False,
     ) -> None:
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be an exact bool")
         self._path = path
         self._connection = connection
         self._identity = identity
         self._fault_injector = fault_injector
+        self._read_only = read_only
         self._closed = False
 
     @classmethod
@@ -613,6 +688,50 @@ class SQLiteOverlay:
             overlay._closed = True
             raise
 
+    @classmethod
+    def open_existing_read_only(
+        cls,
+        path: str | Path,
+        *,
+        expected_identity: OverlayIdentity,
+    ) -> SQLiteOverlay:
+        """Open and exhaustively validate through ``mode=ro`` and query-only."""
+
+        if type(expected_identity) is not OverlayIdentity:
+            raise TypeError("expected_identity must be OverlayIdentity")
+        selected_path = Path(path).absolute()
+        if selected_path.is_symlink():
+            raise OverlayError(
+                OverlayErrorCode.CORRUPT,
+                "refusing to open an overlay through a symbolic link",
+                path=str(selected_path),
+            )
+        if not selected_path.is_file():
+            raise OverlayError(
+                OverlayErrorCode.MISSING,
+                "expected overlay file does not exist",
+                path=str(selected_path),
+            )
+        connection = _connect_ro(selected_path)
+        overlay = cls(
+            selected_path,
+            connection,
+            expected_identity,
+            None,
+            read_only=True,
+        )
+        try:
+            _configure_read_only(connection)
+            overlay._verify_schema()
+            meta = overlay._read_meta()
+            overlay._expect_identity(meta.identity, expected_identity)
+            overlay._validated_commits(meta)
+            return overlay
+        except Exception:
+            connection.close()
+            overlay._closed = True
+            raise
+
     @property
     def path(self) -> Path:
         return self._path
@@ -620,6 +739,10 @@ class SQLiteOverlay:
     @property
     def identity(self) -> OverlayIdentity:
         return self._identity
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
 
     @property
     def state(self) -> OverlayState:
@@ -634,6 +757,8 @@ class SQLiteOverlay:
 
     def durability_settings(self) -> DurabilitySettings:
         self._ensure_open()
+        if self._read_only:
+            return _configure_read_only(self._connection)
         return _configure_durability(self._connection)
 
     def set_fault_injector(self, fault_injector: FaultInjector | None) -> None:
@@ -644,6 +769,7 @@ class SQLiteOverlay:
         """Atomically append one exact next commit; return False for an exact duplicate."""
 
         self._ensure_open()
+        self._ensure_writable()
         if type(frame) is not CommitFrame:
             raise TypeError("append requires CommitFrame")
         if frame.run_id != self._identity.run_id:
@@ -800,6 +926,162 @@ class SQLiteOverlay:
         self._assert_stored_identity(meta.identity)
         return tuple(item.frame for item in self._validated_commits(meta))
 
+    def discard_unsealed_tail(
+        self,
+        *,
+        expected_base: OverlayState,
+    ) -> OverlayTailDiscardResult:
+        """Atomically discard the whole tail only at one exact sealed base.
+
+        The expected base is deliberately not a cutoff. It must describe a
+        zero-tail state whose head equals its base, and every base field is
+        compared under BEGIN IMMEDIATE before all retained commits are
+        removed. This makes the operation an exact compare-and-swap rather
+        than an arbitrary truncation primitive.
+        """
+
+        self._ensure_open()
+        self._ensure_writable()
+        if type(expected_base) is not OverlayState:
+            raise TypeError("expected_base must be OverlayState")
+        if type(expected_base.run_id) is not RunId:
+            raise TypeError("expected_base run_id must be RunId")
+        _validate_manifest_generation_root(
+            expected_base.base_manifest_generation,
+            expected_base.base_manifest_root,
+            generation_label="expected_base base_manifest_generation",
+            root_label="expected_base base_manifest_root",
+        )
+        if type(expected_base.base_commit_sequence) is not CommitSequence:
+            raise TypeError("expected_base base_commit_sequence must be CommitSequence")
+        if type(expected_base.base_prefix_root) is not Hash32:
+            raise TypeError("expected_base base_prefix_root must be Hash32")
+        if type(expected_base.thresholds) is not OverlayThresholds:
+            raise TypeError("expected_base thresholds must be OverlayThresholds")
+        for label, value in (
+            ("tail_commit_count", expected_base.tail_commit_count),
+            ("tail_row_count", expected_base.tail_row_count),
+            ("tail_bytes", expected_base.tail_bytes),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"expected_base {label} must be an exact integer")
+        if type(expected_base.head_commit_sequence) is not CommitSequence:
+            raise TypeError("expected_base head_commit_sequence must be CommitSequence")
+        if type(expected_base.head_prefix_root) is not Hash32:
+            raise TypeError("expected_base head_prefix_root must be Hash32")
+        if (
+            expected_base.tail_commit_count != 0
+            or expected_base.tail_row_count != 0
+            or expected_base.tail_bytes != 0
+            or expected_base.head_commit_sequence != expected_base.base_commit_sequence
+            or expected_base.head_prefix_root != expected_base.base_prefix_root
+        ):
+            raise OverlayError(
+                OverlayErrorCode.EXPECTED_STATE_MISMATCH,
+                "discard authority must describe one exact sealed base",
+            )
+
+        committed = False
+        try:
+            self._hit(FAULT_BEFORE_TRANSACTION)
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._hit(FAULT_AFTER_BEGIN)
+            meta = self._read_meta()
+            self._assert_stored_identity(meta.identity)
+            commits = self._validated_commits(meta)
+            actual_base = (
+                meta.run_id,
+                meta.base_manifest_generation,
+                meta.base_manifest_root,
+                meta.base_commit_sequence,
+                meta.base_prefix_root,
+                meta.thresholds,
+            )
+            authorized_base = (
+                expected_base.run_id,
+                expected_base.base_manifest_generation,
+                expected_base.base_manifest_root,
+                expected_base.base_commit_sequence,
+                expected_base.base_prefix_root,
+                expected_base.thresholds,
+            )
+            if actual_base != authorized_base:
+                raise OverlayError(
+                    OverlayErrorCode.EXPECTED_STATE_MISMATCH,
+                    "overlay base differs from discard authority",
+                )
+
+            before = meta.public()
+            after = OverlayState(
+                run_id=meta.run_id,
+                base_manifest_generation=meta.base_manifest_generation,
+                base_manifest_root=meta.base_manifest_root,
+                base_commit_sequence=meta.base_commit_sequence,
+                base_prefix_root=meta.base_prefix_root,
+                thresholds=meta.thresholds,
+                tail_commit_count=0,
+                tail_row_count=0,
+                tail_bytes=0,
+                head_commit_sequence=meta.base_commit_sequence,
+                head_prefix_root=meta.base_prefix_root,
+            )
+            result = OverlayTailDiscardResult(
+                before=before,
+                after=after,
+                discarded_commit_count=meta.tail_commit_count,
+                discarded_row_count=meta.tail_row_count,
+                discarded_bytes=meta.tail_bytes,
+            )
+            if not commits:
+                self._connection.rollback()
+                return result
+
+            deleted = self._connection.execute("DELETE FROM overlay_commits")
+            if deleted.rowcount != len(commits):
+                raise OverlayError(
+                    OverlayErrorCode.CORRUPT,
+                    "whole-tail discard removed an unexpected commit count",
+                )
+            updated = self._connection.execute(
+                """
+                UPDATE overlay_meta
+                SET tail_commit_count = ?, tail_row_count = ?, tail_byte_count = ?,
+                    head_commit_sequence = ?, head_prefix_root = ?
+                WHERE singleton = 1
+                """,
+                (
+                    _u64_text(0, label="tail_commit_count"),
+                    _u64_text(0, label="tail_row_count"),
+                    _u64_text(0, label="tail_byte_count"),
+                    _u64_text(
+                        int(meta.base_commit_sequence),
+                        label="head_commit_sequence",
+                    ),
+                    bytes(meta.base_prefix_root),
+                ),
+            )
+            if updated.rowcount != 1:
+                raise OverlayError(
+                    OverlayErrorCode.CORRUPT,
+                    "whole-tail discard did not update exactly one metadata row",
+                )
+            self._hit(FAULT_BEFORE_COMMIT)
+            self._connection.commit()
+            committed = True
+            self._hit(FAULT_AFTER_COMMIT)
+            return result
+        except sqlite3.Error as error:
+            if not committed and self._connection.in_transaction:
+                self._connection.rollback()
+            raise OverlayError(
+                OverlayErrorCode.CORRUPT,
+                "SQLite rejected the atomic whole-tail discard",
+            ) from error
+        except Exception:
+            if not committed and self._connection.in_transaction:
+                self._connection.rollback()
+            raise
+
     def advance_base(
         self,
         *,
@@ -816,6 +1098,7 @@ class SQLiteOverlay:
         """
 
         self._ensure_open()
+        self._ensure_writable()
         _validate_manifest_generation_root(
             manifest_generation,
             manifest_root,
@@ -990,6 +1273,14 @@ class SQLiteOverlay:
     def _ensure_open(self) -> None:
         if self._closed:
             raise OverlayError(OverlayErrorCode.CLOSED, "overlay connection is closed")
+
+    def _ensure_writable(self) -> None:
+        if self._read_only:
+            raise OverlayError(
+                OverlayErrorCode.READ_ONLY,
+                "read-only overlay rejects mutation",
+                path=str(self._path),
+            )
 
     def _hit(self, point: str) -> None:
         if self._fault_injector is not None:
@@ -1307,6 +1598,7 @@ __all__ = [
     "OverlayErrorCode",
     "OverlayIdentity",
     "OverlayState",
+    "OverlayTailDiscardResult",
     "OverlayThresholds",
     "SQLiteOverlay",
 ]

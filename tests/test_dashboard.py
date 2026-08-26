@@ -522,8 +522,8 @@ def test_dashboard_escapes_report_title(tmp_path: Path) -> None:
     page = TestClient(create_app(data_dir=tmp_path)).get("/")
     assert page.status_code == 200
     assert "<script>alert(1)</script>" not in page.text
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
-    assert 'href="/api/reports/latest_summary.json"' in page.text
+    assert "alert(1)" not in page.text
+    assert "__LEGACY_REPORT" not in page.text
 
 
 def test_dashboard_latest_summary_links_to_verified_export_target(tmp_path: Path) -> None:
@@ -535,10 +535,14 @@ def test_dashboard_latest_summary_links_to_verified_export_target(tmp_path: Path
         encoding="utf-8",
     )
 
-    page = TestClient(create_app(data_dir=tmp_path)).get("/")
+    client = TestClient(create_app(data_dir=tmp_path))
+    page = client.get("/")
+    download = client.get("/api/reports/latest")
 
     assert page.status_code == 200
-    assert 'href="/api/reports/public%20export.parquet"' in page.text
+    assert "Public export" not in page.text
+    assert download.status_code == 200
+    assert download.content == b"PAR1"
 
 
 def test_report_download_uses_explicit_root_and_safe_attachment_headers(tmp_path: Path) -> None:
@@ -548,11 +552,15 @@ def test_report_download_uses_explicit_root_and_safe_attachment_headers(tmp_path
     nested.mkdir(parents=True)
     report = nested / "result.csv"
     report.write_bytes(b"metric,value\nnet,0\n")
+    (reports_dir / "latest_summary.json").write_text(
+        '{"title":"Latest public export","download_path":"research/result.csv"}',
+        encoding="utf-8",
+    )
     outside = tmp_path / "secret.json"
     outside.write_text('{"private": true}', encoding="utf-8")
     client = TestClient(create_app(data_dir=data_dir, reports_dir=reports_dir))
 
-    response = client.get("/api/reports/research/result.csv")
+    response = client.get("/api/reports/latest")
 
     assert response.status_code == 200
     assert response.content == report.read_bytes()
@@ -571,8 +579,9 @@ def test_report_download_uses_explicit_root_and_safe_attachment_headers(tmp_path
     ):
         assert _resolve_report_download(reports_dir, unsafe) is None
     assert _resolve_report_download(reports_dir, "research/result.csv") == report.resolve()
+    assert client.get("/api/reports/research/result.csv").status_code == 404
     for method in ("post", "put", "patch", "delete"):
-        assert getattr(client, method)("/api/reports/research/result.csv").status_code == 405
+        assert getattr(client, method)("/api/reports/latest").status_code == 405
 
 
 def test_report_download_rejects_symlink_escape(
@@ -596,8 +605,12 @@ def test_report_download_rejects_symlink_escape(
         )
 
     assert _resolve_report_download(reports_dir, link.name) is None
+    (reports_dir / "latest_summary.json").write_text(
+        '{"download_path":"linked.json"}',
+        encoding="utf-8",
+    )
     response = TestClient(create_app(data_dir=tmp_path / "data", reports_dir=reports_dir)).get(
-        "/api/reports/linked.json"
+        "/api/reports/latest"
     )
     assert response.status_code == 404
 
@@ -613,6 +626,7 @@ def test_serve_uses_explicit_runtime_report_and_paper_directories(
     runtime_dir = tmp_path / "runtime"
     reports_dir = tmp_path / "reports"
     paper_dir = tmp_path / "paper"
+    h1_campaign_root = tmp_path / "explicit-h1-campaign"
     runtime_dir.mkdir()
     reports_dir.mkdir()
     paper_dir.mkdir()
@@ -627,6 +641,11 @@ def test_serve_uses_explicit_runtime_report_and_paper_directories(
     monkeypatch.setenv("HYPERLAB_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("HYPERLAB_REPORTS_DIR", str(reports_dir))
     monkeypatch.setenv("HYPERLAB_PAPER_DIR", str(paper_dir))
+    monkeypatch.setenv("HYPERLAB_H1_CAMPAIGN_ROOT", str(h1_campaign_root))
+    monkeypatch.setenv(
+        "HYPERLAB_H1_POLICY_CONFIG",
+        str(Path("config/research/hyperliquid-h1-ghost-v1.json")),
+    )
     monkeypatch.setattr(
         cli_module,
         "_settings",
@@ -645,8 +664,9 @@ def test_serve_uses_explicit_runtime_report_and_paper_directories(
     assert dashboard.version == __version__
     client = TestClient(dashboard)
     assert client.get("/ready").status_code == 200
-    assert client.get("/api/reports/latest_summary.json").status_code == 200
+    assert client.get("/api/reports/latest").status_code == 200
     assert client.get("/api/paper").json()["status"] == "NOT_STARTED"
+    assert client.get("/api/h1/snapshot").json()["state"]["code"] == "ABSENT"
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8123
 

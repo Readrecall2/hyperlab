@@ -254,3 +254,8 @@ Le paquet opérateur Linux/systemd reproductible de la première campagne est
 documenté dans `docs/H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1.md`. Sa préparation
 reste locale et offline; son exécution VPS et le démarrage de la collecte sont
 exclusivement humains.
+
+Le cockpit local de suivi est documenté dans
+[`H1_GHOST_OBSERVABILITY_DASHBOARD_V1.md`](H1_GHOST_OBSERVABILITY_DASHBOARD_V1.md).
+Il lit une seule racine explicitement configurée, conserve le holdout scellé et
+n'ajoute aucune commande de campagne.

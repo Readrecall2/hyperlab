@@ -185,8 +185,8 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "4a74bcfc01af7a6a02447a293731eb6df92e8a73bfaecc1d0a44d12eef56b380"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "e2d0a46d536ea272894cc1b92e7cde844664d717d6a05a2af16703098f0352df"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "e516453d24f4efe917a606c2eff9888097c4ddfbb7a4029190d8b1a4b9d3380f"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "599ce0c628691a644c83a5cd620de2857d8a2b28ce69d278f1f7fccdc23a57e9"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -399,6 +399,16 @@ def _configured_directory(name: str, default: Path) -> Path:
     value = os.getenv(name)
     if value is None:
         return default
+    normalized = value.strip()
+    if not normalized:
+        raise typer.BadParameter(f"{name} ne peut pas être vide")
+    return Path(normalized)
+
+
+def _optional_configured_path(name: str) -> Path | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
     normalized = value.strip()
     if not normalized:
         raise typer.BadParameter(f"{name} ne peut pas être vide")
@@ -3086,6 +3096,12 @@ def serve(
         runtime_dir=_configured_directory("HYPERLAB_RUNTIME_DIR", data_dir),
         reports_dir=_configured_directory("HYPERLAB_REPORTS_DIR", data_dir / "reports"),
         paper_dir=_configured_directory("HYPERLAB_PAPER_DIR", data_dir / "paper"),
+        h1_campaign_root=_optional_configured_path("HYPERLAB_H1_CAMPAIGN_ROOT"),
+        h1_policy_path=_configured_directory(
+            "HYPERLAB_H1_POLICY_CONFIG",
+            Path("config/research/hyperliquid-h1-ghost-v1.json"),
+        ),
+        h1_default_fixture=os.getenv("HYPERLAB_H1_FIXTURE", "PREPARED_NOT_STARTED"),
     )
     uvicorn.run(dashboard, host=host, port=port)
 

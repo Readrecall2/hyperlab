@@ -280,6 +280,22 @@ def test_read_only_export_and_offline_diagnostic_identify_first_real_shape_diver
         assert report["runtime_error_class"] == (
             "prediction terminal collection result is not admissible"
         )
+
+    def _divergent_plan(*_args, **_kwargs) -> None:
+        raise forensics.ForensicError("SYNTHETIC/FIXTURE frozen plan divergence")
+
+    monkeypatch.setattr(forensics, "_verify_binding_plan", _divergent_plan)
+    diagnosis_with_later_plan_divergence = forensics.diagnose_forensics(
+        forensic_root,
+        expected_source_commit=SOURCE_COMMIT,
+    )
+    for venue in ("polymarket", "kalshi"):
+        report = diagnosis_with_later_plan_divergence["reports"][venue]
+        assert report["first_divergence"]["field"] == "terminal_health.accepted"
+        assert report["context_checks_after_result_stage"][0]["field"] == (
+            "post_result_context.verify_collection_plan"
+        )
+        assert report["context_checks_after_result_stage"][0]["ok"] is False
     standalone = subprocess.run(
         [
             sys.executable,

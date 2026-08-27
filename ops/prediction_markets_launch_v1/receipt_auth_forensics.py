@@ -1062,8 +1062,22 @@ def diagnose_forensics(
             "segments", "source_timestamp_max_ns", "source_timestamp_min_ns",
             "terminal_health", "venue",
         }
-        stage_checks: list[dict[str, object]] = []
-        stage_checks.append(
+        runtime_checks: list[dict[str, object]] = []
+        binding_error: str | None = None
+        try:
+            binding = _binding_view(probe_raw)
+        except (ForensicError, OSError, ValueError) as error:
+            binding_error = f"{type(error).__name__}:{error}"
+            binding = None
+        runtime_checks.append(
+            {
+                "expected": "authenticated prediction collection binding",
+                "field": "probe_config.binding",
+                "observed": binding_error,
+                "ok": binding_error is None,
+            }
+        )
+        runtime_checks.append(
             {
                 "expected": sorted(expected_fields),
                 "field": "result.fields",
@@ -1071,7 +1085,7 @@ def diagnose_forensics(
                 "ok": set(result) == expected_fields,
             }
         )
-        stage_checks.append(
+        runtime_checks.append(
             {
                 "expected": "canonical JSON without trailing bytes",
                 "field": "result.canonical_json",
@@ -1079,29 +1093,48 @@ def diagnose_forensics(
                 "ok": result_raw == canonical_json_bytes(result),
             }
         )
-        binding_error: str | None = None
+        if binding is not None:
+            for field in ("manifest_sha256", "root_sha256", "terminal_health"):
+                value = result.get(field)
+                runtime_checks.append(
+                    {
+                        "expected": "nonempty text",
+                        "field": f"result.{field}.text",
+                        "observed": _brief(value),
+                        "ok": type(value) is str and bool(value.strip()),
+                    }
+                )
+            runtime_checks.extend(_result_checks(result=result, binding=binding))
+
+        context_checks: list[dict[str, object]] = []
+        raw_plan = candidate_plans.get(label)
+        plan = raw_plan if isinstance(raw_plan, dict) else {}
+        plan_error: str | None = None
         try:
-            binding = _binding_view(probe_raw)
-            raw_plan = candidate_plans.get(label)
+            if binding is None:
+                raise ForensicError("binding unavailable after runtime parsing stage")
             if not isinstance(raw_plan, dict):
                 raise ForensicError(f"{label} frozen collection plan is absent")
-            plan = raw_plan
             _verify_binding_plan(binding, venue=venue_value, plan=plan)
         except (ForensicError, OSError, ValueError) as error:
-            binding_error = f"{type(error).__name__}:{error}"
-            binding = None
-            raw_plan = candidate_plans.get(label)
-            plan = raw_plan if isinstance(raw_plan, dict) else {}
-        stage_checks.append(
+            plan_error = f"{type(error).__name__}:{error}"
+        context_checks.append(
             {
-                "expected": "authenticated binding exactly matching frozen venue plan",
-                "field": "probe_config.binding_and_plan",
-                "observed": binding_error,
-                "ok": binding_error is None,
+                "expected": "binding exactly matching frozen venue plan",
+                "field": "post_result_context.verify_collection_plan",
+                "observed": plan_error,
+                "ok": plan_error is None,
             }
         )
-        if binding is not None:
-            stage_checks.extend(_result_checks(result=result, binding=binding))
+        context_checks.append(
+            {
+                "expected": "authenticated raw segment replay and required-feed coverage",
+                "field": "from_probe_output.raw_payload_replay",
+                "observed": "NOT_EVALUATED_RAW_CONTENT_EXCLUDED",
+                "ok": None,
+            }
+        )
+        if binding is not None and plan_error is None:
             shard_name = shard_names.get(label)
             match = _SHARD_LEAF.fullmatch(str(shard_name))
             if match is None:
@@ -1144,9 +1177,10 @@ def diagnose_forensics(
                 ("runner.collection_id", binding.collection_id, expected_collection_id),
                 ("runner.collection_cutoff_utc_ns_exclusive", binding.payload.get("collection_cutoff_utc_ns_exclusive"), expected_cutoff),
             ):
-                stage_checks.append(
+                context_checks.append(
                     {"expected": expected, "field": field, "observed": observed, "ok": observed == expected}
                 )
+        if binding is not None:
             manifest_hash = result.get("manifest_sha256")
             if isinstance(manifest_hash, str) and _SHA256.fullmatch(manifest_hash):
                 manifest_path = f"payload/venues/{label}/raw/manifests/{manifest_hash}.manifest.json"
@@ -1166,7 +1200,7 @@ def diagnose_forensics(
                         ("raw_manifest.segment_count", decoded_manifest["segment_count"], result.get("segments")),
                     )
                     for field, observed, expected_value in manifest_checks:
-                        stage_checks.append(
+                        context_checks.append(
                             {
                                 "expected": expected_value,
                                 "field": field,
@@ -1176,7 +1210,7 @@ def diagnose_forensics(
                         )
                 except (ForensicError, ValueError) as error:
                     manifest_error = f"{type(error).__name__}:{error}"
-                stage_checks.append(
+                context_checks.append(
                     {
                         "expected": "content-addressed manifest metadata authenticated",
                         "field": "raw_manifest.metadata_authentication",
@@ -1184,9 +1218,10 @@ def diagnose_forensics(
                         "ok": manifest_error is None,
                     }
                 )
-        first = next((item for item in stage_checks if item["ok"] is not True), None)
+        first = next((item for item in runtime_checks if item["ok"] is False), None)
         reports[label] = {
-            "checks": stage_checks,
+            "checks": runtime_checks,
+            "context_checks_after_result_stage": context_checks,
             "first_divergence": first,
             "result_terminal_health": result.get("terminal_health"),
             "runtime_error_class": (

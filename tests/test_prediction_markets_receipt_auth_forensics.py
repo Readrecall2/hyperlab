@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -33,6 +34,45 @@ CANDIDATE_PACK = (
 RUN_SLUG = "pm-20260827t131512z-6f59caae"
 SOURCE_COMMIT = "6f59caae46e7f473cee9dec00103f4157920f8cb"
 FORENSIC_SLUG = "receipt-auth-20260827t133835z-6f59caae"
+POWERSHELL_51 = Path(
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+)
+TRANSFER_NAMES = (
+    "forensic-scope.json",
+    "forensic-inventory.json",
+    "forensic-inventory.json.sha256",
+    "receipt-auth-forensic.tar",
+    "receipt-auth-forensic.tar.sha256",
+)
+
+
+def _run_powershell_51(
+    script: Path,
+    *,
+    cwd: Path,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not POWERSHELL_51.is_file():
+        raise AssertionError(f"Windows PowerShell 5.1 is absent: {POWERSHELL_51}")
+    return subprocess.run(
+        [
+            str(POWERSHELL_51),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=cwd,
+        env=environment,
+        errors="replace",
+        text=True,
+        timeout=30,
+    )
 
 
 def _tree_digest(root: Path) -> str:
@@ -244,6 +284,101 @@ def _materialize_failed_campaign(
     return campaign, incoming, source, forensic_root
 
 
+def _materialize_windows_followup(
+    root: Path,
+    *,
+    campaign_root: Path,
+    archive_sha256: str,
+    file_count: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    operator = root / "operator"
+    tools = root / "tools"
+    operator.mkdir(parents=True)
+    tools.mkdir()
+    monkeypatch.setattr(pack_builder, "CAMPAIGN_ROOT", str(campaign_root))
+    fetch = operator / "G-windows-fetch-receipt-auth-forensic.ps1"
+    diagnose = operator / "H-windows-offline-diagnose.ps1"
+    fetch.write_text(
+        pack_builder.render_windows_fetch(
+            expected_archive_sha256=archive_sha256,
+            expected_file_count=file_count,
+        ),
+        encoding="utf-8",
+    )
+    diagnose.write_text(pack_builder.render_windows_diagnose(), encoding="utf-8")
+    (tools / "receipt_auth_forensics.py").write_bytes(
+        (ROOT / "ops/prediction_markets_launch_v1/receipt_auth_forensics.py").read_bytes()
+    )
+    return fetch, diagnose
+
+
+def _install_strict_fake_scp(fake_bin: Path) -> Path:
+    fake_bin.mkdir()
+    stub = fake_bin / "strict_scp.py"
+    stub.write_text(
+        r"""from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+ALLOWED = {
+    "forensic-scope.json",
+    "forensic-inventory.json",
+    "forensic-inventory.json.sha256",
+    "receipt-auth-forensic.tar",
+    "receipt-auth-forensic.tar.sha256",
+}
+
+
+def refuse(message: str) -> None:
+    print(f"STRICT_FAKE_SCP_REFUSED:{message}", file=sys.stderr)
+    raise SystemExit(91)
+
+
+arguments = sys.argv[1:]
+if len(arguments) != 5 or arguments[0] != "-i" or arguments[2] != "--":
+    refuse("arguments")
+key = Path(arguments[1]).resolve(strict=True)
+if key != Path(os.environ["HYPERLAB_PM_TEST_KEY"]).resolve(strict=True):
+    refuse("key")
+remote_prefix = os.environ["HYPERLAB_PM_TEST_REMOTE_PREFIX"] + "/"
+remote = arguments[3]
+if not remote.startswith(remote_prefix):
+    refuse("remote_prefix")
+name = remote[len(remote_prefix):]
+if name not in ALLOWED or "/" in name or "\\" in name:
+    refuse("remote_name")
+source_root = Path(os.environ["HYPERLAB_PM_TEST_REMOTE_FILES"]).resolve(strict=True)
+source = source_root / name
+if source.is_symlink() or not source.is_file():
+    refuse("source")
+local_root = Path(os.environ["HYPERLAB_PM_TEST_LOCAL_ROOT"]).resolve(strict=True)
+destination = Path(arguments[4])
+if destination.name != name or destination.parent.resolve(strict=True) != local_root:
+    refuse("destination")
+if destination.exists():
+    refuse("destination_exists")
+log = Path(os.environ["HYPERLAB_PM_TEST_SCP_LOG"])
+seen = log.read_text(encoding="ascii").splitlines() if log.exists() else []
+if name in seen:
+    refuse("duplicate")
+shutil.copyfile(source, destination)
+with log.open("a", encoding="ascii", newline="\n") as handle:
+    handle.write(name + "\n")
+""",
+        encoding="utf-8",
+    )
+    launcher = fake_bin / "scp.cmd"
+    launcher.write_text(
+        f'@echo off\r\n"{sys.executable}" "{stub}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+        encoding="ascii",
+    )
+    return launcher
+
+
 def test_read_only_export_and_offline_diagnostic_identify_first_real_shape_divergence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -370,6 +505,187 @@ def test_offline_diagnostic_refuses_archive_corruption(
         )
 
 
+@pytest.mark.skipif(
+    os.name != "nt" or not POWERSHELL_51.is_file(),
+    reason="Windows PowerShell 5.1 runtime required",
+)
+def test_materialized_g_then_h_execute_under_powershell_51_without_repo_cwd_or_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign, incoming, source, forensic_root = _materialize_failed_campaign(
+        tmp_path,
+        monkeypatch,
+    )
+    exported = forensics.export_forensics(
+        campaign_root=campaign,
+        incoming_root=incoming,
+        source_root=source,
+        output_root=forensic_root,
+        expected_source_commit=SOURCE_COMMIT,
+    )
+    assert sorted(path.name for path in forensic_root.iterdir() if path.is_file()) == sorted(
+        TRANSFER_NAMES
+    )
+    pack_root = tmp_path / "materialized-windows-followup"
+    fetch, diagnose = _materialize_windows_followup(
+        pack_root,
+        campaign_root=campaign,
+        archive_sha256=str(exported["archive_sha256"]),
+        file_count=int(exported["file_count"]),
+        monkeypatch=monkeypatch,
+    )
+    fetch_text = fetch.read_text(encoding="utf-8")
+    parser_start = fetch_text.index("function Assert-Pin {")
+    parser_end = fetch_text.index("$null = Assert-Pin")
+    legacy_fetch = fetch.with_name("G-legacy-invalid-pin-regex.ps1")
+    legacy_fetch.write_text(
+        fetch_text[:parser_start]
+        + r"""function Assert-Pin {
+    param([string] $PinName, [string] $TargetName)
+    $Line = (Get-Content -LiteralPath (Join-Path $LocalRoot $PinName) -Raw).Trim()
+    if ($Line -notmatch '^([0-9a-f]{64})  ([^/\]+)$' -or $Matches[2] -cne $TargetName) { throw "Malformed pin: $PinName" }
+    if ((Get-Sha256Hex (Join-Path $LocalRoot $TargetName)) -cne $Matches[1]) { throw "SHA-256 diverged: $TargetName" }
+}
+"""
+        + fetch_text[parser_end:],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "strict-fake-bin"
+    fake_scp = _install_strict_fake_scp(fake_bin)
+    assert fake_scp.is_file()
+    fake_key = tmp_path / "synthetic-fixture-ssh-key"
+    fake_key.write_text("SYNTHETIC/FIXTURE NOT A REAL KEY\n", encoding="ascii")
+    non_repo_cwd = Path(r"C:\Windows\System32")
+    assert non_repo_cwd.is_dir()
+    repository_probe = subprocess.run(
+        ["git", "-C", str(non_repo_cwd), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert repository_probe.returncode != 0
+    local_root = tmp_path / "receipt-auth-local-v2"
+    assert not local_root.exists()
+    scp_log = tmp_path / "strict-scp.log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HYPERLAB_PM_FORENSIC_LOCAL_ROOT": str(local_root),
+            "HYPERLAB_PM_SSH_KEY": str(fake_key),
+            "HYPERLAB_PM_SSH_TARGET": "fixture@127.0.0.1",
+            "HYPERLAB_PM_TEST_KEY": str(fake_key),
+            "HYPERLAB_PM_TEST_LOCAL_ROOT": str(local_root),
+            "HYPERLAB_PM_TEST_REMOTE_FILES": str(forensic_root),
+            "HYPERLAB_PM_TEST_REMOTE_PREFIX": (
+                "fixture@127.0.0.1:" + pack_builder.FORENSIC_ROOT
+            ),
+            "HYPERLAB_PM_TEST_SCP_LOG": str(scp_log),
+            "PATH": str(fake_bin),
+        }
+    )
+    legacy_local_root = tmp_path / "receipt-auth-local-legacy-regex"
+    legacy_scp_log = tmp_path / "strict-scp-legacy.log"
+    legacy_environment = environment.copy()
+    legacy_environment.update(
+        {
+            "HYPERLAB_PM_FORENSIC_LOCAL_ROOT": str(legacy_local_root),
+            "HYPERLAB_PM_TEST_LOCAL_ROOT": str(legacy_local_root),
+            "HYPERLAB_PM_TEST_SCP_LOG": str(legacy_scp_log),
+        }
+    )
+    legacy_failed = _run_powershell_51(
+        legacy_fetch,
+        cwd=non_repo_cwd,
+        environment=legacy_environment,
+    )
+    legacy_output = legacy_failed.stdout + legacy_failed.stderr
+    assert legacy_failed.returncode != 0
+    assert "System.ArgumentException" in legacy_output
+    assert r"([^/\]+)" in legacy_output
+    assert "PREDICTION_MARKETS_RECEIPT_AUTH_FORENSIC_FETCHED" not in legacy_output
+    assert legacy_scp_log.read_text(encoding="ascii").splitlines() == list(
+        TRANSFER_NAMES
+    )
+    assert sorted(path.name for path in legacy_local_root.iterdir()) == sorted(
+        TRANSFER_NAMES
+    )
+
+    fetched = _run_powershell_51(
+        fetch,
+        cwd=non_repo_cwd,
+        environment=environment,
+    )
+    assert fetched.returncode == 0, fetched.stdout + fetched.stderr
+    assert "PREDICTION_MARKETS_RECEIPT_AUTH_FORENSIC_FETCHED" in fetched.stdout
+    assert sorted(path.name for path in local_root.iterdir()) == sorted(TRANSFER_NAMES)
+    assert scp_log.read_text(encoding="ascii").splitlines() == list(TRANSFER_NAMES)
+    for name in TRANSFER_NAMES:
+        assert (local_root / name).read_bytes() == (forensic_root / name).read_bytes()
+    before_diagnostic = _tree_digest(local_root)
+
+    refused_reuse = _run_powershell_51(
+        fetch,
+        cwd=non_repo_cwd,
+        environment=environment,
+    )
+    assert refused_reuse.returncode != 0
+    assert "Local forensic root must be new" in (
+        refused_reuse.stdout + refused_reuse.stderr
+    )
+
+    diagnosed = _run_powershell_51(
+        diagnose,
+        cwd=non_repo_cwd,
+        environment=environment,
+    )
+    assert diagnosed.returncode == 0, diagnosed.stdout + diagnosed.stderr
+    assert "PREDICTION_MARKETS_RECEIPT_AUTH_DIVERGENCE_IDENTIFIED" in diagnosed.stdout
+    diagnostic_json = next(
+        json.loads(line)
+        for line in diagnosed.stdout.splitlines()
+        if line.startswith("{")
+    )
+    assert diagnostic_json["raw_segments_read"] == 0
+    assert diagnostic_json["source_commit"] == SOURCE_COMMIT
+    for venue in ("polymarket", "kalshi"):
+        first = diagnostic_json["reports"][venue]["first_divergence"]
+        assert first["field"] == "terminal_health.accepted"
+        assert first["observed"] == "PUBLIC_SOURCE_INVALID"
+    assert _tree_digest(local_root) == before_diagnostic
+    assert sorted(path.name for path in local_root.iterdir()) == sorted(TRANSFER_NAMES)
+
+    traversal_remote = tmp_path / "traversal-pin-remote"
+    traversal_remote.mkdir()
+    for name in TRANSFER_NAMES:
+        (traversal_remote / name).write_bytes((forensic_root / name).read_bytes())
+    archive_hash = str(exported["archive_sha256"])
+    (traversal_remote / "receipt-auth-forensic.tar.sha256").write_bytes(
+        f"{archive_hash}  ../receipt-auth-forensic.tar\n".encode("ascii")
+    )
+    traversal_root = tmp_path / "receipt-auth-local-traversal-refused"
+    traversal_log = tmp_path / "strict-scp-traversal.log"
+    traversal_environment = environment.copy()
+    traversal_environment.update(
+        {
+            "HYPERLAB_PM_FORENSIC_LOCAL_ROOT": str(traversal_root),
+            "HYPERLAB_PM_TEST_LOCAL_ROOT": str(traversal_root),
+            "HYPERLAB_PM_TEST_REMOTE_FILES": str(traversal_remote),
+            "HYPERLAB_PM_TEST_SCP_LOG": str(traversal_log),
+        }
+    )
+    traversal_refused = _run_powershell_51(
+        fetch,
+        cwd=non_repo_cwd,
+        environment=traversal_environment,
+    )
+    traversal_output = traversal_refused.stdout + traversal_refused.stderr
+    assert traversal_refused.returncode != 0
+    assert "Malformed pin layout" in traversal_output
+    assert "PREDICTION_MARKETS_RECEIPT_AUTH_FORENSIC_FETCHED" not in traversal_output
+
+
 def test_generated_operator_blocks_are_exact_bounded_and_do_not_mutate_services() -> None:
     tool_raw = (
         ROOT / "ops/prediction_markets_launch_v1/receipt_auth_forensics.py"
@@ -398,8 +714,54 @@ def test_generated_operator_blocks_are_exact_bounded_and_do_not_mutate_services(
     assert "Local forensic root must be new" in fetch
     assert "receipt-auth-forensic.tar.sha256" in fetch
     assert "PREDICTION_MARKETS_RECEIPT_AUTH_FORENSIC_FETCHED" in fetch
+    assert pack_builder.ACQUIRED_REMOTE_ARCHIVE_SHA256 not in fetch
+    assert "file count diverged from the acquired F evidence" not in fetch
+    assert "$Matches" not in fetch
+    assert "Malformed pin layout" in fetch
+    assert "[Security.Cryptography.SHA256]::Create()" in fetch
+    assert "[IO.Path]::IsPathRooted($LocalRootRaw)" in fetch
     assert "--expected-source-commit" in diagnose
+    assert "$Matches" not in diagnose
+    assert "[IO.Path]::GetFullPath($BundleRootRaw)" in diagnose
     assert "aucun" not in fetch.lower() or "systemctl" not in fetch
+
+
+def test_windows_followup_pack_reuses_remote_forensic_and_omits_new_f(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_commit = "7" * 40
+
+    def fake_git(_repo: Path, *arguments: str) -> str:
+        values = {
+            ("rev-parse", "HEAD"): tool_commit,
+            ("branch", "--show-current"): pack_builder.EXPECTED_BRANCH,
+            ("status", "--porcelain"): "",
+        }
+        return values[arguments]
+
+    monkeypatch.setattr(pack_builder, "_git", fake_git)
+    output = tmp_path / "windows-followup-pack"
+    inventory = pack_builder.build_pack(
+        repo_root=ROOT,
+        output_root=output,
+        tool_commit=tool_commit,
+        windows_followup=True,
+    )
+    assert inventory["scope"] == "WINDOWS_FETCH_DIAG_ONLY_REMOTE_FORENSIC_REUSE"
+    paths = {str(item["path"]) for item in inventory["files"]}
+    assert "operator/F-tabby-export-receipt-auth-forensic.sh" not in paths
+    assert paths == {
+        "README.md",
+        "operator/G-windows-fetch-receipt-auth-forensic.ps1",
+        "operator/H-windows-offline-diagnose.ps1",
+        "tools/receipt_auth_forensics.py",
+    }
+    fetch = (output / "operator/G-windows-fetch-receipt-auth-forensic.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert pack_builder.FORENSIC_ROOT in fetch
+    assert pack_builder.ACQUIRED_REMOTE_ARCHIVE_SHA256 in fetch
 
 
 def test_static_forensic_allowlist_excludes_raw_payloads_and_h1() -> None:

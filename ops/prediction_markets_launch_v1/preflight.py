@@ -31,6 +31,7 @@ _NETWORK_TIMEOUT_SECONDS = 3.0
 _COMMAND_TIMEOUT_SECONDS = 20.0
 _SHA256 = frozenset("0123456789abcdef")
 _RUN_SLUG = re.compile(r"^pm-[0-9]{8}t[0-9]{6}z-[0-9a-f]{8}$")
+_HOME_MOUNT = PurePosixPath("/home")
 _INCOMING_PARENT = PurePosixPath("/home/hyperlab/hyperlab-prediction-markets/incoming")
 _VOLUME_BASE = PurePosixPath(
     "/mnt/HC_Volume_106716684/hyperlab-prediction-markets"
@@ -150,6 +151,10 @@ def validate_install_layout(
         venue: f"hyperlab-pm-{suffix}-{venue}.service"
         for venue in ("polymarket", "kalshi", "dashboard")
     }
+    namespace_probe_services = {
+        venue: f"hyperlab-pm-{suffix}-{venue}-namespace-probe.service"
+        for venue in ("polymarket", "kalshi")
+    }
     services = handoff.get("services")
     disk = handoff.get("disk")
     source_commit = handoff.get("source_commit")
@@ -175,6 +180,7 @@ def validate_install_layout(
         "campaign_root": campaign.as_posix(),
         "incoming_root": incoming.as_posix(),
         "run_slug": slug,
+        "namespace_probe_services": namespace_probe_services,
         "services": expected_services,
         "source_commit": source_commit,
         "source_root": source.as_posix(),
@@ -191,6 +197,7 @@ class CommandResult:
 
 
 CommandRunner = Callable[[Sequence[str]], CommandResult]
+WriteSurfaceProbe = Callable[[Path], dict[str, object]]
 
 
 def _command(arguments: Sequence[str]) -> CommandResult:
@@ -209,6 +216,293 @@ def _required_command(name: str) -> str:
     if value is None:
         raise PreflightError(f"required offline command is absent: {name}")
     return value
+
+
+def _stat_device_major_minor(path: Path) -> str:
+    """Return the kernel device identity used by stat(2), not a mount source label."""
+
+    try:
+        identity = path.stat()
+    except OSError as error:
+        raise PreflightError(f"filesystem path is unavailable for device authentication: {path}") from error
+    major = getattr(os, "major", None)
+    minor = getattr(os, "minor", None)
+    if not callable(major) or not callable(minor):
+        raise PreflightError("stat device major:minor authentication is unavailable")
+    value = f"{major(identity.st_dev)}:{minor(identity.st_dev)}"
+    if re.fullmatch(r"[0-9]+:[0-9]+", value) is None:
+        raise PreflightError("stat device major:minor identity is invalid")
+    return value
+
+
+def _mount_evidence(
+    path: Path,
+    *,
+    run: CommandRunner,
+    label: str,
+    expected_target: Path | None = None,
+    target_may_be_ancestor: bool = False,
+    expected_device: str | None = None,
+    expected_fstype: str | None = None,
+    expected_fsroot: str | None = None,
+    required_mode: str | None = None,
+) -> dict[str, object]:
+    """Authenticate a mount view with findmnt plus the path's stat(2) device."""
+
+    mounted = run(
+        [
+            "findmnt",
+            "-rn",
+            "--raw",
+            "-T",
+            path.as_posix(),
+            "-o",
+            "TARGET,SOURCE,FSTYPE,VFS-OPTIONS,MAJ:MIN,FSROOT",
+        ]
+    )
+    fields = mounted.stdout.split(maxsplit=5)
+    if mounted.returncode != 0 or len(fields) != 6:
+        raise PreflightError(f"{label} mount evidence is unavailable or malformed")
+    target_text, source, fstype, options_text, device, fsroot = fields
+    target = PurePosixPath(target_text)
+    candidate = PurePosixPath(path.as_posix())
+    target_is_absolute = target.is_absolute() or (
+        os.name == "nt" and re.fullmatch(r"[A-Za-z]:/.*", target_text) is not None
+    )
+    if not target_is_absolute or (target != candidate and not target_may_be_ancestor):
+        raise PreflightError(f"{label} mount target diverged")
+    if target_may_be_ancestor and target != candidate and target not in candidate.parents:
+        raise PreflightError(f"{label} mount target is not an authenticated ancestor")
+    if expected_target is not None and target != PurePosixPath(expected_target.as_posix()):
+        raise PreflightError(f"{label} mount target diverged")
+    if re.fullmatch(r"[0-9]+:[0-9]+", device) is None:
+        raise PreflightError(f"{label} findmnt device identity is invalid")
+    stat_device = _stat_device_major_minor(path)
+    if stat_device != device:
+        raise PreflightError(f"{label} findmnt and stat device identities diverged")
+    if expected_device is not None and device != expected_device:
+        raise PreflightError(f"{label} filesystem device diverged")
+    if expected_fstype is not None and fstype != expected_fstype:
+        raise PreflightError(f"{label} filesystem type diverged")
+    if not fsroot.startswith("/") or ".." in PurePosixPath(fsroot).parts:
+        raise PreflightError(f"{label} filesystem root is invalid")
+    if expected_fsroot is not None and fsroot != expected_fsroot:
+        raise PreflightError(f"{label} filesystem root/bind identity diverged")
+    options = options_text.split(",")
+    if required_mode is not None:
+        opposite = "ro" if required_mode == "rw" else "rw"
+        if required_mode not in options or opposite in options:
+            raise PreflightError(f"{label} is not mounted {required_mode}")
+    return {
+        "device_major_minor": device,
+        "filesystem": fstype,
+        "filesystem_root": fsroot,
+        "mount": target.as_posix(),
+        "options": options,
+        "source": source,
+        "stat_device_major_minor": stat_device,
+    }
+
+
+def _expected_filesystem_root(
+    *,
+    admitted_root: str,
+    volume_mount: Path,
+    path: Path,
+) -> str:
+    try:
+        relative = PurePosixPath(path.as_posix()).relative_to(
+            PurePosixPath(volume_mount.as_posix())
+        )
+    except ValueError as error:
+        raise PreflightError("namespace path leaves the admitted volume mount") from error
+    root = PurePosixPath(admitted_root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise PreflightError("admitted filesystem root identity is invalid")
+    return (root / relative).as_posix()
+
+
+def _authenticate_volume_namespace_mapping(
+    evidence: Mapping[str, object],
+    *,
+    admitted_root: str,
+    allowed_targets: Sequence[Path],
+    label: str,
+    volume_mount: Path,
+) -> None:
+    """Authenticate a systemd mount target without assuming every RO path survives."""
+
+    target_text = evidence.get("mount")
+    filesystem_root = evidence.get("filesystem_root")
+    if not isinstance(target_text, str) or not isinstance(filesystem_root, str):
+        raise PreflightError(f"{label} mount mapping evidence is invalid")
+    target = PurePosixPath(target_text)
+    allowed = {PurePosixPath(path.as_posix()) for path in allowed_targets}
+    if target not in allowed:
+        raise PreflightError(f"{label} mount target is not allowlisted")
+    volume = PurePosixPath(volume_mount.as_posix())
+    root = PurePosixPath(admitted_root)
+    try:
+        relative = target.relative_to(volume)
+    except ValueError as error:
+        raise PreflightError(f"{label} mount target leaves the admitted volume") from error
+    expected_root = (root / relative).as_posix()
+    if filesystem_root != expected_root:
+        raise PreflightError(f"{label} filesystem root/bind identity diverged")
+
+
+def _authenticate_incoming_namespace_target(
+    evidence: Mapping[str, object],
+    *,
+    incoming: Path,
+    label: str,
+) -> None:
+    target_text = evidence.get("mount")
+    if not isinstance(target_text, str):
+        raise PreflightError(f"{label} mount mapping evidence is invalid")
+    target = PurePosixPath(target_text)
+    allowed = {_HOME_MOUNT, PurePosixPath(incoming.as_posix())}
+    if target not in allowed:
+        raise PreflightError(f"{label} mount target is not allowlisted")
+
+
+def _durable_write_surface_probe(root: Path) -> dict[str, object]:
+    """Prove the sole writable venue surface without touching an existing file."""
+
+    before = root.lstat()
+    if root.is_symlink() or not stat.S_ISDIR(before.st_mode) or root.resolve(strict=True) != root:
+        raise PreflightError("venue write surface is absent, symlinked, or non-canonical")
+    probe_name = f".prediction-write-surface-probe-{uuid4().hex}"
+    probe = root / probe_name
+    directory_descriptor: int | None = None
+    file_descriptor: int | None = None
+    created = False
+    removed = False
+    probe_identity: tuple[int, int, int] | None = None
+    primary_error: OSError | PreflightError | None = None
+    cleanup_error: OSError | PreflightError | None = None
+
+    def identity(value: os.stat_result) -> tuple[int, int, int]:
+        return value.st_dev, value.st_ino, value.st_mode
+
+    def current_probe_identity() -> tuple[int, int, int]:
+        if directory_descriptor is not None:
+            return identity(
+                os.stat(
+                    probe_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        return identity(probe.lstat())
+
+    try:
+        if os.name != "nt":
+            directory_descriptor = os.open(
+                root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if identity(os.fstat(directory_descriptor)) != identity(before):
+                raise PreflightError("venue write surface directory identity diverged")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        if directory_descriptor is not None:
+            file_descriptor = os.open(
+                probe_name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+        else:
+            file_descriptor = os.open(probe, flags, 0o600)
+        created = True
+        probe_identity = identity(os.fstat(file_descriptor))
+        if (
+            not stat.S_ISREG(probe_identity[2])
+            or probe_identity[0] != before.st_dev
+        ):
+            raise PreflightError("venue write surface probe identity is invalid")
+        with os.fdopen(file_descriptor, "wb", closefd=True) as handle:
+            file_descriptor = None
+            handle.write(b"PREDICTION_MARKETS_WRITE_SURFACE_PROBE_V1\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if directory_descriptor is not None:
+            os.fsync(directory_descriptor)
+            if current_probe_identity() != probe_identity:
+                raise PreflightError("venue write surface probe identity changed before removal")
+            os.unlink(probe_name, dir_fd=directory_descriptor)
+            removed = True
+            os.fsync(directory_descriptor)
+        else:
+            if current_probe_identity() != probe_identity:
+                raise PreflightError("venue write surface probe identity changed before removal")
+            probe.unlink()
+            removed = True
+    except (OSError, PreflightError) as error:
+        primary_error = error
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError as error:
+                cleanup_error = error
+        try:
+            if created and not removed:
+                if probe_identity is None or current_probe_identity() != probe_identity:
+                    raise PreflightError(
+                        "venue write surface cleanup target identity changed"
+                    )
+                if directory_descriptor is not None:
+                    os.unlink(probe_name, dir_fd=directory_descriptor)
+                else:
+                    probe.unlink()
+                removed = True
+                if directory_descriptor is not None:
+                    os.fsync(directory_descriptor)
+        except (OSError, PreflightError) as error:
+            cleanup_error = error
+    try:
+        after = root.lstat()
+        descriptor_after = (
+            os.fstat(directory_descriptor)
+            if directory_descriptor is not None
+            else after
+        )
+    except OSError as error:
+        if cleanup_error is None:
+            cleanup_error = error
+        after = before
+        descriptor_after = before
+    if directory_descriptor is not None:
+        try:
+            os.close(directory_descriptor)
+        except OSError as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(after.st_mode)
+        or identity(before) != identity(after)
+        or identity(before) != identity(descriptor_after)
+    ):
+        raise PreflightError("venue write surface changed during durable probe")
+    if cleanup_error is not None:
+        raise PreflightError(
+            f"venue write surface probe cleanup was not durable: {cleanup_error}"
+        ) from cleanup_error
+    if primary_error is not None:
+        raise PreflightError(f"venue write surface durable probe failed: {primary_error}") from primary_error
+    if not removed or probe.exists() or probe.is_symlink():
+        raise PreflightError("venue write surface probe was not removed")
+    return {
+        "directory_fsync": os.name != "nt",
+        "exclusive_create": True,
+        "file_fsync": True,
+        "probe_removed": True,
+        "root": root.as_posix(),
+    }
 
 
 def verify_transfer_inventory(incoming_root: Path, handoff: Mapping[str, object]) -> dict[str, object]:
@@ -678,15 +972,15 @@ def host_preflight(
             raise PreflightError("NTP is not synchronized")
         checks["ntp"] = {"synchronized": True}
         mount = str(handoff["volume_mount"])
-        target = run(["findmnt", "-rn", "-T", mount, "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
-        if target.returncode != 0:
-            raise PreflightError("campaign filesystem is not mounted")
-        fields = target.stdout.split(maxsplit=3)
-        if len(fields) != 4 or fields[0] != mount or fields[2] != "ext4":
-            raise PreflightError(f"campaign filesystem identity diverged: {target.stdout}")
-        options = fields[3].split(",")
-        if "rw" not in options or "ro" in options:
-            raise PreflightError("campaign filesystem is not read-write")
+        filesystem = _mount_evidence(
+            Path(mount),
+            run=run,
+            label="campaign host filesystem",
+            expected_target=Path(mount),
+            expected_fstype="ext4",
+            expected_fsroot="/",
+            required_mode="rw",
+        )
         capacity = run(["df", "-PB1", mount])
         if capacity.returncode != 0:
             raise PreflightError(f"campaign capacity check failed: {capacity.stderr}")
@@ -704,11 +998,8 @@ def host_preflight(
             )
         checks["filesystem"] = {
             "available_bytes": available,
-            "filesystem": fields[2],
-            "mount": mount,
-            "options": options,
             "required_free_bytes": required,
-            "source": fields[1],
+            **filesystem,
         }
         for key in ("source_root", "campaign_root"):
             candidate = Path(str(handoff[key]))
@@ -724,9 +1015,20 @@ def host_preflight(
         services = handoff.get("services")
         if not isinstance(services, Mapping) or set(services) != {"dashboard", "kalshi", "polymarket"}:
             raise PreflightError("service identity map diverged")
+        slug = handoff.get("run_slug")
+        if not isinstance(slug, str) or _RUN_SLUG.fullmatch(slug) is None:
+            raise PreflightError("host preflight run slug is invalid")
+        suffix = slug.removeprefix("pm-")
+        namespace_probes = {
+            venue: f"hyperlab-pm-{suffix}-{venue}-namespace-probe.service"
+            for venue in ("polymarket", "kalshi")
+        }
         checks["services"] = [
-            _systemd_collision(str(services[name]), run)
-            for name in ("polymarket", "kalshi", "dashboard")
+            _systemd_collision(service, run)
+            for service in [
+                *(str(services[name]) for name in ("polymarket", "kalshi", "dashboard")),
+                *(str(namespace_probes[name]) for name in ("polymarket", "kalshi")),
+            ]
         ]
     except (OSError, PreflightError, subprocess.SubprocessError) as error:
         errors.append(str(error))
@@ -974,17 +1276,15 @@ def _live_reservation_checks(
     if ntp.returncode != 0 or ntp.stdout != "yes":
         raise PreflightError(f"NTP is not synchronized for {label}")
     mount = str(handoff["volume_mount"])
-    mounted = run(["findmnt", "-rn", "-T", mount, "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
-    fields = mounted.stdout.split(maxsplit=3)
-    if (
-        mounted.returncode != 0
-        or len(fields) != 4
-        or fields[0] != mount
-        or fields[2] != "ext4"
-        or "rw" not in fields[3].split(",")
-        or "ro" in fields[3].split(",")
-    ):
-        raise PreflightError(f"{label} filesystem is not the admitted ext4 rw mount")
+    filesystem = _mount_evidence(
+        Path(mount),
+        run=run,
+        label=f"{label} filesystem",
+        expected_target=Path(mount),
+        expected_fstype="ext4",
+        expected_fsroot="/",
+        required_mode="rw",
+    )
     capacity = run(["df", "-PB1", mount])
     if capacity.returncode != 0:
         raise PreflightError(f"{label} capacity check failed: {capacity.stderr}")
@@ -1004,12 +1304,7 @@ def _live_reservation_checks(
             "available_bytes": available,
             "required_free_bytes": required,
         },
-        "filesystem": {
-            "filesystem": fields[2],
-            "mount": fields[0],
-            "options": fields[3].split(","),
-            "source": fields[1],
-        },
+        "filesystem": filesystem,
         "ntp": {"synchronized": True},
     }
 
@@ -1091,7 +1386,14 @@ def install_admission_preflight(
         if (
             not isinstance(host_filesystem, Mapping)
             or not isinstance(live_filesystem, Mapping)
-            or host_filesystem.get("source") != live_filesystem.get("source")
+            or host_filesystem.get("device_major_minor")
+            != live_filesystem.get("device_major_minor")
+            or host_filesystem.get("stat_device_major_minor")
+            != live_filesystem.get("stat_device_major_minor")
+            or host_filesystem.get("filesystem") != "ext4"
+            or live_filesystem.get("filesystem") != "ext4"
+            or host_filesystem.get("filesystem_root") != "/"
+            or live_filesystem.get("filesystem_root") != "/"
         ):
             raise PreflightError("install filesystem device diverged from host preflight")
         port = int(handoff["dashboard_port"])
@@ -1099,11 +1401,16 @@ def install_admission_preflight(
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
             probe.bind(("127.0.0.1", port))
         services = handoff["services"]
-        assert isinstance(services, Mapping)
-        service_checks = [
-            _systemd_collision(str(services[name]), run)
-            for name in ("polymarket", "kalshi", "dashboard")
+        if not isinstance(services, Mapping):
+            raise PreflightError("handoff services mapping is invalid")
+        namespace_probes = layout["namespace_probe_services"]
+        if not isinstance(namespace_probes, Mapping):
+            raise PreflightError("namespace probe services mapping is invalid")
+        all_services = [
+            *(str(services[name]) for name in ("polymarket", "kalshi", "dashboard")),
+            *(str(namespace_probes[name]) for name in ("polymarket", "kalshi")),
         ]
+        service_checks = [_systemd_collision(service, run) for service in all_services]
         verify_transfer_inventory(handoff_path.parent, handoff)
         inventory = _object(handoff_path.parent / "transfer-inventory.json")
         items = inventory.get("files")
@@ -1115,8 +1422,7 @@ def install_admission_preflight(
             if isinstance(item, Mapping)
         }
         unit_sha256: dict[str, str] = {}
-        for name in ("polymarket", "kalshi", "dashboard"):
-            service = str(services[name])
+        for service in all_services:
             item = by_path.get(f"systemd/{service}")
             if not isinstance(item, Mapping):
                 raise PreflightError(f"authenticated unit is absent: {service}")
@@ -1161,7 +1467,7 @@ def _validated_install_admission(
     install_admission_path: Path,
     *,
     operation: str,
-) -> tuple[dict[str, Any], dict[str, object], str]:
+) -> tuple[dict[str, Any], dict[str, object], dict[str, object]]:
     handoff = load_handoff(handoff_path)
     layout = validate_install_layout(handoff, handoff_path=handoff_path)
     expected_admission_path = (
@@ -1180,8 +1486,8 @@ def _validated_install_admission(
     prior_filesystem = (
         prior_live.get("filesystem") if isinstance(prior_live, Mapping) else None
     )
-    admitted_source = (
-        prior_filesystem.get("source")
+    admitted_device = (
+        prior_filesystem.get("device_major_minor")
         if isinstance(prior_filesystem, Mapping)
         else None
     )
@@ -1205,11 +1511,16 @@ def _validated_install_admission(
         or evidence.get("handoff_sha256")
         != sha256_bytes(_safe_regular_bytes(handoff_path))
         or evidence.get("layout") != layout
-        or not isinstance(admitted_source, str)
-        or not admitted_source
+        or not isinstance(prior_filesystem, Mapping)
+        or not isinstance(admitted_device, str)
+        or re.fullmatch(r"[0-9]+:[0-9]+", admitted_device) is None
+        or prior_filesystem.get("stat_device_major_minor") != admitted_device
+        or prior_filesystem.get("filesystem") != "ext4"
+        or prior_filesystem.get("filesystem_root") != "/"
+        or prior_filesystem.get("mount") != layout["volume_mount"]
     ):
         raise PreflightError(f"{operation} install admission binding diverged")
-    return handoff, layout, admitted_source
+    return handoff, layout, dict(prior_filesystem)
 
 
 def collector_activation_guard(
@@ -1223,7 +1534,7 @@ def collector_activation_guard(
     errors: list[str] = []
     live: dict[str, object] = {}
     try:
-        handoff, _layout, admitted_source = _validated_install_admission(
+        handoff, _layout, admitted_filesystem = _validated_install_admission(
             handoff_path,
             install_admission_path,
             operation="collector guard",
@@ -1232,7 +1543,12 @@ def collector_activation_guard(
         current_filesystem = live.get("filesystem")
         if (
             not isinstance(current_filesystem, Mapping)
-            or current_filesystem.get("source") != admitted_source
+            or current_filesystem.get("device_major_minor")
+            != admitted_filesystem.get("device_major_minor")
+            or current_filesystem.get("stat_device_major_minor")
+            != admitted_filesystem.get("stat_device_major_minor")
+            or current_filesystem.get("filesystem") != "ext4"
+            or current_filesystem.get("filesystem_root") != "/"
         ):
             raise PreflightError("collector activation filesystem device diverged")
     except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
@@ -1252,18 +1568,218 @@ def collector_activation_guard(
     }
 
 
+def _canonical_directory(path: Path, *, label: str) -> tuple[int, int, int]:
+    try:
+        identity = path.lstat()
+    except OSError as error:
+        raise PreflightError(f"{label} is absent") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(identity.st_mode)
+        or path.resolve(strict=True) != path
+    ):
+        raise PreflightError(f"{label} is symlinked, non-directory, or non-canonical")
+    return identity.st_dev, identity.st_ino, identity.st_mode
+
+
+def _runner_namespace_checks(
+    handoff: Mapping[str, object],
+    layout: Mapping[str, object],
+    admitted_filesystem: Mapping[str, object],
+    *,
+    venue: str,
+    run: CommandRunner,
+    write_probe: WriteSurfaceProbe,
+) -> dict[str, object]:
+    if venue not in {"polymarket", "kalshi"}:
+        raise PreflightError("runner namespace venue is invalid")
+    service_user = str(handoff.get("service_user") or "")
+    if os.environ.get("USER") != service_user:
+        raise PreflightError("runner namespace guard must run as the dedicated service user")
+    if Path.home().as_posix() != f"/home/{service_user}":
+        raise PreflightError("runner namespace guard service user HOME diverged")
+    incoming = Path(str(layout["incoming_root"]))
+    volume_mount = Path(str(layout["volume_mount"]))
+    volume_base = Path(str(layout["volume_base"]))
+    source = Path(str(layout["source_root"]))
+    campaign = Path(str(layout["campaign_root"]))
+    venue_root = campaign / venue
+    roots_before = {
+        "incoming": _canonical_directory(incoming, label="runner incoming root"),
+        "volume_base": _canonical_directory(
+            volume_base, label="runner Prediction Markets volume base"
+        ),
+        "source": _canonical_directory(source, label="runner source root"),
+        "campaign": _canonical_directory(campaign, label="runner campaign root"),
+        "venue": _canonical_directory(venue_root, label="runner venue root"),
+    }
+    device = str(admitted_filesystem.get("device_major_minor") or "")
+    admitted_root = str(admitted_filesystem.get("filesystem_root") or "")
+    if re.fullmatch(r"[0-9]+:[0-9]+", device) is None or admitted_root != "/":
+        raise PreflightError("runner namespace admitted filesystem identity is invalid")
+    parent_mount = _mount_evidence(
+        volume_mount,
+        run=run,
+        label="runner namespace volume parent",
+        expected_target=volume_mount,
+        expected_device=device,
+        expected_fstype="ext4",
+        expected_fsroot=admitted_root,
+        required_mode="ro",
+    )
+    volume_base_mount = _mount_evidence(
+        volume_base,
+        run=run,
+        label="runner Prediction Markets volume base",
+        target_may_be_ancestor=True,
+        expected_device=device,
+        expected_fstype="ext4",
+        required_mode="ro",
+    )
+    _authenticate_volume_namespace_mapping(
+        volume_base_mount,
+        admitted_root=admitted_root,
+        allowed_targets=(volume_mount, volume_base),
+        label="runner Prediction Markets volume base",
+        volume_mount=volume_mount,
+    )
+    incoming_mount = _mount_evidence(
+        incoming,
+        run=run,
+        label="runner namespace incoming root",
+        target_may_be_ancestor=True,
+        required_mode="ro",
+    )
+    _authenticate_incoming_namespace_target(
+        incoming_mount,
+        incoming=incoming,
+        label="runner namespace incoming root",
+    )
+    readonly_mounts: dict[str, dict[str, object]] = {}
+    for label, path in (("source", source), ("campaign", campaign)):
+        readonly_mounts[label] = _mount_evidence(
+            path,
+            run=run,
+            label=f"runner namespace {label} root",
+            target_may_be_ancestor=True,
+            expected_device=device,
+            expected_fstype="ext4",
+            required_mode="ro",
+        )
+        _authenticate_volume_namespace_mapping(
+            readonly_mounts[label],
+            admitted_root=admitted_root,
+            allowed_targets=(volume_mount, volume_base, path),
+            label=f"runner namespace {label} root",
+            volume_mount=volume_mount,
+        )
+    venue_expected_root = _expected_filesystem_root(
+        admitted_root=admitted_root,
+        volume_mount=volume_mount,
+        path=venue_root,
+    )
+    venue_mount = _mount_evidence(
+        venue_root,
+        run=run,
+        label="runner namespace venue root",
+        expected_target=venue_root,
+        expected_device=device,
+        expected_fstype="ext4",
+        expected_fsroot=venue_expected_root,
+        required_mode="rw",
+    )
+    write_surface = write_probe(venue_root)
+    venue_mount_after = _mount_evidence(
+        venue_root,
+        run=run,
+        label="runner namespace venue root after durable probe",
+        expected_target=venue_root,
+        expected_device=device,
+        expected_fstype="ext4",
+        expected_fsroot=venue_expected_root,
+        required_mode="rw",
+    )
+    roots_after = {
+        "incoming": _canonical_directory(incoming, label="runner incoming root after probe"),
+        "volume_base": _canonical_directory(
+            volume_base, label="runner Prediction Markets volume base after probe"
+        ),
+        "source": _canonical_directory(source, label="runner source root after probe"),
+        "campaign": _canonical_directory(campaign, label="runner campaign root after probe"),
+        "venue": _canonical_directory(venue_root, label="runner venue root after probe"),
+    }
+    if roots_after != roots_before or venue_mount_after != venue_mount:
+        raise PreflightError("runner namespace roots or venue mount changed during admission")
+    return {
+        "admitted_device_major_minor": device,
+        "incoming_readonly": incoming_mount,
+        "parent_mount": parent_mount,
+        "readonly_roots": readonly_mounts,
+        "volume_base_readonly": volume_base_mount,
+        "venue": venue,
+        "venue_mount": venue_mount,
+        "write_surface": write_surface,
+    }
+
+
+def runner_namespace_admission(
+    handoff_path: Path,
+    install_admission_path: Path,
+    *,
+    venue: str,
+    run: CommandRunner = _command,
+    write_probe: WriteSurfaceProbe = _durable_write_surface_probe,
+) -> dict[str, object]:
+    """Prove the exact systemd namespace write surface before the collector process."""
+
+    errors: list[str] = []
+    checks: dict[str, object] = {}
+    try:
+        handoff, layout, admitted_filesystem = _validated_install_admission(
+            handoff_path,
+            install_admission_path,
+            operation="runner namespace guard",
+        )
+        checks = _runner_namespace_checks(
+            handoff,
+            layout,
+            admitted_filesystem,
+            venue=venue,
+            run=run,
+            write_probe=write_probe,
+        )
+    except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        errors.append(str(error))
+    return {
+        "boundary": BOUNDARY,
+        "checks": checks,
+        "errors": errors,
+        "namespace_admissible": not errors,
+        "recorded_at_utc": _utc_now_text(),
+        "schema_version": 1,
+        "terminal_signal": (
+            "PREDICTION_RUNNER_NAMESPACE_GREEN"
+            if not errors
+            else "PREDICTION_RUNNER_NAMESPACE_REFUSED"
+        ),
+        "venue": venue,
+    }
+
+
 def runner_startup_admission(
     handoff_path: Path,
     install_admission_path: Path,
     *,
+    venue: str,
     run: CommandRunner = _command,
+    write_probe: WriteSurfaceProbe = _durable_write_surface_probe,
 ) -> dict[str, object]:
     """Re-authenticate clock, source, transfer and mount before a service run."""
 
     errors: list[str] = []
     checks: dict[str, object] = {}
     try:
-        handoff, layout, admitted_source = _validated_install_admission(
+        handoff, layout, admitted_filesystem = _validated_install_admission(
             handoff_path,
             install_admission_path,
             operation="runner startup",
@@ -1326,27 +1842,17 @@ def runner_startup_admission(
         ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
         if ntp.returncode != 0 or ntp.stdout != "yes":
             raise PreflightError("NTP is not synchronized for runner startup")
-        mount = str(layout["volume_mount"])
-        mounted = run(["findmnt", "-rn", "-T", mount, "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
-        fields = mounted.stdout.split(maxsplit=3)
-        if (
-            mounted.returncode != 0
-            or len(fields) != 4
-            or fields[0] != mount
-            or fields[1] != admitted_source
-            or fields[2] != "ext4"
-            or "rw" not in fields[3].split(",")
-            or "ro" in fields[3].split(",")
-        ):
-            raise PreflightError("runner startup filesystem device or ext4 rw mount diverged")
+        namespace = _runner_namespace_checks(
+            handoff,
+            layout,
+            admitted_filesystem,
+            venue=venue,
+            run=run,
+            write_probe=write_probe,
+        )
         checks = {
             "capacity": {"deferred_to_ledger_accounted_runner_gate": True},
-            "filesystem": {
-                "filesystem": fields[2],
-                "mount": fields[0],
-                "options": fields[3].split(","),
-                "source": fields[1],
-            },
+            "namespace": namespace,
             "ntp": {"synchronized": True},
             "roots": {"campaign": str(campaign), "source": str(source)},
             "source_identity": source_identity,
@@ -1712,6 +2218,12 @@ def _parser() -> argparse.ArgumentParser:
     activation_guard.add_argument("--handoff", type=Path, required=True)
     activation_guard.add_argument("--install-admission-report", type=Path, required=True)
     activation_guard.add_argument("--report", type=Path, required=True)
+    namespace_guard = subparsers.add_parser("runner-namespace-guard")
+    namespace_guard.add_argument("--handoff", type=Path, required=True)
+    namespace_guard.add_argument("--install-admission-report", type=Path, required=True)
+    namespace_guard.add_argument(
+        "--venue", choices=("polymarket", "kalshi"), required=True
+    )
     recovery_admission = subparsers.add_parser("recovery-admission")
     recovery_admission.add_argument("--handoff", type=Path, required=True)
     recovery_admission.add_argument("--report", type=Path, required=True)
@@ -1742,6 +2254,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(canonical_json_bytes(report).decode("utf-8"))
             return 0
+        if arguments.command == "runner-namespace-guard":
+            report = runner_namespace_admission(
+                arguments.handoff,
+                arguments.install_admission_report,
+                venue=arguments.venue,
+            )
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0 if report["namespace_admissible"] is True else 4
         if arguments.command == "install-admission":
             report = install_admission_preflight(
                 arguments.handoff,

@@ -43,14 +43,16 @@ def test_runner_startup_admission_refusal_exits_four_before_runner_or_child(
             "campaign_root": str(tmp_path / "campaign"),
         },
     )
-    monkeypatch.setattr(
-        runner,
-        "runner_startup_admission",
-        lambda *_args, **_kwargs: {
+    admissions: list[str] = []
+
+    def refused_admission(*_args: object, **kwargs: object) -> dict[str, object]:
+        admissions.append(str(kwargs.get("venue")))
+        return {
             "errors": ["NTP is not synchronized for runner startup"],
             "startup_admissible": False,
-        },
-    )
+        }
+
+    monkeypatch.setattr(runner, "runner_startup_admission", refused_admission)
 
     def forbidden_runner(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("venue runner or collection child must not be created")
@@ -61,6 +63,67 @@ def test_runner_startup_admission_refusal_exits_four_before_runner_or_child(
     with pytest.raises(SystemExit) as stopped:
         runner.main(["--handoff", str(handoff_path), "--venue", "polymarket"])
     assert stopped.value.code == 4
+    assert admissions == ["polymarket", "polymarket"]
+
+
+def test_run_from_handoff_passes_exact_venue_admission_then_creates_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _current_synthetic_campaign(tmp_path)
+    source = tmp_path / "source"
+    config = source / "config" / "research"
+    config.mkdir(parents=True)
+    for name in (
+        "prediction-markets-candidate-v1.json",
+        "polymarket-public-contract-v1.json",
+        "kalshi-public-contract-v1.json",
+    ):
+        (config / name).write_bytes((ROOT / "config" / "research" / name).read_bytes())
+    runtime = source / ".venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("SYNTHETIC/FIXTURE offline runtime\n", encoding="utf-8")
+    handoff_path = tmp_path / "handoff.json"
+    handoff = {
+        "boundary": runner.BOUNDARY,
+        "campaign_root": str(context.campaign_root),
+        "disk": {
+            "h1_reserved_bytes": 154_618_822_656,
+            "prediction_maximum_raw_bytes": 22_548_578_304,
+            "safety_margin_bytes": 17_179_869_184,
+        },
+        "source_root": str(source),
+    }
+    handoff_path.write_text("SYNTHETIC/FIXTURE pinned by monkeypatch\n", encoding="utf-8")
+    monkeypatch.setattr(runner, "_pinned_object", lambda _path: handoff)
+    admitted: list[str] = []
+
+    def startup_green(*_args: object, **kwargs: object) -> dict[str, object]:
+        admitted.append(str(kwargs.get("venue")))
+        return {"errors": [], "startup_admissible": True}
+
+    monkeypatch.setattr(runner, "runner_startup_admission", startup_green)
+    monkeypatch.setattr(
+        runner,
+        "capacity_snapshot",
+        lambda **_kwargs: {
+            "admitted": True,
+            "available_bytes": 200_000_000_000,
+            "required_free_bytes": 194_347_270_144,
+        },
+    )
+
+    def publish_waiting(instance: runner.VenueRunner) -> int:
+        assert instance._publish("WAITING_NEXT_SLOT") is True
+        return 0
+
+    monkeypatch.setattr(runner.VenueRunner, "_run_owned", publish_waiting)
+    assert runner.run_from_handoff(handoff_path, Venue.POLYMARKET) == 0
+    assert admitted == ["polymarket"]
+    state_path = context.campaign_root / "polymarket" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["lifecycle"] == "WAITING_NEXT_SLOT"
+    assert not (context.campaign_root / "polymarket" / "ledger.jsonl").exists()
 
 
 def _campaign(tmp_path: Path) -> runner.CampaignContext:

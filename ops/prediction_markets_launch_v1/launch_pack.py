@@ -18,6 +18,9 @@ _RUN_SLUG = re.compile(r"^pm-[0-9]{8}t[0-9]{6}z-[0-9a-f]{8}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SERVICE = re.compile(r"^hyperlab-pm-[a-z0-9-]+-(?:polymarket|kalshi|dashboard)\.service$")
+_PROBE_SERVICE = re.compile(
+    r"^hyperlab-pm-[a-z0-9-]+-(?:polymarket|kalshi)-namespace-probe\.service$"
+)
 _SCRIPTS = (
     "bootstrap-offline.sh",
     "cockpit.py",
@@ -248,7 +251,25 @@ def _service_names(slug: str) -> dict[str, str]:
     return values
 
 
-def _common_unit(service_user: str, source_root: str, campaign_root: str) -> str:
+def _namespace_probe_service_names(slug: str) -> dict[str, str]:
+    suffix = slug.removeprefix("pm-")
+    values = {
+        venue: f"hyperlab-pm-{suffix}-{venue}-namespace-probe.service"
+        for venue in ("polymarket", "kalshi")
+    }
+    if any(_PROBE_SERVICE.fullmatch(value) is None for value in values.values()):
+        raise LaunchPackError("rendered namespace probe service identity is invalid")
+    return values
+
+
+def _common_unit(
+    service_user: str,
+    source_root: str,
+    campaign_root: str,
+    incoming_root: str,
+    volume_base: str,
+    volume_mount: str,
+) -> str:
     return f"""User={service_user}
 Group={service_user}
 WorkingDirectory={source_root}
@@ -282,7 +303,7 @@ MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadOnlyPaths={source_root} {campaign_root}
+ReadOnlyPaths={volume_mount} {volume_base} {incoming_root} {source_root} {campaign_root}
 """
 
 
@@ -290,12 +311,23 @@ def render_units(handoff: Mapping[str, object]) -> dict[str, str]:
     source_root = _text(handoff.get("source_root"), label="source root")
     campaign_root = _text(handoff.get("campaign_root"), label="campaign root")
     incoming_root = _text(handoff.get("incoming_root"), label="incoming root")
+    volume_base = _text(handoff.get("volume_base"), label="volume base")
+    volume_mount = _text(handoff.get("volume_mount"), label="volume mount")
     service_user = _text(handoff.get("service_user"), label="service user")
     services = handoff.get("services")
     if not isinstance(services, Mapping):
         raise LaunchPackError("service map is absent")
     python = f"{source_root}/.venv/bin/python"
-    common = _common_unit(service_user, source_root, campaign_root)
+    common = _common_unit(
+        service_user,
+        source_root,
+        campaign_root,
+        incoming_root,
+        volume_base,
+        volume_mount,
+    )
+    run_slug = _text(handoff.get("run_slug"), label="run slug")
+    namespace_probes = _namespace_probe_service_names(run_slug)
     units: dict[str, str] = {}
     for venue in ("polymarket", "kalshi"):
         service = _text(services.get(venue), label=f"{venue} service")
@@ -319,6 +351,22 @@ Restart=on-failure
 RestartSec=60
 SuccessExitStatus=0 130
 RestartPreventExitStatus=4
+
+[Install]
+WantedBy=multi-user.target
+"""
+        probe_service = namespace_probes[venue]
+        units[probe_service] = f"""[Unit]
+Description=HyperLab Prediction Markets {venue} systemd namespace admission probe
+After=network.target time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=oneshot
+{common}ReadWritePaths={campaign_root}/{venue}
+ExecStart={python} -I {source_root}/ops/prediction_markets_launch_v1/preflight.py runner-namespace-guard --handoff {incoming_root}/handoff.json --install-admission-report {campaign_root}/state/install-admission-report.json --venue {venue}
+TimeoutStartSec=30
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
@@ -347,6 +395,7 @@ WantedBy=multi-user.target
 def render_operator_readme(handoff: Mapping[str, object]) -> str:
     services = handoff["services"]
     assert isinstance(services, Mapping)
+    namespace_probes = _namespace_probe_service_names(str(handoff["run_slug"]))
     return f"""# Prediction Markets — exécution humaine unique
 
 Ce pack est strictement `{BOUNDARY}`. Il ne contient aucun ordre, wallet,
@@ -369,7 +418,8 @@ signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
    `operator/D-windows-dashboard-tunnel.ps1`. Ouvrir l'URL seulement après
    `PREDICTION_TUNNEL_READY http://127.0.0.1:18081`.
 5. `operator/E-recovery-rollback.sh recovery|rollback` reprend sans rejouer un
-   slot terminal, ou arrête/désactive uniquement les trois services ci-dessous.
+   slot terminal, ou arrête/désactive uniquement les trois services et deux
+   probes ci-dessous.
    Aucun raw, manifest, ledger, run ou rapport n'est supprimé.
 
 Les blocs Windows lisent `HYPERLAB_PM_SSH_TARGET` et `HYPERLAB_PM_SSH_KEY` dans
@@ -385,6 +435,8 @@ le shell opérateur. Aucune valeur de connexion n'est enregistrée dans ce pack.
 - collecteur Polymarket : `{services['polymarket']}`
 - collecteur Kalshi : `{services['kalshi']}`
 - cockpit : `{services['dashboard']}` sur `127.0.0.1:18081`
+- probe namespace Polymarket : `{namespace_probes['polymarket']}`
+- probe namespace Kalshi : `{namespace_probes['kalshi']}`
 
 Polymarket et Kalshi sont indépendants. Un reçu authentique
 `PUBLIC_SOURCE_INVALID` est comptabilisé comme slot terminal de qualité de
@@ -410,10 +462,19 @@ La sélection des collecteurs provient de ce même moniteur authentifié et tout
 La capacité est remesurée après bootstrap puis immédiatement avant les
 collecteurs. Si les 194 347 270 144 octets réservés ne sont plus libres, B refuse
 et demande un volume ext4 plus grand ou distinct; il ne réduit jamais le budget
-H1 ni la marge. Chaque reprise systemd réauthentifie handoff, admission,
-transfert, source, NTP, racines et device ext4 avant de sélectionner un ordinal;
-le runner applique ensuite son gate capacité lié au ledger. Un refus antérieur
-au slot sort en code 4 sans boucle de restart.
+H1 ni la marge. La dernière marge observée n'était que de 1 137 221 632 octets :
+une extension ou un autre volume ext4 sera probablement nécessaire, sans jamais
+supprimer un historique. Chaque reprise systemd réauthentifie handoff, admission,
+transfert, source, NTP, racines et device ext4 avant de sélectionner un ordinal.
+Sous le namespace durci, le target volume admis reste exact read-only. systemd
+peut coalescer les `ReadOnlyPaths` imbriqués : `volume_base`, source et campagne
+ne peuvent résoudre que vers leurs targets RO allowlistés, et l'incoming vers
+`/home` ou son target exact. Leur `MAJ:MIN`/`FSROOT` est réauthentifié depuis le
+target effectif ; seule la venue doit rester un bind exact read-write. B exécute d'abord
+le probe oneshot `Restart=no`, puis le runner répète create/fsync/unlink/fsync.
+Un refus avant state produit un diagnostic borné et désarme les cinq unités du
+slug; aucun raw n'est supprimé. Le runner applique ensuite son gate capacité lié
+au ledger. Un refus antérieur au slot sort en code 4 sans boucle de restart.
 """
 
 
@@ -624,9 +685,9 @@ def render_recovery_rollback(handoff: Mapping[str, object]) -> str:
     return f"""#!/usr/bin/env bash
 # Lieu: Tabby/VPS Bash. Durée attendue: 1-4 min; maximum: 12 min.
 # Prompts: sudo peut demander le mot de passe. Ctrl+C ne supprime aucune preuve,
-# mais peut laisser un sous-ensemble des trois services Prediction Markets actif.
+# mais peut laisser un sous-ensemble des cinq unités Prediction Markets actif.
 # RECOVERY redémarre seulement les services Prediction Markets admissibles.
-# ROLLBACK arrête/désactive seulement ces trois services et préserve tous les raw/manifests/runs.
+# ROLLBACK arrête/désactive seulement ces trois services et deux probes, et préserve tous les raw/manifests/runs.
 set -Eeuo pipefail
 MODE=${{1:-}}
 case "$MODE" in

@@ -38,9 +38,11 @@ context=validate_install_layout(load_handoff(handoff_path),handoff_path=handoff_
 services=context['services']
 print(context['source_root']); print(context['campaign_root']); print(context['source_commit'])
 print(services['polymarket']); print(services['kalshi']); print(services['dashboard'])
+probes=context['namespace_probe_services']
+print(probes['polymarket']); print(probes['kalshi'])
 PY
 )
-(( ${#VALUES[@]} == 6 )) || fail 'authenticated handoff context is incomplete'
+(( ${#VALUES[@]} == 8 )) || fail 'authenticated handoff context is incomplete'
 for VALUE_INDEX in "${!VALUES[@]}"; do
   VALUES[$VALUE_INDEX]=${VALUES[$VALUE_INDEX]%$'\r'}
 done
@@ -50,6 +52,8 @@ SOURCE_COMMIT=${VALUES[2]}
 POLYMARKET_SERVICE=${VALUES[3]}
 KALSHI_SERVICE=${VALUES[4]}
 DASHBOARD_SERVICE=${VALUES[5]}
+POLYMARKET_NAMESPACE_PROBE_SERVICE=${VALUES[6]}
+KALSHI_NAMESPACE_PROBE_SERVICE=${VALUES[7]}
 [[ $SOURCE_ROOT == "$TRUSTED_SOURCE_ROOT" ]] \
   || fail "authenticated source root diverged handoff=$SOURCE_ROOT script=$TRUSTED_SOURCE_ROOT"
 [[ $(pwd -P) == "$SOURCE_ROOT" ]] || cd "$SOURCE_ROOT"
@@ -70,7 +74,8 @@ source=Path(sys.argv[1]); sys.path[:0]=[str(source/'src'),str(source)]
 from hyperlab.research_data.envelope import Venue
 from ops.prediction_markets_launch_v1 import cockpit,runner
 required=(cockpit._validate_venue_state,cockpit.active_optional_service_is_admissible,cockpit.classify_monitored_service,cockpit.complete_service_is_admissible,cockpit.prepared_state_is_stale,cockpit.validate_activation_evidence,runner.read_ledger,runner.validate_service_ledger_against_manifest)
-assert Venue and all(callable(value) for value in required)
+if not Venue or not all(callable(value) for value in required):
+ raise SystemExit('monitor-runtime-helper-self-check:required-symbol-unavailable')
 PY
 then
   fail 'monitor runtime helper import self-check failed before campaign preparation'
@@ -80,15 +85,24 @@ START_AT_UTC=${HYPERLAB_PM_START_AT_UTC:-}
 if [[ -z $START_AT_UTC ]]; then
   START_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 else
-  "$VENV_PYTHON" -I - "$START_AT_UTC" <<'PY'
+  if ! "$VENV_PYTHON" -I - "$START_AT_UTC" <<'PY'
 from datetime import UTC,datetime,timedelta
 import sys
-value=datetime.fromisoformat(sys.argv[1].replace('Z','+00:00'))
-assert value.tzinfo is not None and value.utcoffset() is not None
+try:
+ value=datetime.fromisoformat(sys.argv[1].replace('Z','+00:00'))
+except ValueError as error:
+ raise SystemExit(f'explicit-start-at:invalid-iso8601:{error}') from error
+if value.tzinfo is None or value.utcoffset() is None:
+ raise SystemExit('explicit-start-at:timezone-required')
 now=datetime.now(UTC)
-assert value.astimezone(UTC) >= now-timedelta(seconds=5)
-assert value.astimezone(UTC) <= now+timedelta(days=1)
+if value.astimezone(UTC) < now-timedelta(seconds=5):
+ raise SystemExit('explicit-start-at:already-stale')
+if value.astimezone(UTC) > now+timedelta(days=1):
+ raise SystemExit('explicit-start-at:too-far-in-future')
 PY
+  then
+    fail 'explicit start_at UTC validation failed before campaign preparation'
+  fi
 fi
 CAMPAIGN_ID=$(basename -- "$CAMPAIGN_ROOT")
 "$VENV_PYTHON" -m hyperlab research-data prediction-prepare \
@@ -168,7 +182,7 @@ INSTALL_ADMISSION_REPORT="$CAMPAIGN_ROOT/state/install-admission-report.json"
   --fsync-report "$CAMPAIGN_ROOT/state/filesystem-fsync-report.json" \
   --report "$INSTALL_ADMISSION_REPORT" \
   || fail 'post-bootstrap install admission refused before any systemd mutation'
-mapfile -t EXPECTED_UNIT_SHA256 < <("$VENV_PYTHON" -I - "$INSTALL_ADMISSION_REPORT" "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" <<'PY'
+mapfile -t EXPECTED_UNIT_SHA256 < <("$VENV_PYTHON" -I - "$INSTALL_ADMISSION_REPORT" "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE" <<'PY'
 import json,stat,sys
 from pathlib import Path
 path=Path(sys.argv[1]); before=path.lstat()
@@ -184,13 +198,13 @@ for service in sys.argv[2:]:
  print(digest)
 PY
 )
-(( ${#EXPECTED_UNIT_SHA256[@]} == 3 )) || fail 'authenticated unit hashes are incomplete'
+(( ${#EXPECTED_UNIT_SHA256[@]} == 5 )) || fail 'authenticated unit hashes are incomplete'
 for UNIT_HASH_INDEX in "${!EXPECTED_UNIT_SHA256[@]}"; do
   EXPECTED_UNIT_SHA256[$UNIT_HASH_INDEX]=${EXPECTED_UNIT_SHA256[$UNIT_HASH_INDEX]%$'\r'}
 done
 
 UNIT_INDEX=0
-for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
+for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
   UNIT_SOURCE="$INCOMING_ROOT/systemd/$SERVICE"
   UNIT_TARGET="/etc/systemd/system/$SERVICE"
   UNIT_TEMP="/etc/systemd/system/.$SERVICE.$SOURCE_COMMIT.tmp"
@@ -205,7 +219,7 @@ for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
   UNIT_INDEX=$((UNIT_INDEX + 1))
 done
 UNIT_INDEX=0
-for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
+for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
   UNIT_SOURCE="$INCOMING_ROOT/systemd/$SERVICE"
   UNIT_TARGET="/etc/systemd/system/$SERVICE"
   UNIT_TEMP="/etc/systemd/system/.$SERVICE.$SOURCE_COMMIT.tmp"
@@ -229,11 +243,35 @@ for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
   UNIT_INDEX=$((UNIT_INDEX + 1))
 done
 sudo systemctl daemon-reload
+
+cleanup_prediction_services() {
+  local cleanup_errors=0 service active_state enabled_state
+  for service in \
+    "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" \
+    "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
+    sudo systemctl stop "$service" || cleanup_errors=1
+    sudo systemctl disable "$service" || cleanup_errors=1
+  done
+  for service in \
+    "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" \
+    "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
+    active_state=$(timeout 5 systemctl show "$service" --property=ActiveState --value --no-pager 2>&1) \
+      || cleanup_errors=1
+    case "$active_state" in
+      inactive|failed) ;;
+      *) cleanup_errors=1 ;;
+    esac
+    if enabled_state=$(timeout 5 systemctl is-enabled "$service" 2>&1); then
+      [[ $enabled_state == disabled ]] || cleanup_errors=1
+    else
+      [[ $enabled_state == disabled ]] || cleanup_errors=1
+    fi
+  done
+  return "$cleanup_errors"
+}
+
 if ! sudo systemctl enable --now "$DASHBOARD_SERVICE"; then
-  DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'dashboard activation failed and targeted cleanup also failed'
+  cleanup_prediction_services || fail 'dashboard activation failed and Prediction Markets cleanup also failed'
   fail 'dashboard activation failed before any venue start'
 fi
 
@@ -244,31 +282,35 @@ for _attempt in {1..20}; do
      DASHBOARD_MONITOR=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json" dashboard-only) && \
      DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" - <<'PY'
 import json,urllib.request
+def require(condition,label):
+ if not condition: raise SystemExit('dashboard-live:'+label)
 with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
  raw=response.read(65537)
- assert len(raw)<=65536
+ require(len(raw)<=65536,'payload-size')
  value=json.loads(raw)
- assert response.status==200
- assert value.get('status')=='alive'
- assert value.get('mode')=='readonly'
- assert value.get('orders_enabled') is False
+ require(response.status==200,'http-status')
+ require(value.get('status')=='alive','live-status')
+ require(value.get('mode')=='readonly','readonly-mode')
+ require(value.get('orders_enabled') is False,'orders-disabled')
 PY
 import json,os
 value=json.loads(os.environ['DASHBOARD_MONITOR'])
-assert value.get('preflight_error') is None
-assert value.get('failure_class') is None
-assert value.get('activation_admissible') is True
+def require(condition,label):
+ if not condition: raise SystemExit('dashboard-monitor:'+label)
+require(value.get('preflight_error') is None,'preflight-error')
+require(value.get('failure_class') is None,'failure-class')
+require(value.get('activation_admissible') is True,'activation-admissible')
 dashboard=value['services']['dashboard']
 properties=dashboard['properties']
-assert properties.get('ActiveState')=='active'
-assert int(properties.get('MainPID','0') or '0')>0
-assert dashboard['command_verified'] is True
-assert dashboard['fragment_verified'] is True
-assert dashboard['listener_verified'] is True
+require(properties.get('ActiveState')=='active','active-state')
+require(int(properties.get('MainPID','0') or '0')>0,'main-pid')
+require(dashboard.get('command_verified') is True,'command')
+require(dashboard.get('fragment_verified') is True,'fragment')
+require(dashboard.get('listener_verified') is True,'listener')
 for venue in ('polymarket','kalshi'):
  service=value['services'][venue]
- assert service['properties'].get('ActiveState')!='active'
- assert int(service['properties'].get('MainPID','0') or '0')==0
+ require(service['properties'].get('ActiveState')!='active',venue+'-inactive')
+ require(int(service['properties'].get('MainPID','0') or '0')==0,venue+'-main-pid')
 PY
   then
     DASHBOARD_READY=yes
@@ -284,10 +326,7 @@ if [[ $DASHBOARD_READY != yes ]]; then
   else
     printf 'PREDICTION_DASHBOARD_READINESS_DIAGNOSTIC=NO_MONITOR_JSON\n' >&2
   fi
-  DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'dashboard readiness failed and targeted cleanup also failed'
+  cleanup_prediction_services || fail 'dashboard readiness failed and Prediction Markets cleanup also failed'
   fail 'dashboard loopback and command readiness did not become green'
 fi
 
@@ -296,30 +335,27 @@ if ! "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.
   --handoff "$INCOMING_ROOT/handoff.json" \
   --install-admission-report "$INSTALL_ADMISSION_REPORT" \
   --report "$COLLECTOR_GUARD_REPORT"; then
-  DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'collector guard refused and targeted dashboard cleanup also failed'
+  cleanup_prediction_services || fail 'collector guard refused and Prediction Markets cleanup also failed'
   fail 'collector activation guard refused; enlarge or choose another ext4 volume if capacity is insufficient'
 fi
 
 if ! ELIGIBLE_RAW=$(DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" -I - <<'PY'
 import json,os
 value=json.loads(os.environ['DASHBOARD_MONITOR'])
-assert value.get('preflight_error') is None
-assert value.get('failure_class') is None
-assert value.get('operational_failure') is False
-assert value.get('activation_admissible') is True
+def require(condition,label):
+ if not condition: raise SystemExit('eligible-venues:'+label)
+require(value.get('preflight_error') is None,'preflight-error')
+require(value.get('failure_class') is None,'failure-class')
+require(value.get('operational_failure') is False,'operational-failure')
+require(value.get('activation_admissible') is True,'activation-admissible')
 eligible=value.get('eligible_venues')
-assert isinstance(eligible,list) and 0<=len(eligible)<=2 and len(set(eligible))==len(eligible)
-assert all(item in {'polymarket','kalshi'} for item in eligible)
+require(isinstance(eligible,list),'list')
+require(0<=len(eligible)<=2 and len(set(eligible))==len(eligible),'cardinality')
+require(all(item in {'polymarket','kalshi'} for item in eligible),'allowlist')
 for venue in eligible: print(venue)
 PY
 ); then
-  DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'eligible venue authentication failed and targeted dashboard cleanup also failed'
+  cleanup_prediction_services || fail 'eligible venue authentication failed and Prediction Markets cleanup also failed'
   fail 'authenticated eligible venue parsing failed before any collector start'
 fi
 ELIGIBLE=()
@@ -329,52 +365,192 @@ if [[ -n $ELIGIBLE_RAW ]]; then
     ELIGIBLE[$ELIGIBLE_INDEX]=${ELIGIBLE[$ELIGIBLE_INDEX]%$'\r'}
   done
 fi
-STARTED_VENUES=()
-FAILED_VENUES=()
-cleanup_collector() {
-  local service=$1 cleanup_errors=0
-  sudo systemctl stop "$service" || cleanup_errors=1
-  sudo systemctl disable "$service" || cleanup_errors=1
-  return "$cleanup_errors"
+
+namespace_probe_diagnostic() {
+  local venue=$1 service=$2 properties journal
+  properties=$(timeout 5 systemctl show "$service" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager 2>&1) || properties='SYSTEMCTL_SHOW_UNAVAILABLE'
+  properties=${properties:0:4096}
+  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
+    || journal='JOURNAL_UNAVAILABLE'
+  [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
+  VENUE="$venue" SERVICE="$service" PROPERTIES="$properties" JOURNAL="$journal" \
+    "$VENV_PYTHON" -I - <<'PY' >&2 \
+    || printf 'PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=ENCODING_FAILED\n' >&2
+import json,os
+value={
+ "journal":os.environ["JOURNAL"][:4096],
+ "properties":os.environ["PROPERTIES"][:4096],
+ "service":os.environ["SERVICE"],
+ "venue":os.environ["VENUE"],
 }
+print("PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC="+json.dumps(value,ensure_ascii=False,separators=(",",":"),sort_keys=True))
+PY
+  return 0
+}
+
+for VENUE in "${ELIGIBLE[@]}"; do
+  case "$VENUE" in
+    polymarket) NAMESPACE_PROBE_SERVICE=$POLYMARKET_NAMESPACE_PROBE_SERVICE ;;
+    kalshi) NAMESPACE_PROBE_SERVICE=$KALSHI_NAMESPACE_PROBE_SERVICE ;;
+    *)
+      cleanup_prediction_services \
+        || fail 'eligible venue invalid and Prediction Markets cleanup also failed'
+      fail 'preflight eligible venue is invalid'
+      ;;
+  esac
+  if ! sudo systemctl start "$NAMESPACE_PROBE_SERVICE"; then
+    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+    cleanup_prediction_services \
+      || fail 'namespace probe refused and Prediction Markets cleanup also failed'
+    fail "collector namespace probe refused before runner activation: $VENUE"
+  fi
+  NAMESPACE_PROBE_PROPERTIES=$(timeout 5 systemctl show "$NAMESPACE_PROBE_SERVICE" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager) || {
+      namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+      cleanup_prediction_services \
+        || fail 'namespace probe properties unavailable and Prediction Markets cleanup also failed'
+      fail "collector namespace probe properties unavailable: $VENUE"
+    }
+  if ! NAMESPACE_PROBE_PROPERTIES="$NAMESPACE_PROBE_PROPERTIES" NAMESPACE_PROBE_SERVICE="$NAMESPACE_PROBE_SERVICE" "$VENV_PYTHON" -I - <<'PY'
+import os
+properties={}
+for line in os.environ['NAMESPACE_PROBE_PROPERTIES'].splitlines():
+ if '=' not in line: raise SystemExit('namespace-probe:malformed-property')
+ key,value=line.split('=',1); properties[key]=value
+def require(condition,label):
+ if not condition: raise SystemExit('namespace-probe:'+label)
+require(properties.get('LoadState')=='loaded','load-state')
+require(properties.get('ActiveState')=='inactive','active-state')
+require(properties.get('SubState')=='dead','sub-state')
+require(properties.get('Result')=='success','result')
+require(properties.get('MainPID')=='0','main-pid')
+require(properties.get('NRestarts')=='0','restart-count')
+require(properties.get('ExecMainCode')=='1','exit-code-kind')
+require(properties.get('ExecMainStatus')=='0','exit-status')
+require(properties.get('FragmentPath')=='/etc/systemd/system/'+os.environ['NAMESPACE_PROBE_SERVICE'],'fragment')
+PY
+  then
+    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+    cleanup_prediction_services \
+      || fail 'namespace probe result diverged and Prediction Markets cleanup also failed'
+    fail "collector namespace probe result diverged before runner activation: $VENUE"
+  fi
+  printf 'PREDICTION_NAMESPACE_PROBE_GREEN=%s\n' "$VENUE"
+done
+
+STARTED_VENUES=()
 collector_ready() {
   local venue=$1 monitor_json
   monitor_json=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json") || return 1
   CAMPAIGN_ROOT="$CAMPAIGN_ROOT" MONITOR_JSON="$monitor_json" "$VENV_PYTHON" - "$venue" <<'PY'
 from datetime import UTC,datetime
 import json,os,sys
-value=json.loads(os.environ['MONITOR_JSON'])
-assert value.get('preflight_error') is None
-assert value.get('failure_class') is None
-venue=sys.argv[1]
-service=value['services'][venue]; properties=service['properties']; state=service['state']
-assert service.get('admission_required') is True
-assert isinstance(state,dict)
-lifecycle=state.get('lifecycle')
-assert lifecycle not in {None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'}
-if service.get('venue_status')=='COMPLETE_WINDOW':
- assert lifecycle=='COMPLETE_WINDOW'
- assert service['fragment_verified'] is True
- assert properties.get('ActiveState') in {'active','inactive'}
- if properties.get('ActiveState')=='inactive':
-  assert properties.get('SubState')=='dead'
-  assert int(properties.get('MainPID','0') or '0')==0
-  assert properties.get('ExecMainStatus')=='0'
-else:
- assert service.get('venue_status') in {
-  'RUNNING','PUBLIC_SOURCE_INVALID','PUBLIC_SOURCE_UNAVAILABLE_RUNTIME'
- }
- assert properties.get('ActiveState')=='active'
- assert int(properties.get('MainPID','0') or '0')>0
- assert service['command_verified'] is True
- assert service['fragment_verified'] is True
-if lifecycle=='PREPARED':
- activation=json.load(open(os.path.join(os.environ['CAMPAIGN_ROOT'],'state','activation-receipt.json'),encoding='utf-8'))
- assert activation['quick_start'] is False
- starts=datetime.fromisoformat(activation['starts_at_utc'].replace('Z','+00:00'))
- assert starts.astimezone(UTC)>datetime.now(UTC)
+def require(condition,label):
+ if not condition:
+  print('PREDICTION_COLLECTOR_READINESS_INVARIANT='+label,file=sys.stderr)
+  raise SystemExit(1)
+try:
+ value=json.loads(os.environ['MONITOR_JSON'])
+ require(isinstance(value,dict),'monitor-object')
+ require(value.get('preflight_error') is None,'monitor-preflight-error')
+ require(value.get('failure_class') is None,'monitor-failure-class')
+ venue=sys.argv[1]
+ services=value.get('services'); require(isinstance(services,dict),'services-object')
+ service=services.get(venue); require(isinstance(service,dict),'venue-service-object')
+ properties=service.get('properties'); require(isinstance(properties,dict),'service-properties-object')
+ state=service.get('state'); require(isinstance(state,dict),'state-object-present')
+ require(service.get('admission_required') is True,'admission-required')
+ lifecycle=state.get('lifecycle')
+ require(lifecycle not in {None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'},'admissible-lifecycle')
+ if service.get('venue_status')=='COMPLETE_WINDOW':
+  require(lifecycle=='COMPLETE_WINDOW','complete-lifecycle')
+  require(service.get('fragment_verified') is True,'complete-fragment')
+  require(properties.get('ActiveState') in {'active','inactive'},'complete-active-state')
+  if properties.get('ActiveState')=='inactive':
+   require(properties.get('SubState')=='dead','complete-sub-state')
+   require(int(properties.get('MainPID','0') or '0')==0,'complete-main-pid')
+   require(properties.get('ExecMainStatus')=='0','complete-exit-status')
+ else:
+  require(service.get('venue_status') in {'RUNNING','PUBLIC_SOURCE_INVALID','PUBLIC_SOURCE_UNAVAILABLE_RUNTIME'},'venue-status')
+  require(properties.get('ActiveState')=='active','active-state')
+  require(int(properties.get('MainPID','0') or '0')>0,'main-pid')
+  require(service.get('command_verified') is True,'command')
+  require(service.get('fragment_verified') is True,'fragment')
+ if lifecycle=='PREPARED':
+  with open(os.path.join(os.environ['CAMPAIGN_ROOT'],'state','activation-receipt.json'),encoding='utf-8') as handle: activation=json.load(handle)
+  require(activation.get('quick_start') is False,'prepared-explicit-start')
+  starts=datetime.fromisoformat(str(activation.get('starts_at_utc')).replace('Z','+00:00'))
+  require(starts.astimezone(UTC)>datetime.now(UTC),'prepared-future-start')
+except (KeyError,TypeError,ValueError,json.JSONDecodeError) as error:
+ print('PREDICTION_COLLECTOR_READINESS_INVARIANT=parse:'+type(error).__name__+':'+str(error)[:512],file=sys.stderr)
+ raise SystemExit(1)
 PY
 }
+
+collector_terminal() {
+  local service=$1 properties
+  properties=$(timeout 5 systemctl show "$service" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager 2>/dev/null) || return 1
+  PROPERTIES="$properties" "$VENV_PYTHON" -I - <<'PY'
+import os
+p={}
+for line in os.environ['PROPERTIES'].splitlines():
+ if '=' in line:
+  key,value=line.split('=',1); p[key]=value
+terminal=(
+ p.get('ActiveState')=='failed'
+ or p.get('SubState')=='failed'
+ or p.get('ExecMainStatus')=='4'
+ or p.get('Result') not in {None,'','success'}
+ or (
+  p.get('ActiveState')=='inactive'
+  and p.get('SubState')=='dead'
+  and p.get('MainPID')=='0'
+ )
+)
+raise SystemExit(0 if terminal else 1)
+PY
+}
+
+collector_readiness_diagnostic() {
+  local venue=$1 service=$2 properties journal monitor_json state_present=false ledger_present=false
+  properties=$(timeout 5 systemctl show "$service" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager 2>&1) || properties='SYSTEMCTL_SHOW_UNAVAILABLE'
+  properties=${properties:0:4096}
+  monitor_json=$( { timeout 10 bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json" 2>&1 || true; } | head -c 4096 ) \
+    || monitor_json='MONITOR_UNAVAILABLE'
+  [[ -n $monitor_json ]] || monitor_json='MONITOR_UNAVAILABLE'
+  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
+    || journal='JOURNAL_UNAVAILABLE'
+  [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
+  [[ -f "$CAMPAIGN_ROOT/$venue/state.json" && ! -L "$CAMPAIGN_ROOT/$venue/state.json" ]] \
+    && state_present=true
+  [[ -f "$CAMPAIGN_ROOT/$venue/ledger.jsonl" && ! -L "$CAMPAIGN_ROOT/$venue/ledger.jsonl" ]] \
+    && ledger_present=true
+  VENUE="$venue" SERVICE="$service" PROPERTIES="$properties" JOURNAL="$journal" \
+    MONITOR_JSON="$monitor_json" STATE_PRESENT="$state_present" LEDGER_PRESENT="$ledger_present" \
+    "$VENV_PYTHON" -I - <<'PY' >&2 \
+    || printf 'PREDICTION_COLLECTOR_READINESS_DIAGNOSTIC=ENCODING_FAILED\n' >&2
+import json,os
+value={
+ 'journal':os.environ['JOURNAL'][:4096],
+ 'ledger_present':os.environ['LEDGER_PRESENT']=='true',
+ 'monitor_json':os.environ['MONITOR_JSON'][:4096],
+ 'properties':os.environ['PROPERTIES'][:4096],
+ 'service':os.environ['SERVICE'],
+ 'state_present':os.environ['STATE_PRESENT']=='true',
+ 'venue':os.environ['VENUE'],
+}
+print('PREDICTION_COLLECTOR_READINESS_DIAGNOSTIC='+json.dumps(value,ensure_ascii=False,separators=(',',':'),sort_keys=True))
+PY
+  return 0
+}
+
 for VENUE in "${ELIGIBLE[@]}"; do
   case "$VENUE" in
     polymarket) SERVICE=$POLYMARKET_SERVICE ;;
@@ -382,10 +558,10 @@ for VENUE in "${ELIGIBLE[@]}"; do
     *) fail 'preflight eligible venue is invalid' ;;
   esac
   if ! sudo systemctl enable --now "$SERVICE"; then
-    cleanup_collector "$SERVICE" || printf 'PREDICTION_INSTALL_COLLECTOR_CLEANUP_FAILED=%s\n' "$VENUE" >&2
-    FAILED_VENUES+=("$VENUE")
-    printf 'PREDICTION_INSTALL_COLLECTOR_ACTIVATION_FAILED=%s\n' "$VENUE" >&2
-    continue
+    collector_readiness_diagnostic "$VENUE" "$SERVICE"
+    cleanup_prediction_services \
+      || fail 'collector activation failed and Prediction Markets cleanup also failed'
+    fail "collector activation failed before readiness: $VENUE"
   fi
   VENUE_READY=no
   for _attempt in {1..20}; do
@@ -393,24 +569,21 @@ for VENUE in "${ELIGIBLE[@]}"; do
       VENUE_READY=yes
       break
     fi
+    if collector_terminal "$SERVICE"; then
+      printf 'PREDICTION_COLLECTOR_TERMINAL_BEFORE_READINESS=%s\n' "$VENUE" >&2
+      break
+    fi
     sleep 0.5
   done
   if [[ $VENUE_READY == yes ]]; then
     STARTED_VENUES+=("$VENUE")
   else
-    cleanup_collector "$SERVICE" || printf 'PREDICTION_INSTALL_COLLECTOR_CLEANUP_FAILED=%s\n' "$VENUE" >&2
-    FAILED_VENUES+=("$VENUE")
-    printf 'PREDICTION_INSTALL_COLLECTOR_READINESS_FAILED=%s\n' "$VENUE" >&2
+    collector_readiness_diagnostic "$VENUE" "$SERVICE"
+    cleanup_prediction_services \
+      || fail 'collector readiness failed and Prediction Markets cleanup also failed'
+    fail "collector readiness failed before authenticated state: $VENUE"
   fi
 done
-
-if (( ${#FAILED_VENUES[@]} > 0 )); then
-  printf 'PREDICTION_STARTED_VENUES=%s\n' "${STARTED_VENUES[*]:-NONE}" >&2
-  printf 'PREDICTION_FAILED_VENUES=%s\n' "${FAILED_VENUES[*]}" >&2
-  printf 'PREDICTION_DASHBOARD_PRESERVED=http://127.0.0.1:18081\n' >&2
-  printf 'PREDICTION_INSTALL_ACTIVATION_PARTIAL_OR_ALERT\n' >&2
-  exit 4
-fi
 
 ACTIVATION_READY=no
 for _attempt in {1..20}; do
@@ -418,58 +591,82 @@ for _attempt in {1..20}; do
      MONITOR_JSON=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json") && \
      CAMPAIGN_ROOT="$CAMPAIGN_ROOT" MONITOR_JSON="$MONITOR_JSON" "$VENV_PYTHON" - "${ELIGIBLE[@]}" <<'PY'
 import json,urllib.request
+def require(condition,label):
+ if not condition: raise SystemExit('final-dashboard:'+label)
 with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
  raw=response.read(65537)
- assert len(raw)<=65536
+ require(len(raw)<=65536,'payload-size')
  value=json.loads(raw)
- assert response.status==200 and value.get('status')=='ready'
- assert value.get('mode')=='readonly' and value.get('orders_enabled') is False
+ require(response.status==200 and value.get('status')=='ready','ready-status')
+ require(value.get('mode')=='readonly' and value.get('orders_enabled') is False,'readonly-orders')
 PY
 from datetime import UTC,datetime
 import json,os,sys
 value=json.loads(os.environ['MONITOR_JSON'])
 activation=json.load(open(os.path.join(os.environ['CAMPAIGN_ROOT'],'state','activation-receipt.json'),encoding='utf-8'))
-assert value.get('preflight_error') is None
-assert value.get('failure_class') is None
-assert value.get('activation_admissible') is True
+def require(condition,label):
+ if not condition: raise SystemExit('final-monitor:'+label)
+require(value.get('preflight_error') is None,'preflight-error')
+require(value.get('failure_class') is None,'failure-class')
+require(value.get('activation_admissible') is True,'activation-admissible')
 required={'dashboard',*sys.argv[1:]}
 for name in required:
  service=value['services'][name]
  properties=service['properties']
  if name == 'dashboard':
-  assert properties.get('ActiveState')=='active'
-  assert int(properties.get('MainPID','0') or '0') > 0
-  assert service['command_verified'] is True
-  assert service['fragment_verified'] is True
-  assert service['listener_verified'] is True
+  require(properties.get('ActiveState')=='active','dashboard-active')
+  require(int(properties.get('MainPID','0') or '0') > 0,'dashboard-main-pid')
+  require(service.get('command_verified') is True,'dashboard-command')
+  require(service.get('fragment_verified') is True,'dashboard-fragment')
+  require(service.get('listener_verified') is True,'dashboard-listener')
   continue
  state=service['state']
- assert isinstance(state,dict) and state.get('lifecycle') is not None
- assert state.get('lifecycle') not in {'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'}
+ require(isinstance(state,dict) and state.get('lifecycle') is not None,name+'-state')
+ require(state.get('lifecycle') not in {'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'},name+'-lifecycle')
  if service.get('venue_status')=='COMPLETE_WINDOW':
-  assert state.get('lifecycle')=='COMPLETE_WINDOW'
-  assert service['fragment_verified'] is True
+  require(state.get('lifecycle')=='COMPLETE_WINDOW',name+'-complete')
+  require(service.get('fragment_verified') is True,name+'-fragment')
  else:
-  assert properties.get('ActiveState')=='active'
-  assert int(properties.get('MainPID','0') or '0') > 0
-  assert service['command_verified'] is True
-  assert service['fragment_verified'] is True
+  require(properties.get('ActiveState')=='active',name+'-active')
+  require(int(properties.get('MainPID','0') or '0') > 0,name+'-main-pid')
+  require(service.get('command_verified') is True,name+'-command')
+  require(service.get('fragment_verified') is True,name+'-fragment')
  if state.get('lifecycle')=='PREPARED':
-  assert activation['quick_start'] is False
+  require(activation.get('quick_start') is False,name+'-prepared-explicit-start')
   starts=datetime.fromisoformat(activation['starts_at_utc'].replace('Z','+00:00'))
-  assert starts.astimezone(UTC) > datetime.now(UTC)
+  require(starts.astimezone(UTC) > datetime.now(UTC),name+'-prepared-future-start')
 PY
   then
     ACTIVATION_READY=yes
     break
   fi
+  FINAL_TERMINAL=no
+  for VENUE in "${ELIGIBLE[@]}"; do
+    case "$VENUE" in
+      polymarket) SERVICE=$POLYMARKET_SERVICE ;;
+      kalshi) SERVICE=$KALSHI_SERVICE ;;
+      *) continue ;;
+    esac
+    if collector_terminal "$SERVICE"; then
+      FINAL_TERMINAL=yes
+      break
+    fi
+  done
+  [[ $FINAL_TERMINAL != yes ]] || break
   sleep 0.5
 done
 if [[ $ACTIVATION_READY != yes ]]; then
-  printf 'PREDICTION_STARTED_VENUES_PRESERVED=%s\n' "${STARTED_VENUES[*]:-NONE}" >&2
-  printf 'PREDICTION_DASHBOARD_PRESERVED=http://127.0.0.1:18081\n' >&2
-  printf 'PREDICTION_INSTALL_ACTIVATION_PARTIAL_OR_ALERT\n' >&2
-  exit 4
+  for VENUE in "${ELIGIBLE[@]}"; do
+    case "$VENUE" in
+      polymarket) SERVICE=$POLYMARKET_SERVICE ;;
+      kalshi) SERVICE=$KALSHI_SERVICE ;;
+      *) continue ;;
+    esac
+    collector_readiness_diagnostic "$VENUE" "$SERVICE"
+  done
+  cleanup_prediction_services \
+    || fail 'final readiness failed and Prediction Markets cleanup also failed'
+  fail 'final authenticated activation readiness failed; all new services disarmed'
 fi
 printf 'PREDICTION_STARTS_AT_UTC=%s\n' "$START_AT_UTC"
 printf 'PREDICTION_ELIGIBLE_VENUES=%s\n' "${ELIGIBLE[*]:-NONE}"

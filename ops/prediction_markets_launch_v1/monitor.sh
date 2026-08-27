@@ -227,7 +227,7 @@ result={'alert':preflight_error is not None,'boundary':'PAPER_ONLY/GHOST_ONLY/PU
 for name in ('polymarket','kalshi','dashboard'):
  service=services[name]; props={}; system_error=None
  try:
-  shown=subprocess.run(['systemctl','show',service,'--property=LoadState,ActiveState,SubState,MainPID,NRestarts,ExecMainStatus,FragmentPath','--no-pager'],capture_output=True,text=True,check=False,timeout=5)
+  shown=subprocess.run(['systemctl','show',service,'--property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath','--no-pager'],capture_output=True,text=True,check=False,timeout=5)
   for line in shown.stdout.splitlines():
    key,sep,value=line.partition('=')
    if sep: props[key]=value
@@ -316,7 +316,7 @@ for name,service in result['services'].items():
  props=service['properties']
  capacity=state.get('capacity') if isinstance(state.get('capacity'),dict) else {}
  quality=state.get('data_quality') if isinstance(state.get('data_quality'),dict) else {}
- semantic['services'][name]={'ActiveState':props.get('ActiveState'),'ExecMainStatus':props.get('ExecMainStatus'),'NRestarts':props.get('NRestarts'),'SubState':props.get('SubState'),'capacity_admitted':capacity.get('admitted'),'command_verified':service['command_verified'],'data_quality_terminal':quality.get('terminal_health'),'fragment_verified':service['fragment_verified'],'last_terminal':state.get('last_terminal'),'lifecycle':state.get('lifecycle'),'listener_verified':service['listener_verified'],'recorded_slots':state.get('recorded_slots'),'terminal_condition':service['terminal_condition'],'venue_status':service['venue_status']}
+ semantic['services'][name]={'ActiveState':props.get('ActiveState'),'ExecMainCode':props.get('ExecMainCode'),'ExecMainStatus':props.get('ExecMainStatus'),'NRestarts':props.get('NRestarts'),'Result':props.get('Result'),'SubState':props.get('SubState'),'capacity_admitted':capacity.get('admitted'),'command_verified':service['command_verified'],'data_quality_terminal':quality.get('terminal_health'),'fragment_verified':service['fragment_verified'],'last_terminal':state.get('last_terminal'),'lifecycle':state.get('lifecycle'),'listener_verified':service['listener_verified'],'recorded_slots':state.get('recorded_slots'),'terminal_condition':service['terminal_condition'],'venue_status':service['venue_status']}
 result['semantic_fingerprint_sha256']=hashlib.sha256(json.dumps(semantic,ensure_ascii=False,separators=(',',':'),sort_keys=True).encode()).hexdigest()
 print(json.dumps(result,ensure_ascii=False,separators=(',',':'),sort_keys=True))
 PY

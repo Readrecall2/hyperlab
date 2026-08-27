@@ -128,9 +128,11 @@ temporelle concrète avait déclenché l'erreur négative. Aucune coercition ni
 tolérance de timestamp n'a été ajoutée ; toute valeur absente reste absente et
 toute valeur présente doit encore être un epoch UTC non négatif et borné.
 
-Le troisième service est un cockpit séparé sur `127.0.0.1:18081`. Les trois
-unités sont non-root, `ProtectSystem=strict`, `NoNewPrivileges`, sans capacité,
-sans secret et avec surfaces d'écriture limitées aux racines de venue.
+Le troisième service persistant est un cockpit séparé sur `127.0.0.1:18081`.
+Deux unités oneshot `Restart=no` prouvent en plus le namespace de chaque venue
+avant le moindre runner. Les cinq unités sont non-root, `ProtectSystem=strict`,
+`NoNewPrivileges`, sans capacité, sans secret et avec surfaces d'écriture
+limitées aux racines de venue.
 
 ## Admission et cohabitation
 
@@ -146,22 +148,38 @@ La cohabitation réserve 144 GiB pour H1, 21 GiB pour les 1 344 shards Predictio
 Markets et 16 GiB de marge, soit 181 GiB libres. Si cette marge n'est pas prouvée,
 le pack refuse et recommande un hôte ou volume distinct sans toucher à H1.
 
-La mesure acquise pendant cette tentative était `196 391 251 968` octets libres
-pour `194 347 270 144` requis : seulement `2 043 981 824` octets restaient en
+La dernière mesure acquise était `195 484 491 776` octets libres pour
+`194 347 270 144` requis : seulement `1 137 221 632` octets restaient en
 marge. Cette mesure n'est pas réutilisée comme preuve pour un prochain B. Le
 pack réauthentifie après bootstrap l'identité du handoff/source/inventaire et les
 hashes des unités, remesure NTP/montage/capacité avant toute mutation systemd,
 puis remesure encore NTP/montage/capacité immédiatement avant les collecteurs.
 Si H1 a consommé la marge, le lancement refuse avec recommandation d'agrandir ou
 de choisir un autre volume ext4. Les réserves ne sont jamais réduites.
+Vu cette marge minime et l'interdiction de supprimer les tentatives historiques,
+une extension du volume ext4 ou un autre volume est probablement nécessaire
+avant le prochain lancement humain.
 
 Chaque démarrage ou redémarrage systemd d'un runner réauthentifie également le
 handoff, l'admission d'installation, l'inventaire transféré, l'inventaire et le
 commit source, l'utilisateur/HOME, NTP, les racines canoniques et le même device
-ext4 `rw` avant de sélectionner un ordinal. Le contrôle de capacité conservateur
+ext4 avant de sélectionner un ordinal. Le contrôle de capacité conservateur
 lié au ledger reste ensuite exécuté immédiatement avant le créneau. Un échec de
 cette admission sort avec le code 4, avant tout enfant de collecte, et
 `RestartPreventExitStatus=4` empêche une boucle de redémarrage.
+
+L'admission hôte continue d'exiger la vue interactive du volume ext4 `rw`. Sous
+`ProtectSystem=strict`, le target volume admis est exact et read-only. systemd
+peut coalescer les `ReadOnlyPaths` imbriqués : les targets effectifs de
+`volume_base`/source/campagne sont donc strictement allowlistés entre le volume,
+le `volume_base` et le chemin exact concerné ; l'incoming accepte seulement
+`/home` ou son target exact. Seul le bind venue reste target exact `rw`.
+`ReadOnlyPaths` applique cette vue sans modifier H1. L'admission compare
+`MAJ:MIN` à `stat(2)`, le fstype et le `FSROOT` dérivé du target effectif ; le
+texte `SOURCE` reste informatif. Le probe venue fait une création exclusive,
+fsync fichier/répertoire, suppression et second fsync, puis le runner répète la
+preuve avant tout ordinal. Un autre device,
+fstype, bind, symlink ou échec fsync reste un refus fail-closed.
 
 Une venue DNS/HTTPS/WSS indisponible reçoit son propre verdict; l'autre venue et
 le cockpit restent installables. Kalshi WSS n'est jamais sondé car le contrat
@@ -207,6 +225,13 @@ Après ce gate, B fige les venues depuis ce même snapshot moniteur authentifié
 propage tout échec de parsing. Il ne relit pas l'incoming mutable pour décider un
 démarrage. `eligible_venues=[]` reste admis comme `BOTH_UNAVAILABLE` explicite,
 dashboard-only, sans faux collecteur ni faux métrique.
+
+Avant d'activer ces collecteurs, B exécute les deux unités oneshot namespace
+éligibles et exige `Result=success`, exit 0 et zéro restart. Si un probe ou un
+collecteur échoue avant un state authentifié, B capture immédiatement Result,
+exit, présence state/ledger, monitor JSON et journal borné, puis arrête/désactive
+les trois services persistants et les deux probes du nouveau slug. Il ne boucle
+plus sur un service déjà terminal et ne laisse plus le dashboard isolément actif.
 
 Le recovery applique les mêmes preuves exactes de fragment au dashboard et aux
 collecteurs, plus la possession du listener dashboard. Sa fermeture exige une

@@ -1377,6 +1377,7 @@ def run_from_handoff(handoff_path: Path, venue: Venue) -> int:
     startup = runner_startup_admission(
         handoff_path,
         claimed_campaign_root / "state" / "install-admission-report.json",
+        venue=venue.value.lower(),
     )
     if startup.get("startup_admissible") is not True:
         startup_errors = startup.get("errors")

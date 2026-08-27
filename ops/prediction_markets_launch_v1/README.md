@@ -1,7 +1,7 @@
 # Prediction Markets Prospective Launch V1
 
 Verdict technique visé :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_MONITOR_BOOTSTRAP_FIXED_AWAITING_SINGLE_HUMAN_EXECUTION`.
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_SYSTEMD_WRITE_SURFACE_FIXED_AWAITING_CAPACITY_AND_SINGLE_HUMAN_EXECUTION`.
 
 Statut économique permanent avant preuve prospective réelle :
 `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
@@ -26,12 +26,15 @@ du budget H1 connu dans son calcul avant d'admettre le nouveau pack.
 
 ## Architecture
 
-Trois unités uniques sont rendues pour chaque `run_slug` :
+Trois unités persistantes et deux probes oneshot uniques sont rendus pour chaque
+`run_slug` :
 
 - `hyperlab-pm-<slug>-polymarket.service` : ordonnanceur Polymarket mono-writer ;
 - `hyperlab-pm-<slug>-kalshi.service` : ordonnanceur Kalshi mono-writer ;
 - `hyperlab-pm-<slug>-dashboard.service` : cockpit read-only sur
   `127.0.0.1:18081`.
+- `hyperlab-pm-<slug>-<venue>-namespace-probe.service` : admission préalable,
+  `Restart=no`, sous exactement le même durcissement filesystem que la venue.
 
 Les deux collecteurs ont leurs propres racines `runs/`, `state.json`,
 `ledger.jsonl`, locks, journaux systemd et politiques de restart. Un échec
@@ -104,14 +107,18 @@ octets libres. Si le minimum n'est plus disponible, le verdict est
 `PREDICTION_CAPACITY_REFUSED_COEXISTENCE_NOT_PROVEN` avec recommandation d'un
 hôte ou volume ext4 distinct. Aucun chemin H1 n'est lu pour obtenir ce verdict.
 
-La dernière observation humaine acquise donnait `196 391 251 968` octets libres
-pour `194 347 270 144` requis, soit seulement `2 043 981 824` octets de marge.
+La dernière observation humaine acquise donnait `195 484 491 776` octets libres
+pour `194 347 270 144` requis, soit seulement `1 137 221 632` octets de marge.
 Cette valeur est historique, pas une admission future. Après bootstrap, B
 réauthentifie le handoff, le source, les inventaires et les unités, puis mesure
 à nouveau NTP/montage/capacité avant toute mutation systemd. Il refait encore le
 contrôle NTP/montage/capacité juste avant le premier collecteur. Si la croissance
 H1 a consommé la marge, B doit refuser et demander d'agrandir ou de choisir un
 autre volume ext4; il est interdit de réduire les réserves ou contourner ce gate.
+Compte tenu de cette marge minime et de la conservation obligatoire de toutes
+les tentatives, une extension du volume ext4 ou un autre volume est probablement
+nécessaire avant le prochain B. Il ne faut supprimer aucun historique ni réduire
+H1 pour récupérer de l'espace.
 
 Chaque runner recalcule ensuite la réservation avant chaque créneau. Il ne lit
 que son propre ledger : le budget de l'autre venue reste donc volontairement
@@ -122,9 +129,23 @@ uniquement la venue concernée fail-closed.
 À chaque démarrage ou redémarrage systemd, avant même la sélection du prochain
 ordinal, le runner réauthentifie le handoff, l'admission d'installation, le
 transfert, le commit/inventaire source, l'utilisateur/HOME, NTP, les racines
-canoniques et le même device ext4 `rw`. Le budget ledger-accounted est contrôlé
+canoniques et le même device ext4. Le budget ledger-accounted est contrôlé
 juste après. Un refus sort en code 4 avant tout enfant de collecte et
 `RestartPreventExitStatus=4` interdit la boucle de restart.
+
+Dans le namespace systemd durci, le mount du volume admis doit rester le target
+exact read-only. systemd peut coalescer les `ReadOnlyPaths` imbriqués devenus
+redondants : `volume_base`, source et campagne doivent alors résoudre seulement
+vers le mount volume, le `volume_base` ou leur target exact suivant une allowlist
+fixe ; l'incoming seulement vers `/home` ou son target exact. L'identité reste
+liée au superblock par `MAJ:MIN` concordant avec `stat(2)`, au type ext4 et au
+`FSROOT` dérivé du target effectif, jamais au texte variable `SOURCE`.
+`ReadOnlyPaths` ne modifie pas H1. Seul `campaign_root/<venue>` doit être un bind
+exact `rw` vers le sous-chemin attendu.
+Le probe oneshot y effectue une création exclusive, fsync fichier, fsync
+répertoire, suppression et second fsync; le runner répète cette preuve avant la
+sélection d'un ordinal. Un device, bind, fstype, chemin ou fsync divergent refuse
+avant toute collecte.
 
 ## Construction locale du bundle
 
@@ -155,7 +176,7 @@ incoming root, un nouveau clone et une nouvelle campaign root. Aucun ancien run
 n'est supprimé, écrasé ou réutilisé.
 
 Le pack final contient également un `README.md` non expert lié au run, au commit,
-aux trois racines et aux trois services exacts. Il fait partie de
+aux trois racines, aux trois services persistants et aux deux probes exacts. Il fait partie de
 `transfer-inventory.json` et est donc vérifié avant activation.
 
 ## Blocs opérateur générés, dans l'ordre
@@ -187,13 +208,18 @@ terminal.
 Dans B, un Ctrl+C après la première activation peut laisser uniquement les
 services Prediction Markets déjà démarrés actifs ; E `rollback` est alors le
 désarmement ciblé. E annonce un maximum de 12 minutes afin de couvrir les délais
-d'arrêt bornés des trois unités sans prétendre qu'une interruption les a toutes
+d'arrêt bornés des cinq unités sans prétendre qu'une interruption les a toutes
 arrêtées. Aucune de ces actions ne supprime les preuves ni ne cible H1.
 
 Le source, l'incoming et la campagne historiques de
 `pm-20260827t183515z-664bef6e` restent des preuves immuables. Le rollback humain
 a rendu `PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED`. Aucun nouveau pack ne peut
 réutiliser ce slug ou l'une de ces racines.
+
+La tentative `pm-20260827t210353z-9fa239e4` et toutes ses racines restent aussi
+immuables. Elle a prouvé le dashboard et l'activation guard, puis les deux
+collecteurs ont refusé avant state/ledger parce que l'ancien runner exigeait à
+tort le parent `rw` dans le namespace systemd. Son rollback humain est acquis.
 
 ## Preflight cible
 
@@ -206,7 +232,8 @@ Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
 - parents dédiés `volume_base`, `sources/`, `campaigns/` non-symlinks, chemins
   réels exacts, propriétaire `hyperlab` et mode `0700` réattestés avant clone ;
 - ext4 réel `rw`, capacité avec réservation H1, NTP ;
-- port loopback 18081 et absence des trois services/racines exacts ;
+- port loopback 18081 et absence des trois services persistants, des deux probes
+  et des racines exactes ;
 - DNS officiel via un processus `getent` borné à 3 s par host, puis TLS/HTTPS
   officiels, une seule tentative totale bornée à 40 s par venue ;
 - WebSocket public Polymarket ; Kalshi WSS reste
@@ -274,7 +301,7 @@ refuse pas une simple alerte de qualité `PUBLIC_SOURCE_INVALID` authentique, ma
 ne peut jamais publier le signal de reprise sur une divergence opérationnelle.
 
 `bash operator/E-recovery-rollback.sh rollback` arrête et désactive uniquement
-ces trois services. Il ne supprime ni unité, source, venv, campagne, raw,
+ces trois services et les deux probes oneshot du même slug. Il ne supprime ni unité, source, venv, campagne, raw,
 manifest, ledger, run ou rapport; il ne nomme aucun service H1.
 
 ## Limites

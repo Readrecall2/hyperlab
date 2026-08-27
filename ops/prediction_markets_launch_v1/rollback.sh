@@ -52,22 +52,27 @@ expected_campaign=f'/mnt/HC_Volume_106716684/hyperlab-prediction-markets/campaig
 if str(incoming)!=expected_incoming or d.get('incoming_root')!=expected_incoming or d.get('source_root')!=expected_source or d.get('campaign_root')!=expected_campaign:
  raise ValueError('handoff roots do not match the authenticated run slug')
 expected_services={name:f'hyperlab-pm-{suffix}-{name}.service' for name in ('polymarket','kalshi','dashboard')}
+expected_probes={name:f'hyperlab-pm-{suffix}-{name}-namespace-probe.service' for name in ('polymarket','kalshi')}
 if d.get('run_slug')!=slug or d.get('services')!=expected_services:
  raise ValueError('handoff services do not match the authenticated run slug')
 for name in ('polymarket','kalshi','dashboard'):
  print(expected_services[name])
+for name in ('polymarket','kalshi'):
+ print(expected_probes[name])
 print(expected_campaign); print(expected_source); print(expected_incoming); print(slug)
 PY
 ) || fail 'handoff authentication failed'
 mapfile -t VALUES <<<"$VALUES_RAW"
-(( ${#VALUES[@]} == 7 )) || fail 'handoff authenticated fields are incomplete'
+(( ${#VALUES[@]} == 9 )) || fail 'handoff authenticated fields are incomplete'
 POLYMARKET_SERVICE=${VALUES[0]}
 KALSHI_SERVICE=${VALUES[1]}
 DASHBOARD_SERVICE=${VALUES[2]}
-CAMPAIGN_ROOT=${VALUES[3]}
-SOURCE_ROOT=${VALUES[4]}
-AUTHENTICATED_INCOMING_ROOT=${VALUES[5]}
-RUN_SLUG=${VALUES[6]}
+POLYMARKET_NAMESPACE_PROBE_SERVICE=${VALUES[3]}
+KALSHI_NAMESPACE_PROBE_SERVICE=${VALUES[4]}
+CAMPAIGN_ROOT=${VALUES[5]}
+SOURCE_ROOT=${VALUES[6]}
+AUTHENTICATED_INCOMING_ROOT=${VALUES[7]}
+RUN_SLUG=${VALUES[8]}
 [[ $INCOMING_ROOT == "$AUTHENTICATED_INCOMING_ROOT" ]] || fail 'incoming root changed after authentication'
 
 SYSTEM_ERRORS=0
@@ -79,20 +84,25 @@ system_action() {
 }
 
 if [[ $MODE == rollback ]]; then
-  for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
+  for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
     system_action stop "$SERVICE"
     system_action disable "$SERVICE"
   done
-  for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE"; do
-    if ! ACTIVE=$(sudo systemctl show "$SERVICE" --property=ActiveState --value --no-pager); then
+  for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
+    if ! ACTIVE=$(timeout 5 sudo systemctl show "$SERVICE" --property=ActiveState --value --no-pager); then
       printf 'PREDICTION_ROLLBACK_POSTCONDITION_UNREADABLE=%s\n' "$SERVICE" >&2
       SYSTEM_ERRORS=1
-    elif [[ $ACTIVE == active || $ACTIVE == activating || $ACTIVE == reloading ]]; then
-      printf 'PREDICTION_ROLLBACK_SERVICE_STILL_ACTIVE=%s:%s\n' "$SERVICE" "$ACTIVE" >&2
-      SYSTEM_ERRORS=1
+    else
+      case "$ACTIVE" in
+        inactive|failed) ;;
+        *)
+          printf 'PREDICTION_ROLLBACK_SERVICE_NOT_DISARMED=%s:%s\n' "$SERVICE" "${ACTIVE:-EMPTY}" >&2
+          SYSTEM_ERRORS=1
+          ;;
+      esac
     fi
     set +e
-    ENABLED=$(sudo systemctl is-enabled "$SERVICE" 2>&1)
+    ENABLED=$(timeout 5 sudo systemctl is-enabled "$SERVICE" 2>&1)
     set -e
     if [[ $ENABLED != disabled ]]; then
       printf 'PREDICTION_ROLLBACK_SERVICE_NOT_DISABLED=%s:%s\n' "$SERVICE" "$ENABLED" >&2
@@ -123,11 +133,16 @@ while IFS=$'\t' read -r VENUE ELIGIBLE VERDICT; do
 done < <(python3.12 -I - "$INITIAL_ADMISSION_REPORT" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1],encoding='utf-8'))
-assert value.get('terminal_signal')=='PREDICTION_RECOVERY_INITIAL_ADMISSION_AUTHENTICATED'
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-initial-admission:'+label)
+require(value.get('terminal_signal')=='PREDICTION_RECOVERY_INITIAL_ADMISSION_AUTHENTICATED','terminal-signal')
 admission=value['admission_by_venue']
-assert set(admission)=={'polymarket','kalshi'}
+require(isinstance(admission,dict) and set(admission)=={'polymarket','kalshi'},'venue-set')
 for venue in ('polymarket','kalshi'):
  row=admission[venue]
+ require(isinstance(row,dict),'row-object:'+venue)
+ require(isinstance(row.get('eligible'),bool),'eligible-type:'+venue)
+ require(isinstance(row.get('network_verdict'),str) and bool(row['network_verdict']),'network-verdict:'+venue)
  print(venue,'yes' if row['eligible'] else 'no',row['network_verdict'],sep='\t')
 PY
 )
@@ -142,30 +157,94 @@ if ! sudo systemctl enable --now "$DASHBOARD_SERVICE"; then
 fi
 DASHBOARD_RECOVERY_READY=no
 VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
+recovery_service_terminal() {
+  local service=$1 label=$2 snapshot active_state sub_state result exec_status main_pid
+  if ! snapshot=$(timeout 5 systemctl show "$service" \
+    --property=ActiveState --property=SubState --property=Result \
+    --property=ExecMainCode --property=ExecMainStatus --property=MainPID \
+    --no-pager 2>&1); then
+    printf 'PREDICTION_RECOVERY_SERVICE_STATUS_UNREADABLE=%s:%s\n' "$label" "$service" >&2
+    return 0
+  fi
+  active_state=$(printf '%s\n' "$snapshot" | awk -F= '$1=="ActiveState" {print $2}')
+  sub_state=$(printf '%s\n' "$snapshot" | awk -F= '$1=="SubState" {print $2}')
+  result=$(printf '%s\n' "$snapshot" | awk -F= '$1=="Result" {print $2}')
+  exec_status=$(printf '%s\n' "$snapshot" | awk -F= '$1=="ExecMainStatus" {print $2}')
+  main_pid=$(printf '%s\n' "$snapshot" | awk -F= '$1=="MainPID" {print $2}')
+  if [[ $active_state == failed || $exec_status == 4 \
+    || ( $active_state == inactive && $sub_state == dead && $main_pid == 0 ) ]]; then
+    printf 'PREDICTION_RECOVERY_SERVICE_TERMINAL=%s:%s ActiveState=%s SubState=%s Result=%s ExecMainStatus=%s MainPID=%s\n' \
+      "$label" "$service" "${active_state:-NON_DISPONIBLE}" "${sub_state:-NON_DISPONIBLE}" \
+      "${result:-NON_DISPONIBLE}" "${exec_status:-NON_DISPONIBLE}" "${main_pid:-NON_DISPONIBLE}" >&2
+    return 0
+  fi
+  return 1
+}
+recovery_monitor_terminal() {
+  local monitor_json=$1 context=$2
+  MONITOR_JSON="$monitor_json" "$VENV_PYTHON" -I - "$context" <<'PY'
+import json,os,sys
+context=sys.argv[1]
+try:
+ value=json.loads(os.environ['MONITOR_JSON'])
+except (KeyError,json.JSONDecodeError) as error:
+ print(f'PREDICTION_RECOVERY_MONITOR_TERMINAL={context}:INVALID_JSON:{error}',file=sys.stderr)
+ raise SystemExit(0) from error
+if not isinstance(value,dict):
+ print(f'PREDICTION_RECOVERY_MONITOR_TERMINAL={context}:NON_OBJECT',file=sys.stderr)
+ raise SystemExit(0)
+if (value.get('preflight_error') is not None or value.get('failure_class') is not None
+    or value.get('operational_failure') is True or value.get('activation_admissible') is False):
+ print(f'PREDICTION_RECOVERY_MONITOR_TERMINAL={context}:FAIL_CLOSED',file=sys.stderr)
+ raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 for _attempt in {1..20}; do
+  DASHBOARD_MONITOR=''
   if "$VENV_PYTHON" - <<'PY' && \
      DASHBOARD_MONITOR=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$HANDOFF" recovery-dashboard) && \
      DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" - "$DASHBOARD_SERVICE" <<'PY'
 import json,urllib.request
-with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
- raw=response.read(65537)
- assert len(raw)<=65536
- value=json.loads(raw)
- assert response.status==200 and value.get('status')=='alive'
- assert value.get('mode')=='readonly' and value.get('orders_enabled') is False
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-dashboard-live:'+label)
+try:
+ with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
+  raw=response.read(65537)
+  require(len(raw)<=65536,'payload-too-large')
+  value=json.loads(raw)
+  require(response.status==200,'http-status')
+except Exception as error:
+ raise SystemExit(f'recovery-dashboard-live:{type(error).__name__}:{error}') from error
+require(value.get('status')=='alive','status')
+require(value.get('mode')=='readonly','mode')
+require(value.get('orders_enabled') is False,'orders-enabled')
 PY
 import json,os,sys
 value=json.loads(os.environ['DASHBOARD_MONITOR'])
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-dashboard-monitor:'+label)
 service=value['services']['dashboard']; properties=service['properties']
-assert value.get('preflight_error') is None and value.get('failure_class') is None
-assert value.get('operational_failure') is False and value.get('activation_admissible') is True
-assert properties.get('ActiveState')=='active'
-assert int(properties.get('MainPID','0') or '0')>0 and service['command_verified'] is True
-assert service['fragment_verified'] is True and service['listener_verified'] is True
-assert properties.get('FragmentPath')==f'/etc/systemd/system/{sys.argv[1]}'
+require(value.get('preflight_error') is None,'preflight-error')
+require(value.get('failure_class') is None,'failure-class')
+require(value.get('operational_failure') is False,'operational-failure')
+require(value.get('activation_admissible') is True,'activation-admissible')
+require(properties.get('ActiveState')=='active','active-state')
+require(int(properties.get('MainPID','0') or '0')>0,'main-pid')
+require(service.get('command_verified') is True,'command')
+require(service.get('fragment_verified') is True,'fragment')
+require(service.get('listener_verified') is True,'listener')
+require(properties.get('FragmentPath')==f'/etc/systemd/system/{sys.argv[1]}','fragment-path')
 PY
   then
     DASHBOARD_RECOVERY_READY=yes
+    break
+  fi
+  if [[ -n $DASHBOARD_MONITOR ]] \
+    && recovery_monitor_terminal "$DASHBOARD_MONITOR" dashboard; then
+    break
+  fi
+  if recovery_service_terminal "$DASHBOARD_SERVICE" dashboard; then
     break
   fi
   sleep 0.5
@@ -187,30 +266,43 @@ recovery_service_status() {
   MONITOR_JSON="$monitor_json" "$VENV_PYTHON" - "$venue" "$expected_service" <<'PY'
 import json,os,sys
 value=json.loads(os.environ['MONITOR_JSON'])
-assert value.get('preflight_error') is None
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-venue-monitor:'+label)
+require(isinstance(value,dict),'monitor-object')
+require(value.get('preflight_error') is None,'preflight-error')
+if value.get('failure_class') is not None:
+ print('recovery-venue-monitor:terminal-operational-failure',file=sys.stderr)
+ print('OPERATIONAL_FAILURE')
+ raise SystemExit(0)
 venue=sys.argv[1]; expected_service=sys.argv[2]
-service=value['services'][venue]; properties=service['properties']; state=service['state']
-assert service.get('admission_required') is True
-assert service.get('fragment_verified') is True
-assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_service}'
-assert isinstance(state,dict)
+services=value.get('services'); require(isinstance(services,dict),'services-object')
+service=services.get(venue); require(isinstance(service,dict),'venue-service-object')
+properties=service.get('properties'); require(isinstance(properties,dict),'properties-object')
+state=service.get('state')
+require(service.get('admission_required') is True,'admission-required')
+if (service.get('fragment_verified') is not True
+    or properties.get('FragmentPath')!=f'/etc/systemd/system/{expected_service}'):
+ print('recovery-venue-monitor:terminal-fragment-divergence',file=sys.stderr)
+ print('OPERATIONAL_FAILURE')
+ raise SystemExit(0)
+require(isinstance(state,dict),'state-object')
 lifecycle=state.get('lifecycle')
-assert lifecycle not in {None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'}
+require(lifecycle not in {None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'},'lifecycle')
 if service.get('venue_status')=='COMPLETE_WINDOW':
- assert lifecycle=='COMPLETE_WINDOW'
- assert properties.get('ActiveState') in {'active','inactive'}
+ require(lifecycle=='COMPLETE_WINDOW','complete-lifecycle')
+ require(properties.get('ActiveState') in {'active','inactive'},'complete-active-state')
  if properties.get('ActiveState')=='inactive':
-  assert properties.get('SubState')=='dead'
-  assert int(properties.get('MainPID','0') or '0')==0
-  assert properties.get('ExecMainStatus')=='0'
+  require(properties.get('SubState')=='dead','complete-sub-state')
+  require(int(properties.get('MainPID','0') or '0')==0,'complete-main-pid')
+  require(properties.get('ExecMainStatus')=='0','complete-exit-status')
  print('COMPLETE_WINDOW')
 else:
- assert service.get('venue_status') in {
+ require(service.get('venue_status') in {
   'RUNNING','PUBLIC_SOURCE_INVALID','PUBLIC_SOURCE_UNAVAILABLE_RUNTIME'
- }
- assert properties.get('ActiveState')=='active'
- assert int(properties.get('MainPID','0') or '0')>0
- assert service['command_verified'] is True
+ },'venue-status')
+ require(properties.get('ActiveState')=='active','active-state')
+ require(int(properties.get('MainPID','0') or '0')>0,'main-pid')
+ require(service.get('command_verified') is True,'command')
  print('RUNNING')
 PY
 }
@@ -291,6 +383,9 @@ PY
         if VENUE_STATUS=$(recovery_service_status "$VENUE" "$SERVICE"); then
           break
         fi
+        if recovery_service_terminal "$SERVICE" "$VENUE"; then
+          break
+        fi
         sleep 0.5
       done
       if [[ $VENUE_STATUS == COMPLETE_WINDOW ]]; then
@@ -331,6 +426,7 @@ if (( SYSTEM_ERRORS != 0 || ${#RECOVERY_FAILED_VENUES[@]} > 0 || ${#RECOVERY_REF
 fi
 RECOVERY_READY=no
 for _attempt in {1..20}; do
+  RECOVERY_MONITOR=''
   if "$VENV_PYTHON" - <<'PY' && \
      RECOVERY_MONITOR=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$HANDOFF") && \
      RECOVERY_MONITOR="$RECOVERY_MONITOR" \
@@ -339,68 +435,105 @@ for _attempt in {1..20}; do
      COMPLETED_VENUES="${RECOVERY_COMPLETED_VENUES[*]}" \
      "$VENV_PYTHON" - "$DASHBOARD_SERVICE" "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" <<'PY'
 import json,urllib.request
-with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
- raw=response.read(65537)
- assert len(raw)<=65536
- value=json.loads(raw)
- assert response.status==200 and value.get('status')=='ready'
- assert value.get('mode')=='readonly' and value.get('orders_enabled') is False
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-dashboard-ready:'+label)
+try:
+ with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
+  raw=response.read(65537)
+  require(len(raw)<=65536,'payload-too-large')
+  value=json.loads(raw)
+  require(response.status==200,'http-status')
+except Exception as error:
+ raise SystemExit(f'recovery-dashboard-ready:{type(error).__name__}:{error}') from error
+require(value.get('status')=='ready','status')
+require(value.get('mode')=='readonly','mode')
+require(value.get('orders_enabled') is False,'orders-enabled')
 PY
 import json,os,sys
 value=json.loads(os.environ['RECOVERY_MONITOR'])
-assert value.get('preflight_error') is None
-assert value.get('failure_class') is None
-assert value.get('operational_failure') is False
-assert value.get('activation_admissible') is True
+def require(condition,label):
+ if not condition: raise SystemExit('recovery-final-monitor:'+label)
+require(isinstance(value,dict),'monitor-object')
+require(value.get('preflight_error') is None,'preflight-error')
+require(value.get('failure_class') is None,'failure-class')
+require(value.get('operational_failure') is False,'operational-failure')
+require(value.get('activation_admissible') is True,'activation-admissible')
 expected_services={'dashboard':sys.argv[1],'polymarket':sys.argv[2],'kalshi':sys.argv[3]}
 started=set(os.environ['STARTED_VENUES'].split())
 refused=set(os.environ['REFUSED_VENUES'].split())
 completed=set(os.environ['COMPLETED_VENUES'].split())
-assert not (started & refused or started & completed or refused & completed)
-assert started | refused | completed == {'polymarket','kalshi'}
-dashboard=value['services']['dashboard']; dashboard_properties=dashboard['properties']
-assert dashboard_properties.get('ActiveState')=='active'
-assert int(dashboard_properties.get('MainPID','0') or '0')>0
-assert dashboard['command_verified'] is True
-assert dashboard['fragment_verified'] is True and dashboard['listener_verified'] is True
-assert dashboard_properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services["dashboard"]}'
+require(not (started & refused or started & completed or refused & completed),'venue-sets-overlap')
+require(started | refused | completed == {'polymarket','kalshi'},'venue-sets-incomplete')
+services=value.get('services'); require(isinstance(services,dict),'services-object')
+dashboard=services.get('dashboard'); require(isinstance(dashboard,dict),'dashboard-object')
+dashboard_properties=dashboard.get('properties'); require(isinstance(dashboard_properties,dict),'dashboard-properties')
+require(dashboard_properties.get('ActiveState')=='active','dashboard-active-state')
+require(int(dashboard_properties.get('MainPID','0') or '0')>0,'dashboard-main-pid')
+require(dashboard.get('command_verified') is True,'dashboard-command')
+require(dashboard.get('fragment_verified') is True,'dashboard-fragment')
+require(dashboard.get('listener_verified') is True,'dashboard-listener')
+require(dashboard_properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services["dashboard"]}','dashboard-fragment-path')
 for venue in started:
- service=value['services'][venue]; properties=service['properties']; state=service['state']
- assert service['fragment_verified'] is True
- assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
- assert isinstance(state,dict) and state.get('lifecycle') not in {
-  None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'
- }
+ service=services.get(venue); require(isinstance(service,dict),'started-service:'+venue)
+ properties=service.get('properties'); require(isinstance(properties,dict),'started-properties:'+venue)
+ state=service.get('state')
+ require(service.get('fragment_verified') is True,'started-fragment:'+venue)
+ require(properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}','started-fragment-path:'+venue)
+ require(isinstance(state,dict) and state.get('lifecycle') not in {
+   None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'
+  },'started-lifecycle:'+venue)
  if service.get('venue_status')=='COMPLETE_WINDOW':
-  assert state.get('lifecycle')=='COMPLETE_WINDOW'
-  assert properties.get('ActiveState') in {'active','inactive'}
+  require(state.get('lifecycle')=='COMPLETE_WINDOW','started-complete-lifecycle:'+venue)
+  require(properties.get('ActiveState') in {'active','inactive'},'started-complete-active-state:'+venue)
   if properties.get('ActiveState')=='inactive':
-   assert properties.get('SubState')=='dead'
-   assert int(properties.get('MainPID','0') or '0')==0
-   assert properties.get('ExecMainStatus')=='0'
+   require(properties.get('SubState')=='dead','started-complete-sub-state:'+venue)
+   require(int(properties.get('MainPID','0') or '0')==0,'started-complete-main-pid:'+venue)
+   require(properties.get('ExecMainStatus')=='0','started-complete-exit-status:'+venue)
  else:
-  assert properties.get('ActiveState')=='active'
-  assert int(properties.get('MainPID','0') or '0')>0
-  assert service['command_verified'] is True
+  require(properties.get('ActiveState')=='active','started-active-state:'+venue)
+  require(int(properties.get('MainPID','0') or '0')>0,'started-main-pid:'+venue)
+  require(service.get('command_verified') is True,'started-command:'+venue)
 for venue in refused:
- service=value['services'][venue]; properties=service['properties']
- assert service['fragment_verified'] is True
- assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
- assert properties.get('ActiveState') not in {'active','activating','reloading'}
- assert int(properties.get('MainPID','0') or '0')==0
+ service=services.get(venue); require(isinstance(service,dict),'refused-service:'+venue)
+ properties=service.get('properties'); require(isinstance(properties,dict),'refused-properties:'+venue)
+ require(service.get('fragment_verified') is True,'refused-fragment:'+venue)
+ require(properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}','refused-fragment-path:'+venue)
+ require(properties.get('ActiveState') in {'inactive','failed'},'refused-active-state:'+venue)
+ require(int(properties.get('MainPID','0') or '0')==0,'refused-main-pid:'+venue)
 for venue in completed:
- service=value['services'][venue]; properties=service['properties']; state=service['state']
- assert service['fragment_verified'] is True
- assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
- assert service.get('venue_status')=='COMPLETE_WINDOW'
- assert isinstance(state,dict) and state.get('lifecycle')=='COMPLETE_WINDOW'
- assert properties.get('ActiveState') not in {'active','activating','reloading'}
- assert int(properties.get('MainPID','0') or '0')==0
+ service=services.get(venue); require(isinstance(service,dict),'completed-service:'+venue)
+ properties=service.get('properties'); require(isinstance(properties,dict),'completed-properties:'+venue)
+ state=service.get('state')
+ require(service.get('fragment_verified') is True,'completed-fragment:'+venue)
+ require(properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}','completed-fragment-path:'+venue)
+ require(service.get('venue_status')=='COMPLETE_WINDOW','completed-status:'+venue)
+ require(isinstance(state,dict) and state.get('lifecycle')=='COMPLETE_WINDOW','completed-lifecycle:'+venue)
+ require(properties.get('ActiveState') in {'inactive','failed'},'completed-active-state:'+venue)
+ require(int(properties.get('MainPID','0') or '0')==0,'completed-main-pid:'+venue)
 PY
   then
     RECOVERY_READY=yes
     break
   fi
+  if [[ -n $RECOVERY_MONITOR ]] \
+    && recovery_monitor_terminal "$RECOVERY_MONITOR" final; then
+    break
+  fi
+  RECOVERY_TERMINAL=no
+  if recovery_service_terminal "$DASHBOARD_SERVICE" dashboard; then
+    RECOVERY_TERMINAL=yes
+  fi
+  for VENUE in "${RECOVERY_STARTED_VENUES[@]}"; do
+    case "$VENUE" in
+      polymarket) SERVICE=$POLYMARKET_SERVICE ;;
+      kalshi) SERVICE=$KALSHI_SERVICE ;;
+      *) RECOVERY_TERMINAL=yes; continue ;;
+    esac
+    if recovery_service_terminal "$SERVICE" "$VENUE"; then
+      RECOVERY_TERMINAL=yes
+    fi
+  done
+  [[ $RECOVERY_TERMINAL == no ]] || break
   sleep 0.5
 done
 if [[ $RECOVERY_READY != yes ]]; then

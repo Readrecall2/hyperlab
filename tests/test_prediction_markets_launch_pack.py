@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -31,6 +32,7 @@ def _handoff() -> dict[str, object]:
         "campaign_root": "/mnt/HC_Volume_106716684/hyperlab-prediction-markets/campaigns/pm-20260827t120000z-deadbeef",
         "dashboard_port": 18081,
         "incoming_root": "/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef",
+        "run_slug": "pm-20260827t120000z-deadbeef",
         "service_user": "hyperlab",
         "services": {
             "dashboard": "hyperlab-pm-20260827t120000z-deadbeef-dashboard.service",
@@ -38,6 +40,8 @@ def _handoff() -> dict[str, object]:
             "polymarket": "hyperlab-pm-20260827t120000z-deadbeef-polymarket.service",
         },
         "source_root": "/mnt/HC_Volume_106716684/hyperlab-prediction-markets/sources/pm-20260827t120000z-deadbeef",
+        "volume_base": "/mnt/HC_Volume_106716684/hyperlab-prediction-markets",
+        "volume_mount": "/mnt/HC_Volume_106716684",
     }
 
 
@@ -96,6 +100,7 @@ def _incoming_handoff(tmp_path: Path) -> Path:
         "dashboard_port": 18081,
         "disk": {"required_free_bytes": 194347270144},
         "incoming_root": str(incoming),
+        "run_slug": "pm-20260827t120000z-deadbeef",
         "schema_version": 1,
         "service_user": "hyperlab",
         "services": _handoff()["services"],
@@ -246,7 +251,8 @@ report=args[args.index('--report')+1]
 if command=='install-admission':
  incoming=os.environ['HYPERLAB_INCOMING_WINDOWS']
  services=json.loads(os.environ['HYPERLAB_SERVICES_JSON'])
- hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in services.values()}
+ unit_names=sorted(os.listdir(os.path.join(incoming,'systemd')))
+ hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in unit_names}
  value={'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'evidence':{'unit_sha256':hashes},'install_admissible':True,'recorded_at_utc':'2026-08-27T18:00:00.000000Z','schema_version':1,'terminal_signal':'PREDICTION_INSTALL_ADMISSION_GREEN'}
 else:
  value={'activation_admissible':True,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'live':{'capacity':{'admitted':True}},'recorded_at_utc':'2026-08-27T18:00:01.000000Z','schema_version':1,'terminal_signal':'PREDICTION_COLLECTOR_ACTIVATION_GUARD_GREEN'}
@@ -337,7 +343,7 @@ def _run_git_bash_script(
         cwd=cwd,
         env=environment,
         text=True,
-        timeout=30,
+        timeout=90,
     )
 
 
@@ -362,7 +368,7 @@ def _internal_install_fixture(
         """#!/usr/bin/bash
 set -Eeuo pipefail
 if [[ ${1:-} == -I && ${2:-} == - && ${3:-} == */handoff.json && $# == 4 ]]; then
-  "$HYPERLAB_REAL_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(d["source_root"]); print(d["campaign_root"]); print(d["source_commit"]); print(d["services"]["polymarket"]); print(d["services"]["kalshi"]); print(d["services"]["dashboard"])' "$3" | tr -d '\\015'
+  "$HYPERLAB_REAL_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); suffix=d["run_slug"].removeprefix("pm-"); print(d["source_root"]); print(d["campaign_root"]); print(d["source_commit"]); print(d["services"]["polymarket"]); print(d["services"]["kalshi"]); print(d["services"]["dashboard"]); print(f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service"); print(f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service")' "$3" | tr -d '\\015'
   exit "${PIPESTATUS[0]}"
 fi
 if [[ ${1:-} == -I && ${2:-} == - && ${3:-} == */host-preflight-report.json && $# == 3 ]]; then
@@ -385,7 +391,12 @@ if [[ ${1:-} == -m && ${4:-} == prediction-prepare ]]; then
   mkdir -p -- "$output"
   cp -- "$HYPERLAB_FIXTURE_MANIFEST" "$output/campaign-manifest.json"
   cp -- "$HYPERLAB_FIXTURE_MANIFEST_PIN" "$output/campaign-manifest.sha256"
+  mkdir -p -- "$output/polymarket"
+  printf 'SYNTHETIC/FIXTURE raw preservation sentinel\n' > "$output/polymarket/SYNTHETIC_RAW_PRESERVED.bin"
   exit 0
+fi
+if [[ ${HYPERLAB_FAIL_DIAGNOSTIC_PYTHON:-0} == 1 && -n ${PROPERTIES+x} && -n ${JOURNAL+x} ]]; then
+  exit 97
 fi
 if [[ ${1:-} == - && -e ${HYPERLAB_DASHBOARD_ENABLE_MARKER:-/absent} && ! -e ${HYPERLAB_FIRST_HEALTH_MARKER:-/absent} ]]; then
   : > "$HYPERLAB_FIRST_HEALTH_MARKER"
@@ -410,7 +421,13 @@ exec "$HYPERLAB_REAL_PYTHON" "$@"
     (incoming / "systemd").mkdir()
     services = handoff["services"]
     assert isinstance(services, dict)
-    for service in services.values():
+    suffix_value = str(handoff["run_slug"]).removeprefix("pm-")
+    all_units = [
+        *services.values(),
+        f"hyperlab-pm-{suffix_value}-polymarket-namespace-probe.service",
+        f"hyperlab-pm-{suffix_value}-kalshi-namespace-probe.service",
+    ]
+    for service in all_units:
         (incoming / "systemd" / str(service)).write_text(
             "[Unit]\nDescription=SYNTHETIC/FIXTURE operator harness\n",
             encoding="utf-8",
@@ -454,6 +471,12 @@ def _internal_install_environment(
     handoff: dict[str, object],
     pack: Path,
     failed_service: str | None = None,
+    terminal_exit_service: str | None = None,
+    clean_exit_service: str | None = None,
+    namespace_probe_failure: str | None = None,
+    namespace_probe_show_failure: str | None = None,
+    cleanup_failure_service: str | None = None,
+    fail_diagnostic_encoding: bool = False,
     monitor_failure: str | None = None,
     collector_guard_failure: bool = False,
     monitor_eligible_venues: tuple[str, ...] = ("polymarket", "kalshi"),
@@ -474,7 +497,8 @@ report=args[args.index('--report')+1]
 if command=='install-admission':
  incoming=os.environ['HYPERLAB_INCOMING_WINDOWS']
  services=json.loads(os.environ['HYPERLAB_SERVICES_JSON'])
- hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in services.values()}
+ unit_names=sorted(os.listdir(os.path.join(incoming,'systemd')))
+ hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in unit_names}
  value={'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'evidence':{'unit_sha256':hashes},'install_admissible':True,'recorded_at_utc':'2026-08-27T18:00:00.000000Z','schema_version':1,'terminal_signal':'PREDICTION_INSTALL_ADMISSION_GREEN'}
 else:
  refused=os.environ.get('HYPERLAB_COLLECTOR_GUARD_FAILURE')=='1'
@@ -532,6 +556,42 @@ fi
     )
     _write_fake_command(
         fake_bin,
+        "systemctl",
+        """printf 'systemctl|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
+if [[ ${1:-} == is-enabled ]]; then
+  printf 'disabled\n'
+  exit 1
+fi
+[[ ${1:-} == show ]] || exit 0
+service=${2:-}
+if [[ -n ${HYPERLAB_NAMESPACE_PROBE_SHOW_FAILURE:-} && $service == "$HYPERLAB_NAMESPACE_PROBE_SHOW_FAILURE" ]]; then exit 95; fi
+if [[ $* == *'--property=ActiveState --value'* ]]; then
+  if [[ -f "$HYPERLAB_SERVICE_STATE_DIR/$service" ]]; then printf 'active\n';
+  elif [[ -f "$HYPERLAB_SERVICE_STATE_DIR/$service.failed" ]]; then printf 'failed\n';
+  else printf 'inactive\n'; fi
+  exit 0
+fi
+if [[ $service == *-namespace-probe.service ]]; then
+  if [[ -f "$HYPERLAB_SERVICE_STATE_DIR/$service.probe-success" ]]; then
+    printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nNRestarts=0\nExecMainCode=1\nExecMainStatus=0\nFragmentPath=/etc/systemd/system/%s\n' "$service"
+  else
+    printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=unset\nMainPID=0\nNRestarts=0\nExecMainCode=\nExecMainStatus=\nFragmentPath=/etc/systemd/system/%s\n' "$service"
+  fi
+  exit 0
+fi
+if [[ -f "$HYPERLAB_SERVICE_STATE_DIR/$service.failed" ]]; then
+  printf 'LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\nMainPID=0\nNRestarts=0\nExecMainCode=1\nExecMainStatus=4\nFragmentPath=/etc/systemd/system/%s\n' "$service"
+  exit 0
+fi
+if [[ -f "$HYPERLAB_SERVICE_STATE_DIR/$service" ]]; then
+  printf 'LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=123\nNRestarts=0\nExecMainCode=0\nExecMainStatus=0\nFragmentPath=/etc/systemd/system/%s\n' "$service"
+else
+  printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nNRestarts=0\nExecMainCode=1\nExecMainStatus=0\nFragmentPath=/etc/systemd/system/%s\n' "$service"
+fi
+""",
+    )
+    _write_fake_command(
+        fake_bin,
         "sudo",
         """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
 if [[ ${1:-} == install ]]; then
@@ -556,18 +616,43 @@ if [[ ${1:-} == rm ]]; then
   for target in "$@"; do rm -f -- "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$target")"; done
   exit 0
 fi
+if [[ ${1:-} == journalctl ]]; then
+  [[ $* == *'--no-pager -n 20 -o cat'* ]] || exit 92
+  printf 'PREDICTION_RUNNER_REFUSED:runner startup admission refused before slot selection: SYNTHETIC/FIXTURE namespace contract diverged\n'
+  exit 0
+fi
 if [[ ${1:-} != systemctl ]]; then exit 0; fi
 shift
 action=${1:-}; shift || true
-if [[ $action == enable && ${1:-} == --now ]]; then
+if [[ $action == start ]]; then
+  service=${1:-}
+  if [[ -n ${HYPERLAB_FAIL_NAMESPACE_PROBE:-} && $service == "$HYPERLAB_FAIL_NAMESPACE_PROBE" ]]; then exit 1; fi
+  : > "$HYPERLAB_SERVICE_STATE_DIR/$service.probe-success"
+elif [[ $action == enable && ${1:-} == --now ]]; then
   service=$2
   if [[ -n ${HYPERLAB_FAIL_SERVICE:-} && $service == "$HYPERLAB_FAIL_SERVICE" ]]; then exit 1; fi
+  if [[ -n ${HYPERLAB_CLEAN_EXIT_SERVICE:-} && $service == "$HYPERLAB_CLEAN_EXIT_SERVICE" ]]; then exit 0; fi
+  if [[ -n ${HYPERLAB_TERMINAL_EXIT_SERVICE:-} && $service == "$HYPERLAB_TERMINAL_EXIT_SERVICE" ]]; then
+    : > "$HYPERLAB_SERVICE_STATE_DIR/$service.failed"
+    exit 0
+  fi
   : > "$HYPERLAB_SERVICE_STATE_DIR/$service"
   if [[ $service == "$HYPERLAB_DASHBOARD_SERVICE" ]]; then
     : > "$HYPERLAB_DASHBOARD_ENABLE_MARKER"
   fi
 elif [[ $action == stop ]]; then
-  for service in "$@"; do rm -f -- "$HYPERLAB_SERVICE_STATE_DIR/$service"; done
+  cleanup_failed=0
+  for service in "$@"; do
+    if [[ -n ${HYPERLAB_CLEANUP_FAILURE_SERVICE:-} && $service == "$HYPERLAB_CLEANUP_FAILURE_SERVICE" ]]; then
+      cleanup_failed=1
+    else
+      rm -f -- "$HYPERLAB_SERVICE_STATE_DIR/$service" "$HYPERLAB_SERVICE_STATE_DIR/$service.failed" "$HYPERLAB_SERVICE_STATE_DIR/$service.probe-success"
+    fi
+  done
+  exit "$cleanup_failed"
+elif [[ $action == disable ]]; then
+  service=${1:-}
+  if [[ -n ${HYPERLAB_CLEANUP_FAILURE_SERVICE:-} && $service == "$HYPERLAB_CLEANUP_FAILURE_SERVICE" ]]; then exit 1; fi
 fi
 """,
     )
@@ -587,8 +672,9 @@ data_quality_alert=False
 for name in ('polymarket','kalshi','dashboard'):
  service=handoff['services'][name]
  active=os.path.isfile(os.path.join(os.environ['HYPERLAB_SERVICE_STATE_DIR'],service))
+ failed=os.path.isfile(os.path.join(os.environ['HYPERLAB_SERVICE_STATE_DIR'],service+'.failed'))
  required=name=='dashboard' or (not dashboard_only and name in eligible)
- properties={'ActiveState':'active' if active else 'inactive','ExecMainStatus':'0','FragmentPath':'/etc/systemd/system/'+service,'LoadState':'loaded','MainPID':'123' if active else '0','NRestarts':'0','SubState':'running' if active else 'dead'}
+ properties={'ActiveState':'failed' if failed else ('active' if active else 'inactive'),'ExecMainCode':'1' if failed or not active else '0','ExecMainStatus':'4' if failed else '0','FragmentPath':'/etc/systemd/system/'+service,'LoadState':'loaded','MainPID':'123' if active else '0','NRestarts':'0','Result':'exit-code' if failed else 'success','SubState':'failed' if failed else ('running' if active else 'dead')}
  state=None if name=='dashboard' or not active else {'lifecycle':'WAITING_NEXT_SLOT'}
  status='RUNNING' if active else 'SERVICE_UNAVAILABLE'
  if forced=='pid-diverged' and name=='dashboard' and dashboard_only:
@@ -651,6 +737,16 @@ exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_HELPER" "$@"
             "HOME": "/home/hyperlab",
             "HYPERLAB_FAKE_LOG": _git_bash_path(log),
             "HYPERLAB_FAIL_SERVICE": failed_service or "",
+            "HYPERLAB_TERMINAL_EXIT_SERVICE": terminal_exit_service or "",
+            "HYPERLAB_CLEAN_EXIT_SERVICE": clean_exit_service or "",
+            "HYPERLAB_FAIL_NAMESPACE_PROBE": namespace_probe_failure or "",
+            "HYPERLAB_NAMESPACE_PROBE_SHOW_FAILURE": (
+                namespace_probe_show_failure or ""
+            ),
+            "HYPERLAB_CLEANUP_FAILURE_SERVICE": cleanup_failure_service or "",
+            "HYPERLAB_FAIL_DIAGNOSTIC_PYTHON": (
+                "1" if fail_diagnostic_encoding else "0"
+            ),
             "HYPERLAB_DASHBOARD_ENABLE_MARKER": _git_bash_path(
                 tmp_path / "dashboard-enabled"
             ),
@@ -839,7 +935,7 @@ def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandR
     if arguments[0] == "findmnt":
         return preflight.CommandResult(
             0,
-            "/mnt/HC_Volume_106716684 /dev/sdb ext4 rw,relatime,discard",
+            "/mnt/HC_Volume_106716684 /dev/sdb ext4 rw,relatime,discard 8:16 /",
             "",
         )
     if arguments[0] == "df":
@@ -932,10 +1028,18 @@ def test_authoritative_base_remains_valid_for_causal_fix_descendants() -> None:
 
 def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     units = launch_pack.render_units(_handoff())
-    assert len(units) == 3
-    polymarket = next(value for key, value in units.items() if "polymarket" in key)
-    kalshi = next(value for key, value in units.items() if "kalshi" in key)
+    assert len(units) == 5
+    polymarket = units[
+        "hyperlab-pm-20260827t120000z-deadbeef-polymarket.service"
+    ]
+    kalshi = units["hyperlab-pm-20260827t120000z-deadbeef-kalshi.service"]
     dashboard = next(value for key, value in units.items() if "dashboard" in key)
+    polymarket_probe = units[
+        "hyperlab-pm-20260827t120000z-deadbeef-polymarket-namespace-probe.service"
+    ]
+    kalshi_probe = units[
+        "hyperlab-pm-20260827t120000z-deadbeef-kalshi-namespace-probe.service"
+    ]
     assert "--venue polymarket" in polymarket and "--venue kalshi" not in polymarket
     assert "--venue kalshi" in kalshi and "--venue polymarket" not in kalshi
     assert "ReadWritePaths=" in polymarket and "/polymarket" in polymarket
@@ -944,6 +1048,13 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     assert "--host 127.0.0.1 --port 18081" in dashboard
     for collector in (polymarket, kalshi):
         assert "RestartPreventExitStatus=4" in collector
+    for venue, probe in (("polymarket", polymarket_probe), ("kalshi", kalshi_probe)):
+        assert "Type=oneshot" in probe
+        assert "TimeoutStartSec=30" in probe
+        assert "Restart=no" in probe
+        assert "runner-namespace-guard" in probe
+        assert f"--venue {venue}" in probe
+        assert f"ReadWritePaths={_handoff()['campaign_root']}/{venue}" in probe
     assert "RestartPreventExitStatus=4" not in dashboard
     for unit in units.values():
         assert "User=hyperlab" in unit
@@ -951,7 +1062,14 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
         assert "NoNewPrivileges=yes" in unit
         assert "ProtectSystem=strict" in unit
         assert "CapabilityBoundingSet=" in unit
-        assert "Restart=on-failure" in unit
+        assert "Restart=on-failure" in unit or "Restart=no" in unit
+        readonly_paths = unit.split("ReadOnlyPaths=", 1)[1].splitlines()[0].split()
+        assert str(_handoff()["volume_mount"]) in readonly_paths
+        assert str(_handoff()["volume_base"]) in readonly_paths
+        assert str(_handoff()["incoming_root"]) in readonly_paths
+        assert str(_handoff()["source_root"]) in readonly_paths
+        assert str(_handoff()["campaign_root"]) in readonly_paths
+        assert unit.count("ReadWritePaths=") <= 1
         assert "hyperlab-h1" not in unit
         assert "18080" not in unit
 
@@ -1223,30 +1341,37 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             self.end_headers()
             self.wfile.write(payload)
 
-    server_holder: list[ThreadingHTTPServer] = []
     server_started = threading.Event()
     server_error: list[OSError] = []
+    servers: list[ThreadingHTTPServer] = []
     first_health_marker = tmp_path / "green" / "first-health-attempt"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as availability_probe:
+            availability_probe.bind(("127.0.0.1", 18081))
+    except OSError as error:
+        pytest.skip(f"loopback port 18081 unavailable for install harness: {error}")
 
     def delayed_dashboard() -> None:
-        deadline = time.monotonic() + 10
+        # The real-script harness performs five authenticated unit installs
+        # before the first loopback request.  Give that setup its own bounded
+        # window; the production readiness deadline remains unchanged.
+        deadline = time.monotonic() + 60
         while not first_health_marker.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not first_health_marker.exists():
             server_error.append(OSError("first dashboard health attempt was not observed"))
             return
-        time.sleep(1.0)
+        time.sleep(1.2)
         try:
             server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
         except OSError as error:
             server_error.append(error)
             return
-        server_holder.append(server)
+        servers.append(server)
         server_started.set()
         server.serve_forever()
 
     thread = threading.Thread(target=delayed_dashboard, daemon=True)
-    thread.start()
     non_git_cwd = tmp_path / "non-git-cwd"
     non_git_cwd.mkdir()
     try:
@@ -1259,6 +1384,10 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             handoff=handoff,
             pack=pack,
         )
+        # Start the delayed listener only after the comparatively expensive pack
+        # fixture has been materialized.  The bounded delay is intended to model
+        # the install-time bind race, not fixture construction time.
+        thread.start()
         green_source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
         green = _run_git_bash_script(
             green_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
@@ -1266,7 +1395,11 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             environment=environment,
             arguments=(_git_bash_path(incoming),),
         )
-        assert green.returncode == 0, green.stderr
+        assert green.returncode == 0, (
+            f"server_started={server_started.is_set()} server_error={server_error} "
+            f"marker={first_health_marker.exists()}\n"
+            f"{log.read_text(encoding='utf-8')}\n{green.stderr}"
+        )
         assert server_started.is_set(), server_error
         assert any(
             signature in green.stderr
@@ -1291,8 +1424,114 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         dashboard_enable = f"sudo|systemctl enable --now {services['dashboard']}"
         polymarket_enable = f"sudo|systemctl enable --now {services['polymarket']}"
         kalshi_enable = f"sudo|systemctl enable --now {services['kalshi']}"
+        suffix = str(handoff["run_slug"]).removeprefix("pm-")
+        polymarket_probe = (
+            f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service"
+        )
+        kalshi_probe = f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service"
+        polymarket_probe_start = f"sudo|systemctl start {polymarket_probe}"
+        kalshi_probe_start = f"sudo|systemctl start {kalshi_probe}"
         assert green_log.index(dashboard_enable) < green_log.index(polymarket_enable)
+        assert green_log.index(dashboard_enable) < green_log.index(
+            polymarket_probe_start
+        )
+        assert green_log.index(polymarket_probe_start) < green_log.index(
+            kalshi_probe_start
+        )
+        assert green_log.index(kalshi_probe_start) < green_log.index(
+            polymarket_enable
+        )
         assert green_log.index(polymarket_enable) < green_log.index(kalshi_enable)
+
+        refused_incoming, refused_handoff, _refused_campaign, refused_pack = (
+            _internal_install_fixture(
+                tmp_path / "namespace-refused",
+                suffix="namespace-refused",
+            )
+        )
+        refused_services = refused_handoff["services"]
+        assert isinstance(refused_services, dict)
+        refused_suffix = str(refused_handoff["run_slug"]).removeprefix("pm-")
+        refused_probe = (
+            f"hyperlab-pm-{refused_suffix}-polymarket-namespace-probe.service"
+        )
+        refused_environment, refused_log_path = _internal_install_environment(
+            tmp_path / "namespace-refused",
+            handoff=refused_handoff,
+            pack=refused_pack,
+            namespace_probe_failure=refused_probe,
+        )
+        refused_source = Path(
+            str(refused_handoff["source_root"]).replace("/c/", "C:/", 1)
+        )
+        namespace_refused = _run_git_bash_script(
+            refused_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=refused_environment,
+            arguments=(_git_bash_path(refused_incoming),),
+        )
+        refused_output = namespace_refused.stdout + namespace_refused.stderr
+        assert namespace_refused.returncode == 4, refused_output
+        assert "PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=" in refused_output
+        assert "collector namespace probe refused before runner activation: polymarket" in refused_output
+        assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in refused_output
+        refused_log = refused_log_path.read_text(encoding="utf-8")
+        assert f"sudo|systemctl start {refused_probe}" in refused_log
+        for venue in ("polymarket", "kalshi"):
+            assert (
+                f"sudo|systemctl enable --now {refused_services[venue]}"
+                not in refused_log
+            )
+        refused_cleanup = [
+            *refused_services.values(),
+            refused_probe,
+            f"hyperlab-pm-{refused_suffix}-kalshi-namespace-probe.service",
+        ]
+        for service in refused_cleanup:
+            assert f"sudo|systemctl stop {service}" in refused_log
+            assert f"sudo|systemctl disable {service}" in refused_log
+
+        cleanup_incoming, cleanup_handoff, _cleanup_campaign, cleanup_pack = (
+            _internal_install_fixture(
+                tmp_path / "namespace-show-cleanup-failure",
+                suffix="namespace-show-cleanup-failure",
+            )
+        )
+        cleanup_services = cleanup_handoff["services"]
+        assert isinstance(cleanup_services, dict)
+        cleanup_suffix = str(cleanup_handoff["run_slug"]).removeprefix("pm-")
+        cleanup_probe = (
+            f"hyperlab-pm-{cleanup_suffix}-polymarket-namespace-probe.service"
+        )
+        cleanup_environment, cleanup_log_path = _internal_install_environment(
+            tmp_path / "namespace-show-cleanup-failure",
+            handoff=cleanup_handoff,
+            pack=cleanup_pack,
+            namespace_probe_show_failure=cleanup_probe,
+            cleanup_failure_service=str(cleanup_services["dashboard"]),
+        )
+        cleanup_source = Path(
+            str(cleanup_handoff["source_root"]).replace("/c/", "C:/", 1)
+        )
+        cleanup_failed = _run_git_bash_script(
+            cleanup_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=cleanup_environment,
+            arguments=(_git_bash_path(cleanup_incoming),),
+        )
+        cleanup_output = cleanup_failed.stdout + cleanup_failed.stderr
+        assert cleanup_failed.returncode == 4, cleanup_output
+        assert (
+            "namespace probe properties unavailable and Prediction Markets cleanup also failed"
+            in cleanup_output
+        )
+        assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in cleanup_output
+        cleanup_log = cleanup_log_path.read_text(encoding="utf-8")
+        for venue in ("polymarket", "kalshi"):
+            assert (
+                f"sudo|systemctl enable --now {cleanup_services[venue]}"
+                not in cleanup_log
+            )
 
         failed_incoming, failed_handoff, _failed_campaign, failed_pack = (
             _internal_install_fixture(
@@ -1320,17 +1559,192 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         assert partial.returncode == 4
         assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in partial.stdout + partial.stderr
         assert partial.stderr.splitlines()[-1] == (
-            "PREDICTION_INSTALL_ACTIVATION_PARTIAL_OR_ALERT"
+            "PREDICTION_INSTALL_REFUSED:collector activation failed before readiness: polymarket"
         )
         failed_log = failed_log_path.read_text(encoding="utf-8")
-        assert f"sudo|systemctl stop {failed_services['polymarket']}" in failed_log
-        assert f"sudo|systemctl disable {failed_services['polymarket']}" in failed_log
-        assert f"sudo|systemctl stop {failed_services['kalshi']}" not in failed_log
-        assert f"sudo|systemctl stop {failed_services['dashboard']}" not in failed_log
+        suffix = str(failed_handoff["run_slug"]).removeprefix("pm-")
+        expected_cleanup = [
+            *failed_services.values(),
+            f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service",
+            f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
+        ]
+        for service in expected_cleanup:
+            assert f"sudo|systemctl stop {service}" in failed_log
+            assert f"sudo|systemctl disable {service}" in failed_log
+        assert f"sudo|systemctl enable --now {failed_services['kalshi']}" not in failed_log
     finally:
-        if server_started.is_set():
-            server_holder[0].shutdown()
-            server_holder[0].server_close()
+        if server_started.is_set() and servers:
+            servers[0].shutdown()
+        if servers:
+            servers[0].server_close()
+        thread.join(timeout=5)
+
+
+def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_all(
+    tmp_path: Path,
+) -> None:
+    class HealthHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+        def do_GET(self) -> None:
+            value = {
+                "mode": "readonly",
+                "orders_enabled": False,
+                "status": "ready" if self.path == "/health/ready" else "alive",
+            }
+            payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    non_git_cwd = tmp_path / "non-git-cwd"
+    non_git_cwd.mkdir()
+    try:
+        incoming, handoff, campaign, pack = _internal_install_fixture(
+            tmp_path / "terminal-exit-four",
+            suffix="terminal-exit-four",
+        )
+        services = handoff["services"]
+        assert isinstance(services, dict)
+        environment, log_path = _internal_install_environment(
+            tmp_path / "terminal-exit-four",
+            handoff=handoff,
+            pack=pack,
+            terminal_exit_service=str(services["polymarket"]),
+        )
+        source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
+        completed = _run_git_bash_script(
+            source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=environment,
+            arguments=(_git_bash_path(incoming),),
+        )
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 4, output
+        assert "AssertionError" not in output
+        assert "PREDICTION_COLLECTOR_READINESS_INVARIANT=state-object-present" in output
+        assert "PREDICTION_COLLECTOR_TERMINAL_BEFORE_READINESS=polymarket" in output
+        assert "PREDICTION_COLLECTOR_READINESS_DIAGNOSTIC=" in output
+        assert "Result=exit-code" in output
+        assert "ExecMainStatus=4" in output
+        assert '"state_present":false' in output
+        assert '"ledger_present":false' in output
+        assert "PREDICTION_RUNNER_REFUSED:runner startup admission refused" in output
+        assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in output
+        assert not (campaign / "polymarket" / "state.json").exists()
+        assert not (campaign / "polymarket" / "ledger.jsonl").exists()
+        sentinel = campaign / "polymarket" / "SYNTHETIC_RAW_PRESERVED.bin"
+        assert sentinel.read_bytes() == b"SYNTHETIC/FIXTURE raw preservation sentinel\n"
+        log = log_path.read_text(encoding="utf-8")
+        collector_enable = f"sudo|systemctl enable --now {services['polymarket']}"
+        assert collector_enable in log
+        after_enable = log.split(collector_enable, 1)[1]
+        assert "sleep|0.5" not in after_enable
+        assert f"sudo|systemctl enable --now {services['kalshi']}" not in log
+        suffix = str(handoff["run_slug"]).removeprefix("pm-")
+        cleanup_services = [
+            *services.values(),
+            f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service",
+            f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
+        ]
+        for service in cleanup_services:
+            assert f"sudo|systemctl stop {service}" in log
+            assert f"sudo|systemctl disable {service}" in log
+        service_state = Path(
+            environment["HYPERLAB_SERVICE_STATE_DIR"].replace("/c/", "C:/", 1)
+        )
+        assert not list(service_state.glob("*.failed"))
+        assert not list(service_state.glob("*.probe-success"))
+
+        diagnostic_incoming, diagnostic_handoff, _diagnostic_campaign, diagnostic_pack = (
+            _internal_install_fixture(
+                tmp_path / "diagnostic-encoding-failure",
+                suffix="diagnostic-encoding-failure",
+            )
+        )
+        diagnostic_services = diagnostic_handoff["services"]
+        assert isinstance(diagnostic_services, dict)
+        diagnostic_environment, diagnostic_log_path = _internal_install_environment(
+            tmp_path / "diagnostic-encoding-failure",
+            handoff=diagnostic_handoff,
+            pack=diagnostic_pack,
+            terminal_exit_service=str(diagnostic_services["polymarket"]),
+            fail_diagnostic_encoding=True,
+        )
+        diagnostic_source = Path(
+            str(diagnostic_handoff["source_root"]).replace("/c/", "C:/", 1)
+        )
+        diagnostic_failed = _run_git_bash_script(
+            diagnostic_source
+            / "ops"
+            / "prediction_markets_launch_v1"
+            / "install.sh",
+            cwd=non_git_cwd,
+            environment=diagnostic_environment,
+            arguments=(_git_bash_path(diagnostic_incoming),),
+        )
+        diagnostic_output = diagnostic_failed.stdout + diagnostic_failed.stderr
+        assert diagnostic_failed.returncode == 4, diagnostic_output
+        assert (
+            "PREDICTION_COLLECTOR_READINESS_DIAGNOSTIC=ENCODING_FAILED"
+            in diagnostic_output
+        )
+        diagnostic_log = diagnostic_log_path.read_text(encoding="utf-8")
+        diagnostic_suffix = str(diagnostic_handoff["run_slug"]).removeprefix("pm-")
+        diagnostic_cleanup = [
+            *diagnostic_services.values(),
+            f"hyperlab-pm-{diagnostic_suffix}-polymarket-namespace-probe.service",
+            f"hyperlab-pm-{diagnostic_suffix}-kalshi-namespace-probe.service",
+        ]
+        for service in diagnostic_cleanup:
+            assert f"sudo|systemctl stop {service}" in diagnostic_log
+            assert f"sudo|systemctl disable {service}" in diagnostic_log
+        assert (
+            f"sudo|systemctl enable --now {diagnostic_services['kalshi']}"
+            not in diagnostic_log
+        )
+
+        clean_incoming, clean_handoff, _clean_campaign, clean_pack = (
+            _internal_install_fixture(
+                tmp_path / "clean-exit-before-state",
+                suffix="clean-exit-before-state",
+            )
+        )
+        clean_services = clean_handoff["services"]
+        assert isinstance(clean_services, dict)
+        clean_environment, clean_log_path = _internal_install_environment(
+            tmp_path / "clean-exit-before-state",
+            handoff=clean_handoff,
+            pack=clean_pack,
+            clean_exit_service=str(clean_services["polymarket"]),
+        )
+        clean_source = Path(
+            str(clean_handoff["source_root"]).replace("/c/", "C:/", 1)
+        )
+        clean_failed = _run_git_bash_script(
+            clean_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=clean_environment,
+            arguments=(_git_bash_path(clean_incoming),),
+        )
+        clean_output = clean_failed.stdout + clean_failed.stderr
+        assert clean_failed.returncode == 4, clean_output
+        assert "PREDICTION_COLLECTOR_TERMINAL_BEFORE_READINESS=polymarket" in clean_output
+        assert '"state_present":false' in clean_output
+        clean_log = clean_log_path.read_text(encoding="utf-8")
+        clean_enable = f"sudo|systemctl enable --now {clean_services['polymarket']}"
+        assert clean_enable in clean_log
+        assert "sleep|0.5" not in clean_log.split(clean_enable, 1)[1]
+        assert f"sudo|systemctl enable --now {clean_services['kalshi']}" not in clean_log
+    finally:
+        server.shutdown()
+        server.server_close()
         thread.join(timeout=5)
 
 
@@ -1432,12 +1846,18 @@ def test_internal_install_refuses_bootstrap_readiness_and_stale_negatives_withou
         dashboard = str(services["dashboard"])
         assert f"sudo|systemctl enable --now {dashboard}" in log
         if failure_mode == "prepared-stale":
-            for venue in ("polymarket", "kalshi"):
-                service = str(services[venue])
-                assert f"sudo|systemctl enable --now {service}" in log
+            assert f"sudo|systemctl enable --now {services['polymarket']}" in log
+            assert f"sudo|systemctl enable --now {services['kalshi']}" not in log
+            suffix = str(handoff["run_slug"]).removeprefix("pm-")
+            cleanup_services = [
+                *services.values(),
+                f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service",
+                f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
+            ]
+            for service in cleanup_services:
                 assert f"sudo|systemctl stop {service}" in log
                 assert f"sudo|systemctl disable {service}" in log
-            assert "PREDICTION_INSTALL_ACTIVATION_PARTIAL_OR_ALERT" in output
+            assert "collector readiness failed before authenticated state: polymarket" in output
         else:
             for venue in ("polymarket", "kalshi"):
                 assert f"sudo|systemctl enable --now {services[venue]}" not in log
@@ -1739,7 +2159,7 @@ def test_internal_rollback_runs_real_script_and_preserves_campaign_bytes(
         "sudo",
         """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
 [[ ${1:-} == systemctl ]] || exit 98
-if [[ ${2:-} == show ]]; then printf 'inactive\n'; fi
+if [[ ${2:-} == show ]]; then printf '%s\n' "${HYPERLAB_ROLLBACK_ACTIVE_STATE:-inactive}"; fi
 if [[ ${2:-} == is-enabled ]]; then printf 'disabled\n'; fi
 """,
     )
@@ -1799,11 +2219,32 @@ set -Eeuo pipefail
     )
     assert {path: path.read_bytes() for path in evidence} == before
     systemd_log = log.read_text(encoding="utf-8")
-    for service in services.values():
+    rollback_services = [
+        *services.values(),
+        f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service",
+        f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
+    ]
+    for service in rollback_services:
         assert f"sudo|systemctl stop {service}" in systemd_log
         assert f"sudo|systemctl disable {service}" in systemd_log
+        assert (
+            f"sudo|systemctl show {service} --property=ActiveState --value --no-pager"
+            in systemd_log
+        )
+        assert f"sudo|systemctl is-enabled {service}" in systemd_log
     assert "hyperlab-h1" not in systemd_log
     assert "rm " not in systemd_log
+
+    environment["HYPERLAB_ROLLBACK_ACTIVE_STATE"] = "deactivating"
+    refused = _run_git_bash_script(
+        harness,
+        cwd=non_git_cwd,
+        environment=environment,
+    )
+    assert refused.returncode == 4
+    assert "PREDICTION_ROLLBACK_SERVICE_NOT_DISARMED=" in refused.stderr
+    assert "PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED" not in refused.stdout
+    assert {path: path.read_bytes() for path in evidence} == before
 
 
 def test_internal_recovery_runs_real_control_flow_and_isolates_start_failure(
@@ -1847,6 +2288,7 @@ def test_internal_recovery_runs_real_control_flow_and_isolates_start_failure(
         slug: str,
         *,
         fail_polymarket: bool,
+        clean_exit_polymarket: bool = False,
         retry_after_partial: bool = False,
         monitor_mode: str | None = None,
     ):
@@ -1911,6 +2353,11 @@ exit "${PIPESTATUS[0]}"
             failed_service=(
                 str(services["polymarket"])
                 if fail_polymarket
+                else None
+            ),
+            clean_exit_service=(
+                str(services["polymarket"])
+                if clean_exit_polymarket
                 else None
             ),
             monitor_failure=monitor_mode,
@@ -2078,6 +2525,20 @@ exit "${PIPESTATUS[0]}"
         )
         assert f"sudo|systemctl stop {fragment_services['polymarket']}" in fragment_log
         assert f"sudo|systemctl disable {fragment_services['polymarket']}" in fragment_log
+
+        clean_exit, _, clean_exit_log, clean_exit_services = run_case(
+            "collector-clean-exit-before-state",
+            "pm-20260827t235957z-0c1ea000",
+            fail_polymarket=False,
+            clean_exit_polymarket=True,
+        )
+        assert clean_exit.returncode == 4
+        assert "PREDICTION_RECOVERY_SERVICE_TERMINAL=polymarket:" in clean_exit.stderr
+        assert "ActiveState=inactive SubState=dead" in clean_exit.stderr
+        assert "ExecMainStatus=0 MainPID=0" in clean_exit.stderr
+        assert "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY" in clean_exit.stderr
+        assert f"sudo|systemctl stop {clean_exit_services['polymarket']}" in clean_exit_log
+        assert "sleep|0.5" not in clean_exit_log
 
         final_failure, _, final_failure_log, final_failure_services = run_case(
             "final-operational-failure",
@@ -2871,7 +3332,8 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slug = "pm-20260827t235959z-feedface"
-    incoming_parent = tmp_path / "home" / "incoming"
+    home_mount = tmp_path / "home"
+    incoming_parent = home_mount / "incoming"
     volume_base = tmp_path / "volume" / "hyperlab-prediction-markets"
     volume_mount = tmp_path / "volume"
     incoming = incoming_parent / slug
@@ -2896,8 +3358,12 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         venue: f"hyperlab-pm-{slug.removeprefix('pm-')}-{venue}.service"
         for venue in ("polymarket", "kalshi", "dashboard")
     }
+    namespace_probes = {
+        venue: f"hyperlab-pm-{slug.removeprefix('pm-')}-{venue}-namespace-probe.service"
+        for venue in ("polymarket", "kalshi")
+    }
     unit_items: list[dict[str, object]] = []
-    for service in services.values():
+    for service in [*services.values(), *namespace_probes.values()]:
         path = incoming / "systemd" / service
         path.write_text(
             "[Unit]\nDescription=SYNTHETIC/FIXTURE admission unit\n",
@@ -2954,7 +3420,17 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     )
     host = {
         "boundary": preflight.BOUNDARY,
-        "checks": {"filesystem": {"source": "/dev/sdb"}},
+        "checks": {
+            "filesystem": {
+                "device_major_minor": "8:16",
+                "filesystem": "ext4",
+                "filesystem_root": "/",
+                "mount": volume_mount.as_posix(),
+                "options": ["rw", "relatime", "discard"],
+                "source": "/dev/sdb",
+                "stat_device_major_minor": "8:16",
+            }
+        },
         "eligible_venues": ["polymarket", "kalshi"],
         "errors": [],
         "host_admitted": True,
@@ -2983,6 +3459,7 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     fsync_path = incoming / "filesystem-fsync-report.json"
     fsync_path.write_bytes(preflight.canonical_json_bytes(fsync) + b"\n")
     monkeypatch.setattr(preflight, "_INCOMING_PARENT", PurePosixPath(incoming_parent.as_posix()))
+    monkeypatch.setattr(preflight, "_HOME_MOUNT", PurePosixPath(home_mount.as_posix()))
     monkeypatch.setattr(preflight, "_VOLUME_BASE", PurePosixPath(volume_base.as_posix()))
     with pytest.raises(preflight.PreflightError, match="install handoff path"):
         preflight.validate_install_layout(
@@ -3004,9 +3481,24 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
             "resume_admissible": True,
         },
     )
-    available = 196_391_251_968
+    incoming_device = "254:0"
+    monkeypatch.setattr(
+        preflight,
+        "_stat_device_major_minor",
+        lambda path: incoming_device if path == incoming else "8:16",
+    )
+    available = 195_484_491_776
     ntp = "yes"
     filesystem_source = "/dev/sdb"
+    filesystem_device = "8:16"
+    namespace_fstype = "ext4"
+    readonly_mode = "ro"
+    venue_mode = "rw"
+    source_mount_target_override: Path | None = None
+    incoming_mount_target_override: Path | None = None
+    readonly_fsroot_override: str | None = None
+    venue_fsroot_override: str | None = None
+    volume_mode = "rw"
     source_identity_green = True
 
     def live_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
@@ -3030,9 +3522,46 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         if arguments[0] == "timedatectl":
             return preflight.CommandResult(0, ntp, "")
         if arguments[0] == "findmnt":
+            target = Path(str(arguments[arguments.index("-T") + 1]))
+            if target == volume_mount:
+                return preflight.CommandResult(
+                    0,
+                    f"{target.as_posix()} {filesystem_source} ext4 {volume_mode},relatime,discard {filesystem_device} /",
+                    "",
+                )
+            if target == incoming:
+                incoming_target = incoming_mount_target_override or home_mount
+                incoming_fsroot = (
+                    "/home"
+                    if incoming_target == home_mount
+                    else "/home/incoming"
+                )
+                return preflight.CommandResult(
+                    0,
+                    f"{incoming_target.as_posix()} /dev/root[{incoming_fsroot}] ext4 ro,relatime {incoming_device} {incoming_fsroot}",
+                    "",
+                )
+            relative = target.relative_to(volume_mount).as_posix()
+            is_venue = target in {campaign_root / "polymarket", campaign_root / "kalshi"}
+            mode = venue_mode if is_venue else readonly_mode
+            mount_target = (
+                target
+                if is_venue
+                else (
+                    source_mount_target_override
+                    if target == source_root and source_mount_target_override is not None
+                    else volume_mount
+                )
+            )
+            if is_venue:
+                fsroot_value = venue_fsroot_override or f"/{relative}"
+            else:
+                mount_relative = mount_target.relative_to(volume_mount).as_posix()
+                derived_fsroot = "/" if mount_relative == "." else f"/{mount_relative}"
+                fsroot_value = readonly_fsroot_override or derived_fsroot
             return preflight.CommandResult(
                 0,
-                f"{volume_mount.as_posix()} {filesystem_source} ext4 rw,relatime,discard",
+                f"{mount_target.as_posix()} {filesystem_source} {namespace_fstype} {mode},relatime {filesystem_device} {fsroot_value}",
                 "",
             )
         if arguments[0] == "df":
@@ -3056,7 +3585,7 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         fsync_path,
         run=live_command,
     )
-    assert green["install_admissible"] is True
+    assert green["install_admissible"] is True, green
     assert green["terminal_signal"] == "PREDICTION_INSTALL_ADMISSION_GREEN"
     live = green["evidence"]["live"]  # type: ignore[index]
     assert live["capacity"] == {  # type: ignore[index]
@@ -3064,13 +3593,15 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         "available_bytes": available,
         "required_free_bytes": 194_347_270_144,
     }
-    assert available - 194_347_270_144 == 2_043_981_824
+    assert available - 194_347_270_144 == 1_137_221_632
     asserted_hashes = green["evidence"]["unit_sha256"]  # type: ignore[index]
-    assert set(asserted_hashes) == set(services.values())
+    assert set(asserted_hashes) == {*services.values(), *namespace_probes.values()}
     install_admission_path = (
         volume_base / "campaigns" / slug / "state" / "install-admission-report.json"
     )
     install_admission_path.parent.mkdir(parents=True)
+    (campaign_root / "polymarket").mkdir()
+    (campaign_root / "kalshi").mkdir()
     install_admission_path.write_bytes(preflight.canonical_json_bytes(green) + b"\n")
     green_guard = preflight.collector_activation_guard(
         handoff_path,
@@ -3078,20 +3609,129 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         run=live_command,
     )
     assert green_guard["activation_admissible"] is True
+    volume_mode = "ro"
+    old_parent_rw_predicate = "rw" in {volume_mode, "relatime"} and "ro" not in {
+        volume_mode,
+        "relatime",
+    }
+    assert old_parent_rw_predicate is False
     startup_green = preflight.runner_startup_admission(
         handoff_path,
         install_admission_path,
+        venue="polymarket",
         run=live_command,
     )
     assert startup_green["startup_admissible"] is True
     assert startup_green["checks"]["capacity"] == {  # type: ignore[index]
         "deferred_to_ledger_accounted_runner_gate": True
     }
+    assert startup_green["checks"]["namespace"]["parent_mount"]["options"][0] == "ro"  # type: ignore[index]
+    assert "rw" not in startup_green["checks"]["namespace"]["parent_mount"]["options"]  # type: ignore[index]
+    assert startup_green["checks"]["namespace"]["volume_base_readonly"]["mount"] == volume_mount.as_posix()  # type: ignore[index]
+    assert startup_green["checks"]["namespace"]["incoming_readonly"]["mount"] == home_mount.as_posix()  # type: ignore[index]
+    assert {
+        row["mount"]
+        for row in startup_green["checks"]["namespace"]["readonly_roots"].values()  # type: ignore[index,union-attr]
+    } == {volume_mount.as_posix()}
+    source_mount_target_override = volume_base / "sources"
+    refused_unlisted_source_mount = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_unlisted_source_mount["namespace_admissible"] is False
+    assert "mount target is not allowlisted" in " ".join(  # type: ignore[arg-type]
+        refused_unlisted_source_mount["errors"]
+    )
+    source_mount_target_override = None
+    incoming_mount_target_override = incoming.parent
+    refused_unlisted_incoming_mount = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_unlisted_incoming_mount["namespace_admissible"] is False
+    assert "mount target is not allowlisted" in " ".join(  # type: ignore[arg-type]
+        refused_unlisted_incoming_mount["errors"]
+    )
+    incoming_mount_target_override = None
+    volume_mode = "rw"
+    namespace_parent_rw_refused = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert namespace_parent_rw_refused["namespace_admissible"] is False
+    assert "volume parent is not mounted ro" in " ".join(  # type: ignore[arg-type]
+        namespace_parent_rw_refused["errors"]
+    )
+    volume_mode = "ro"
+    namespace_fstype = "xfs"
+    refused_fstype = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_fstype["namespace_admissible"] is False
+    assert "filesystem type diverged" in " ".join(refused_fstype["errors"])  # type: ignore[arg-type]
+    namespace_fstype = "ext4"
+    venue_mode = "ro"
+    refused_readonly = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_readonly["namespace_admissible"] is False
+    assert "venue root is not mounted rw" in " ".join(  # type: ignore[arg-type]
+        refused_readonly["errors"]
+    )
+    venue_mode = "rw"
+    venue_fsroot_override = "/other/same-device-bind"
+    refused_bind = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_bind["namespace_admissible"] is False
+    assert "root/bind identity diverged" in " ".join(refused_bind["errors"])  # type: ignore[arg-type]
+    venue_fsroot_override = None
+    readonly_fsroot_override = "/other/same-device-bind"
+    refused_readonly_bind = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+    )
+    assert refused_readonly_bind["namespace_admissible"] is False
+    assert "root/bind identity diverged" in " ".join(  # type: ignore[arg-type]
+        refused_readonly_bind["errors"]
+    )
+    readonly_fsroot_override = None
+
+    def fsync_refused(_root: Path) -> dict[str, object]:
+        raise preflight.PreflightError("SYNTHETIC/FIXTURE fsync impossible")
+
+    refused_fsync = preflight.runner_namespace_admission(
+        handoff_path,
+        install_admission_path,
+        venue="polymarket",
+        run=live_command,
+        write_probe=fsync_refused,
+    )
+    assert refused_fsync["namespace_admissible"] is False
+    assert "fsync impossible" in " ".join(refused_fsync["errors"])  # type: ignore[arg-type]
 
     ntp = "no"
     startup_ntp_refused = preflight.runner_startup_admission(
         handoff_path,
         install_admission_path,
+        venue="polymarket",
         run=live_command,
     )
     assert startup_ntp_refused["startup_admissible"] is False
@@ -3104,6 +3744,7 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     startup_source_refused = preflight.runner_startup_admission(
         handoff_path,
         install_admission_path,
+        venue="polymarket",
         run=live_command,
     )
     assert startup_source_refused["startup_admissible"] is False
@@ -3183,14 +3824,17 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         )
     host_path.write_bytes(host_raw)
 
+    volume_mode = "rw"
     filesystem_source = "/dev/sdc"
+    filesystem_device = "8:17"
     startup_device_refused = preflight.runner_startup_admission(
         handoff_path,
         install_admission_path,
+        venue="polymarket",
         run=live_command,
     )
     assert startup_device_refused["startup_admissible"] is False
-    assert "filesystem device" in " ".join(  # type: ignore[arg-type]
+    assert "device identities diverged" in " ".join(  # type: ignore[arg-type]
         startup_device_refused["errors"]
     )
     refused_device = preflight.collector_activation_guard(
@@ -3199,10 +3843,11 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         run=live_command,
     )
     assert refused_device["activation_admissible"] is False
-    assert "filesystem device diverged" in " ".join(  # type: ignore[arg-type]
+    assert "device identities diverged" in " ".join(  # type: ignore[arg-type]
         refused_device["errors"]
     )
     filesystem_source = "/dev/sdb"
+    filesystem_device = "8:16"
 
     mutated = incoming / "systemd" / services["polymarket"]
     mutated.write_text("SYNTHETIC/FIXTURE unit mutated after inventory\n", encoding="utf-8")
@@ -3284,6 +3929,7 @@ def test_host_preflight_synchronously_proves_ntp_capacity_port_services_and_isol
     monkeypatch.setenv("USER", "hyperlab")
     monkeypatch.setattr(preflight.Path, "home", classmethod(lambda _cls: Path("/home/hyperlab")))
     monkeypatch.setattr(preflight, "_required_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:16")
     result = preflight.host_preflight(
         handoff,
         run=_green_command,
@@ -3310,7 +3956,7 @@ def test_host_preflight_synchronously_proves_ntp_capacity_port_services_and_isol
         "host": "127.0.0.1",
         "port": 18081,
     }
-    assert len(result["checks"]["services"]) == 3  # type: ignore[index]
+    assert len(result["checks"]["services"]) == 5  # type: ignore[index]
 
 
 def test_host_preflight_refuses_dangling_attempt_root_symlink(
@@ -3339,6 +3985,7 @@ def test_host_preflight_refuses_dangling_attempt_root_symlink(
         classmethod(lambda _cls: Path("/home/hyperlab")),
     )
     monkeypatch.setattr(preflight, "_required_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:16")
     result = preflight.host_preflight(
         handoff_path,
         run=_green_command,
@@ -3387,6 +4034,7 @@ def test_host_and_fsync_preflights_refuse_dangling_parent_symlink(
         classmethod(lambda _cls: Path("/home/hyperlab")),
     )
     monkeypatch.setattr(preflight, "_required_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:16")
     result = preflight.host_preflight(
         handoff_path,
         run=_green_command,
@@ -3414,6 +4062,7 @@ def test_host_preflight_refuses_ntp_capacity_or_service_collision(
     monkeypatch.setenv("USER", "hyperlab")
     monkeypatch.setattr(preflight.Path, "home", classmethod(lambda _cls: Path("/home/hyperlab")))
     monkeypatch.setattr(preflight, "_required_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:16")
 
     def run(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
         if failure == "ntp" and arguments[0] == "timedatectl":
@@ -3512,6 +4161,198 @@ def test_filesystem_probe_fsyncs_and_removes_only_its_exclusive_file(
     assert result["probe_removed"] is True
     assert result["parent_roots"] == [str(root) for root in roots]
     assert set(base.iterdir()) == {base / "sources", base / "campaigns"}
+
+
+def test_runner_write_surface_probe_is_exclusive_bounded_and_cleans_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venue = tmp_path / "polymarket"
+    venue.mkdir()
+    sentinel = venue / "SYNTHETIC_FIXTURE_RAW_PRESERVED.bin"
+    sentinel.write_bytes(b"SYNTHETIC/FIXTURE raw sentinel\n")
+    before = sentinel.read_bytes()
+    result = preflight._durable_write_surface_probe(venue)
+    assert result["exclusive_create"] is True
+    assert result["file_fsync"] is True
+    assert result["probe_removed"] is True
+    assert sentinel.read_bytes() == before
+    assert not list(venue.glob(".prediction-write-surface-probe-*"))
+
+    real_fsync = preflight.os.fsync
+    calls = 0
+
+    def refused_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("SYNTHETIC/FIXTURE file fsync refused")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(preflight.os, "fsync", refused_fsync)
+    with pytest.raises(preflight.PreflightError, match="durable probe failed"):
+        preflight._durable_write_surface_probe(venue)
+    assert sentinel.read_bytes() == before
+    assert not list(venue.glob(".prediction-write-surface-probe-*"))
+
+
+def test_runner_write_surface_probe_posix_fsyncs_directory_before_and_after_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venue = tmp_path / "polymarket"
+    venue.mkdir()
+    model_file = tmp_path / "SYNTHETIC_FIXTURE_REGULAR_FILE"
+    model_file.write_bytes(b"SYNTHETIC/FIXTURE\n")
+    root_stat = venue.lstat()
+    file_stat = model_file.lstat()
+    events: list[str] = []
+    directory_descriptor = 700
+    file_descriptor = 701
+    real_stat = preflight.os.stat
+
+    class ProbeHandle:
+        def __enter__(self) -> ProbeHandle:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("close-file")
+
+        def fileno(self) -> int:
+            return file_descriptor
+
+        def flush(self) -> None:
+            events.append("flush-file")
+
+        def write(self, value: bytes) -> int:
+            assert value == b"PREDICTION_MARKETS_WRITE_SURFACE_PROBE_V1\n"
+            events.append("write-file")
+            return len(value)
+
+    def fake_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del mode
+        if path == venue:
+            assert dir_fd is None
+            events.append("open-directory")
+            return directory_descriptor
+        assert isinstance(path, str)
+        assert path.startswith(".prediction-write-surface-probe-")
+        assert dir_fd == directory_descriptor
+        assert flags & os.O_EXCL
+        events.append("open-file-exclusive")
+        return file_descriptor
+
+    def fake_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == directory_descriptor:
+            return root_stat
+        assert descriptor == file_descriptor
+        return file_stat
+
+    def fake_stat(
+        path: object,
+        *args: object,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+        **kwargs: object,
+    ) -> os.stat_result:
+        if dir_fd == directory_descriptor:
+            assert isinstance(path, str)
+            assert path.startswith(".prediction-write-surface-probe-")
+            assert follow_symlinks is False
+            events.append("authenticate-file-before-unlink")
+            return file_stat
+        return real_stat(
+            path,  # type: ignore[arg-type]
+            *args,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+            **kwargs,
+        )
+
+    def fake_fsync(descriptor: int) -> None:
+        if descriptor == file_descriptor:
+            events.append("fsync-file")
+            return
+        assert descriptor == directory_descriptor
+        events.append("fsync-directory")
+
+    def fake_unlink(path: object, *, dir_fd: int | None = None) -> None:
+        assert isinstance(path, str)
+        assert path.startswith(".prediction-write-surface-probe-")
+        assert dir_fd == directory_descriptor
+        events.append("unlink-file")
+
+    monkeypatch.setattr(preflight.os, "name", "posix")
+    monkeypatch.setattr(preflight.os, "open", fake_open)
+    monkeypatch.setattr(preflight.os, "fstat", fake_fstat)
+    monkeypatch.setattr(preflight.os, "stat", fake_stat)
+    monkeypatch.setattr(preflight.os, "fdopen", lambda *_args, **_kwargs: ProbeHandle())
+    monkeypatch.setattr(preflight.os, "fsync", fake_fsync)
+    monkeypatch.setattr(preflight.os, "unlink", fake_unlink)
+    monkeypatch.setattr(
+        preflight.os,
+        "close",
+        lambda descriptor: events.append(f"close-descriptor-{descriptor}"),
+    )
+
+    result = preflight._durable_write_surface_probe(venue)
+    assert result["directory_fsync"] is True
+    assert events == [
+        "open-directory",
+        "open-file-exclusive",
+        "write-file",
+        "flush-file",
+        "fsync-file",
+        "close-file",
+        "fsync-directory",
+        "authenticate-file-before-unlink",
+        "unlink-file",
+        "fsync-directory",
+        "close-descriptor-700",
+    ]
+
+
+def test_runner_namespace_directory_refuses_symlink_or_non_directory(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "SYNTHETIC_FIXTURE_NOT_A_DIRECTORY"
+    file_path.write_text("SYNTHETIC/FIXTURE\n", encoding="utf-8")
+    with pytest.raises(preflight.PreflightError, match="non-directory"):
+        preflight._canonical_directory(file_path, label="runner venue root")
+    real = tmp_path / "real-venue"
+    real.mkdir()
+    linked = tmp_path / "linked-venue"
+    try:
+        linked.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+    with pytest.raises(preflight.PreflightError, match="symlinked"):
+        preflight._canonical_directory(linked, label="runner venue root")
+
+
+def test_runner_write_surface_probe_never_removes_preexisting_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venue = tmp_path / "kalshi"
+    venue.mkdir()
+
+    class FixedUuid:
+        hex = "syntheticcollision"
+
+    monkeypatch.setattr(preflight, "uuid4", lambda: FixedUuid())
+    collision = venue / ".prediction-write-surface-probe-syntheticcollision"
+    collision.write_bytes(b"SYNTHETIC/FIXTURE preexisting evidence\n")
+    before = collision.read_bytes()
+    with pytest.raises(preflight.PreflightError, match="durable probe failed"):
+        preflight._durable_write_surface_probe(venue)
+    assert collision.read_bytes() == before
 
 
 def test_network_recovery_preflight_returns_nonzero_for_only_the_failed_venue(

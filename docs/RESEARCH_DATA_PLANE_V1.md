@@ -99,6 +99,21 @@ Incentives use a separate ledger. `hypothetical_reward` is research-only,
 `realizable_reward` stays unpresumed, and primary economics always uses
 `reward=0`.
 
+The versioned event/market/outcome graph, raw-derived fee/tick/lifecycle
+timelines, immutable multi-shard bundle, sealed Ghost replay and bounded access
+evidence for both prediction venues are specified in
+`docs/PREDICTION_MARKETS_CANDIDATE_V1.md`. The current Windows probes ended
+`PUBLIC_SOURCE_UNAVAILABLE` before any frame and are not promoted into access,
+alpha, capacity or economic evidence.
+
+For a future bound campaign, every train/validation slot is hash-classified as
+replayable raw, nonreplayable positive raw, explicit terminal exclusion, or
+missing. Positive raw from a fail-closed terminal is retained immutably but is
+excluded from economic projection. `schedule_accounted` is an operational
+ledger property; only `economic_corpus_complete`, with no missing/excluded/
+nonreplayable slot, can satisfy the later corpus gate. The sealed holdout is not
+opened by this accounting.
+
 ### Lighter
 
 The V1 adapter permits only `GET /api/v1/orderBooks` plus the credential-free
@@ -184,10 +199,13 @@ Terminal files:
 
 Exit codes:
 
-- `0`: `COMPLETE` or bounded `MAX_BYTES_REACHED`;
+- `0`: `COMPLETE` or a planned bound (`MAX_BYTES_REACHED`,
+  `MAX_DURATION_REACHED`, `MAX_FRAMES_REACHED`, `MAX_NETWORK_CALLS_REACHED`,
+  `MAX_SEGMENTS_REACHED`);
 - `3`: `PUBLIC_SOURCE_UNAVAILABLE`;
 - `4`: `PUBLIC_SOURCE_INVALID` (payload public incompatible avec le contrat fail-closed);
-- `5`: `BACKPRESSURE_LIMIT_REACHED` (gap visible, jamais masqué);
+- `5`: `BACKPRESSURE_LIMIT_REACHED`, `CONTINUITY_BROKEN_FROZEN` ou
+  `CONTINUITY_UNKNOWN_AFTER_RECONNECT_FROZEN` (jamais masqué comme succès);
 - `130`: `INTERRUPTED_RECOVERABLE`;
 - Typer validation errors use the standard configuration-error exit.
 

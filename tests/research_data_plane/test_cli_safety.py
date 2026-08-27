@@ -71,6 +71,7 @@ def test_research_data_cli_announces_safety_and_emits_terminal_json(
             source_timestamp_max_ns=1,
             manifest_sha256="a" * 64,
             root_sha256="b" * 64,
+            network_calls=1,
             limitations=(),
             error=None,
         )
@@ -128,6 +129,7 @@ def test_research_data_cli_uses_documented_public_unavailable_exit_code(
             source_timestamp_max_ns=None,
             manifest_sha256=None,
             root_sha256=None,
+            network_calls=1,
             limitations=(),
             error="ConnectionError:SYNTHETIC/FIXTURE source unavailable",
         )

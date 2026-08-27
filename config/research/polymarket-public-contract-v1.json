@@ -1,0 +1,262 @@
+{
+  "accessibility": {
+    "classification": "UNKNOWN_NOT_OBSERVED",
+    "value": "A bounded direct probe is required; documentation alone is not access evidence."
+  },
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "capture_date": "2026-08-27",
+  "classification_vocabulary": [
+    "DOCUMENTED",
+    "OBSERVED_PUBLICLY",
+    "INFERRED",
+    "UNKNOWN_NOT_OBSERVED"
+  ],
+  "contract_id": "polymarket-official-public-contract-v1",
+  "endpoints": [
+    {
+      "classification": "DOCUMENTED",
+      "id": "gamma-markets-keyset",
+      "method": "GET",
+      "pagination": {
+        "cursor_request": "after_cursor",
+        "cursor_response": "next_cursor",
+        "limit_max": 100,
+        "offset_forbidden": true
+      },
+      "url": "https://gamma-api.polymarket.com/markets/keyset"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "gamma-events-keyset",
+      "method": "GET",
+      "pagination": {
+        "cursor_request": "after_cursor",
+        "cursor_response": "next_cursor",
+        "limit_max": 500,
+        "offset_forbidden": true
+      },
+      "url": "https://gamma-api.polymarket.com/events/keyset"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "gamma-market",
+      "method": "GET",
+      "url_template": "https://gamma-api.polymarket.com/markets/{market_id}"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "gamma-event",
+      "method": "GET",
+      "url_template": "https://gamma-api.polymarket.com/events/{event_id}"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-market-by-token",
+      "method": "GET",
+      "url_template": "https://clob.polymarket.com/markets-by-token/{token_id}"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-market-info",
+      "method": "GET",
+      "url_template": "https://clob.polymarket.com/clob-markets/{condition_id}"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-order-book",
+      "method": "GET",
+      "query": ["token_id"],
+      "url": "https://clob.polymarket.com/book"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-last-trade-price",
+      "method": "GET",
+      "query": ["token_id"],
+      "sentinel": {
+        "meaning": "NO_TRADE_OBSERVED",
+        "price": "0.5",
+        "side": ""
+      },
+      "url": "https://clob.polymarket.com/last-trade-price"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-tick-size",
+      "method": "GET",
+      "query": ["token_id"],
+      "url": "https://clob.polymarket.com/tick-size"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "clob-fee-rate",
+      "method": "GET",
+      "query": ["token_id"],
+      "url": "https://clob.polymarket.com/fee-rate"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "data-trades",
+      "method": "GET",
+      "pagination": {
+        "limit_max": 10000,
+        "offset_max": 10000,
+        "time_window_fields": ["start", "end"],
+        "time_window_unit": "UNIX_SECONDS"
+      },
+      "query": ["market", "eventId", "limit", "offset", "start", "end", "takerOnly"],
+      "url": "https://data-api.polymarket.com/trades"
+    },
+    {
+      "classification": "DOCUMENTED",
+      "id": "market-websocket",
+      "method": "WSS",
+      "subscription_fields": [
+        "assets_ids",
+        "custom_feature_enabled",
+        "initial_dump",
+        "type"
+      ],
+      "url": "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    }
+  ],
+  "fees": {
+    "classification": "DOCUMENTED",
+    "exactness_gate": [
+      "point_in_time_fee_schedule_present",
+      "rate_present",
+      "exponent_present",
+      "taker_only_present",
+      "rounding_contract_unambiguous",
+      "gamma_and_clob_schedule_consistent"
+    ],
+    "formula_displayed": "contracts * fee_rate * price * (1-price)",
+    "maker_charged": false,
+    "minimum_fee_pusd": "0.00001",
+    "primary_when_gate_missing": "UNKNOWN_FAIL_CLOSED",
+    "rounding_displayed_decimals": 5,
+    "schedule_source_fields": [
+      "Gamma.market.feeSchedule.rate",
+      "Gamma.market.feeSchedule.exponent",
+      "Gamma.market.feeSchedule.takerOnly",
+      "Gamma.market.feeSchedule.rebateRate",
+      "CLOB.market.fd.r",
+      "CLOB.market.fd.e",
+      "CLOB.market.fd.to"
+    ]
+  },
+  "identity_graph": {
+    "classification": "DOCUMENTED",
+    "edges": [
+      "event.id -> event.markets[].id",
+      "market.id -> market.conditionId",
+      "market.conditionId -> CLOB market.condition_id",
+      "market.clobTokenIds[index] -> market.outcomes[index]",
+      "market.questionID -> resolution question"
+    ],
+    "index_contract": {
+      "clobTokenIds[0]": "YES",
+      "clobTokenIds[1]": "NO",
+      "outcomes_and_tokens_same_length_required": true
+    },
+    "required_market_fields": [
+      "id",
+      "conditionId",
+      "questionID",
+      "outcomes",
+      "clobTokenIds",
+      "rules",
+      "closed"
+    ],
+    "silent_change_policy": "REFUSE_AND_VERSION_NEW_RULE_GRAPH"
+  },
+  "lifecycle": {
+    "classification": "DOCUMENTED",
+    "closed_semantics": "CLOSED_OR_RESOLVED_NOT_SETTLEMENT_PROOF",
+    "states": [
+      "TRADING",
+      "CLOSED_UNRESOLVED",
+      "PROPOSED_UNKNOWN",
+      "DISPUTED_UNKNOWN",
+      "RESOLVED_BINARY",
+      "RESOLVED_50_50",
+      "SETTLED"
+    ]
+  },
+  "negative_risk": {
+    "classification": "DOCUMENTED",
+    "admission": "EXPLICIT_EVENT_COMPLETE_SET_AND_ENABLE_NEG_RISK_REQUIRED",
+    "augmented_admission": "enableNegRisk=true AND negRiskAugmented=true",
+    "title_similarity_is_relationship_evidence": false
+  },
+  "observed_publicly": [],
+  "prices_and_precision": {
+    "classification": "DOCUMENTED",
+    "executable_source": "FINITE_BID_ASK_DEPTH_ONLY",
+    "price_max": "1",
+    "price_min": "0",
+    "ticks_documented": ["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"]
+  },
+  "rate_limits": {
+    "classification": "DOCUMENTED",
+    "cloudflare_behavior": "SLIDING_WINDOW_MAY_THROTTLE_OR_QUEUE",
+    "requests_per_10_seconds": {
+      "clob": 9000,
+      "clob_book": 1500,
+      "clob_books": 500,
+      "data": 1000,
+      "data_trades": 200,
+      "gamma": 4000,
+      "gamma_events": 500,
+      "gamma_markets": 300,
+      "global": 15000
+    },
+    "websocket_connection_limit": "UNKNOWN_NOT_OBSERVED"
+  },
+  "resolution": {
+    "classification": "DOCUMENTED",
+    "challenge_window_typical_hours": 2,
+    "dispute_path": "UMA_OPTIMISTIC_ORACLE_THEN_DVM",
+    "fifty_fifty_payout_per_token": "0.5",
+    "losing_payout_per_token": "0",
+    "winning_payout_per_token": "1"
+  },
+  "schema_version": 1,
+  "sources": [
+    "https://docs.polymarket.com/getting-started/api",
+    "https://docs.polymarket.com/api-reference/markets/list-markets-keyset-pagination",
+    "https://docs.polymarket.com/api-reference/events/list-events-keyset-pagination",
+    "https://docs.polymarket.com/concepts/markets-events",
+    "https://docs.polymarket.com/market-data/market-details",
+    "https://docs.polymarket.com/api-reference/markets/get-market-by-token",
+    "https://docs.polymarket.com/api-reference/markets/get-clob-market-info",
+    "https://docs.polymarket.com/api-reference/market-data/get-order-book",
+    "https://docs.polymarket.com/api-reference/market-data/get-last-trade-price",
+    "https://docs.polymarket.com/api-reference/market-data/get-tick-size",
+    "https://docs.polymarket.com/api-reference/market-data/get-fee-rate",
+    "https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets",
+    "https://docs.polymarket.com/api-reference/wss/market",
+    "https://docs.polymarket.com/asyncapi.json",
+    "https://docs.polymarket.com/trading/fees",
+    "https://docs.polymarket.com/concepts/resolution",
+    "https://docs.polymarket.com/concepts/negative-risk",
+    "https://docs.polymarket.com/api-reference/rate-limits"
+  ],
+  "timestamps": {
+    "classification": "DOCUMENTED",
+    "gamma": "RFC3339_FIELDS_WITH_FIELD_SPECIFIC_SEMANTICS",
+    "rest_book": "STRING_UNIT_UNKNOWN_NOT_OBSERVED",
+    "trades_filter": "UNIX_SECONDS",
+    "trades_record": "INT64_UNIT_UNKNOWN_NOT_OBSERVED",
+    "websocket_book_price_change_last_trade": "UNIX_MILLISECONDS",
+    "websocket_other": "STRING_UNIT_UNKNOWN_NOT_OBSERVED"
+  },
+  "unknowns": [
+    "complete public UMA proposal/dispute/clarification history",
+    "documented websocket subscription and connection cap",
+    "exact fee exponent reconciliation when exponent != 1",
+    "generic void/cancelled payout semantics",
+    "continuity sequence for public websocket"
+  ],
+  "venue": "polymarket"
+}

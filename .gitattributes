@@ -8,3 +8,11 @@ config/paper/hyperliquid-tier0-fee-table-capture-2026-08-16.json text eol=lf
 config/paper/phase08-v9-historical-attestation.json text eol=lf
 reports/phase12-phase05/benchmark.json text eol=lf
 reports/phase12-phase05/technical-evidence.json text eol=lf
+
+# Prediction Markets V1 hashes and canonically decodes these UTF-8/LF artifacts.
+config/research/kalshi-public-contract-v1.json text eol=lf
+config/research/polymarket-public-contract-v1.json text eol=lf
+config/research/prediction-markets-candidate-v1.json text eol=lf
+docs/evidence/prediction-markets-candidate-v1/**/*.json text eol=lf
+ops/prediction_markets_candidate_v1/**/*.json text eol=lf
+ops/prediction_markets_candidate_v1/**/*.sha256 text eol=lf

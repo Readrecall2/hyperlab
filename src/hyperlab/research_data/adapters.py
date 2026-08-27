@@ -1,29 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any, Final, cast
 from urllib.parse import unquote, urlsplit
 
 from .canonical import CanonicalValue, canonical_json_bytes
 from .envelope import CaptureProvenance, PublicDataEnvelope, SessionEnvelopeFactory, Venue
+from .prediction_time import prediction_rfc3339_to_ns
 
 HYPERLIQUID_PUBLIC_HTTP_URL: Final = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_PUBLIC_WEBSOCKET_URL: Final = "wss://api.hyperliquid.xyz/ws"
 POLYMARKET_GAMMA_PUBLIC_URL: Final = "https://gamma-api.polymarket.com"
 POLYMARKET_CLOB_PUBLIC_URL: Final = "https://clob.polymarket.com"
 POLYMARKET_DATA_PUBLIC_URL: Final = "https://data-api.polymarket.com"
-POLYMARKET_PUBLIC_WEBSOCKET_URL: Final = (
-    "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-)
+POLYMARKET_PUBLIC_WEBSOCKET_URL: Final = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 KALSHI_PUBLIC_HTTP_URL: Final = "https://external-api.kalshi.com/trade-api/v2"
 
 HYPERLIQUID_METADATA_VERSION: Final = "hyperliquid-official-public-api-2026-08-26"
-POLYMARKET_METADATA_VERSION: Final = "polymarket-official-public-api-2026-08-26"
-KALSHI_METADATA_VERSION: Final = "kalshi-official-public-rest-2026-08-26"
+POLYMARKET_METADATA_VERSION: Final = "polymarket-official-public-api-2026-08-27"
+KALSHI_METADATA_VERSION: Final = "kalshi-official-public-rest-2026-08-27"
 
 _PRIVATE_PATH_SEGMENTS = {
     "account",
@@ -64,6 +63,49 @@ _LIGHTER_PUBLIC_CHANNEL = re.compile(r"^(?:order_book|ticker|market_stats|trade)
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}$")
 
 
+def _documented_public_get_route(host: str, path: str) -> bool:
+    static_routes = {
+        "clob.polymarket.com": {
+            "/book",
+            "/fee-rate",
+            "/last-trade-price",
+            "/tick-size",
+        },
+        "data-api.polymarket.com": {"/trades"},
+        "external-api.kalshi.com": {
+            "/trade-api/v2/events",
+            "/trade-api/v2/events/fee_changes",
+            "/trade-api/v2/exchange/schedule",
+            "/trade-api/v2/exchange/status",
+            "/trade-api/v2/historical/cutoff",
+            "/trade-api/v2/historical/markets",
+            "/trade-api/v2/historical/trades",
+            "/trade-api/v2/incentive_programs",
+            "/trade-api/v2/markets",
+            "/trade-api/v2/markets/trades",
+            "/trade-api/v2/series",
+            "/trade-api/v2/series/fee_changes",
+        },
+        "gamma-api.polymarket.com": {"/events/keyset", "/markets/keyset"},
+        "mainnet.zklighter.elliot.ai": {_LIGHTER_PUBLIC_HTTP_PATH},
+    }
+    if path in static_routes.get(host, set()):
+        return True
+    dynamic_patterns = {
+        "clob.polymarket.com": (r"/(?:clob-markets|markets-by-token)/[A-Za-z0-9._:@+-]+",),
+        "external-api.kalshi.com": (
+            r"/trade-api/v2/events/[A-Za-z0-9._:@+-]+",
+            r"/trade-api/v2/events/[A-Za-z0-9._:@+-]+/metadata",
+            r"/trade-api/v2/historical/markets/[A-Za-z0-9._:@+-]+",
+            r"/trade-api/v2/markets/[A-Za-z0-9._:@+-]+",
+            r"/trade-api/v2/markets/[A-Za-z0-9._:@+-]+/orderbook",
+            r"/trade-api/v2/series/[A-Za-z0-9._:@+-]+",
+        ),
+        "gamma-api.polymarket.com": (r"/(?:events|markets)/[A-Za-z0-9._:@+-]+",),
+    }
+    return any(re.fullmatch(pattern, path) for pattern in dynamic_patterns.get(host, ()))
+
+
 def _mapping(value: object, *, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be an object")
@@ -78,7 +120,9 @@ def _sequence(value: object, *, label: str) -> Sequence[Any]:
 
 def _json(raw_payload: bytes) -> object:
     try:
-        return json.loads(raw_payload.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        return json.loads(
+            raw_payload.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value))
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("public venue payload is not strict UTF-8 JSON") from error
 
@@ -86,6 +130,12 @@ def _json(raw_payload: bytes) -> object:
 def _path_component(value: str, *, label: str) -> str:
     if _PATH_COMPONENT.fullmatch(value) is None:
         raise ValueError(f"{label} is not a safe public path component")
+    return value
+
+
+def _opaque_query_value(value: str, *, label: str) -> str:
+    if not value or len(value) > 4_096 or any(ord(character) < 32 for character in value):
+        raise ValueError(f"{label} is not a bounded opaque query value")
     return value
 
 
@@ -101,17 +151,7 @@ def _milliseconds_to_ns(value: object | None) -> int | None:
 def _iso_to_ns(value: object | None) -> int | None:
     if value is None or value == "":
         return None
-    text = str(value).replace("Z", "+00:00")
-    timestamp = datetime.fromisoformat(text)
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("source timestamp must be timezone-aware")
-    epoch = datetime(1970, 1, 1, tzinfo=UTC)
-    delta = timestamp.astimezone(UTC) - epoch
-    return (
-        delta.days * 86_400_000_000_000
-        + delta.seconds * 1_000_000_000
-        + delta.microseconds * 1_000
-    )
+    return prediction_rfc3339_to_ns(value, label="source timestamp")
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +175,11 @@ class PublicHttpRequest:
         ):
             raise ValueError("public HTTP request must use HTTPS")
         segments = {part.lower() for part in unquote(parsed.path).split("/") if part}
-        if segments & _PRIVATE_PATH_SEGMENTS:
+        exact_public_exchange_route = parsed.path in {
+            "/trade-api/v2/exchange/schedule",
+            "/trade-api/v2/exchange/status",
+        }
+        if segments & _PRIVATE_PATH_SEGMENTS and not exact_public_exchange_route:
             raise ValueError("private/account/order route is forbidden")
         if self.method == "POST" and self.url != HYPERLIQUID_PUBLIC_HTTP_URL:
             raise ValueError("POST is restricted to the public Hyperliquid info surface")
@@ -146,6 +190,8 @@ class PublicHttpRequest:
             or set(dict(self.query)) - {"filter", "market_id"}
         ):
             raise ValueError("Lighter HTTP is restricted to documented public market metadata")
+        if self.method == "GET" and not _documented_public_get_route(parsed.hostname or "", parsed.path):
+            raise ValueError("GET route is not in the documented public allowlist")
         if self.method == "GET" and self.json_body is not None:
             raise ValueError("GET public requests cannot carry a JSON body")
         if any(type(key) is not str or not key or type(value) is not str for key, value in self.query):
@@ -208,12 +254,24 @@ def canonical_kalshi_market(ticker: str) -> str:
     return f"KALSHI:{cleaned}"
 
 
+def canonical_kalshi_event(ticker: str) -> str:
+    cleaned = ticker.strip().upper()
+    if not cleaned:
+        raise ValueError("Kalshi event ticker cannot be empty")
+    return f"KALSHI_EVENT:{cleaned}"
+
+
+def canonical_kalshi_series(ticker: str) -> str:
+    cleaned = ticker.strip().upper()
+    if not cleaned:
+        raise ValueError("Kalshi series ticker cannot be empty")
+    return f"KALSHI_SERIES:{cleaned}"
+
+
 class HyperliquidPublicAdapter:
     venue = Venue.HYPERLIQUID
     metadata_version = HYPERLIQUID_METADATA_VERSION
-    supported_feeds = frozenset(
-        {"bbo", "l2_book", "trades", "all_mids", "active_asset_context", "metadata"}
-    )
+    supported_feeds = frozenset({"bbo", "l2_book", "trades", "all_mids", "active_asset_context", "metadata"})
     unavailable_public_global_labels = (
         "TWAP_GLOBAL_PUBLIC_SOURCE_UNVERIFIED",
         "LIQUIDATION_GLOBAL_PUBLIC_SOURCE_UNVERIFIED",
@@ -361,9 +419,7 @@ class HyperliquidPublicAdapter:
         return factory.make(
             feed_type=feed_type,
             instrument_id=(
-                "HL:GLOBAL:public"
-                if instrument is None
-                else canonical_hyperliquid_instrument(instrument)
+                "HL:GLOBAL:public" if instrument is None else canonical_hyperliquid_instrument(instrument)
             ),
             market_id=None,
             source_timestamp_ns=None,
@@ -388,27 +444,70 @@ class PolymarketPublicAdapter:
             "tick_size",
             "fees",
             "price_change",
+            "best_bid_ask",
             "tick_size_change",
             "market_lifecycle",
         }
     )
 
-    def market_census_request(self, *, limit: int) -> PublicHttpRequest:
+    def market_census_request(self, *, limit: int, after_cursor: str | None = None) -> PublicHttpRequest:
         if limit <= 0 or limit > 100:
             raise ValueError("Polymarket census limit must be within 1..100")
+        query = [("closed", "false"), ("limit", str(limit))]
+        if after_cursor is not None:
+            query.append(
+                (
+                    "after_cursor",
+                    _opaque_query_value(after_cursor, label="Polymarket market cursor"),
+                )
+            )
         return PublicHttpRequest(
             method="GET",
-            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/markets",
-            query=(("active", "true"), ("closed", "false"), ("limit", str(limit))),
+            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/markets/keyset",
+            query=tuple(query),
         )
 
-    def event_census_request(self, *, limit: int) -> PublicHttpRequest:
-        if limit <= 0 or limit > 100:
-            raise ValueError("Polymarket event census limit must be within 1..100")
+    def event_census_request(self, *, limit: int, after_cursor: str | None = None) -> PublicHttpRequest:
+        if limit <= 0 or limit > 500:
+            raise ValueError("Polymarket event census limit must be within 1..500")
+        query = [("closed", "false"), ("limit", str(limit))]
+        if after_cursor is not None:
+            query.append(
+                (
+                    "after_cursor",
+                    _opaque_query_value(after_cursor, label="Polymarket event cursor"),
+                )
+            )
         return PublicHttpRequest(
             method="GET",
-            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/events",
-            query=(("active", "true"), ("closed", "false"), ("limit", str(limit))),
+            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/events/keyset",
+            query=tuple(query),
+        )
+
+    def market_metadata_by_token_request(self, token_id: str) -> PublicHttpRequest:
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/markets/keyset",
+            query=(
+                (
+                    "clob_token_ids",
+                    _path_component(token_id, label="Polymarket token id"),
+                ),
+                ("limit", "1"),
+            ),
+        )
+
+    def market_metadata_by_condition_request(self, condition_id: str) -> PublicHttpRequest:
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{POLYMARKET_GAMMA_PUBLIC_URL}/markets/keyset",
+            query=(
+                (
+                    "condition_ids",
+                    _path_component(condition_id, label="Polymarket condition id"),
+                ),
+                ("limit", "1"),
+            ),
         )
 
     def market_metadata_request(self, market_id: str) -> PublicHttpRequest:
@@ -438,19 +537,46 @@ class PolymarketPublicAdapter:
             ),
         )
 
-    def public_trade_request(
-        self, condition_ids: Sequence[str], *, limit: int = 100
-    ) -> PublicHttpRequest:
-        if not condition_ids or limit <= 0 or limit > 10_000:
-            raise ValueError("Polymarket public trades need markets and a limit within 1..10000")
-        markets = ",".join(
-            _path_component(item, label="Polymarket condition id")
-            for item in condition_ids
+    def clob_market_request(self, condition_id: str) -> PublicHttpRequest:
+        return PublicHttpRequest(
+            method="GET",
+            url=(
+                f"{POLYMARKET_CLOB_PUBLIC_URL}/clob-markets/"
+                f"{_path_component(condition_id, label='Polymarket condition id')}"
+            ),
         )
+
+    def public_trade_request(
+        self,
+        condition_ids: Sequence[str],
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        start: int | None = None,
+        end: int | None = None,
+        taker_only: bool = True,
+    ) -> PublicHttpRequest:
+        if not condition_ids or limit <= 0 or limit > 10_000 or offset < 0 or offset > 10_000:
+            raise ValueError("Polymarket public trades need markets and a limit within 1..10000")
+        if (start is None) != (end is None) or (
+            start is not None and (start < 0 or end is None or end <= start)
+        ):
+            raise ValueError("Polymarket trade time window must be a positive start/end pair")
+        markets = ",".join(_path_component(item, label="Polymarket condition id") for item in condition_ids)
+        query = [
+            ("limit", str(limit)),
+            ("market", markets),
+        ]
+        if offset:
+            query.append(("offset", str(offset)))
+        if not taker_only:
+            query.append(("takerOnly", "false"))
+        if start is not None and end is not None:
+            query.extend((("start", str(start)), ("end", str(end))))
         return PublicHttpRequest(
             method="GET",
             url=f"{POLYMARKET_DATA_PUBLIC_URL}/trades",
-            query=(("market", markets), ("limit", str(limit))),
+            query=tuple(query),
         )
 
     def token_parameter_requests(
@@ -482,15 +608,10 @@ class PolymarketPublicAdapter:
 
     def order_book_requests(self, token_ids: Sequence[str]) -> tuple[PublicHttpRequest, ...]:
         return tuple(
-            request
-            for _, request in self.token_parameter_requests(
-                token_ids, feeds=("order_book",)
-            )
+            request for _, request in self.token_parameter_requests(token_ids, feeds=("order_book",))
         )
 
-    def websocket_subscription(
-        self, token_ids: Sequence[str]
-    ) -> PublicWebsocketSubscription:
+    def websocket_subscription(self, token_ids: Sequence[str]) -> PublicWebsocketSubscription:
         if not token_ids:
             raise ValueError("Polymarket subscription requires explicit token ids")
         if any(type(item) is not str or not item for item in token_ids):
@@ -500,6 +621,7 @@ class PolymarketPublicAdapter:
             {
                 "assets_ids": list(token_ids),
                 "custom_feature_enabled": True,
+                "initial_dump": True,
                 "type": "market",
             },
         )
@@ -515,15 +637,18 @@ class PolymarketPublicAdapter:
     ) -> PublicDataEnvelope:
         decoded = _json(raw_payload)
         if isinstance(decoded, list):
+            if not decoded or any(not isinstance(item, Mapping) for item in decoded):
+                raise ValueError("Polymarket WebSocket batch records must be objects")
             return factory.make(
                 feed_type="market_batch",
-                instrument_id="PM:GLOBAL",
+                instrument_id=canonical_polymarket_instrument("GLOBAL"),
                 market_id="PM:GLOBAL",
                 source_timestamp_ns=None,
                 receive_timestamp_utc_ns=receive_timestamp_utc_ns,
                 receive_monotonic_ns=receive_monotonic_ns,
                 raw_payload=raw_payload,
                 source_sequence=None,
+                source_event_id=hashlib.sha256(raw_payload).hexdigest(),
                 provenance=provenance,
             )
         payload = _mapping(decoded, label="Polymarket WebSocket payload")
@@ -532,6 +657,7 @@ class PolymarketPublicAdapter:
             "book": "order_book",
             "price_change": "price_change",
             "last_trade_price": "last_trade_price",
+            "best_bid_ask": "best_bid_ask",
             "tick_size_change": "tick_size_change",
             "new_market": "market_lifecycle",
             "market_resolved": "market_lifecycle",
@@ -557,7 +683,11 @@ class PolymarketPublicAdapter:
             feed_type=feed_type,
             instrument_id=canonical_polymarket_instrument(asset_id),
             market_id=f"PM:{market}",
-            source_timestamp_ns=_milliseconds_to_ns(payload.get("timestamp")),
+            source_timestamp_ns=(
+                _milliseconds_to_ns(payload.get("timestamp"))
+                if event_type in {"book", "last_trade_price", "price_change"}
+                else None
+            ),
             receive_timestamp_utc_ns=receive_timestamp_utc_ns,
             receive_monotonic_ns=receive_monotonic_ns,
             raw_payload=raw_payload,
@@ -590,9 +720,12 @@ class PolymarketPublicAdapter:
             raise ValueError("unsupported Polymarket public HTTP feed")
         decoded = _json(raw_payload)
         source_timestamp_ns = None
+        source_cursor = None
         source_event_id = None
         if isinstance(decoded, Mapping):
-            if decoded.get("timestamp") is not None:
+            if decoded.get("next_cursor"):
+                source_cursor = str(decoded["next_cursor"])
+            if feed_type != "order_book" and decoded.get("timestamp") is not None:
                 source_timestamp_ns = _milliseconds_to_ns(decoded.get("timestamp"))
             else:
                 for field in ("updatedAt", "createdAt", "endDate", "startDate"):
@@ -610,6 +743,7 @@ class PolymarketPublicAdapter:
             receive_monotonic_ns=receive_monotonic_ns,
             raw_payload=raw_payload,
             source_sequence=None,
+            source_cursor=source_cursor,
             source_event_id=source_event_id,
             provenance=provenance,
         )
@@ -621,19 +755,116 @@ class KalshiPublicAdapter:
     websocket_public_without_credentials = False
     websocket_limitation = "PUBLIC_CHANNELS_REQUIRE_AUTHENTICATED_WEBSOCKET_HANDSHAKE"
     supported_feeds = frozenset(
-        {"series", "events", "markets", "order_book", "trades", "incentives", "fee_changes"}
+        {
+            "series",
+            "events",
+            "markets",
+            "order_book",
+            "trades",
+            "block_trades",
+            "incentives",
+            "fee_changes",
+            "event_fee_changes",
+            "event_metadata",
+            "exchange_status",
+            "exchange_schedule",
+            "historical_cutoff",
+            "historical_markets",
+            "historical_trades",
+        }
     )
 
     def websocket_subscriptions(self, *_: object, **__: object) -> tuple[PublicWebsocketSubscription, ...]:
         return ()
 
-    def market_census_request(self, *, limit: int) -> PublicHttpRequest:
+    def market_census_request(self, *, limit: int, cursor: str | None = None) -> PublicHttpRequest:
         if limit <= 0 or limit > 1000:
             raise ValueError("Kalshi census limit must be within 1..1000")
+        query = [("limit", str(limit)), ("status", "open")]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi market cursor")))
         return PublicHttpRequest(
             method="GET",
             url=f"{KALSHI_PUBLIC_HTTP_URL}/markets",
-            query=(("limit", str(limit)), ("status", "open")),
+            query=tuple(query),
+        )
+
+    def event_census_request(self, *, limit: int, cursor: str | None = None) -> PublicHttpRequest:
+        if limit <= 0 or limit > 200:
+            raise ValueError("Kalshi event census limit must be within 1..200")
+        query = [("limit", str(limit)), ("status", "open")]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi event cursor")))
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/events",
+            query=tuple(query),
+        )
+
+    def series_census_request(self) -> PublicHttpRequest:
+        return PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/series")
+
+    def trade_request(
+        self,
+        ticker: str,
+        *,
+        block_trade: bool,
+        limit: int = 1000,
+        cursor: str | None = None,
+    ) -> PublicHttpRequest:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("Kalshi trade limit must be within 1..1000")
+        query = [
+            ("is_block_trade", "true" if block_trade else "false"),
+            ("limit", str(limit)),
+            ("ticker", _path_component(ticker, label="Kalshi market ticker")),
+        ]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi trade cursor")))
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/trades",
+            query=tuple(query),
+        )
+
+    def incentive_request(
+        self, *, limit: int = 1000, cursor: str | None = None
+    ) -> PublicHttpRequest:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("Kalshi incentive limit must be within 1..1000")
+        query = [("limit", str(limit))]
+        if cursor is not None:
+            query.append(
+                ("cursor", _opaque_query_value(cursor, label="Kalshi incentive cursor"))
+            )
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/incentive_programs",
+            query=tuple(query),
+        )
+
+    def event_fee_changes_request(
+        self,
+        event_ticker: str,
+        *,
+        limit: int = 1000,
+        cursor: str | None = None,
+    ) -> PublicHttpRequest:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("Kalshi event fee-change limit must be within 1..1000")
+        query = [
+            (
+                "event_ticker",
+                _path_component(event_ticker, label="Kalshi event ticker"),
+            ),
+            ("limit", str(limit)),
+        ]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi fee cursor")))
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/events/fee_changes",
+            query=tuple(query),
         )
 
     def requests_for_market(
@@ -655,41 +886,56 @@ class KalshiPublicAdapter:
             raise ValueError(f"unsupported Kalshi public feeds: {sorted(unknown)}")
         requests: list[PublicHttpRequest] = []
         if "markets" in selected:
-            requests.append(
-                PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/{ticker}")
-            )
+            requests.append(PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/{ticker}"))
         if "order_book" in selected:
             requests.append(
-                PublicHttpRequest(
-                    method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/{ticker}/orderbook"
-                )
+                PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/{ticker}/orderbook")
             )
         if "trades" in selected:
             requests.append(
                 PublicHttpRequest(
                     method="GET",
                     url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/trades",
-                    query=(("ticker", ticker), ("limit", "1000")),
+                    query=(
+                        ("is_block_trade", "false"),
+                        ("limit", "1000"),
+                        ("ticker", ticker),
+                    ),
+                )
+            )
+        if "block_trades" in selected:
+            requests.append(
+                PublicHttpRequest(
+                    method="GET",
+                    url=f"{KALSHI_PUBLIC_HTTP_URL}/markets/trades",
+                    query=(
+                        ("is_block_trade", "true"),
+                        ("limit", "1000"),
+                        ("ticker", ticker),
+                    ),
                 )
             )
         if "events" in selected and event_ticker:
             requests.append(
+                PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/events/{event_ticker}")
+            )
+        if "event_metadata" in selected and event_ticker:
+            requests.append(
                 PublicHttpRequest(
-                    method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/events/{event_ticker}"
+                    method="GET",
+                    url=f"{KALSHI_PUBLIC_HTTP_URL}/events/{event_ticker}/metadata",
                 )
             )
         if "series" in selected and series_ticker:
             requests.append(
-                PublicHttpRequest(
-                    method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/series/{series_ticker}"
-                )
+                PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/series/{series_ticker}")
             )
         if "incentives" in selected:
             requests.append(
                 PublicHttpRequest(
                     method="GET",
                     url=f"{KALSHI_PUBLIC_HTTP_URL}/incentive_programs",
-                    query=(("market_ticker", ticker),),
+                    query=(("limit", "1000"),),
                 )
             )
         if "fee_changes" in selected and series_ticker:
@@ -700,7 +946,65 @@ class KalshiPublicAdapter:
                     query=(("series_ticker", series_ticker), ("show_historical", "true")),
                 )
             )
+        if "event_fee_changes" in selected and event_ticker:
+            requests.append(
+                PublicHttpRequest(
+                    method="GET",
+                    url=f"{KALSHI_PUBLIC_HTTP_URL}/events/fee_changes",
+                    query=(
+                        ("event_ticker", event_ticker),
+                        ("limit", "1000"),
+                    ),
+                )
+            )
+        if "exchange_status" in selected:
+            requests.append(PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/exchange/status"))
+        if "exchange_schedule" in selected:
+            requests.append(
+                PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/exchange/schedule")
+            )
         return tuple(requests)
+
+    def historical_cutoff_request(self) -> PublicHttpRequest:
+        return PublicHttpRequest(method="GET", url=f"{KALSHI_PUBLIC_HTTP_URL}/historical/cutoff")
+
+    def historical_market_census_request(self, *, limit: int, cursor: str | None = None) -> PublicHttpRequest:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("Kalshi historical census limit must be within 1..1000")
+        query = [("limit", str(limit))]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi historical cursor")))
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/historical/markets",
+            query=tuple(query),
+        )
+
+    def historical_market_request(self, ticker: str) -> PublicHttpRequest:
+        return PublicHttpRequest(
+            method="GET",
+            url=(
+                f"{KALSHI_PUBLIC_HTTP_URL}/historical/markets/"
+                f"{_path_component(ticker, label='Kalshi historical ticker')}"
+            ),
+        )
+
+    def historical_trade_request(
+        self, ticker: str, *, limit: int = 1000, cursor: str | None = None
+    ) -> PublicHttpRequest:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("Kalshi historical trade limit must be within 1..1000")
+        query = [
+            ("limit", str(limit)),
+            ("ticker", _path_component(ticker, label="Kalshi market ticker")),
+        ]
+        if cursor is not None:
+            query.append(("cursor", _opaque_query_value(cursor, label="Kalshi historical trade cursor")))
+        return PublicHttpRequest(
+            method="GET",
+            url=f"{KALSHI_PUBLIC_HTTP_URL}/historical/trades",
+            query=tuple(query),
+        )
 
     def envelope_from_http(
         self,
@@ -721,14 +1025,17 @@ class KalshiPublicAdapter:
         source_event_id: str | None = None
         detected_ticker = ticker
         if isinstance(decoded, Mapping):
-            if decoded.get("cursor"):
-                source_cursor = str(decoded["cursor"])
+            for cursor_key in ("cursor", "next_cursor"):
+                if decoded.get(cursor_key):
+                    source_cursor = str(decoded[cursor_key])
+                    break
             record: Mapping[str, Any] | None = None
             singular_keys = {
                 "series": "series",
                 "events": "event",
                 "markets": "market",
                 "order_book": "orderbook_fp",
+                "event_metadata": "event_metadata",
             }
             singular_key = singular_keys.get(feed_type)
             if singular_key and isinstance(decoded.get(singular_key), Mapping):
@@ -737,11 +1044,16 @@ class KalshiPublicAdapter:
                 for key in ("ticker", "market_ticker"):
                     if record.get(key):
                         detected_ticker = str(record[key])
-                for key in ("updated_time", "last_updated_ts", "created_time"):
+                for key in (
+                    "updated_time",
+                    "last_updated_ts",
+                    "created_time",
+                    "settlement_ts",
+                ):
                     if record.get(key):
                         source_timestamp_ns = _iso_to_ns(record[key])
                         break
-            if feed_type == "trades":
+            if feed_type in {"trades", "block_trades", "historical_trades"}:
                 trades = decoded.get("trades")
                 if isinstance(trades, list) and len(trades) == 1 and isinstance(trades[0], Mapping):
                     trade = trades[0]
@@ -750,10 +1062,16 @@ class KalshiPublicAdapter:
                     if trade.get("trade_id"):
                         source_event_id = str(trade["trade_id"])
         canonical_ticker = detected_ticker or "GLOBAL"
+        if feed_type in {"events", "event_metadata", "event_fee_changes"}:
+            canonical_id = canonical_kalshi_event(canonical_ticker)
+        elif feed_type in {"series", "fee_changes"}:
+            canonical_id = canonical_kalshi_series(canonical_ticker)
+        else:
+            canonical_id = canonical_kalshi_market(canonical_ticker)
         return factory.make(
             feed_type=feed_type,
             instrument_id=None,
-            market_id=canonical_kalshi_market(canonical_ticker),
+            market_id=canonical_id,
             source_timestamp_ns=source_timestamp_ns,
             receive_timestamp_utc_ns=receive_timestamp_utc_ns,
             receive_monotonic_ns=receive_monotonic_ns,
@@ -791,11 +1109,17 @@ def all_public_route_specs() -> tuple[PublicHttpRequest | PublicWebsocketSubscri
         polymarket.market_census_request(limit=1),
         polymarket.event_census_request(limit=1),
         polymarket.market_by_token_request("fixture-token"),
+        polymarket.market_metadata_by_token_request("fixture-token"),
+        polymarket.market_metadata_by_condition_request("fixture-condition"),
+        polymarket.clob_market_request("fixture-condition"),
         polymarket.order_book_requests(("fixture-token",))[0],
         polymarket.public_trade_request(("fixture-condition",), limit=1),
-        *(request for _, request in polymarket.token_parameter_requests(
-            ("fixture-token",), feeds=("last_trade_price", "tick_size", "fees")
-        )),
+        *(
+            request
+            for _, request in polymarket.token_parameter_requests(
+                ("fixture-token",), feeds=("last_trade_price", "tick_size", "fees")
+            )
+        ),
         polymarket.websocket_subscription(("fixture-token",)),
         kalshi.market_census_request(limit=1),
         *kalshi.requests_for_market(
@@ -825,6 +1149,8 @@ __all__ = [
     "PublicWebsocketSubscription",
     "all_public_route_specs",
     "canonical_hyperliquid_instrument",
+    "canonical_kalshi_event",
     "canonical_kalshi_market",
+    "canonical_kalshi_series",
     "canonical_polymarket_instrument",
 ]

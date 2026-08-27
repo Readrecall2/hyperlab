@@ -214,6 +214,9 @@ restore-smoke réussi sont obligatoires avant toute suppression.
 ## Documentation
 
 Commencez par [`docs/GUIDE_COMPLET_FR.md`](docs/GUIDE_COMPLET_FR.md).
+Le candidat public/Ghost Polymarket + Kalshi, ses contrats officiels, ses probes
+bornés, son bundle raw→replay et son statut économique non prouvé sont décrits
+dans [`docs/PREDICTION_MARKETS_CANDIDATE_V1.md`](docs/PREDICTION_MARKETS_CANDIDATE_V1.md).
 Le contrat détaillé du collecteur public, ses limites de reprise et le protocole
 soak non encore certifié sont dans
 [`docs/HYPERLIQUID_COLLECTOR.md`](docs/HYPERLIQUID_COLLECTOR.md). Suivez ensuite les prompts Codex dans `prompts/` dans l'ordre.

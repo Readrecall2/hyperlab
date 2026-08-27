@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,101 @@ def _incoming_handoff(tmp_path: Path) -> Path:
         encoding="ascii",
     )
     return path
+
+
+def _materialize_windows_transfer_layout(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, Path]:
+    pack = tmp_path / "materialized-pack"
+    operator = pack / "operator"
+    wheelhouse = pack / "wheelhouse"
+    operator.mkdir(parents=True)
+    wheelhouse.mkdir()
+    bundle = pack / "hyperlab-prediction-markets-prospective-launch-v1.bundle"
+    bundle.write_bytes(b"real-bundle-hash-fixture")
+    handoff_json = pack / "handoff.json"
+    handoff_json.write_bytes(b'{"fixture":"SYNTHETIC_LAYOUT_ONLY"}\n')
+    wheel = wheelhouse / "fixture-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"real-wheel-hash-fixture")
+    (pack / "handoff.sha256").write_text(
+        f"{launch_pack.sha256_file(handoff_json)}  handoff.json\n",
+        encoding="ascii",
+    )
+    (pack / "wheelhouse.sha256").write_text(
+        f"{launch_pack.sha256_file(wheel)}  {wheel.name}\n",
+        encoding="ascii",
+    )
+    handoff = _handoff()
+    handoff.update(
+        {
+            "bundle_filename": bundle.name,
+            "bundle_sha256": launch_pack.sha256_file(bundle),
+        }
+    )
+    block_a = operator / "A-windows-bundle-verify-transfer.ps1"
+    block_a.write_text(launch_pack.render_windows_transfer(handoff), encoding="utf-8")
+    ssh_key = tmp_path / "hyperlab_hetzner"
+    ssh_key.write_bytes(b"SYNTHETIC_PRIVATE_KEY_PATH_FIXTURE_NOT_A_KEY")
+    return pack, block_a, bundle, handoff_json, ssh_key
+
+
+def _invoke_windows_transfer_with_strict_fakes(
+    tmp_path: Path,
+    block_a: Path,
+    ssh_key: Path,
+    *,
+    log_name: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable for the materialized-layout regression")
+    log = tmp_path / log_name
+    wrapper = tmp_path / f"invoke-{log_name}.ps1"
+    wrapper.write_text(
+        """$ErrorActionPreference = 'Stop'
+function global:git {
+    Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('git|' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}
+function global:ssh {
+    Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('ssh|' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}
+function global:scp {
+    Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('scp|' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}
+& $env:HYPERLAB_PM_A_SCRIPT
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HYPERLAB_PM_A_SCRIPT": str(block_a),
+            "HYPERLAB_PM_FAKE_LOG": str(log),
+            "HYPERLAB_PM_SSH_KEY": str(ssh_key),
+            "HYPERLAB_PM_SSH_TARGET": "hyperlab@5.223.60.130",
+        }
+    )
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(wrapper),
+        ],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+    return completed, log
 
 
 def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
@@ -183,6 +280,18 @@ def test_new_slugs_produce_unique_incoming_source_campaign_and_service_identitie
     )
 
 
+def test_authoritative_base_remains_valid_for_causal_fix_descendants() -> None:
+    base = "3f188b9c28c9fec406b904a9e3307b43f54243e8"
+    head = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    assert launch_pack._git_is_ancestor(ROOT, base, head)
+    assert not launch_pack._git_is_ancestor(ROOT, head, base)
+
+
 def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     units = launch_pack.render_units(_handoff())
     assert len(units) == 3
@@ -221,6 +330,10 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     tunnel = launch_pack.render_windows_tunnel(handoff)
     recovery = launch_pack.render_recovery_rollback(handoff)
     assert "$ErrorActionPreference = 'Stop'" in windows
+    assert "$BundleRoot = (Resolve-Path -LiteralPath (Join-Path $OperatorRoot '..')).Path" in windows
+    assert "$BundleRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path" not in windows
+    assert "Assert-Sha256Manifest" in windows
+    assert "HYPERLAB_PM_SSH_KEY" in windows
     assert "PREDICTION_WINDOWS_TRANSFER_VERIFIED" in windows
     assert install.startswith("#!/usr/bin/env bash")
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" in install
@@ -232,6 +345,58 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     assert "systemctl" not in windows
     assert "hyperlab-h1" not in rendered
     assert "18080" not in rendered
+
+
+def test_materialized_windows_a_uses_parent_pack_root_and_real_local_hashes(
+    tmp_path: Path,
+) -> None:
+    pack, block_a, bundle, handoff_json, ssh_key = _materialize_windows_transfer_layout(
+        tmp_path
+    )
+    completed, log = _invoke_windows_transfer_with_strict_fakes(
+        tmp_path,
+        block_a,
+        ssh_key,
+        log_name="successful-external-commands.log",
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "PREDICTION_WINDOWS_TRANSFER_VERIFIED" in completed.stdout
+    lines = log.read_text(encoding="utf-8").splitlines()
+    git_lines = [line for line in lines if line.startswith("git|")]
+    ssh_lines = [line for line in lines if line.startswith("ssh|")]
+    scp_lines = [line for line in lines if line.startswith("scp|")]
+    assert len(git_lines) == 1 and str(bundle) in git_lines[0]
+    assert len(ssh_lines) == 2
+    assert all(f"|-i|{ssh_key}|hyperlab@5.223.60.130|" in line for line in ssh_lines)
+    assert len(scp_lines) == len(list(pack.iterdir()))
+    assert all(f"|-i|{ssh_key}|-r|" in line for line in scp_lines)
+    assert any(str(bundle) in line for line in scp_lines)
+    assert any(str(handoff_json) in line for line in scp_lines)
+    assert any(str(pack / "wheelhouse") in line for line in scp_lines)
+    assert not any(str(pack / "operator" / bundle.name) in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "relative_corruption",
+    ["handoff.json", "wheelhouse/fixture-1.0-py3-none-any.whl"],
+)
+def test_materialized_windows_a_refuses_root_hash_divergence_before_external_commands(
+    tmp_path: Path,
+    relative_corruption: str,
+) -> None:
+    pack, block_a, _bundle, _handoff_json, ssh_key = _materialize_windows_transfer_layout(
+        tmp_path
+    )
+    (pack / relative_corruption).write_bytes(b"corrupted-after-manifest")
+    completed, log = _invoke_windows_transfer_with_strict_fakes(
+        tmp_path,
+        block_a,
+        ssh_key,
+        log_name="refused-external-commands.log",
+    )
+    assert completed.returncode != 0
+    assert "SHA-256 diverged" in completed.stderr
+    assert not log.exists()
 
 
 def test_connectivity_preflight_is_per_venue_and_kalshi_never_uses_wss_credentials() -> None:

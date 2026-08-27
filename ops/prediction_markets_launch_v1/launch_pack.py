@@ -163,6 +163,18 @@ def _git(repo_root: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _git_is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode not in (0, 1):
+        raise LaunchPackError(completed.stderr.strip() or "Git ancestry check failed")
+    return completed.returncode == 0
+
+
 def build_source_inventory(repo_root: Path, commit: str) -> dict[str, object]:
     if _COMMIT.fullmatch(commit) is None:
         raise LaunchPackError("source commit is invalid")
@@ -338,21 +350,64 @@ def render_windows_transfer(handoff: Mapping[str, object]) -> str:
 # Prompts: SSH host-key/password possibles. Ctrl+C interrompt uniquement le transfert;
 # le nouvel incoming root reste non activé. Signal terminal: PREDICTION_WINDOWS_TRANSFER_VERIFIED.
 $ErrorActionPreference = 'Stop'
-$BundleRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+$OperatorRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Split-Path -Leaf $OperatorRoot), 'operator')) {{ throw 'Block A must remain in the pack operator directory.' }}
+$BundleRoot = (Resolve-Path -LiteralPath (Join-Path $OperatorRoot '..')).Path
 $SshTarget = $env:HYPERLAB_PM_SSH_TARGET
-if ([string]::IsNullOrWhiteSpace($SshTarget)) {{ throw 'Set HYPERLAB_PM_SSH_TARGET, for example hyperlab@host.' }}
+if ([string]::IsNullOrWhiteSpace($SshTarget) -or $SshTarget -notmatch '^[a-z0-9._-]+@[a-z0-9.-]+$') {{ throw 'Set HYPERLAB_PM_SSH_TARGET to user@host.' }}
+$SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY
+if ([string]::IsNullOrWhiteSpace($SshKeyRaw)) {{ throw 'Set HYPERLAB_PM_SSH_KEY to the dedicated private-key path.' }}
+$SshKeyPath = (Resolve-Path -LiteralPath $SshKeyRaw).Path
+if (-not (Test-Path -LiteralPath $SshKeyPath -PathType Leaf)) {{ throw 'HYPERLAB_PM_SSH_KEY is not a regular file.' }}
 $IncomingRoot = '{incoming}'
-$BundlePath = Join-Path $BundleRoot '{bundle}'
-if ((Get-FileHash -LiteralPath $BundlePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne '{bundle_sha}') {{ throw 'Git bundle SHA-256 diverged.' }}
+
+function Get-Sha256Hex {{
+    param([string] $Path)
+    $Stream = [IO.File]::OpenRead($Path)
+    try {{
+        $Hasher = [Security.Cryptography.SHA256]::Create()
+        try {{
+            return [BitConverter]::ToString($Hasher.ComputeHash($Stream)).Replace('-', '').ToLowerInvariant()
+        }} finally {{
+            $Hasher.Dispose()
+        }}
+    }} finally {{
+        $Stream.Dispose()
+    }}
+}}
+
+function Assert-Sha256Manifest {{
+    param([string] $ManifestPath, [string] $ContentRoot)
+    $ResolvedRoot = (Resolve-Path -LiteralPath $ContentRoot).Path
+    $ResolvedManifest = (Resolve-Path -LiteralPath $ManifestPath).Path
+    $Lines = @(Get-Content -LiteralPath $ResolvedManifest)
+    if ($Lines.Count -eq 0) {{ throw "Empty SHA-256 manifest: $ResolvedManifest" }}
+    foreach ($Line in $Lines) {{
+        if ($Line -notmatch '^([0-9a-f]{{64}})  ([^/\\\\]+)$') {{ throw "Invalid SHA-256 manifest line: $ResolvedManifest" }}
+        $ExpectedHash = $Matches[1]
+        $LeafName = $Matches[2]
+        if ([IO.Path]::GetFileName($LeafName) -cne $LeafName) {{ throw "Unsafe SHA-256 manifest leaf: $LeafName" }}
+        $ResolvedTarget = (Resolve-Path -LiteralPath (Join-Path $ResolvedRoot $LeafName)).Path
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Split-Path -Parent $ResolvedTarget), $ResolvedRoot)) {{ throw "SHA-256 target escaped its root: $LeafName" }}
+        $ActualHash = Get-Sha256Hex -Path $ResolvedTarget
+        if ($ActualHash -cne $ExpectedHash) {{ throw "SHA-256 diverged: $LeafName" }}
+    }}
+}}
+
+$BundlePath = (Resolve-Path -LiteralPath (Join-Path $BundleRoot '{bundle}')).Path
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Split-Path -Parent $BundlePath), $BundleRoot)) {{ throw 'Git bundle escaped the pack root.' }}
+if ((Get-Sha256Hex -Path $BundlePath) -ne '{bundle_sha}') {{ throw 'Git bundle SHA-256 diverged.' }}
+Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'handoff.sha256') -ContentRoot $BundleRoot
+Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'wheelhouse.sha256') -ContentRoot (Join-Path $BundleRoot 'wheelhouse')
 git bundle verify $BundlePath
 if ($LASTEXITCODE -ne 0) {{ throw 'git bundle verify failed.' }}
-ssh $SshTarget "test ! -e '$IncomingRoot' && install -d -m 0700 '$IncomingRoot'"
+ssh -i $SshKeyPath $SshTarget "test ! -e '$IncomingRoot' && install -d -m 0700 '$IncomingRoot'"
 if ($LASTEXITCODE -ne 0) {{ throw 'Unique incoming root creation failed.' }}
 Get-ChildItem -LiteralPath $BundleRoot -Force | ForEach-Object {{
-    scp -r -- $_.FullName "${{SshTarget}}:${{IncomingRoot}}/"
+    scp -i $SshKeyPath -r -- $_.FullName "${{SshTarget}}:${{IncomingRoot}}/"
     if ($LASTEXITCODE -ne 0) {{ throw "Transfer failed: $($_.Name)" }}
 }}
-ssh $SshTarget "cd '$IncomingRoot' && sha256sum -c handoff.sha256 && (cd wheelhouse && sha256sum -c ../wheelhouse.sha256) && git bundle verify '{bundle}'"
+ssh -i $SshKeyPath $SshTarget "cd '$IncomingRoot' && sha256sum -c handoff.sha256 && (cd wheelhouse && sha256sum -c ../wheelhouse.sha256) && git bundle verify '{bundle}'"
 if ($LASTEXITCODE -ne 0) {{ throw 'Transferred bundle or hashes diverged; do not run the Tabby block.' }}
 Write-Output 'PREDICTION_WINDOWS_TRANSFER_VERIFIED'
 """
@@ -493,8 +548,8 @@ def finalize(
         raise LaunchPackError("target branch differs from requested final commit")
     if _git(repo_root, "status", "--porcelain"):
         raise LaunchPackError("launch worktree must be clean before finalization")
-    if _git(repo_root, "rev-parse", f"{source_commit}^") != plan["base_commit"]:
-        raise LaunchPackError("final commit must be the single direct child of the authoritative base")
+    if not _git_is_ancestor(repo_root, str(plan["base_commit"]), source_commit):
+        raise LaunchPackError("authoritative base is not an ancestor of the final commit")
     candidate_config = _object(
         repo_root / "config" / "research" / "prediction-markets-candidate-v1.json"
     )

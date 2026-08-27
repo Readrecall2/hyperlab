@@ -82,7 +82,8 @@ $outputRoot = "D:\hyperlab-evidence\$runSlug"
   -OutputRoot $outputRoot
 ```
 
-Le générateur exige la branche exacte, le commit exact et un worktree propre. Il
+Le générateur exige la branche exacte, le commit exact, la base autoritaire dans
+son ascendance et un worktree propre. Il
 crée et vérifie un Git bundle, construit sur Windows un wheelhouse Linux x86_64
 multi-tags `manylinux_2_28` + `manylinux_2_17` strictement depuis
 `requirements-runtime.lock` avec `--require-hashes`, puis authentifie chaque
@@ -110,9 +111,13 @@ hashes exacts :
 5. `operator/E-recovery-rollback.sh` — reprise ou désarmement ciblé, sans
    supprimer raw, manifests, ledgers, runs ou unités.
 
-Les blocs A et D lisent la cible SSH depuis `HYPERLAB_PM_SSH_TARGET`; aucune
-adresse, credential ou secret n'est inscrit dans le bundle. Chaque fichier
-annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal terminal.
+Les blocs A et D lisent la cible SSH depuis `HYPERLAB_PM_SSH_TARGET`. Le bloc A
+exige en plus le chemin local de la clé dédiée dans `HYPERLAB_PM_SSH_KEY`, résout
+la racine canonique comme le parent de son dossier `operator`, puis vérifie
+localement le bundle, `handoff.sha256` et `wheelhouse.sha256` avant toute commande
+SSH. Aucune adresse, credential ou clé n'est inscrite dans le bundle. Chaque
+fichier annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal
+terminal.
 
 ## Preflight cible
 

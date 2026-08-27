@@ -403,6 +403,9 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     assert install.startswith("#!/usr/bin/env bash")
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" in install
     assert "PREDICTION_MONITOR_TRANSITION_OR_ALERT" in monitor
+    assert "$SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY" in tunnel
+    assert "Resolve-Path -LiteralPath $SshKeyRaw" in tunnel
+    assert "ssh -i $SshKeyPath -N -o ExitOnForwardFailure=yes" in tunnel
     assert "127.0.0.1:18081:127.0.0.1:18081" in tunnel
     assert "recovery|rollback" in recovery
     rendered = "\n".join((windows, install, monitor, tunnel, recovery))

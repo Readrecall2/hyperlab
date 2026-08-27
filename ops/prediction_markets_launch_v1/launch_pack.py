@@ -525,8 +525,12 @@ def render_windows_tunnel(handoff: Mapping[str, object]) -> str:
 $ErrorActionPreference = 'Stop'
 $SshTarget = $env:HYPERLAB_PM_SSH_TARGET
 if ([string]::IsNullOrWhiteSpace($SshTarget)) { throw 'Set HYPERLAB_PM_SSH_TARGET, for example hyperlab@host.' }
+$SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY
+if ([string]::IsNullOrWhiteSpace($SshKeyRaw)) { throw 'Set HYPERLAB_PM_SSH_KEY to the dedicated private-key path.' }
+$SshKeyPath = (Resolve-Path -LiteralPath $SshKeyRaw).Path
+if (-not (Test-Path -LiteralPath $SshKeyPath -PathType Leaf)) { throw 'HYPERLAB_PM_SSH_KEY is not a regular file.' }
 Write-Output 'PREDICTION_TUNNEL_READY http://127.0.0.1:18081'
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18081:127.0.0.1:18081 $SshTarget
+ssh -i $SshKeyPath -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18081:127.0.0.1:18081 $SshTarget
 """
 
 

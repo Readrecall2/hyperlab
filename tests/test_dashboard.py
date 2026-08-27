@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+import typer
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -18,6 +19,7 @@ from hyperlab.dashboard.app import (
     _runtime_summary,
     create_app,
 )
+from hyperlab.dashboard.h1_dashboard import H1ExpectedIdentity
 from hyperlab.paper import (
     PaperEngine,
     PaperExecutionConfig,
@@ -669,6 +671,80 @@ def test_serve_uses_explicit_runtime_report_and_paper_directories(
     assert client.get("/api/h1/snapshot").json()["state"]["code"] == "ABSENT"
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8123
+
+
+def test_bound_h1_dashboard_cli_requires_identity_and_always_uses_loopback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hyperlab import cli as cli_module
+
+    environment = {
+        "HYPERLAB_H1_CAMPAIGN_ROOT": str(tmp_path / "campaign-slug"),
+        "HYPERLAB_H1_POLICY_CONFIG": str(tmp_path / "policy.json"),
+        "HYPERLAB_H1_EXPECTED_CAMPAIGN_ID": "h1-" + "1" * 24,
+        "HYPERLAB_H1_EXPECTED_CAMPAIGN_MANIFEST_SHA256": "2" * 64,
+        "HYPERLAB_H1_EXPECTED_CAMPAIGN_SLUG": "campaign-slug",
+        "HYPERLAB_H1_COLLECTOR_SOURCE_COMMIT": "3" * 40,
+        "HYPERLAB_H1_DASHBOARD_SOURCE_COMMIT": "4" * 40,
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        cli_module,
+        "_settings",
+        lambda: SimpleNamespace(app=SimpleNamespace(data_dir=tmp_path / "data", mode="readonly")),
+    )
+    monkeypatch.setattr(
+        "hyperlab.dashboard.h1_dashboard.h1_snapshot",
+        lambda *_args, **_kwargs: ({"fixture": False, "state": {"code": "PREPARED_NOT_STARTED"}}, 200),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "hyperlab.dashboard.app.create_app",
+        lambda **kwargs: captured.setdefault("create_app", kwargs),
+    )
+
+    def fake_run(app: object, *, host: str, port: int) -> None:
+        captured.update({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    cli_module.h1_dashboard_serve(port=8765)
+
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8765
+    assert "host" not in cli_module.h1_dashboard_serve.__annotations__
+    configured = cast(dict[str, object], captured["create_app"])
+    assert configured["h1_campaign_root"] == tmp_path / "campaign-slug"
+    expected = cast(H1ExpectedIdentity, configured["h1_expected_identity"])
+    assert expected.campaign_manifest_sha256 == "2" * 64
+
+
+def test_bound_h1_dashboard_cli_refuses_missing_identity_before_listening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hyperlab import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_settings",
+        lambda: SimpleNamespace(app=SimpleNamespace(data_dir=tmp_path, mode="readonly")),
+    )
+    monkeypatch.delenv("HYPERLAB_H1_CAMPAIGN_ROOT", raising=False)
+    called = False
+
+    def fake_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    with pytest.raises(typer.BadParameter, match="HYPERLAB_H1_CAMPAIGN_ROOT"):
+        cli_module.h1_dashboard_serve()
+
+    assert called is False
 
 
 def test_old_live_runtime_status_is_not_reported_as_active(tmp_path: Path) -> None:

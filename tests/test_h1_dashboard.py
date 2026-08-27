@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import hyperlab.research_data.h1_campaign as campaign_module
 from hyperlab.dashboard.app import create_app
 from hyperlab.dashboard.h1_dashboard import (
+    H1ExpectedIdentity,
     H1SnapshotHeadChangedError,
     h1_fixture_names,
     h1_fixture_snapshot,
@@ -75,6 +76,30 @@ def _prepared_campaign(
         fee_reviewed_at_utc=campaign_start - timedelta(hours=1),
     )
     return campaign_root
+
+
+def _expected_identity(campaign_root: Path) -> H1ExpectedIdentity:
+    campaign = json.loads((campaign_root / "campaign-manifest.json").read_text(encoding="utf-8"))
+    pin = (campaign_root / "campaign-manifest.sha256").read_text(encoding="ascii").split()[0]
+    return H1ExpectedIdentity(
+        campaign_id=str(campaign["campaign_id"]),
+        campaign_manifest_sha256=pin,
+        campaign_slug=campaign_root.name,
+        collector_source_commit="1" * 40,
+        dashboard_source_commit="2" * 40,
+    )
+
+
+def _assert_no_synthetic_error_payload(payload: dict[str, object]) -> None:
+    assert payload["fixture"] is False
+    assert "SYNTHETIC" not in json.dumps(payload, ensure_ascii=False)
+    state = payload["state"]
+    assert isinstance(state, dict)
+    assert payload["safety"] == {
+        "kill_rules": [],
+        "stale_feeds": [],
+        "integrity": state["integrity"],
+    }
 
 
 def _publish_public_tail(campaign_root: Path) -> tuple[str, str, tuple[str, ...]]:
@@ -285,6 +310,121 @@ def test_prepared_campaign_uses_explicit_root_and_authenticates_campaign_pin(
     assert sorted(path.relative_to(campaign_root) for path in campaign_root.rglob("*")) == original_names
 
 
+def test_bound_campaign_requires_exact_external_id_pin_and_slug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_root = _prepared_campaign(tmp_path, monkeypatch)
+    expected = _expected_identity(campaign_root)
+    candidates = (
+        H1ExpectedIdentity(
+            campaign_id="h1-" + "0" * 24,
+            campaign_manifest_sha256=expected.campaign_manifest_sha256,
+            campaign_slug=campaign_root.name,
+        ),
+        H1ExpectedIdentity(
+            campaign_id=expected.campaign_id,
+            campaign_manifest_sha256="0" * 64,
+            campaign_slug=campaign_root.name,
+        ),
+        H1ExpectedIdentity(
+            campaign_id=expected.campaign_id,
+            campaign_manifest_sha256=expected.campaign_manifest_sha256,
+            campaign_slug="different-campaign-slug",
+        ),
+    )
+
+    for candidate in candidates:
+        response = TestClient(
+            create_app(
+                data_dir=tmp_path / "data",
+                h1_campaign_root=campaign_root,
+                h1_policy_path=CONFIG,
+                h1_expected_identity=candidate,
+            )
+        ).get("/api/h1/snapshot")
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["state"]["code"] == "INTEGRITY_FAILED"
+        assert payload["identity"] == {}
+        _assert_no_synthetic_error_payload(payload)
+
+
+def test_bound_campaign_missing_root_and_unbound_readiness_fail_closed(tmp_path: Path) -> None:
+    expected = H1ExpectedIdentity(
+        campaign_id="h1-" + "1" * 24,
+        campaign_manifest_sha256="2" * 64,
+        campaign_slug="missing-campaign",
+    )
+    bound = TestClient(
+        create_app(
+            data_dir=tmp_path / "data",
+            h1_campaign_root=tmp_path / "missing-campaign",
+            h1_policy_path=CONFIG,
+            h1_expected_identity=expected,
+        )
+    )
+    missing = bound.get("/api/h1/snapshot")
+    assert missing.status_code == 503
+    missing_payload = missing.json()
+    assert missing_payload["state"]["code"] == "UNREADABLE_FAIL_CLOSED"
+    _assert_no_synthetic_error_payload(missing_payload)
+    assert bound.get("/health/h1-ready").status_code == 503
+
+    unbound = TestClient(create_app(data_dir=tmp_path / "unbound"))
+    readiness = unbound.get("/health/h1-ready")
+    assert readiness.status_code == 503
+    assert readiness.json()["status"] == "H1_BINDING_NOT_CONFIGURED"
+
+
+def test_bound_dashboard_observes_prepared_to_running_without_restart_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_root = _prepared_campaign(
+        tmp_path,
+        monkeypatch,
+        starts=datetime.now(tz=UTC) - timedelta(seconds=1),
+    )
+    expected = _expected_identity(campaign_root)
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path / "data",
+            h1_campaign_root=campaign_root,
+            h1_policy_path=CONFIG,
+            h1_expected_identity=expected,
+        )
+    )
+    assert client.get("/api/h1/snapshot").json()["state"]["code"] == "PREPARED_NOT_STARTED"
+
+    _write_health(campaign_root, terminal="RUNNING")
+    before = {
+        path.relative_to(campaign_root): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in campaign_root.rglob("*")
+        if path.is_file()
+    }
+    running = client.get("/api/h1/snapshot")
+    readiness = client.get("/health/h1-ready")
+    after = {
+        path.relative_to(campaign_root): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in campaign_root.rglob("*")
+        if path.is_file()
+    }
+
+    assert running.status_code == 200
+    assert running.json()["state"]["code"] == "RUNNING_HEALTHY"
+    assert running.json()["identity"]["collector_source_commit"] == "1" * 40
+    assert running.json()["identity"]["dashboard_source_commit"] == "2" * 40
+    assert readiness.status_code == 200
+    assert readiness.json()["status"] == "H1_BOUND_READONLY_READY"
+    assert before == after
+
+
+def test_every_http_route_is_get_head_only(tmp_path: Path) -> None:
+    dashboard = create_app(data_dir=tmp_path)
+    assert all(route.methods is None or route.methods <= {"GET", "HEAD"} for route in dashboard.routes)
+
+
 def test_same_head_retry_is_bounded_and_returns_retryable_409(tmp_path: Path) -> None:
     campaign_root = tmp_path / "campaign"
     campaign_root.mkdir()
@@ -306,6 +446,20 @@ def test_same_head_retry_is_bounded_and_returns_retryable_409(tmp_path: Path) ->
     assert payload["state"]["code"] == "HEAD_CHANGED_RETRY"
     assert payload["state"]["retryable"] is True
     assert payload["orders_enabled"] is False
+    _assert_no_synthetic_error_payload(payload)
+
+
+def test_unreadable_real_campaign_error_never_inherits_synthetic_fixture_values(
+    tmp_path: Path,
+) -> None:
+    campaign_root = tmp_path / "unreadable-campaign"
+    campaign_root.mkdir()
+
+    payload, status = h1_snapshot(campaign_root, policy_path=None)
+
+    assert status == 503
+    assert payload["state"]["code"] == "UNREADABLE_FAIL_CLOSED"
+    _assert_no_synthetic_error_payload(payload)
 
 
 def test_same_head_retry_can_recover_on_the_second_bounded_attempt(tmp_path: Path) -> None:

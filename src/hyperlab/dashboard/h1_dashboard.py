@@ -67,6 +67,46 @@ class H1SnapshotUnreadableError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class H1ExpectedIdentity:
+    """Externally pinned identity for one bound H1 dashboard service."""
+
+    campaign_id: str
+    campaign_manifest_sha256: str
+    campaign_slug: str | None = None
+    collector_source_commit: str | None = None
+    dashboard_source_commit: str | None = None
+
+    def __post_init__(self) -> None:
+        campaign_suffix = self.campaign_id.removeprefix("h1-")
+        if (
+            not self.campaign_id.startswith("h1-")
+            or len(campaign_suffix) != 24
+            or any(character not in "0123456789abcdef" for character in campaign_suffix)
+        ):
+            raise ValueError("expected H1 campaign_id must be h1- plus 24 lowercase hex characters")
+        _validate_lowercase_hex(
+            self.campaign_manifest_sha256,
+            length=64,
+            label="expected H1 campaign manifest SHA-256",
+        )
+        if self.campaign_slug is not None and (
+            not self.campaign_slug
+            or len(self.campaign_slug) > 128
+            or self.campaign_slug != Path(self.campaign_slug).name
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in self.campaign_slug
+            )
+        ):
+            raise ValueError("expected H1 campaign slug is invalid")
+        for label, commit in (
+            ("collector source commit", self.collector_source_commit),
+            ("dashboard source commit", self.dashboard_source_commit),
+        ):
+            if commit is not None:
+                _validate_lowercase_hex(commit, length=40, label=f"expected H1 {label}")
+
+
+@dataclass(frozen=True, slots=True)
 class _ReadIdentity:
     size: int
     modified_ns: int
@@ -114,6 +154,11 @@ def _safe_text(value: object, *, maximum: int = 512) -> str | None:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _validate_lowercase_hex(value: str, *, length: int, label: str) -> None:
+    if len(value) != length or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{label} must be {length} lowercase hex characters")
 
 
 def _identity(path: Path) -> _ReadIdentity:
@@ -861,6 +906,7 @@ def _snapshot_once(
     *,
     policy: H1PolicyConfig | None,
     now: datetime,
+    expected_identity: H1ExpectedIdentity | None = None,
 ) -> dict[str, Any]:
     tracked: dict[Path, _ReadIdentity] = {}
     manifest_read = _bounded_read(root, Path("campaign-manifest.json"), maximum_bytes=_MAX_CAMPAIGN_MANIFEST_BYTES)
@@ -870,9 +916,16 @@ def _snapshot_once(
     pin = _pin_digest(pin_read.value)
     if pin != manifest_read.identity.digest:
         raise H1SnapshotIntegrityError("campaign manifest differs from its immutable pin")
+    if expected_identity is not None:
+        if pin != expected_identity.campaign_manifest_sha256:
+            raise H1SnapshotIntegrityError("campaign manifest differs from the external dashboard binding")
+        if expected_identity.campaign_slug is not None and root.name != expected_identity.campaign_slug:
+            raise H1SnapshotIntegrityError("campaign root slug differs from the external dashboard binding")
     manifest = _decode_object(manifest_read, label="campaign manifest", canonical=True)
     if manifest.get("boundary") != H1_BOUNDARY or manifest.get("schema_version") != 1:
         raise H1SnapshotIntegrityError("campaign manifest boundary or schema is invalid")
+    if expected_identity is not None and manifest.get("campaign_id") != expected_identity.campaign_id:
+        raise H1SnapshotIntegrityError("campaign ID differs from the external dashboard binding")
     policy_sha = _safe_text(manifest.get("policy_config_sha256"), maximum=64)
     if policy is not None and policy_sha != policy.config_sha256:
         raise H1SnapshotIntegrityError("campaign manifest policy differs from configured H1 policy")
@@ -973,6 +1026,9 @@ def _snapshot_once(
     health_modified = datetime.fromtimestamp(health_read.identity.modified_ns / 1_000_000_000, tz=UTC)
     reconnects = _safe_number(health.get("reconnects"))
     stale_feeds = [f"{row['market']}/{row['feed']}" for row in feeds if row["status"] == "STALE"]
+    source_commit = manifest.get("source_commit") or manifest.get("source_commit_sha256")
+    if expected_identity is not None and expected_identity.collector_source_commit is not None:
+        source_commit = expected_identity.collector_source_commit
     snapshot = _base_snapshot(now=now, fixture=False, fixture_name=None)
     snapshot.update(
         {
@@ -986,13 +1042,22 @@ def _snapshot_once(
             },
             "identity": {
                 "campaign_id": manifest.get("campaign_id"),
+                "campaign_slug": (
+                    root.name
+                    if expected_identity is None or expected_identity.campaign_slug is None
+                    else expected_identity.campaign_slug
+                ),
                 "policy_id": manifest.get("policy_id"),
                 "policy_config_sha256": policy_sha,
                 "campaign_manifest_sha256": pin,
                 "raw_manifest_sha256": None if raw_manifest is None else raw_manifest.manifest_sha256,
                 "raw_root_sha256": None if raw_manifest is None else raw_manifest.root_sha256,
                 "fee_artifact_sha256": manifest.get("fee_artifact_sha256"),
-                "source_commit": manifest.get("source_commit") or manifest.get("source_commit_sha256"),
+                "source_commit": source_commit,
+                "collector_source_commit": source_commit,
+                "dashboard_source_commit": (
+                    None if expected_identity is None else expected_identity.dashboard_source_commit
+                ),
             },
             "progress": _progress(manifest, now=now, holdout_open=holdout_open),
             "collection": {
@@ -1036,18 +1101,71 @@ def _snapshot_once(
     return snapshot
 
 
+def _real_fail_closed_snapshot(
+    now: datetime,
+    *,
+    data_classification: str,
+    state_code: str,
+    freshness: str,
+    integrity: str,
+    retryable: bool,
+) -> dict[str, Any]:
+    payload = _base_snapshot(now=now, fixture=False, fixture_name=None)
+    payload.update(
+        {
+            "data_classification": data_classification,
+            "state": {
+                "code": state_code,
+                "freshness": freshness,
+                "integrity": integrity,
+                "retryable": retryable,
+                "last_updated_at_utc": None,
+                "last_observation_at_utc": None,
+            },
+            "identity": {},
+            "progress": {},
+            "collection": {},
+            "feeds": [],
+            "safety": {"kill_rules": [], "stale_feeds": [], "integrity": integrity},
+            "strategy": {},
+            "economics": _empty_economics(),
+            "variants": [],
+            "incidents": [],
+            "reports": [],
+            "report_binding": None,
+        }
+    )
+    return payload
+
+
+def _bound_campaign_unavailable(now: datetime) -> dict[str, Any]:
+    return _real_fail_closed_snapshot(
+        now,
+        data_classification="BOUND_CAMPAIGN_UNAVAILABLE_FAIL_CLOSED",
+        state_code="UNREADABLE_FAIL_CLOSED",
+        freshness="FAILED",
+        integrity="BOUND_CAMPAIGN_UNAVAILABLE_FAIL_CLOSED",
+        retryable=True,
+    )
+
+
 def h1_snapshot(
     campaign_root: Path | None,
     *,
     policy_path: Path | None,
+    expected_identity: H1ExpectedIdentity | None = None,
     default_fixture: str = "PREPARED_NOT_STARTED",
     now: datetime | None = None,
     snapshot_once: Callable[[Path, H1PolicyConfig | None, datetime], dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], int]:
     current = (now or datetime.now(tz=UTC)).astimezone(UTC)
     if campaign_root is None:
+        if expected_identity is not None:
+            return _bound_campaign_unavailable(current), 503
         return _fixture_snapshot(default_fixture, now=current), 200
     if not campaign_root.exists():
+        if expected_identity is not None:
+            return _bound_campaign_unavailable(current), 503
         payload = _base_snapshot(now=current, fixture=False, fixture_name=None)
         payload.update(
             {
@@ -1072,9 +1190,14 @@ def h1_snapshot(
             }
         )
         return payload, 200
-    reader = snapshot_once or (lambda root, configured_policy, stamp: _snapshot_once(
-        root, policy=configured_policy, now=stamp
-    ))
+    reader = snapshot_once or (
+        lambda root, configured_policy, stamp: _snapshot_once(
+            root,
+            policy=configured_policy,
+            now=stamp,
+            expected_identity=expected_identity,
+        )
+    )
     for _attempt in range(_HEAD_READ_ATTEMPTS):
         try:
             policy = _load_policy(policy_path)
@@ -1082,85 +1205,31 @@ def h1_snapshot(
         except H1SnapshotHeadChangedError:
             continue
         except H1SnapshotIntegrityError:
-            payload = _fixture_snapshot("INTEGRITY_FAILED", now=current)
-            payload.update(
-                {
-                    "fixture": False,
-                    "fixture_name": None,
-                    "data_classification": "CAMPAIGN_PUBLICATION_REJECTED_FAIL_CLOSED",
-                    "state": {
-                        "code": "INTEGRITY_FAILED",
-                        "freshness": "FAILED",
-                        "integrity": "FAILED_READONLY",
-                        "retryable": False,
-                        "last_updated_at_utc": None,
-                        "last_observation_at_utc": None,
-                    },
-                    "identity": {},
-                    "progress": {},
-                    "collection": {},
-                    "feeds": [],
-                    "strategy": {},
-                    "economics": _empty_economics(),
-                    "variants": [],
-                    "incidents": [],
-                    "reports": [],
-                }
-            )
-            return payload, 503
+            return _real_fail_closed_snapshot(
+                current,
+                data_classification="CAMPAIGN_PUBLICATION_REJECTED_FAIL_CLOSED",
+                state_code="INTEGRITY_FAILED",
+                freshness="FAILED",
+                integrity="FAILED_READONLY",
+                retryable=False,
+            ), 503
         except (H1SnapshotUnreadableError, OSError):
-            payload = _fixture_snapshot("INTEGRITY_FAILED", now=current)
-            payload.update(
-                {
-                    "fixture": False,
-                    "fixture_name": None,
-                    "data_classification": "CAMPAIGN_PUBLICATION_UNREADABLE_FAIL_CLOSED",
-                    "state": {
-                        "code": "UNREADABLE_FAIL_CLOSED",
-                        "freshness": "FAILED",
-                        "integrity": "UNREADABLE_FAIL_CLOSED",
-                        "retryable": True,
-                        "last_updated_at_utc": None,
-                        "last_observation_at_utc": None,
-                    },
-                    "identity": {},
-                    "progress": {},
-                    "collection": {},
-                    "feeds": [],
-                    "strategy": {},
-                    "economics": _empty_economics(),
-                    "variants": [],
-                    "incidents": [],
-                    "reports": [],
-                }
-            )
-            return payload, 503
-    payload = _fixture_snapshot("INTEGRITY_FAILED", now=current)
-    payload.update(
-        {
-            "fixture": False,
-            "fixture_name": None,
-            "data_classification": "HEAD_CHANGED_RETRY",
-            "state": {
-                "code": "HEAD_CHANGED_RETRY",
-                "freshness": "RETRY",
-                "integrity": "HEAD_CHANGED_RETRY",
-                "retryable": True,
-                "last_updated_at_utc": None,
-                "last_observation_at_utc": None,
-            },
-            "identity": {},
-            "progress": {},
-            "collection": {},
-            "feeds": [],
-            "strategy": {},
-            "economics": _empty_economics(),
-            "variants": [],
-            "incidents": [],
-            "reports": [],
-        }
-    )
-    return payload, 409
+            return _real_fail_closed_snapshot(
+                current,
+                data_classification="CAMPAIGN_PUBLICATION_UNREADABLE_FAIL_CLOSED",
+                state_code="UNREADABLE_FAIL_CLOSED",
+                freshness="FAILED",
+                integrity="UNREADABLE_FAIL_CLOSED",
+                retryable=True,
+            ), 503
+    return _real_fail_closed_snapshot(
+        current,
+        data_classification="HEAD_CHANGED_RETRY",
+        state_code="HEAD_CHANGED_RETRY",
+        freshness="RETRY",
+        integrity="HEAD_CHANGED_RETRY",
+        retryable=True,
+    ), 409
 
 
 def h1_fixture_snapshot(name: str, *, now: datetime | None = None) -> dict[str, Any]:
@@ -1172,6 +1241,7 @@ def h1_report_download(
     report_id: str,
     *,
     policy_path: Path | None,
+    expected_identity: H1ExpectedIdentity | None = None,
     now: datetime | None = None,
 ) -> H1ReportDownload | None:
     if campaign_root is None or report_id not in _REPORT_PATHS:
@@ -1179,6 +1249,7 @@ def h1_report_download(
     snapshot, status_code = h1_snapshot(
         campaign_root,
         policy_path=policy_path,
+        expected_identity=expected_identity,
         now=now,
     )
     if status_code != 200 or snapshot.get("fixture") is True:
@@ -1217,6 +1288,7 @@ __all__ = [
     "H1_BOUNDARY",
     "H1_FIXTURE_LABEL",
     "H1_MODE",
+    "H1ExpectedIdentity",
     "H1ReportDownload",
     "H1SnapshotHeadChangedError",
     "H1SnapshotIntegrityError",

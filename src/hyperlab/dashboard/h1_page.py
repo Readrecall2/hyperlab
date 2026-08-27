@@ -734,7 +734,7 @@ H1_JS = r"""
     });
     const identities = $("identities");
     clear(identities);
-    const labels = { campaign_id: "Campaign ID", policy_id: "Politique", policy_config_sha256: "Hash configuration", campaign_manifest_sha256: "Hash manifest campagne", raw_manifest_sha256: "Hash manifest raw", raw_root_sha256: "Racine raw", fee_artifact_sha256: "Hash frais publics", source_commit: "Commit source" };
+    const labels = { campaign_id: "Campaign ID", campaign_slug: "Slug campagne", policy_id: "Politique", policy_config_sha256: "Hash configuration", campaign_manifest_sha256: "Hash manifest campagne", raw_manifest_sha256: "Hash manifest raw", raw_root_sha256: "Racine raw", fee_artifact_sha256: "Hash frais publics", collector_source_commit: "Commit collecteur", dashboard_source_commit: "Commit dashboard" };
     const values = snapshot.identity || {};
     Object.entries(labels).forEach(([key, label]) => {
       const wrapper = node("div");

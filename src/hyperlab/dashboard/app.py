@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from hyperlab import __version__
 from hyperlab.dashboard.h1_dashboard import (
+    H1ExpectedIdentity,
     h1_fixture_names,
     h1_fixture_snapshot,
     h1_report_download,
@@ -333,6 +334,7 @@ def create_app(
     paper_dir: Path | None = None,
     h1_campaign_root: Path | None = None,
     h1_policy_path: Path | None = Path("config/research/hyperliquid-h1-ghost-v1.json"),
+    h1_expected_identity: H1ExpectedIdentity | None = None,
     h1_default_fixture: str = "PREPARED_NOT_STARTED",
 ) -> FastAPI:
     app = FastAPI(title="HyperLab Read-Only Dashboard", version=__version__)
@@ -359,6 +361,7 @@ def create_app(
         payload, status_code = h1_snapshot(
             h1_campaign_root,
             policy_path=h1_policy_path,
+            expected_identity=h1_expected_identity,
             default_fixture=h1_default_fixture,
         )
         return JSONResponse(payload, status_code=status_code, headers=h1_headers())
@@ -367,6 +370,7 @@ def create_app(
         payload, status_code = h1_snapshot(
             h1_campaign_root,
             policy_path=h1_policy_path,
+            expected_identity=h1_expected_identity,
             default_fixture=h1_default_fixture,
         )
         body = {
@@ -423,6 +427,42 @@ def create_app(
     @app.get("/ready")
     def readiness() -> JSONResponse:
         return readiness_response()
+
+    @app.api_route("/health/h1-ready", methods=["GET", "HEAD"])
+    def h1_readiness() -> JSONResponse:
+        if h1_expected_identity is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "ready": False,
+                    "mode": "readonly",
+                    "orders_enabled": False,
+                    "status": "H1_BINDING_NOT_CONFIGURED",
+                },
+                status_code=503,
+                headers=h1_headers(),
+            )
+        payload, status_code = h1_snapshot(
+            h1_campaign_root,
+            policy_path=h1_policy_path,
+            expected_identity=h1_expected_identity,
+        )
+        state = payload.get("state", {})
+        identity = payload.get("identity", {})
+        ready = status_code == 200 and payload.get("fixture") is False
+        return JSONResponse(
+            {
+                "ok": ready,
+                "ready": ready,
+                "mode": "readonly",
+                "orders_enabled": False,
+                "status": "H1_BOUND_READONLY_READY" if ready else "H1_BOUND_FAIL_CLOSED",
+                "state": state,
+                "identity": identity,
+            },
+            status_code=200 if ready else 503,
+            headers=h1_headers(),
+        )
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:
@@ -501,6 +541,7 @@ def create_app(
             h1_campaign_root,
             report_id,
             policy_path=h1_policy_path,
+            expected_identity=h1_expected_identity,
         )
         if report is None:
             return JSONResponse(

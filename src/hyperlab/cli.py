@@ -415,6 +415,13 @@ def _optional_configured_path(name: str) -> Path | None:
     return Path(normalized)
 
 
+def _required_environment_value(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise typer.BadParameter(f"{name} doit être défini et non vide")
+    return value.strip()
+
+
 def _strict_persistence_enabled() -> bool:
     value = os.getenv("HYPERLAB_REQUIRE_PERSISTENT_LAYOUT")
     if value is None or value == "0":
@@ -3104,6 +3111,56 @@ def serve(
         h1_default_fixture=os.getenv("HYPERLAB_H1_FIXTURE", "PREPARED_NOT_STARTED"),
     )
     uvicorn.run(dashboard, host=host, port=port)
+
+
+@app.command("h1-dashboard-serve")
+def h1_dashboard_serve(
+    port: Annotated[int, typer.Option(min=1, max=65_535)] = 8000,
+) -> None:
+    """Serve one externally pinned H1 campaign on IPv4 loopback only."""
+
+    import uvicorn
+
+    from hyperlab.dashboard.app import create_app
+    from hyperlab.dashboard.h1_dashboard import H1ExpectedIdentity, h1_snapshot
+
+    settings = _settings()
+    if settings.app.mode != "readonly":
+        raise typer.BadParameter("h1-dashboard-serve exige HYPERLAB_MODE=readonly")
+    campaign_root = Path(_required_environment_value("HYPERLAB_H1_CAMPAIGN_ROOT"))
+    policy_path = Path(_required_environment_value("HYPERLAB_H1_POLICY_CONFIG"))
+    try:
+        expected_identity = H1ExpectedIdentity(
+            campaign_id=_required_environment_value("HYPERLAB_H1_EXPECTED_CAMPAIGN_ID"),
+            campaign_manifest_sha256=_required_environment_value(
+                "HYPERLAB_H1_EXPECTED_CAMPAIGN_MANIFEST_SHA256"
+            ),
+            campaign_slug=_required_environment_value("HYPERLAB_H1_EXPECTED_CAMPAIGN_SLUG"),
+            collector_source_commit=_required_environment_value("HYPERLAB_H1_COLLECTOR_SOURCE_COMMIT"),
+            dashboard_source_commit=_required_environment_value("HYPERLAB_H1_DASHBOARD_SOURCE_COMMIT"),
+        )
+    except ValueError as error:
+        raise typer.BadParameter(f"identité H1 bindée invalide: {error}") from None
+    payload, status_code = h1_snapshot(
+        campaign_root,
+        policy_path=policy_path,
+        expected_identity=expected_identity,
+    )
+    state = payload.get("state")
+    state_code = state.get("code") if isinstance(state, dict) else "UNREADABLE_FAIL_CLOSED"
+    if status_code != 200 or payload.get("fixture") is not False:
+        raise typer.BadParameter(f"binding campagne H1 refusé: {state_code}")
+    data_dir = settings.app.data_dir
+    dashboard = create_app(
+        data_dir=data_dir,
+        runtime_dir=_configured_directory("HYPERLAB_RUNTIME_DIR", data_dir),
+        reports_dir=_configured_directory("HYPERLAB_REPORTS_DIR", data_dir / "reports"),
+        paper_dir=_configured_directory("HYPERLAB_PAPER_DIR", data_dir / "paper"),
+        h1_campaign_root=campaign_root,
+        h1_policy_path=policy_path,
+        h1_expected_identity=expected_identity,
+    )
+    uvicorn.run(dashboard, host="127.0.0.1", port=port)
 
 
 if __name__ == "__main__":

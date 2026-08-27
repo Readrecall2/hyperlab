@@ -94,40 +94,72 @@ def _incoming_handoff(tmp_path: Path) -> Path:
     return path
 
 
+def _run_git(*arguments: str, cwd: Path | None = None) -> None:
+    completed = subprocess.run(
+        ["git", *arguments],
+        capture_output=True,
+        check=False,
+        cwd=cwd,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _create_real_git_bundle(tmp_path: Path, bundle: Path) -> None:
+    source = tmp_path / "synthetic-bundle-source"
+    _run_git("init", "--quiet", str(source))
+    _run_git("config", "user.email", "synthetic-fixture@invalid.example", cwd=source)
+    _run_git("config", "user.name", "Synthetic Fixture", cwd=source)
+    (source / "SYNTHETIC_FIXTURE.txt").write_text(
+        "SYNTHETIC/FIXTURE only; no economic evidence.\n",
+        encoding="utf-8",
+    )
+    _run_git("add", "SYNTHETIC_FIXTURE.txt", cwd=source)
+    _run_git("commit", "--quiet", "-m", "synthetic bundle fixture", cwd=source)
+    _run_git("bundle", "create", str(bundle), "HEAD", cwd=source)
+
+
+def _git_bash_path(path: Path) -> str:
+    resolved = path.resolve()
+    drive = resolved.drive.removesuffix(":").lower()
+    assert len(drive) == 1
+    return f"/{drive}{resolved.as_posix()[2:]}"
+
+
 def _materialize_windows_transfer_layout(
     tmp_path: Path,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, dict[str, object]]:
     pack = tmp_path / "materialized-pack"
     operator = pack / "operator"
     wheelhouse = pack / "wheelhouse"
     operator.mkdir(parents=True)
     wheelhouse.mkdir()
     bundle = pack / "hyperlab-prediction-markets-prospective-launch-v1.bundle"
-    bundle.write_bytes(b"real-bundle-hash-fixture")
+    _create_real_git_bundle(tmp_path, bundle)
     handoff_json = pack / "handoff.json"
     handoff_json.write_bytes(b'{"fixture":"SYNTHETIC_LAYOUT_ONLY"}\n')
     wheel = wheelhouse / "fixture-1.0-py3-none-any.whl"
     wheel.write_bytes(b"real-wheel-hash-fixture")
-    (pack / "handoff.sha256").write_text(
-        f"{launch_pack.sha256_file(handoff_json)}  handoff.json\n",
-        encoding="ascii",
+    (pack / "handoff.sha256").write_bytes(
+        f"{launch_pack.sha256_file(handoff_json)}  handoff.json\n".encode("ascii")
     )
-    (pack / "wheelhouse.sha256").write_text(
-        f"{launch_pack.sha256_file(wheel)}  {wheel.name}\n",
-        encoding="ascii",
+    (pack / "wheelhouse.sha256").write_bytes(
+        f"{launch_pack.sha256_file(wheel)}  {wheel.name}\n".encode("ascii")
     )
     handoff = _handoff()
     handoff.update(
         {
             "bundle_filename": bundle.name,
             "bundle_sha256": launch_pack.sha256_file(bundle),
+            "incoming_root": _git_bash_path(pack),
         }
     )
     block_a = operator / "A-windows-bundle-verify-transfer.ps1"
     block_a.write_text(launch_pack.render_windows_transfer(handoff), encoding="utf-8")
     ssh_key = tmp_path / "hyperlab_hetzner"
     ssh_key.write_bytes(b"SYNTHETIC_PRIVATE_KEY_PATH_FIXTURE_NOT_A_KEY")
-    return pack, block_a, bundle, handoff_json, ssh_key
+    return pack, block_a, bundle, handoff_json, ssh_key, handoff
 
 
 def _invoke_windows_transfer_with_strict_fakes(
@@ -136,21 +168,31 @@ def _invoke_windows_transfer_with_strict_fakes(
     ssh_key: Path,
     *,
     log_name: str,
-) -> tuple[subprocess.CompletedProcess[str], Path]:
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell is unavailable for the materialized-layout regression")
+    if os.name == "nt":
+        program_files = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        candidate = program_files / "Git" / "bin" / "bash.exe"
+        git_bash = str(candidate) if candidate.is_file() else None
+    else:
+        git_bash = shutil.which("bash")
+    if git_bash is None:
+        pytest.skip("Git Bash is unavailable for the remote-command simulation")
     log = tmp_path / log_name
     wrapper = tmp_path / f"invoke-{log_name}.ps1"
     wrapper.write_text(
         """$ErrorActionPreference = 'Stop'
-function global:git {
-    Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('git|' + ($args -join '|'))
-    $global:LASTEXITCODE = 0
-}
 function global:ssh {
     Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('ssh|' + ($args -join '|'))
-    $global:LASTEXITCODE = 0
+    $RemoteCommand = $args[-1]
+    if ($RemoteCommand.Contains('git -C "$VERIFY_REPO" bundle verify "$BUNDLE_PATH"')) {
+        & $env:HYPERLAB_PM_TEST_BASH -lc $RemoteCommand
+        $global:LASTEXITCODE = $LASTEXITCODE
+    } else {
+        $global:LASTEXITCODE = 0
+    }
 }
 function global:scp {
     Add-Content -LiteralPath $env:HYPERLAB_PM_FAKE_LOG -Value ('scp|' + ($args -join '|'))
@@ -160,6 +202,10 @@ function global:scp {
 """,
         encoding="utf-8",
     )
+    powershell_temp = tmp_path / "powershell-temp"
+    powershell_temp.mkdir()
+    non_git_cwd = tmp_path / "non-git-cwd"
+    non_git_cwd.mkdir()
     environment = os.environ.copy()
     environment.update(
         {
@@ -167,6 +213,9 @@ function global:scp {
             "HYPERLAB_PM_FAKE_LOG": str(log),
             "HYPERLAB_PM_SSH_KEY": str(ssh_key),
             "HYPERLAB_PM_SSH_TARGET": "hyperlab@5.223.60.130",
+            "HYPERLAB_PM_TEST_BASH": git_bash,
+            "TEMP": str(powershell_temp),
+            "TMP": str(powershell_temp),
         }
     )
     completed = subprocess.run(
@@ -182,11 +231,13 @@ function global:scp {
         ],
         capture_output=True,
         check=False,
+        cwd=non_git_cwd,
         env=environment,
         text=True,
         timeout=30,
     )
-    return completed, log
+    assert not (non_git_cwd / ".git").exists()
+    return completed, log, powershell_temp
 
 
 def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
@@ -194,7 +245,14 @@ def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandR
         "/.venv/bin/python"
     ):
         return preflight.CommandResult(0, "", "")
-    if arguments[:3] == ["git", "bundle", "verify"]:
+    if arguments[:4] == ["git", "init", "--bare", "--quiet"]:
+        return preflight.CommandResult(0, "", "")
+    if (
+        len(arguments) >= 6
+        and arguments[0] == "git"
+        and arguments[1] == "-C"
+        and arguments[3:5] == ["bundle", "verify"]
+    ):
         return preflight.CommandResult(0, "bundle verified", "")
     if arguments[0] == "timedatectl":
         return preflight.CommandResult(0, "yes", "")
@@ -333,6 +391,10 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     assert "$BundleRoot = (Resolve-Path -LiteralPath (Join-Path $OperatorRoot '..')).Path" in windows
     assert "$BundleRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path" not in windows
     assert "Assert-Sha256Manifest" in windows
+    assert "git -C $VerifyRoot bundle verify $Path" in windows
+    assert "git bundle verify $BundlePath" not in windows
+    assert 'git -C "$VERIFY_REPO" bundle verify "$BUNDLE_PATH"' in windows
+    assert "cd '$IncomingRoot' && git bundle verify" not in windows
     assert "HYPERLAB_PM_SSH_KEY" in windows
     assert "PREDICTION_WINDOWS_TRANSFER_VERIFIED" in windows
     assert install.startswith("#!/usr/bin/env bash")
@@ -350,10 +412,10 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
 def test_materialized_windows_a_uses_parent_pack_root_and_real_local_hashes(
     tmp_path: Path,
 ) -> None:
-    pack, block_a, bundle, handoff_json, ssh_key = _materialize_windows_transfer_layout(
-        tmp_path
+    pack, block_a, bundle, handoff_json, ssh_key, _handoff_data = (
+        _materialize_windows_transfer_layout(tmp_path)
     )
-    completed, log = _invoke_windows_transfer_with_strict_fakes(
+    completed, log, powershell_temp = _invoke_windows_transfer_with_strict_fakes(
         tmp_path,
         block_a,
         ssh_key,
@@ -361,11 +423,10 @@ def test_materialized_windows_a_uses_parent_pack_root_and_real_local_hashes(
     )
     assert completed.returncode == 0, completed.stderr
     assert "PREDICTION_WINDOWS_TRANSFER_VERIFIED" in completed.stdout
+    assert "PREDICTION_REMOTE_BUNDLE_VERIFIED" in completed.stdout
     lines = log.read_text(encoding="utf-8").splitlines()
-    git_lines = [line for line in lines if line.startswith("git|")]
     ssh_lines = [line for line in lines if line.startswith("ssh|")]
     scp_lines = [line for line in lines if line.startswith("scp|")]
-    assert len(git_lines) == 1 and str(bundle) in git_lines[0]
     assert len(ssh_lines) == 2
     assert all(f"|-i|{ssh_key}|hyperlab@5.223.60.130|" in line for line in ssh_lines)
     assert len(scp_lines) == len(list(pack.iterdir()))
@@ -374,6 +435,30 @@ def test_materialized_windows_a_uses_parent_pack_root_and_real_local_hashes(
     assert any(str(handoff_json) in line for line in scp_lines)
     assert any(str(pack / "wheelhouse") in line for line in scp_lines)
     assert not any(str(pack / "operator" / bundle.name) in line for line in lines)
+    assert list(powershell_temp.iterdir()) == []
+    assert not list(pack.glob(".git-bundle-verify-*"))
+
+
+def test_materialized_windows_a_rejects_sha_valid_non_bundle_with_real_git(
+    tmp_path: Path,
+) -> None:
+    pack, block_a, bundle, _handoff_json, ssh_key, handoff = (
+        _materialize_windows_transfer_layout(tmp_path)
+    )
+    bundle.write_bytes(b"SHA-valid but not a Git bundle")
+    handoff["bundle_sha256"] = launch_pack.sha256_file(bundle)
+    block_a.write_text(launch_pack.render_windows_transfer(handoff), encoding="utf-8")
+    completed, log, powershell_temp = _invoke_windows_transfer_with_strict_fakes(
+        tmp_path,
+        block_a,
+        ssh_key,
+        log_name="invalid-bundle-external-commands.log",
+    )
+    assert completed.returncode != 0
+    assert "git bundle verify failed" in completed.stderr
+    assert not log.exists()
+    assert list(powershell_temp.iterdir()) == []
+    assert not list(pack.glob(".git-bundle-verify-*"))
 
 
 @pytest.mark.parametrize(
@@ -384,11 +469,11 @@ def test_materialized_windows_a_refuses_root_hash_divergence_before_external_com
     tmp_path: Path,
     relative_corruption: str,
 ) -> None:
-    pack, block_a, _bundle, _handoff_json, ssh_key = _materialize_windows_transfer_layout(
-        tmp_path
+    pack, block_a, _bundle, _handoff_json, ssh_key, _handoff_data = (
+        _materialize_windows_transfer_layout(tmp_path)
     )
     (pack / relative_corruption).write_bytes(b"corrupted-after-manifest")
-    completed, log = _invoke_windows_transfer_with_strict_fakes(
+    completed, log, powershell_temp = _invoke_windows_transfer_with_strict_fakes(
         tmp_path,
         block_a,
         ssh_key,
@@ -397,6 +482,27 @@ def test_materialized_windows_a_refuses_root_hash_divergence_before_external_com
     assert completed.returncode != 0
     assert "SHA-256 diverged" in completed.stderr
     assert not log.exists()
+    assert list(powershell_temp.iterdir()) == []
+
+
+def test_target_preflight_verifies_real_bundle_from_non_git_cwd_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pack, _block_a, _bundle, _handoff_json, _ssh_key, handoff = (
+        _materialize_windows_transfer_layout(tmp_path)
+    )
+    non_git_cwd = tmp_path / "preflight-non-git-cwd"
+    non_git_cwd.mkdir()
+    monkeypatch.chdir(non_git_cwd)
+    result = preflight.verify_git_bundle(pack, handoff, preflight._command)
+    assert result == {
+        "sha256": handoff["bundle_sha256"],
+        "temporary_repository_removed": True,
+        "verified": True,
+    }
+    assert not (non_git_cwd / ".git").exists()
+    assert not list(pack.glob(".git-bundle-verify-*"))
 
 
 def test_connectivity_preflight_is_per_venue_and_kalshi_never_uses_wss_credentials() -> None:
@@ -503,6 +609,12 @@ def test_host_preflight_synchronously_proves_ntp_capacity_port_services_and_isol
     assert result["installation_admissible"] is True
     assert result["eligible_venues"] == ["kalshi"]
     assert result["checks"]["ntp"] == {"synchronized": True}  # type: ignore[index]
+    assert result["checks"]["git_bundle"] == {  # type: ignore[index]
+        "sha256": preflight.load_handoff(handoff)["bundle_sha256"],
+        "temporary_repository_removed": True,
+        "verified": True,
+    }
+    assert not list(handoff.parent.glob(".git-bundle-verify-*"))
     assert result["checks"]["loopback_port"] == {  # type: ignore[index]
         "free": True,
         "host": "127.0.0.1",
@@ -675,6 +787,8 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     assert "command_verified" in install and "MainPID" in install
     assert "manylinux_2_28_x86_64" in bundle
     assert "manylinux_2_17_x86_64" in bundle
+    assert "git -C $RepoRoot bundle verify $BundlePath" in bundle
+    assert "git bundle verify $BundlePath" not in bundle
     assert "glibc" in bootstrap
     assert "admission_required" in monitor and "eligible_venues" in monitor
     assert "CAPACITY_REFUSED" in monitor and "INTERRUPTED_RECOVERABLE" in monitor

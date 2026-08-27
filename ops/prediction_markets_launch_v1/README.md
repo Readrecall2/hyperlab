@@ -115,7 +115,10 @@ Les blocs A et D lisent la cible SSH depuis `HYPERLAB_PM_SSH_TARGET`. Le bloc A
 exige en plus le chemin local de la clé dédiée dans `HYPERLAB_PM_SSH_KEY`, résout
 la racine canonique comme le parent de son dossier `operator`, puis vérifie
 localement le bundle, `handoff.sha256` et `wheelhouse.sha256` avant toute commande
-SSH. Aucune adresse, credential ou clé n'est inscrite dans le bundle. Chaque
+SSH. Les vérifications Git locale, distante et du preflight B utilisent chacune
+un dépôt bare temporaire neuf : elles restent valides depuis un cwd non-Git et
+nettoient uniquement leur racine temporaire bornée. Aucune adresse, credential
+ou clé n'est inscrite dans le bundle. Chaque
 fichier annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal
 terminal.
 

@@ -228,6 +228,45 @@ def verify_wheelhouse(incoming_root: Path, handoff: Mapping[str, object]) -> dic
     return {"bytes": total, "files": count, "manifest_sha256": expected_manifest}
 
 
+def verify_git_bundle(
+    incoming_root: Path,
+    handoff: Mapping[str, object],
+    run: CommandRunner,
+) -> dict[str, object]:
+    bundle = incoming_root / str(handoff["bundle_filename"])
+    expected = _validate_sha256(handoff.get("bundle_sha256"), label="Git bundle hash")
+    payload = _safe_regular_bytes(bundle, maximum_bytes=512 * 1024 * 1024)
+    if sha256_bytes(payload) != expected:
+        raise PreflightError("Git bundle SHA-256 diverged")
+    verify_root = incoming_root / f".git-bundle-verify-{uuid4().hex}"
+    verify_root.mkdir(mode=0o700, exist_ok=False)
+    try:
+        initialized = run(["git", "init", "--bare", "--quiet", str(verify_root)])
+        if initialized.returncode != 0:
+            raise PreflightError(
+                f"temporary bare repository initialization failed: {initialized.stderr}"
+            )
+        verified = run(
+            ["git", "-C", str(verify_root), "bundle", "verify", str(bundle)]
+        )
+        if verified.returncode != 0:
+            raise PreflightError(f"Git bundle verification failed: {verified.stderr}")
+    finally:
+        if (
+            verify_root.is_symlink()
+            or verify_root.resolve(strict=True) != verify_root
+            or verify_root.parent != incoming_root
+            or not verify_root.name.startswith(".git-bundle-verify-")
+        ):
+            raise PreflightError("refusing unsafe Git bundle verification cleanup")
+        shutil.rmtree(verify_root)
+    return {
+        "sha256": expected,
+        "temporary_repository_removed": not verify_root.exists(),
+        "verified": True,
+    }
+
+
 def _dns(host: str) -> list[str]:
     try:
         completed = subprocess.run(
@@ -484,15 +523,7 @@ def host_preflight(
             "required": "CPython 3.12 x86_64",
             "system_command_green": True,
         }
-        bundle = incoming / str(handoff["bundle_filename"])
-        verified = run(["git", "bundle", "verify", str(bundle)])
-        if verified.returncode != 0:
-            raise PreflightError(f"Git bundle verification failed: {verified.stderr}")
-        if sha256_bytes(_safe_regular_bytes(bundle, maximum_bytes=512 * 1024 * 1024)) != handoff.get(
-            "bundle_sha256"
-        ):
-            raise PreflightError("Git bundle SHA-256 diverged")
-        checks["git_bundle"] = {"sha256": handoff["bundle_sha256"], "verified": True}
+        checks["git_bundle"] = verify_git_bundle(incoming, handoff, run)
         ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
         if ntp.returncode != 0 or ntp.stdout != "yes":
             raise PreflightError("NTP is not synchronized")

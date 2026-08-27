@@ -394,20 +394,67 @@ function Assert-Sha256Manifest {{
     }}
 }}
 
+function Assert-GitBundle {{
+    param([string] $Path)
+    $VerifyParent = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path.TrimEnd('\')
+    $VerifyLeaf = 'hyperlab-pm-git-bundle-verify-' + [Guid]::NewGuid().ToString('N')
+    $VerifyRoot = Join-Path $VerifyParent $VerifyLeaf
+    if (Test-Path -LiteralPath $VerifyRoot) {{ throw 'Git bundle verification root must be new.' }}
+    try {{
+        git init --bare --quiet $VerifyRoot
+        if ($LASTEXITCODE -ne 0) {{ throw 'Temporary bare repository initialization failed.' }}
+        git -C $VerifyRoot bundle verify $Path
+        if ($LASTEXITCODE -ne 0) {{ throw 'git bundle verify failed.' }}
+    }} finally {{
+        if (Test-Path -LiteralPath $VerifyRoot) {{
+            $ResolvedVerifyRoot = (Resolve-Path -LiteralPath $VerifyRoot).Path.TrimEnd('\')
+            $ExpectedVerifyRoot = [IO.Path]::GetFullPath($VerifyRoot).TrimEnd('\')
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($ResolvedVerifyRoot, $ExpectedVerifyRoot)) {{ throw 'Refusing unsafe Git bundle verification cleanup.' }}
+            Remove-Item -LiteralPath $ResolvedVerifyRoot -Recurse -Force
+        }}
+    }}
+}}
+
 $BundlePath = (Resolve-Path -LiteralPath (Join-Path $BundleRoot '{bundle}')).Path
 if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Split-Path -Parent $BundlePath), $BundleRoot)) {{ throw 'Git bundle escaped the pack root.' }}
 if ((Get-Sha256Hex -Path $BundlePath) -ne '{bundle_sha}') {{ throw 'Git bundle SHA-256 diverged.' }}
 Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'handoff.sha256') -ContentRoot $BundleRoot
 Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'wheelhouse.sha256') -ContentRoot (Join-Path $BundleRoot 'wheelhouse')
-git bundle verify $BundlePath
-if ($LASTEXITCODE -ne 0) {{ throw 'git bundle verify failed.' }}
+Assert-GitBundle -Path $BundlePath
 ssh -i $SshKeyPath $SshTarget "test ! -e '$IncomingRoot' && install -d -m 0700 '$IncomingRoot'"
 if ($LASTEXITCODE -ne 0) {{ throw 'Unique incoming root creation failed.' }}
 Get-ChildItem -LiteralPath $BundleRoot -Force | ForEach-Object {{
     scp -i $SshKeyPath -r -- $_.FullName "${{SshTarget}}:${{IncomingRoot}}/"
     if ($LASTEXITCODE -ne 0) {{ throw "Transfer failed: $($_.Name)" }}
 }}
-ssh -i $SshKeyPath $SshTarget "cd '$IncomingRoot' && sha256sum -c handoff.sha256 && (cd wheelhouse && sha256sum -c ../wheelhouse.sha256) && git bundle verify '{bundle}'"
+$RemoteVerify = @'
+set -Eeuo pipefail
+INCOMING_ROOT='{incoming}'
+BUNDLE_PATH="$INCOMING_ROOT/{bundle}"
+VERIFY_REPO=''
+cleanup() {{
+  status=$?
+  trap - EXIT
+  if [[ -n "$VERIFY_REPO" ]]; then
+    case "$VERIFY_REPO" in
+      "$INCOMING_ROOT"/.git-bundle-verify.*) ;;
+      *) printf 'PREDICTION_REMOTE_BUNDLE_CLEANUP_REFUSED\n' >&2; exit 4 ;;
+    esac
+    rm -rf -- "$VERIFY_REPO" || exit 4
+  fi
+  exit "$status"
+}}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+cd "$INCOMING_ROOT"
+sha256sum -c handoff.sha256
+(cd wheelhouse && sha256sum -c ../wheelhouse.sha256)
+VERIFY_REPO=$(mktemp -d "$INCOMING_ROOT/.git-bundle-verify.XXXXXXXX")
+git init --bare --quiet "$VERIFY_REPO"
+git -C "$VERIFY_REPO" bundle verify "$BUNDLE_PATH"
+printf 'PREDICTION_REMOTE_BUNDLE_VERIFIED\n'
+'@
+ssh -i $SshKeyPath $SshTarget $RemoteVerify
 if ($LASTEXITCODE -ne 0) {{ throw 'Transferred bundle or hashes diverged; do not run the Tabby block.' }}
 Write-Output 'PREDICTION_WINDOWS_TRANSFER_VERIFIED'
 """

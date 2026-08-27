@@ -43,7 +43,7 @@ New-Item -ItemType Directory -Path $OutputRoot | Out-Null
 $BundlePath = Join-Path $OutputRoot 'hyperlab-prediction-markets-prospective-launch-v1.bundle'
 git -C $RepoRoot bundle create $BundlePath $ExpectedRef
 if ($LASTEXITCODE -ne 0) { throw 'git bundle create failed.' }
-git bundle verify $BundlePath
+git -C $RepoRoot bundle verify $BundlePath
 if ($LASTEXITCODE -ne 0) { throw 'git bundle verify failed.' }
 
 $Wheelhouse = Join-Path $OutputRoot 'wheelhouse'

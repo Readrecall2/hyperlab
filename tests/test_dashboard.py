@@ -747,6 +747,32 @@ def test_bound_h1_dashboard_cli_refuses_missing_identity_before_listening(
     assert called is False
 
 
+def test_bound_h1_dashboard_cli_refuses_relative_campaign_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hyperlab import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_settings",
+        lambda: SimpleNamespace(app=SimpleNamespace(data_dir=tmp_path, mode="readonly")),
+    )
+    monkeypatch.setenv("HYPERLAB_H1_CAMPAIGN_ROOT", "relative/campaign")
+    called = False
+
+    def fake_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    with pytest.raises(typer.BadParameter, match="chemin absolu exact"):
+        cli_module.h1_dashboard_serve()
+
+    assert called is False
+
+
 def test_old_live_runtime_status_is_not_reported_as_active(tmp_path: Path) -> None:
     now = datetime(2026, 8, 12, 12, tzinfo=UTC)
     runtime = {

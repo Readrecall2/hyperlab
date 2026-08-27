@@ -1,49 +1,86 @@
-# Generic H1 Dashboard Binding
+# H1 V8 Dashboard Binding V1
 
-Ce répertoire contient seulement le mécanisme réutilisable et fail-closed de
-liaison d'un dashboard H1 à une campagne. Il ne fige aucune identité de campagne
-et ne fournit donc aucun bundle directement exécutable. Statut :
-`H1_DASHBOARD_GENERIC_INTEGRATION_READY_AWAITING_V8_IDENTITY`.
+Ce pack lie le cockpit H1 read-only à la campagne V8
+`h1-20260827t004500z-5973abde`. Il ne modifie, ne redémarre et ne remplace
+jamais le collecteur existant. Il ne contient aucune route d'ordre, aucun
+wallet, signer, secret, endpoint privé ou accès real-money.
 
-Le validateur exige un plan JSON externe complet avant tout rendu. Le plan lie
-explicitement les quatre commits distincts (base de lancement, dashboard
-original, cherry-pick d'intégration et source finale), la branche, l'identité et
-le hash du manifest, les chemins exacts, le service collecteur et le service
-dashboard séparé. `manifest_checks` contient uniquement les champs réellement
-présents dans le manifest canonique ; le slug, le chemin et le commit collecteur
-sont liés ailleurs dans le plan sans inventer de champs de manifest.
+L'input suivi `binding-input-v8.json` fige la base collecteur, le cherry-pick du
+dashboard et son commit original, l'identité campagne/manifest, les chemins VPS,
+le service dashboard séparé et `127.0.0.1:18080`. Il omet volontairement le
+commit source final. Après le commit final, le générateur PowerShell l'injecte
+dans `binding-plan.json` et vérifie :
 
-Les invariants non paramétriques sont :
+- HEAD, branche historique exacte et worktree propre ;
+- parent direct `base -> integration`, puis ancestry `integration -> source` ;
+- marqueur exact du cherry-pick vers le commit dashboard original ;
+- Git bundle exposant uniquement la ref attendue au commit final ;
+- hashes des fichiers suivis, du bundle et des artefacts essentiels transmis.
 
-- `PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY`, API GET/HEAD et mode read-only ;
-- écoute IPv4 exclusivement sur `127.0.0.1`, port non privilégié ;
-- source dashboard dédiée puis root-owned sans bit d'écriture ;
-- campagne montée par self-bind systemd en lecture seule ;
-- `ProtectSystem=strict`, `NoNewPrivileges`, capacités vides, secrets bannis ;
-- collecteur inspecté uniquement avec `systemctl show`, jamais muté ;
-- accès Beelink via `ssh -N -T -L 127.0.0.1:PORT:127.0.0.1:PORT` avec
-  `ClearAllForwardings=yes` et `ExitOnForwardFailure=yes`.
+`binding-files.sha256` couvre l'ensemble essentiel non circulaire : bundle,
+input, plan, handoff, README, bootstrap et unité. Son propre SHA-256 est injecté
+dans les étapes 01 et 02 ; chacune vérifie ce pin avant de parser la liste ou
+d'appeler `sha256sum -c`. Les blocs opérateur sont produits seulement après ce
+gel, ce qui évite toute auto-référence.
 
-## Séquence future, après gel humain de l'identité V8
+L'unité générée écoute uniquement sur IPv4 loopback, monte le campaign root par
+self-bind en lecture seule, rend la source et le handoff immuables, utilise
+`ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges`, aucune capacité,
+aucun fichier de secrets et aucune écriture dans la campagne. Son préflight
+vérifie le manifest canonique, les checkouts source, le port et le collecteur via
+la seule commande `systemctl show`.
 
-1. Windows PowerShell : valider le plan, produire et transférer un bundle depuis
-   un worktree propre. Durée attendue 2–10 min, maximum 30 min ; seuls la clé SSH
-   ou le host-key peuvent demander confirmation ; Ctrl+C stoppe le transfert ;
-   signal attendu : `H1_DASHBOARD_BINDING_TRANSFER_GREEN_NOT_INSTALLED`.
-2. Tabby/Bash VPS : installer la source dashboard séparée et l'unité rendue.
-   Durée attendue 10–25 min, maximum 45 min ; `sudo` peut demander le mot de
-   passe ; monitorer dans un second onglet avec `systemctl show` et des GET
-   loopback ; Ctrl+C avant enable stoppe l'installation, après enable le service
-   reste géré par systemd ; signal : `H1_DASHBOARD_BINDING_INSTALL_GREEN`.
-3. Windows PowerShell : exécuter le tunnel rendu. Session foreground, durée
-   contrôlée par l'opérateur ; Ctrl+C ferme seulement le tunnel ; le signal de
-   succès est un GET navigateur sur l'URL loopback.
+La preuve runtime opérateur acquise le `2026-08-27T00:45:31Z` est
+`H1_SERVICE_RUNNING_HEALTH_GREEN` : collecteur active/running, PID principal
+`118072`, `NRestarts=0`, `ExecMainStatus=0`, santé terminale `RUNNING`. Après
+21,106 s, la santé publiée comptait 834 frames, 0 gap, 0 reconnect, un
+`queue_high_water` de 9, 0 segment et 0 octet stocké, sans erreur. Ces valeurs
+sont une observation historique, pas un pin de disponibilité : le cockpit
+représente honnêtement les zéros initiaux et admet un manifest raw encore nul
+pendant `RUNNING_HEALTHY` sans ouvrir le holdout ni inventer une erreur.
 
-Le bootstrap Linux vérifie explicitement
-`python -m hyperlab h1-dashboard-serve --help`. L'unité rendue utilise le fichier
-réel `config/research.toml`, passe le commit source final au dashboard et conserve
-séparément les commits dashboard original et d'intégration.
+## 00 — Finalisation locale après le commit final
 
-La preuve causale finale `integration -> base -> source`, le nom de branche et
-l'identité de campagne restent un gate différé : ils ne pourront être gelés et
-validés qu'au jalon V8, lorsque ces valeurs existeront réellement.
+- lieu : Windows PowerShell, dans le worktree isolé du Beelink ;
+- durée attendue : 1–3 minutes ; maximum : 10 minutes ;
+- prompts : aucun ;
+- monitoring : validation input, Git bundle, SHA-256 et inventaire final ;
+- Ctrl+C : interrompt uniquement la génération locale, sans action VPS ;
+- signal terminal :
+  `H1_V8_DASHBOARD_BINDING_WINDOWS_BUNDLE_FINALIZED_NOT_TRANSFERRED`.
+
+```powershell
+& '.\ops\h1_dashboard_binding\New-H1V8DashboardBindingBundle.ps1' `
+  -Commit '<COMMIT_FINAL_40_HEX>' `
+  -OutputRoot 'C:\hyperlab-offline-validation\h1-v8-dashboard-binding-v1'
+```
+
+Le répertoire de sortie doit être nouveau. Le générateur refuse toute branche,
+source, causalité ou propreté divergente.
+
+## 01–03 — Exécution humaine ordonnée
+
+Exécuter ensuite, sans les fusionner :
+
+1. `operator/01-windows-transfer.ps1.txt` dans Windows PowerShell sur le
+   Beelink. Le signal terminal confirme uniquement le transfert, pas
+   l'installation.
+2. `operator/02-tabby-vps-install.sh.txt` dans Tabby/Bash sur le VPS. Ce bloc
+   clone le bundle vers une source dashboard dédiée, crée le venv hash-locké,
+   compare le rendu canonique de l'unité, rend source et plan root-owned/read-only,
+   installe et démarre uniquement le service dashboard, puis vérifie GET, HEAD et
+   l'unique listener `127.0.0.1:18080`.
+3. `operator/03-windows-tunnel.ps1.txt` dans Windows PowerShell uniquement après
+   le signal vert Tabby. Le tunnel foreground est strictement
+   `ssh -N -T -L 127.0.0.1:18080:127.0.0.1:18080` avec
+   `ClearAllForwardings=yes` et `ExitOnForwardFailure=yes`. Ctrl+C ferme seulement
+   ce tunnel.
+
+Chaque bloc contient son lieu, ses durées attendue/maximale, ses prompts, son
+monitoring, l'effet de Ctrl+C et son signal terminal. Aucun bloc n'ouvre de
+firewall. Le second onglet Tabby proposé est purement read-only ; le dashboard
+suit `PREPARED_NOT_STARTED -> RUNNING_HEALTHY` sans relance ni mutation de la
+campagne. Le holdout demeure scellé.
+
+Verdict du pack :
+`H1_V8_DASHBOARD_BINDING_V1_GREEN_AWAITING_HUMAN_VPS_EXECUTION`.

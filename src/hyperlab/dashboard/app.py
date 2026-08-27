@@ -17,7 +17,7 @@ from hyperlab.dashboard.h1_dashboard import (
     h1_report_download,
     h1_snapshot,
 )
-from hyperlab.dashboard.h1_page import H1_CSS, H1_JS, H1_PAGE
+from hyperlab.dashboard.h1_page import H1_CSS, H1_JS, h1_page_html
 from hyperlab.storage.sqlite import database_status
 
 if TYPE_CHECKING:
@@ -519,6 +519,16 @@ def create_app(
     def api_h1_fixture(fixture_name: str) -> JSONResponse:
         """Expose one allowlisted, visibly synthetic UI fixture."""
 
+        if h1_expected_identity is not None:
+            return JSONResponse(
+                {
+                    "mode": "readonly",
+                    "orders_enabled": False,
+                    "status": "H1_FIXTURES_DISABLED_FOR_BOUND_CAMPAIGN",
+                },
+                status_code=404,
+                headers=h1_headers(),
+            )
         try:
             payload = h1_fixture_snapshot(fixture_name)
         except KeyError:
@@ -771,7 +781,7 @@ def create_app(
     @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
     def index() -> HTMLResponse:
         return HTMLResponse(
-            H1_PAGE,
+            h1_page_html(fixtures_enabled=h1_expected_identity is None),
             headers={
                 "Cache-Control": "no-store",
                 "Content-Security-Policy": (

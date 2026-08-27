@@ -13,7 +13,7 @@ H1_PAGE = """<!doctype html>
   <link rel="stylesheet" href="/assets/h1-dashboard.css">
   <script src="/assets/h1-dashboard.js" defer></script>
 </head>
-<body>
+<body data-fixtures-enabled="true">
   <a class="skip-link" href="#main">Aller au contenu principal</a>
   <div class="safety-ribbon" role="status" aria-label="Frontière de sécurité permanente">
     <span aria-hidden="true">◆</span>
@@ -27,7 +27,7 @@ H1_PAGE = """<!doctype html>
       <span><strong>HyperLab</strong><small>Ghost Observatory</small></span>
     </a>
     <div class="topbar-actions">
-      <label class="fixture-control" for="fixture-select">
+      <label class="fixture-control" id="fixture-control" for="fixture-select">
         <span>État de démonstration</span>
         <select id="fixture-select" aria-describedby="fixture-help"></select>
       </label>
@@ -485,6 +485,7 @@ H1_JS = r"""
     "INTERRUPTED_RECOVERABLE", "INTEGRITY_FAILED", "COMPLETE_COLLECTION_WINDOW",
     "HOLDOUT_SEALED", "HOLDOUT_OPEN"
   ];
+  const fixturesEnabled = document.body.dataset.fixturesEnabled === "true";
   const stateCopy = {
     ABSENT: ["Campagne non reliée", "La racine configurée n’existe pas encore. Le cockpit reste prêt en lecture seule.", "warning"],
     PREPARED_NOT_STARTED: ["Campagne préparée, pas encore démarrée", "Les identités sont figées. Aucune frame prospective n’a encore été publiée.", "calm"],
@@ -542,6 +543,10 @@ H1_JS = r"""
   const toneFor = (code) => (stateCopy[code] || ["État publié", "Consultez les détails d’intégrité.", "warning"])[2];
 
   function setupFixtureControl() {
+    if (!fixturesEnabled) {
+      $("fixture-control").hidden = true;
+      return;
+    }
     const select = $("fixture-select");
     const real = node("option", "", "Source configurée / fixture par défaut");
     real.value = "";
@@ -790,7 +795,7 @@ H1_JS = r"""
   let failures = 0;
   async function refresh(immediate = false) {
     if (timer) window.clearTimeout(timer);
-    const fixture = $("fixture-select").value;
+    const fixture = fixturesEnabled ? $("fixture-select").value : "";
     const endpoint = fixture ? `/api/h1/fixtures/${encodeURIComponent(fixture)}` : "/api/h1/snapshot";
     try {
       const response = await fetch(endpoint, { headers: { Accept: "application/json" }, cache: "no-store" });
@@ -817,4 +822,12 @@ H1_JS = r"""
 """
 
 
-__all__ = ["H1_CSS", "H1_JS", "H1_PAGE"]
+def h1_page_html(*, fixtures_enabled: bool) -> str:
+    return H1_PAGE.replace(
+        'data-fixtures-enabled="true"',
+        f'data-fixtures-enabled="{str(fixtures_enabled).lower()}"',
+        1,
+    )
+
+
+__all__ = ["H1_CSS", "H1_JS", "H1_PAGE", "h1_page_html"]

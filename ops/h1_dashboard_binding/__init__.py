@@ -1,1 +1,1 @@
-"""Reusable fail-closed H1 read-only dashboard binding pack."""
+"""Fail-closed H1 V8 read-only dashboard binding pack."""

@@ -72,6 +72,7 @@ class H1ExpectedIdentity:
 
     campaign_id: str
     campaign_manifest_sha256: str
+    campaign_root: Path | None = None
     campaign_slug: str | None = None
     collector_source_commit: str | None = None
     dashboard_source_commit: str | None = None
@@ -89,6 +90,11 @@ class H1ExpectedIdentity:
             length=64,
             label="expected H1 campaign manifest SHA-256",
         )
+        if self.campaign_root is not None and (
+            not self.campaign_root.is_absolute()
+            or any(part in {"", ".", ".."} for part in self.campaign_root.parts)
+        ):
+            raise ValueError("expected H1 campaign root must be an exact absolute path")
         if self.campaign_slug is not None and (
             not self.campaign_slug
             or len(self.campaign_slug) > 128
@@ -638,7 +644,7 @@ def _state_code(health: Mapping[str, object], *, now: datetime, modified_ns: int
         "MAX_BYTES_REACHED",
     }:
         return "INTEGRITY_FAILED", "FAILED"
-    return terminal, "NON DISPONIBLE"
+    raise H1SnapshotIntegrityError("campaign health terminal state is unsupported")
 
 
 def _validate_raw_tail(
@@ -919,6 +925,8 @@ def _snapshot_once(
     if expected_identity is not None:
         if pin != expected_identity.campaign_manifest_sha256:
             raise H1SnapshotIntegrityError("campaign manifest differs from the external dashboard binding")
+        if expected_identity.campaign_root is not None and root != expected_identity.campaign_root:
+            raise H1SnapshotIntegrityError("campaign root differs from the external dashboard binding")
         if expected_identity.campaign_slug is not None and root.name != expected_identity.campaign_slug:
             raise H1SnapshotIntegrityError("campaign root slug differs from the external dashboard binding")
     manifest = _decode_object(manifest_read, label="campaign manifest", canonical=True)

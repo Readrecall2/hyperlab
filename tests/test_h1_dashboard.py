@@ -35,6 +35,9 @@ def _write_health(
     terminal: str,
     manifest_sha256: str | None = None,
     raw_root_sha256: str | None = None,
+    frames: int | None = None,
+    segments: int | None = None,
+    stored_bytes: int | None = None,
 ) -> None:
     campaign = json.loads((campaign_root / "campaign-manifest.json").read_text(encoding="utf-8"))
     (campaign_root / "state" / "health.json").write_bytes(
@@ -43,15 +46,17 @@ def _write_health(
                 "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
                 "campaign_id": campaign["campaign_id"],
                 "error": None,
-                "frames": 1 if manifest_sha256 else 0,
+                "frames": (1 if manifest_sha256 else 0) if frames is None else frames,
                 "gaps": 0,
                 "manifest_sha256": manifest_sha256,
                 "monitoring": "state/health.json",
                 "queue_high_water": 3,
                 "raw_root_sha256": raw_root_sha256,
                 "reconnects": 0,
-                "segments": 1 if manifest_sha256 else 0,
-                "stored_bytes": 1 if manifest_sha256 else 0,
+                "segments": (1 if manifest_sha256 else 0) if segments is None else segments,
+                "stored_bytes": (
+                    (1 if manifest_sha256 else 0) if stored_bytes is None else stored_bytes
+                ),
                 "terminal_health": terminal,
             }
         )
@@ -84,6 +89,7 @@ def _expected_identity(campaign_root: Path) -> H1ExpectedIdentity:
     return H1ExpectedIdentity(
         campaign_id=str(campaign["campaign_id"]),
         campaign_manifest_sha256=pin,
+        campaign_root=campaign_root,
         campaign_slug=campaign_root.name,
         collector_source_commit="1" * 40,
         dashboard_source_commit="2" * 40,
@@ -354,6 +360,7 @@ def test_bound_campaign_missing_root_and_unbound_readiness_fail_closed(tmp_path:
     expected = H1ExpectedIdentity(
         campaign_id="h1-" + "1" * 24,
         campaign_manifest_sha256="2" * 64,
+        campaign_root=(tmp_path / "missing-campaign").resolve(),
         campaign_slug="missing-campaign",
     )
     bound = TestClient(
@@ -370,6 +377,10 @@ def test_bound_campaign_missing_root_and_unbound_readiness_fail_closed(tmp_path:
     assert missing_payload["state"]["code"] == "UNREADABLE_FAIL_CLOSED"
     _assert_no_synthetic_error_payload(missing_payload)
     assert bound.get("/health/h1-ready").status_code == 503
+    fixture = bound.get("/api/h1/fixtures/RUNNING_HEALTHY")
+    assert fixture.status_code == 404
+    assert fixture.json()["status"] == "H1_FIXTURES_DISABLED_FOR_BOUND_CAMPAIGN"
+    assert 'data-fixtures-enabled="false"' in bound.get("/").text
 
     unbound = TestClient(create_app(data_dir=tmp_path / "unbound"))
     readiness = unbound.get("/health/h1-ready")
@@ -420,6 +431,41 @@ def test_bound_dashboard_observes_prepared_to_running_without_restart_or_mutatio
     assert before == after
 
 
+def test_running_health_preserves_initial_zero_storage_before_raw_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_root = _prepared_campaign(
+        tmp_path,
+        monkeypatch,
+        starts=datetime.now(tz=UTC) - timedelta(seconds=21),
+    )
+    _write_health(
+        campaign_root,
+        terminal="RUNNING",
+        manifest_sha256=None,
+        raw_root_sha256=None,
+        frames=834,
+        segments=0,
+        stored_bytes=0,
+    )
+
+    payload, status = h1_snapshot(
+        campaign_root,
+        policy_path=CONFIG,
+        expected_identity=_expected_identity(campaign_root),
+    )
+
+    assert status == 200
+    assert payload["state"]["code"] == "RUNNING_HEALTHY"
+    assert payload["identity"]["raw_manifest_sha256"] is None
+    assert payload["identity"]["raw_root_sha256"] is None
+    assert payload["collection"]["frames"] == 834
+    assert payload["collection"]["segments"] == 0
+    assert payload["collection"]["stored_bytes"] == 0
+    assert payload["incidents"] == []
+
+
 def test_every_http_route_is_get_head_only(tmp_path: Path) -> None:
     dashboard = create_app(data_dir=tmp_path)
     assert all(route.methods is None or route.methods <= {"GET", "HEAD"} for route in dashboard.routes)
@@ -459,6 +505,20 @@ def test_unreadable_real_campaign_error_never_inherits_synthetic_fixture_values(
 
     assert status == 503
     assert payload["state"]["code"] == "UNREADABLE_FAIL_CLOSED"
+    _assert_no_synthetic_error_payload(payload)
+
+
+def test_unknown_real_campaign_terminal_health_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_root = _prepared_campaign(tmp_path, monkeypatch)
+    _write_health(campaign_root, terminal="UNKNOWN_FUTURE_STATE")
+
+    payload, status = h1_snapshot(campaign_root, policy_path=CONFIG)
+
+    assert status == 503
+    assert payload["state"]["code"] == "INTEGRITY_FAILED"
     _assert_no_synthetic_error_payload(payload)
 
 

@@ -185,8 +185,8 @@ _PHASE12_PAPER_RUNTIME_SOURCE_POLL_TIMEOUT_SECONDS = 0.25
 _PHASE12_PAPER_CONFIG_HASH = "4f081a7c8ae57e51cb8b0185fc4a46baa65e49e778b85868f2b02b9bc4a23934"
 _PHASE12_PAPER_READINESS_MANIFEST_SHA256 = "82f818253081e142351bbbd873148dfb8377985ba43ff154e8edb0df36a185e6"
 _PHASE12_PAPER_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
-_PHASE12_MULTISTRATEGY_CONFIG_HASH = "e516453d24f4efe917a606c2eff9888097c4ddfbb7a4029190d8b1a4b9d3380f"
-_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "599ce0c628691a644c83a5cd620de2857d8a2b28ce69d278f1f7fccdc23a57e9"
+_PHASE12_MULTISTRATEGY_CONFIG_HASH = "0e2ee82bf2180239f8daa48fba7f4aa10598b8412df5d2aa1e6d35c6232d9844"
+_PHASE12_MULTISTRATEGY_READINESS_MANIFEST_SHA256 = "2e7dc5923990c3b327e65839453123d24f51fac32e3914828251590f52b4e0bf"
 _PHASE12_MULTISTRATEGY_READINESS_PROFILE_SHA256 = "e727a03939928ea6de0201a7c58c542519669a6ec4f1575be89f3eaf10f0136a"
 
 
@@ -3128,6 +3128,8 @@ def h1_dashboard_serve(
     if settings.app.mode != "readonly":
         raise typer.BadParameter("h1-dashboard-serve exige HYPERLAB_MODE=readonly")
     campaign_root = Path(_required_environment_value("HYPERLAB_H1_CAMPAIGN_ROOT"))
+    if not campaign_root.is_absolute() or any(part in {"", ".", ".."} for part in campaign_root.parts):
+        raise typer.BadParameter("HYPERLAB_H1_CAMPAIGN_ROOT doit être un chemin absolu exact")
     policy_path = Path(_required_environment_value("HYPERLAB_H1_POLICY_CONFIG"))
     try:
         expected_identity = H1ExpectedIdentity(
@@ -3135,6 +3137,7 @@ def h1_dashboard_serve(
             campaign_manifest_sha256=_required_environment_value(
                 "HYPERLAB_H1_EXPECTED_CAMPAIGN_MANIFEST_SHA256"
             ),
+            campaign_root=campaign_root,
             campaign_slug=_required_environment_value("HYPERLAB_H1_EXPECTED_CAMPAIGN_SLUG"),
             collector_source_commit=_required_environment_value("HYPERLAB_H1_COLLECTOR_SOURCE_COMMIT"),
             dashboard_source_commit=_required_environment_value("HYPERLAB_H1_DASHBOARD_SOURCE_COMMIT"),

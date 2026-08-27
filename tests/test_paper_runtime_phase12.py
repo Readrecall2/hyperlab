@@ -521,12 +521,14 @@ def test_signal_interrupts_startup_without_new_durable_session(
         MutableClock(_START + timedelta(seconds=2)),
     )
     requested = False
+    signal_requested_at: float | None = None
     original_observer = restarted.engine.store._observe_integrity_buffer
     original_restore = strategy.restore
 
     def raise_requested_signal() -> None:
-        nonlocal requested
+        nonlocal requested, signal_requested_at
         requested = True
+        signal_requested_at = time.perf_counter()
         handler = signal.getsignal(getattr(signal, signal_name))
         assert callable(handler)
         signal.raise_signal(getattr(signal, signal_name))
@@ -556,19 +558,19 @@ def test_signal_interrupts_startup_without_new_durable_session(
         )
     else:
         monkeypatch.setattr(strategy, "restore", interrupting_restore)
-    interrupted_at = time.perf_counter()
     with (
         cli_module._cooperative_signal_handlers(restarted.stop),
         pytest.raises(PaperStartupInterrupted, match="startup interrupted"),
     ):
         restarted.start()
-    interruption_seconds = time.perf_counter() - interrupted_at
+    assert signal_requested_at is not None
+    signal_response_seconds = time.perf_counter() - signal_requested_at
     after_store = PaperStore(database, initialize=False)
     after = after_store.get_run(_config().run_id)
     after_projection = after_store.get_projection(_config().run_id)
     after_store.close()
     assert requested is True
-    assert interruption_seconds < 1.0
+    assert signal_response_seconds < 1.0
     assert after.head_identity == before.head_identity
     assert after_projection.to_dict() == before_projection.to_dict()
     assert after_projection.runtime_session_generation == 1

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import hyperlab.research_data.h1_campaign as campaign_module
 from ops.h1_campaign import launch_pack
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -572,8 +573,13 @@ def test_campaign_write_probe_is_exclusive_fsynced_removed_and_fail_closed(
         launch_pack._campaign_root_write_probe(tmp_path)
 
 
-def test_canonical_h1_prepare_creates_new_portable_seed_without_network(tmp_path: Path) -> None:
+def test_canonical_h1_prepare_creates_new_portable_seed_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plan = launch_pack.validate_plan(_plan())
+    starts_at = datetime.fromisoformat(str(plan["starts_at_utc"]).replace("Z", "+00:00"))
+    monkeypatch.setattr(campaign_module, "_utc_now", lambda: starts_at - timedelta(minutes=1))
     inventory = launch_pack.build_inventory(ROOT, plan)
     seed = tmp_path / "unique-seed"
     prepared = launch_pack._prepare_campaign_seed(ROOT, plan, seed)

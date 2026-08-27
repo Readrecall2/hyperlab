@@ -145,7 +145,7 @@ VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 for _attempt in {1..20}; do
   if "$VENV_PYTHON" - <<'PY' && \
      DASHBOARD_MONITOR=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$HANDOFF" recovery-dashboard) && \
-     DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" - <<'PY'
+     DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" - "$DASHBOARD_SERVICE" <<'PY'
 import json,urllib.request
 with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
  raw=response.read(65537)
@@ -154,12 +154,15 @@ with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as r
  assert response.status==200 and value.get('status')=='alive'
  assert value.get('mode')=='readonly' and value.get('orders_enabled') is False
 PY
-import json,os
+import json,os,sys
 value=json.loads(os.environ['DASHBOARD_MONITOR'])
 service=value['services']['dashboard']; properties=service['properties']
-assert value.get('preflight_error') is None and value.get('activation_admissible') is True
+assert value.get('preflight_error') is None and value.get('failure_class') is None
+assert value.get('operational_failure') is False and value.get('activation_admissible') is True
 assert properties.get('ActiveState')=='active'
 assert int(properties.get('MainPID','0') or '0')>0 and service['command_verified'] is True
+assert service['fragment_verified'] is True and service['listener_verified'] is True
+assert properties.get('FragmentPath')==f'/etc/systemd/system/{sys.argv[1]}'
 PY
   then
     DASHBOARD_RECOVERY_READY=yes
@@ -179,15 +182,17 @@ RECOVERY_REFUSED_VENUES=()
 RECOVERY_COMPLETED_VENUES=()
 RECOVERY_FAILED_VENUES=()
 recovery_service_status() {
-  local venue=$1 monitor_json
+  local venue=$1 expected_service=$2 monitor_json
   monitor_json=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$HANDOFF") || return 1
-  MONITOR_JSON="$monitor_json" "$VENV_PYTHON" - "$venue" <<'PY'
+  MONITOR_JSON="$monitor_json" "$VENV_PYTHON" - "$venue" "$expected_service" <<'PY'
 import json,os,sys
 value=json.loads(os.environ['MONITOR_JSON'])
 assert value.get('preflight_error') is None
-venue=sys.argv[1]
+venue=sys.argv[1]; expected_service=sys.argv[2]
 service=value['services'][venue]; properties=service['properties']; state=service['state']
 assert service.get('admission_required') is True
+assert service.get('fragment_verified') is True
+assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_service}'
 assert isinstance(state,dict)
 lifecycle=state.get('lifecycle')
 assert lifecycle not in {None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'}
@@ -283,7 +288,7 @@ PY
     if sudo systemctl enable --now "$SERVICE"; then
       VENUE_STATUS=''
       for _attempt in {1..20}; do
-        if VENUE_STATUS=$(recovery_service_status "$VENUE"); then
+        if VENUE_STATUS=$(recovery_service_status "$VENUE" "$SERVICE"); then
           break
         fi
         sleep 0.5
@@ -332,7 +337,7 @@ for _attempt in {1..20}; do
      STARTED_VENUES="${RECOVERY_STARTED_VENUES[*]}" \
      REFUSED_VENUES="${RECOVERY_REFUSED_VENUES[*]}" \
      COMPLETED_VENUES="${RECOVERY_COMPLETED_VENUES[*]}" \
-     "$VENV_PYTHON" - <<'PY'
+     "$VENV_PYTHON" - "$DASHBOARD_SERVICE" "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" <<'PY'
 import json,urllib.request
 with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
  raw=response.read(65537)
@@ -341,9 +346,13 @@ with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as 
  assert response.status==200 and value.get('status')=='ready'
  assert value.get('mode')=='readonly' and value.get('orders_enabled') is False
 PY
-import json,os
+import json,os,sys
 value=json.loads(os.environ['RECOVERY_MONITOR'])
 assert value.get('preflight_error') is None
+assert value.get('failure_class') is None
+assert value.get('operational_failure') is False
+assert value.get('activation_admissible') is True
+expected_services={'dashboard':sys.argv[1],'polymarket':sys.argv[2],'kalshi':sys.argv[3]}
 started=set(os.environ['STARTED_VENUES'].split())
 refused=set(os.environ['REFUSED_VENUES'].split())
 completed=set(os.environ['COMPLETED_VENUES'].split())
@@ -353,8 +362,12 @@ dashboard=value['services']['dashboard']; dashboard_properties=dashboard['proper
 assert dashboard_properties.get('ActiveState')=='active'
 assert int(dashboard_properties.get('MainPID','0') or '0')>0
 assert dashboard['command_verified'] is True
+assert dashboard['fragment_verified'] is True and dashboard['listener_verified'] is True
+assert dashboard_properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services["dashboard"]}'
 for venue in started:
  service=value['services'][venue]; properties=service['properties']; state=service['state']
+ assert service['fragment_verified'] is True
+ assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
  assert isinstance(state,dict) and state.get('lifecycle') not in {
   None,'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'
  }
@@ -371,10 +384,14 @@ for venue in started:
   assert service['command_verified'] is True
 for venue in refused:
  service=value['services'][venue]; properties=service['properties']
+ assert service['fragment_verified'] is True
+ assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
  assert properties.get('ActiveState') not in {'active','activating','reloading'}
  assert int(properties.get('MainPID','0') or '0')==0
 for venue in completed:
  service=value['services'][venue]; properties=service['properties']; state=service['state']
+ assert service['fragment_verified'] is True
+ assert properties.get('FragmentPath')==f'/etc/systemd/system/{expected_services[venue]}'
  assert service.get('venue_status')=='COMPLETE_WINDOW'
  assert isinstance(state,dict) and state.get('lifecycle')=='COMPLETE_WINDOW'
  assert properties.get('ActiveState') not in {'active','activating','reloading'}

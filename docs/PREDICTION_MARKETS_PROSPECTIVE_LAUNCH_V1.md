@@ -1,7 +1,8 @@
 # Prediction Markets Prospective Launch V1
 
-Verdict terminal logiciel après admission des reçus forensics réels :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_REAL_RECEIPTS_ADMITTED_AWAITING_SINGLE_HUMAN_EXECUTION`.
+Verdict terminal logiciel après admission des reçus forensics réels et fermeture
+du bootstrap moniteur :
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_MONITOR_BOOTSTRAP_FIXED_AWAITING_SINGLE_HUMAN_EXECUTION`.
 
 Verdict économique : `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
 
@@ -22,6 +23,35 @@ exécutée sur un VPS et aucune campagne H1 n'a été sondée ou modifiée.
 Le générateur final lie ces identités, le commit de livraison, l'arbre Git
 complet, le Git bundle, le wheelhouse Linux et les cinq blocs opérateur dans un
 `handoff.json` et un inventaire SHA-256. Les racines sont uniques par tentative.
+
+## Incident `664bef6e` et cause exacte
+
+Le pack historique `pm-20260827t183515z-664bef6e` a passé intégralement le
+preflight hôte, créé un manifest authentique, puis B a refusé la readiness du
+dashboard avant l'activation de Polymarket ou Kalshi. Le premier refus de
+connexion loopback était une course de bind normale. L'exception primaire des
+tentatives suivantes était `ModuleNotFoundError: No module named 'numpy'`.
+
+`monitor.sh` utilisait `python3.12 -I`, donc le Python système. Or l'import du
+cockpit atteint le runner, le bundle/candidat Prediction Markets puis
+`hyperlab.backtest.attribution`, qui importe NumPy. Le bootstrap offline interdit
+les system-site-packages et NumPy n'est attesté que dans `.venv`. Le même `try`
+capturait cette erreur puis le code appelait `prepared_state_is_stale` hors de ce
+bloc; ce nom n'avait jamais été lié. Le `NameError` observé était donc secondaire
+et masquait l'erreur d'environnement primaire. Les handoff, manifest, activation
+et chemins du pack correspondaient bien au commit `664bef6e`; aucune divergence
+de binding n'était la cause primaire.
+
+Le moniteur dérive maintenant le source root canonique depuis son propre chemin,
+le lie au handoff SHA-256 et utilise uniquement son Python de venv attesté avec
+`-I`. Les helpers statiques sont tous liés et vérifiés appelables avant la phase
+de validation runtime. Un échec de runtime/import ou une preuve initiale invalide
+produit un JSON borné avec `preflight_error`, `alert=true`,
+`operational_failure=true` et une classe fail-closed, jamais un symbole non
+défini. La campagne historique
+`/mnt/HC_Volume_106716684/hyperlab-prediction-markets/campaigns/pm-20260827t183515z-664bef6e`
+et ses racines associées restent préservées; le rollback humain a publié
+`PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED`.
 
 ## Services et persistance
 
@@ -116,6 +146,23 @@ La cohabitation réserve 144 GiB pour H1, 21 GiB pour les 1 344 shards Predictio
 Markets et 16 GiB de marge, soit 181 GiB libres. Si cette marge n'est pas prouvée,
 le pack refuse et recommande un hôte ou volume distinct sans toucher à H1.
 
+La mesure acquise pendant cette tentative était `196 391 251 968` octets libres
+pour `194 347 270 144` requis : seulement `2 043 981 824` octets restaient en
+marge. Cette mesure n'est pas réutilisée comme preuve pour un prochain B. Le
+pack réauthentifie après bootstrap l'identité du handoff/source/inventaire et les
+hashes des unités, remesure NTP/montage/capacité avant toute mutation systemd,
+puis remesure encore NTP/montage/capacité immédiatement avant les collecteurs.
+Si H1 a consommé la marge, le lancement refuse avec recommandation d'agrandir ou
+de choisir un autre volume ext4. Les réserves ne sont jamais réduites.
+
+Chaque démarrage ou redémarrage systemd d'un runner réauthentifie également le
+handoff, l'admission d'installation, l'inventaire transféré, l'inventaire et le
+commit source, l'utilisateur/HOME, NTP, les racines canoniques et le même device
+ext4 `rw` avant de sélectionner un ordinal. Le contrôle de capacité conservateur
+lié au ledger reste ensuite exécuté immédiatement avant le créneau. Un échec de
+cette admission sort avec le code 4, avant tout enfant de collecte, et
+`RestartPreventExitStatus=4` empêche une boucle de redémarrage.
+
 Une venue DNS/HTTPS/WSS indisponible reçoit son propre verdict; l'autre venue et
 le cockpit restent installables. Kalshi WSS n'est jamais sondé car le contrat
 documenté exige une authentification; la collecte Kalshi V1 reste REST publique.
@@ -142,6 +189,32 @@ Un state `PREPARED` est toléré seulement pendant la fenêtre de réveil borné
 runner : après `starts_at_utc + 35 s`, il est affiché `PREPARED_STALE`, la
 readiness devient non verte et le moniteur s'arrête sur alerte sans inventer une
 corruption d'intégrité.
+
+B tolère de façon bornée une première connexion loopback refusée ou un 503 de
+démarrage. Avant le moindre collecteur, le verdict dashboard exige simultanément
+le HTTP live readonly, `orders_enabled=false`, le PID/commande systemd exacts,
+le `FragmentPath` exact et la preuve `/proc` que ce même PID possède l'unique
+listener IPv4 `127.0.0.1:18081`. Un serveur étranger, un mauvais PID, une
+commande/unité divergente, une preuve initiale invalide ou un délai dépassé ne
+peut donc jamais produire GREEN; seul le dashboard de la nouvelle tentative est
+alors arrêté/désactivé et les racines restent intactes.
+
+Le moniteur refuse aussi la racine de campagne, `state/` et tout répertoire de
+venue présent s'ils sont liés, spéciaux ou non canoniques. Cette règle précède
+la lecture des preuves : un alias filesystem ne peut pas produire un faux GREEN.
+
+Après ce gate, B fige les venues depuis ce même snapshot moniteur authentifié et
+propage tout échec de parsing. Il ne relit pas l'incoming mutable pour décider un
+démarrage. `eligible_venues=[]` reste admis comme `BOTH_UNAVAILABLE` explicite,
+dashboard-only, sans faux collecteur ni faux métrique.
+
+Le recovery applique les mêmes preuves exactes de fragment au dashboard et aux
+collecteurs, plus la possession du listener dashboard. Sa fermeture exige une
+admission globale sans panne opérationnelle. Une alerte
+`PUBLIC_SOURCE_INVALID` authentique reste admissible et comptabilisée; une
+divergence de fragment, listener, commande ou état ne peut pas produire le signal
+de reprise.
+
 Ses scénarios synthétiques couvrent aussi les terminaux invalides propres à
 chaque venue, les deux venues invalides, les états mixtes invalid/unavailable et
 `CAPACITY_REFUSED`, sans masquer le dernier état terminal courant.

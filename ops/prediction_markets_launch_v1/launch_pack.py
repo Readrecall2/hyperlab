@@ -253,6 +253,7 @@ def _common_unit(service_user: str, source_root: str, campaign_root: str) -> str
 Group={service_user}
 WorkingDirectory={source_root}
 Environment=HOME=/home/{service_user}
+Environment=USER={service_user}
 Environment=PYTHONPATH={source_root}/src:{source_root}
 Environment=PYTHONNOUSERSITE=1
 Environment=PYTHONDONTWRITEBYTECODE=1
@@ -390,6 +391,29 @@ Polymarket et Kalshi sont indépendants. Un reçu authentique
 donnée, mais reste `source_usable=false`, `economic_eligible=false` et n'est
 jamais rejoué. Une divergence de reçu, plan, identité, hash, manifest ou ledger
 reste `INTEGRITY_FAILED` et ne redémarre pas en boucle.
+
+Le moniteur utilise exclusivement le Python du venv offline lié au source root
+authentifié. Avant tout collecteur, B exige en même temps le HTTP loopback
+readonly, `orders_enabled=false`, le PID/commande et l'unité systemd exacts, et
+la preuve que ce PID possède `127.0.0.1:18081`. Une course de premier bind ou un
+503 est retenté de façon bornée; aucune preuve divergente n'est admise. Le
+moniteur refuse aussi les racines de campagne/state/venue liées ou non
+canoniques.
+
+La sélection des collecteurs provient de ce même moniteur authentifié et tout
+échec de parsing refuse avant activation. Si les deux sources sont indisponibles,
+`PREDICTION_ELIGIBLE_VENUES=NONE` conserve honnêtement le dashboard seul. E lie
+également fragments, PID/commande et listener; son signal de reprise exige
+`operational_failure=false`, tout en admettant une alerte
+`PUBLIC_SOURCE_INVALID` authentique.
+
+La capacité est remesurée après bootstrap puis immédiatement avant les
+collecteurs. Si les 194 347 270 144 octets réservés ne sont plus libres, B refuse
+et demande un volume ext4 plus grand ou distinct; il ne réduit jamais le budget
+H1 ni la marge. Chaque reprise systemd réauthentifie handoff, admission,
+transfert, source, NTP, racines et device ext4 avant de sélectionner un ordinal;
+le runner applique ensuite son gate capacité lié au ledger. Un refus antérieur
+au slot sort en code 4 sans boucle de restart.
 """
 
 
@@ -541,7 +565,7 @@ python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-roo
 bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROOT/wheelhouse"
 printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
 printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
-bash "$INCOMING_ROOT/scripts/install.sh" "$INCOMING_ROOT"
+bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/install.sh" "$INCOMING_ROOT"
 """
 
 
@@ -555,9 +579,18 @@ def render_tabby_monitor(handoff: Mapping[str, object]) -> str:
 set -Eeuo pipefail
 PREVIOUS=''
 while :; do
-  CURRENT=$(bash '{source}/ops/prediction_markets_launch_v1/monitor.sh' '{incoming}/handoff.json')
+  if ! CURRENT=$(bash '{source}/ops/prediction_markets_launch_v1/monitor.sh' '{incoming}/handoff.json'); then
+    printf 'PREDICTION_MONITOR_EXECUTION_FAILED\n' >&2
+    printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
+    exit 4
+  fi
   printf '%s\n' "$CURRENT"
-  read -r FINGERPRINT ALERT < <(printf '%s' "$CURRENT" | python3.12 -I -c 'import json,re,sys; d=json.load(sys.stdin); f=d.get("semantic_fingerprint_sha256"); assert isinstance(f,str) and re.fullmatch(r"[0-9a-f]{{64}}",f); print(f,"yes" if d["alert"] else "no")')
+  if ! PARSED=$(printf '%s' "$CURRENT" | python3.12 -I -c 'import json,re,sys; d=json.load(sys.stdin); f=d.get("semantic_fingerprint_sha256"); assert isinstance(f,str) and re.fullmatch(r"[0-9a-f]{{64}}",f); assert isinstance(d.get("alert"),bool); print(f,"yes" if d["alert"] else "no")'); then
+    printf 'PREDICTION_MONITOR_JSON_INVALID\n' >&2
+    printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
+    exit 4
+  fi
+  read -r FINGERPRINT ALERT <<< "$PARSED"
   if [[ $ALERT == yes || ( -n $PREVIOUS && $FINGERPRINT != "$PREVIOUS" ) ]]; then
     printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
     break

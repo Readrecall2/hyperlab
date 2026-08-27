@@ -27,6 +27,42 @@ from hyperlab.research_data.segments import ResearchDataCapacityError
 from ops.prediction_markets_launch_v1 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_runner_startup_admission_refusal_exits_four_before_runner_or_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff_path = tmp_path / "handoff.json"
+    handoff_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        runner,
+        "_pinned_object",
+        lambda _path: {
+            "boundary": runner.BOUNDARY,
+            "campaign_root": str(tmp_path / "campaign"),
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "runner_startup_admission",
+        lambda *_args, **_kwargs: {
+            "errors": ["NTP is not synchronized for runner startup"],
+            "startup_admissible": False,
+        },
+    )
+
+    def forbidden_runner(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("venue runner or collection child must not be created")
+
+    monkeypatch.setattr(runner, "VenueRunner", forbidden_runner)
+    with pytest.raises(runner.RunnerError, match="before slot selection"):
+        runner.run_from_handoff(handoff_path, Venue.POLYMARKET)
+    with pytest.raises(SystemExit) as stopped:
+        runner.main(["--handoff", str(handoff_path), "--venue", "polymarket"])
+    assert stopped.value.code == 4
+
+
 def _campaign(tmp_path: Path) -> runner.CampaignContext:
     campaign = tmp_path / "campaign"
     candidate = CandidatePreregistration.from_path(
@@ -330,6 +366,103 @@ def test_capacity_reserves_full_h1_budget_remaining_prediction_and_margin(
         accounted_bytes=0,
     )
     assert refused["admitted"] is False
+
+
+def test_capacity_refusal_publishes_the_exact_denied_snapshot_without_reread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _campaign(tmp_path)
+    service = runner.VenueRunner(
+        context=context,
+        source_root=ROOT,
+        python=Path("/source/.venv/bin/python"),
+        venue=Venue.POLYMARKET,
+        h1_reserved_bytes=144 * 1024**3,
+        prediction_maximum_raw_bytes=21 * 1024**3,
+        safety_margin_bytes=16 * 1024**3,
+    )
+    denied = {
+        "admitted": False,
+        "available_bytes": 194_347_270_143,
+        "h1_reserved_bytes": 144 * 1024**3,
+        "prediction_remaining_bytes": 21 * 1024**3,
+        "required_free_bytes": 181 * 1024**3,
+        "safety_margin_bytes": 16 * 1024**3,
+    }
+    admitted = {**denied, "admitted": True, "available_bytes": 300 * 1024**3}
+    snapshots = iter((denied, admitted))
+    calls = 0
+
+    def sequenced_snapshot(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(runner, "capacity_snapshot", sequenced_snapshot)
+    monkeypatch.setattr(
+        runner,
+        "schedule_decision",
+        lambda *_args, **_kwargs: runner.ScheduleDecision("RUN_SLOT", 0, (), 0.0),
+    )
+    assert service._run_owned() == 4
+    assert calls == 1
+    state = json.loads(service.state_path.read_bytes())
+    assert state["lifecycle"] == "CAPACITY_REFUSED"
+    assert state["capacity"] == denied
+    assert state["active_ordinal"] is None
+    assert not service.runs_root.exists()
+
+
+def test_capacity_rechecked_immediately_before_slot_and_denial_never_spawns_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _campaign(tmp_path)
+    service = runner.VenueRunner(
+        context=context,
+        source_root=ROOT,
+        python=Path("/source/.venv/bin/python"),
+        venue=Venue.KALSHI,
+        h1_reserved_bytes=144 * 1024**3,
+        prediction_maximum_raw_bytes=21 * 1024**3,
+        safety_margin_bytes=16 * 1024**3,
+    )
+    admitted = {
+        "admitted": True,
+        "available_bytes": 300 * 1024**3,
+        "h1_reserved_bytes": 144 * 1024**3,
+        "prediction_remaining_bytes": 21 * 1024**3,
+        "required_free_bytes": 181 * 1024**3,
+        "safety_margin_bytes": 16 * 1024**3,
+    }
+    denied = {**admitted, "admitted": False, "available_bytes": 180 * 1024**3}
+    snapshots = iter((admitted, denied))
+    calls = 0
+
+    def sequenced_snapshot(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(runner, "capacity_snapshot", sequenced_snapshot)
+    monkeypatch.setattr(
+        runner,
+        "schedule_decision",
+        lambda *_args, **_kwargs: runner.ScheduleDecision("RUN_SLOT", 0, (), 0.0),
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("capacity-denied slot spawned a child"),
+    )
+    assert service._run_owned() == 4
+    assert calls == 2
+    state = json.loads(service.state_path.read_bytes())
+    assert state["lifecycle"] == "CAPACITY_REFUSED"
+    assert state["capacity"] == denied
+    assert state["active_ordinal"] is None
+    assert not service.runs_root.exists()
 
 
 def test_capacity_accounting_never_reads_or_depends_on_the_other_venue_ledger(

@@ -8,9 +8,11 @@ import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
@@ -28,6 +30,17 @@ _MAX_JSON_BYTES = 8 * 1024 * 1024
 _NETWORK_TIMEOUT_SECONDS = 3.0
 _COMMAND_TIMEOUT_SECONDS = 20.0
 _SHA256 = frozenset("0123456789abcdef")
+_RUN_SLUG = re.compile(r"^pm-[0-9]{8}t[0-9]{6}z-[0-9a-f]{8}$")
+_INCOMING_PARENT = PurePosixPath("/home/hyperlab/hyperlab-prediction-markets/incoming")
+_VOLUME_BASE = PurePosixPath(
+    "/mnt/HC_Volume_106716684/hyperlab-prediction-markets"
+)
+_DISK_RESERVATION = {
+    "h1_reserved_bytes": 154_618_822_656,
+    "prediction_maximum_raw_bytes": 22_548_578_304,
+    "required_free_bytes": 194_347_270_144,
+    "safety_margin_bytes": 17_179_869_184,
+}
 
 
 class PreflightError(RuntimeError):
@@ -95,16 +108,79 @@ def _validate_sha256(value: object, *, label: str) -> str:
 
 
 def load_handoff(path: Path) -> dict[str, Any]:
-    handoff = _object(path)
+    raw = _safe_regular_bytes(path)
+    try:
+        handoff = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError("handoff is invalid JSON") from error
+    if not isinstance(handoff, dict) or raw != canonical_json_bytes(handoff) + b"\n":
+        raise PreflightError("handoff is not canonical JSON with LF")
     pin_path = path.with_name("handoff.sha256")
     pin = _safe_regular_bytes(pin_path, maximum_bytes=256).decode("ascii").strip().split()
     if len(pin) != 2 or pin[1] != path.name:
         raise PreflightError("handoff pin is malformed")
-    if sha256_bytes(_safe_regular_bytes(path)) != pin[0]:
+    if sha256_bytes(raw) != pin[0]:
         raise PreflightError("handoff physical SHA-256 diverged")
     if handoff.get("boundary") != BOUNDARY or handoff.get("schema_version") != 1:
         raise PreflightError("handoff boundary or schema diverged")
     return handoff
+
+
+def validate_install_layout(
+    handoff: Mapping[str, object],
+    *,
+    handoff_path: Path,
+    trusted_source_root: Path | None = None,
+) -> dict[str, object]:
+    """Bind every mutable operator path/name to the generated attempt slug."""
+
+    slug = handoff.get("run_slug")
+    if not isinstance(slug, str) or _RUN_SLUG.fullmatch(slug) is None:
+        raise PreflightError("install run slug is invalid")
+    volume_base = PurePosixPath(str(handoff.get("volume_base") or ""))
+    volume_mount = PurePosixPath(str(handoff.get("volume_mount") or ""))
+    incoming = PurePosixPath(str(handoff.get("incoming_root") or ""))
+    source = PurePosixPath(str(handoff.get("source_root") or ""))
+    campaign = PurePosixPath(str(handoff.get("campaign_root") or ""))
+    expected_incoming = _INCOMING_PARENT / slug
+    expected_source = _VOLUME_BASE / "sources" / slug
+    expected_campaign = _VOLUME_BASE / "campaigns" / slug
+    suffix = slug.removeprefix("pm-")
+    expected_services = {
+        venue: f"hyperlab-pm-{suffix}-{venue}.service"
+        for venue in ("polymarket", "kalshi", "dashboard")
+    }
+    services = handoff.get("services")
+    disk = handoff.get("disk")
+    source_commit = handoff.get("source_commit")
+    if (
+        volume_base != _VOLUME_BASE
+        or volume_mount != _VOLUME_BASE.parent
+        or incoming != expected_incoming
+        or source != expected_source
+        or campaign != expected_campaign
+        or PurePosixPath(handoff_path.as_posix()) != expected_incoming / "handoff.json"
+        or handoff.get("service_user") != "hyperlab"
+        or handoff.get("dashboard_port") != 18081
+        or services != expected_services
+        or disk != _DISK_RESERVATION
+        or not isinstance(source_commit, str)
+        or len(source_commit) != 40
+        or any(character not in _SHA256 for character in source_commit)
+    ):
+        raise PreflightError("install handoff path, service, disk, or source identity diverged")
+    if trusted_source_root is not None and trusted_source_root.as_posix() != source.as_posix():
+        raise PreflightError("install script source root diverged from authenticated handoff")
+    return {
+        "campaign_root": campaign.as_posix(),
+        "incoming_root": incoming.as_posix(),
+        "run_slug": slug,
+        "services": expected_services,
+        "source_commit": source_commit,
+        "source_root": source.as_posix(),
+        "volume_base": volume_base.as_posix(),
+        "volume_mount": volume_mount.as_posix(),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,9 +255,51 @@ def verify_transfer_inventory(incoming_root: Path, handoff: Mapping[str, object]
         if pure.is_absolute() or ".." in pure.parts:
             raise PreflightError("transfer inventory path escapes incoming root")
         candidate = incoming_root.joinpath(*pure.parts)
-        if candidate.resolve(strict=True).parent != candidate.parent.resolve(strict=True):
-            raise PreflightError("transfer inventory file uses a symlink")
+        parent_identities: list[tuple[Path, tuple[int, int, int]]] = []
+        parent = incoming_root
+        for part in pure.parts[:-1]:
+            parent /= part
+            try:
+                before_parent = parent.lstat()
+            except OSError as error:
+                raise PreflightError(
+                    f"transfer inventory parent directory is unreadable: {parent}"
+                ) from error
+            if (
+                parent.is_symlink()
+                or not stat.S_ISDIR(before_parent.st_mode)
+                or parent.resolve(strict=True) != parent
+            ):
+                raise PreflightError(
+                    f"transfer inventory parent directory is unsafe: {parent}"
+                )
+            parent_identities.append(
+                (
+                    parent,
+                    (before_parent.st_dev, before_parent.st_ino, before_parent.st_mode),
+                )
+            )
         payload = _safe_regular_bytes(candidate, maximum_bytes=512 * 1024 * 1024)
+        for parent, before_identity in parent_identities:
+            try:
+                after_parent = parent.lstat()
+            except OSError as error:
+                raise PreflightError(
+                    f"transfer inventory parent directory changed during read: {parent}"
+                ) from error
+            after_identity = (
+                after_parent.st_dev,
+                after_parent.st_ino,
+                after_parent.st_mode,
+            )
+            if (
+                parent.is_symlink()
+                or not stat.S_ISDIR(after_parent.st_mode)
+                or after_identity != before_identity
+            ):
+                raise PreflightError(
+                    f"transfer inventory parent directory changed during read: {parent}"
+                )
         if len(payload) != expected_size or sha256_bytes(payload) != expected:
             raise PreflightError(f"transfer file hash diverged: {relative}")
         checked += 1
@@ -835,6 +953,422 @@ def resume_preflight(
     }
 
 
+def _canonical_runtime_report(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
+    raw = _safe_regular_bytes(path)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict) or raw != canonical_json_bytes(value) + b"\n":
+        raise PreflightError(f"{label} is not canonical JSON with LF")
+    return value, raw
+
+
+def _live_reservation_checks(
+    handoff: Mapping[str, object],
+    *,
+    run: CommandRunner,
+    label: str,
+) -> dict[str, object]:
+    ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
+    if ntp.returncode != 0 or ntp.stdout != "yes":
+        raise PreflightError(f"NTP is not synchronized for {label}")
+    mount = str(handoff["volume_mount"])
+    mounted = run(["findmnt", "-rn", "-T", mount, "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+    fields = mounted.stdout.split(maxsplit=3)
+    if (
+        mounted.returncode != 0
+        or len(fields) != 4
+        or fields[0] != mount
+        or fields[2] != "ext4"
+        or "rw" not in fields[3].split(",")
+        or "ro" in fields[3].split(",")
+    ):
+        raise PreflightError(f"{label} filesystem is not the admitted ext4 rw mount")
+    capacity = run(["df", "-PB1", mount])
+    if capacity.returncode != 0:
+        raise PreflightError(f"{label} capacity check failed: {capacity.stderr}")
+    available = _parse_df_available(capacity.stdout)
+    disk = handoff.get("disk")
+    if not isinstance(disk, Mapping) or type(disk.get("required_free_bytes")) is not int:
+        raise PreflightError(f"{label} disk reservation contract is absent")
+    required = int(disk["required_free_bytes"])
+    if available < required:
+        raise PreflightError(
+            "PREDICTION_CAPACITY_REFUSED_COEXISTENCE_NOT_PROVEN "
+            f"available={available} required={required}; enlarge or choose another ext4 volume"
+        )
+    return {
+        "capacity": {
+            "admitted": True,
+            "available_bytes": available,
+            "required_free_bytes": required,
+        },
+        "filesystem": {
+            "filesystem": fields[2],
+            "mount": fields[0],
+            "options": fields[3].split(","),
+            "source": fields[1],
+        },
+        "ntp": {"synchronized": True},
+    }
+
+
+def install_admission_preflight(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+    *,
+    run: CommandRunner = _command,
+) -> dict[str, object]:
+    """Re-authenticate static inputs and live reserves immediately before systemd mutation."""
+
+    errors: list[str] = []
+    evidence: dict[str, object] = {}
+    try:
+        handoff = load_handoff(handoff_path)
+        layout = validate_install_layout(handoff, handoff_path=handoff_path)
+        if os.environ.get("USER") != "hyperlab" or Path.home().as_posix() != "/home/hyperlab":
+            raise PreflightError("install admission must run as the dedicated hyperlab user")
+        host, host_raw = _canonical_runtime_report(
+            host_report_path,
+            label="host preflight report",
+        )
+        network = host.get("network")
+        eligible = host.get("eligible_venues")
+        if (
+            host.get("boundary") != BOUNDARY
+            or host.get("schema_version") != 1
+            or host.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+            or host.get("host_admitted") is not True
+            or host.get("installation_admissible") is not True
+            or host.get("errors") != []
+            or not isinstance(network, Mapping)
+            or set(network) != {"polymarket", "kalshi"}
+            or not isinstance(eligible, list)
+            or eligible
+            != [
+                venue
+                for venue in ("polymarket", "kalshi")
+                if isinstance(network.get(venue), Mapping)
+                and network[venue].get("verdict") == "NETWORK_PREFLIGHT_GREEN"
+            ]
+        ):
+            raise PreflightError("host preflight admission evidence diverged")
+        fsync, fsync_raw = _canonical_runtime_report(
+            fsync_report_path,
+            label="filesystem fsync report",
+        )
+        expected_parents = [
+            str(_VOLUME_BASE),
+            str(_VOLUME_BASE / "sources"),
+            str(_VOLUME_BASE / "campaigns"),
+        ]
+        if (
+            fsync.get("boundary") != BOUNDARY
+            or fsync.get("schema_version") != 1
+            or fsync.get("terminal_signal") != "PREDICTION_FILESYSTEM_FSYNC_GREEN"
+            or fsync.get("filesystem_write_surface") != str(_VOLUME_BASE)
+            or fsync.get("parent_roots") != expected_parents
+            or fsync.get("probe_removed") is not True
+        ):
+            raise PreflightError("filesystem fsync admission evidence diverged")
+        resumed = resume_preflight(handoff_path, run=run)
+        if resumed.get("resume_admissible") is not True:
+            resume_errors = resumed.get("errors")
+            if not isinstance(resume_errors, list):
+                resume_errors = ["resume error schema diverged"]
+            raise PreflightError(
+                "install source/reservation revalidation failed: "
+                + "; ".join(str(item) for item in resume_errors)
+            )
+        live = _live_reservation_checks(handoff, run=run, label="install admission")
+        host_checks = host.get("checks")
+        host_filesystem = (
+            host_checks.get("filesystem") if isinstance(host_checks, Mapping) else None
+        )
+        live_filesystem = live.get("filesystem")
+        if (
+            not isinstance(host_filesystem, Mapping)
+            or not isinstance(live_filesystem, Mapping)
+            or host_filesystem.get("source") != live_filesystem.get("source")
+        ):
+            raise PreflightError("install filesystem device diverged from host preflight")
+        port = int(handoff["dashboard_port"])
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            probe.bind(("127.0.0.1", port))
+        services = handoff["services"]
+        assert isinstance(services, Mapping)
+        service_checks = [
+            _systemd_collision(str(services[name]), run)
+            for name in ("polymarket", "kalshi", "dashboard")
+        ]
+        verify_transfer_inventory(handoff_path.parent, handoff)
+        inventory = _object(handoff_path.parent / "transfer-inventory.json")
+        items = inventory.get("files")
+        if not isinstance(items, list):
+            raise PreflightError("transfer inventory entries are absent")
+        by_path = {
+            str(item.get("path")): item
+            for item in items
+            if isinstance(item, Mapping)
+        }
+        unit_sha256: dict[str, str] = {}
+        for name in ("polymarket", "kalshi", "dashboard"):
+            service = str(services[name])
+            item = by_path.get(f"systemd/{service}")
+            if not isinstance(item, Mapping):
+                raise PreflightError(f"authenticated unit is absent: {service}")
+            unit_sha256[service] = _validate_sha256(
+                item.get("sha256"),
+                label=f"{service} unit hash",
+            )
+        resume_checks = resumed.get("checks")
+        evidence = {
+            "filesystem_fsync_report_sha256": sha256_bytes(fsync_raw),
+            "handoff_sha256": sha256_bytes(_safe_regular_bytes(handoff_path)),
+            "host_preflight_report_sha256": sha256_bytes(host_raw),
+            "layout": layout,
+            "live": live,
+            "loopback_port": {"free": True, "host": "127.0.0.1", "port": port},
+            "services": service_checks,
+            "source_identity": resume_checks.get("source_identity")
+            if isinstance(resume_checks, Mapping)
+            else None,
+            "transfer_inventory_sha256": handoff["transfer_inventory_sha256"],
+            "unit_sha256": unit_sha256,
+        }
+    except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        errors.append(str(error))
+    return {
+        "boundary": BOUNDARY,
+        "errors": errors,
+        "evidence": evidence,
+        "install_admissible": not errors,
+        "recorded_at_utc": _utc_now_text(),
+        "schema_version": 1,
+        "terminal_signal": (
+            "PREDICTION_INSTALL_ADMISSION_GREEN"
+            if not errors
+            else "PREDICTION_INSTALL_ADMISSION_REFUSED"
+        ),
+    }
+
+
+def _validated_install_admission(
+    handoff_path: Path,
+    install_admission_path: Path,
+    *,
+    operation: str,
+) -> tuple[dict[str, Any], dict[str, object], str]:
+    handoff = load_handoff(handoff_path)
+    layout = validate_install_layout(handoff, handoff_path=handoff_path)
+    expected_admission_path = (
+        Path(str(layout["campaign_root"]))
+        / "state"
+        / "install-admission-report.json"
+    )
+    if install_admission_path != expected_admission_path:
+        raise PreflightError(f"{operation} install admission path diverged")
+    admission, _admission_raw = _canonical_runtime_report(
+        install_admission_path,
+        label="install admission report",
+    )
+    evidence = admission.get("evidence")
+    prior_live = evidence.get("live") if isinstance(evidence, Mapping) else None
+    prior_filesystem = (
+        prior_live.get("filesystem") if isinstance(prior_live, Mapping) else None
+    )
+    admitted_source = (
+        prior_filesystem.get("source")
+        if isinstance(prior_filesystem, Mapping)
+        else None
+    )
+    if (
+        set(admission)
+        != {
+            "boundary",
+            "errors",
+            "evidence",
+            "install_admissible",
+            "recorded_at_utc",
+            "schema_version",
+            "terminal_signal",
+        }
+        or admission.get("boundary") != BOUNDARY
+        or admission.get("errors") != []
+        or admission.get("install_admissible") is not True
+        or admission.get("schema_version") != 1
+        or admission.get("terminal_signal") != "PREDICTION_INSTALL_ADMISSION_GREEN"
+        or not isinstance(evidence, Mapping)
+        or evidence.get("handoff_sha256")
+        != sha256_bytes(_safe_regular_bytes(handoff_path))
+        or evidence.get("layout") != layout
+        or not isinstance(admitted_source, str)
+        or not admitted_source
+    ):
+        raise PreflightError(f"{operation} install admission binding diverged")
+    return handoff, layout, admitted_source
+
+
+def collector_activation_guard(
+    handoff_path: Path,
+    install_admission_path: Path,
+    *,
+    run: CommandRunner = _command,
+) -> dict[str, object]:
+    """Rebind the admitted device, then refresh reserves before collectors."""
+
+    errors: list[str] = []
+    live: dict[str, object] = {}
+    try:
+        handoff, _layout, admitted_source = _validated_install_admission(
+            handoff_path,
+            install_admission_path,
+            operation="collector guard",
+        )
+        live = _live_reservation_checks(handoff, run=run, label="collector activation")
+        current_filesystem = live.get("filesystem")
+        if (
+            not isinstance(current_filesystem, Mapping)
+            or current_filesystem.get("source") != admitted_source
+        ):
+            raise PreflightError("collector activation filesystem device diverged")
+    except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        errors.append(str(error))
+    return {
+        "boundary": BOUNDARY,
+        "errors": errors,
+        "live": live,
+        "activation_admissible": not errors,
+        "recorded_at_utc": _utc_now_text(),
+        "schema_version": 1,
+        "terminal_signal": (
+            "PREDICTION_COLLECTOR_ACTIVATION_GUARD_GREEN"
+            if not errors
+            else "PREDICTION_COLLECTOR_ACTIVATION_GUARD_REFUSED"
+        ),
+    }
+
+
+def runner_startup_admission(
+    handoff_path: Path,
+    install_admission_path: Path,
+    *,
+    run: CommandRunner = _command,
+) -> dict[str, object]:
+    """Re-authenticate clock, source, transfer and mount before a service run."""
+
+    errors: list[str] = []
+    checks: dict[str, object] = {}
+    try:
+        handoff, layout, admitted_source = _validated_install_admission(
+            handoff_path,
+            install_admission_path,
+            operation="runner startup",
+        )
+        service_user = str(handoff.get("service_user") or "")
+        if os.environ.get("USER") != service_user:
+            raise PreflightError("runner startup must run as the dedicated service user")
+        if Path.home().as_posix() != f"/home/{service_user}":
+            raise PreflightError("runner startup service user HOME diverged")
+        source = Path(str(layout["source_root"]))
+        campaign = Path(str(layout["campaign_root"]))
+        if (
+            source.is_symlink()
+            or campaign.is_symlink()
+            or source.resolve(strict=True) != source
+            or campaign.resolve(strict=True) != campaign
+        ):
+            raise PreflightError("runner startup roots are absent, symlinked, or non-canonical")
+        runtime = source / ".venv" / "bin" / "python"
+        if runtime.is_symlink() or not runtime.is_file():
+            raise PreflightError("runner startup offline Python is absent or unsafe")
+        transfer = verify_transfer_inventory(handoff_path.parent, handoff)
+        source_commit = str(layout["source_commit"])
+        source_inventory_sha256 = _validate_sha256(
+            handoff.get("source_inventory_sha256"),
+            label="runner startup source inventory hash",
+        )
+        identity_command = run(
+            [
+                str(runtime),
+                "-I",
+                str(handoff_path.parent / "scripts" / "launch_pack.py"),
+                "verify-source",
+                "--source-root",
+                str(source),
+                "--inventory",
+                str(handoff_path.parent / "source-inventory.json"),
+                "--expected-commit",
+                source_commit,
+            ]
+        )
+        if identity_command.returncode != 0:
+            raise PreflightError(
+                f"runner startup source identity failed: {identity_command.stderr}"
+            )
+        try:
+            source_identity = json.loads(identity_command.stdout)
+        except json.JSONDecodeError as error:
+            raise PreflightError("runner startup source identity output is invalid") from error
+        if (
+            not isinstance(source_identity, dict)
+            or set(source_identity) != {"commit", "files", "inventory_sha256", "status"}
+            or source_identity.get("commit") != source_commit
+            or type(source_identity.get("files")) is not int
+            or int(source_identity["files"]) <= 0
+            or source_identity.get("inventory_sha256") != source_inventory_sha256
+            or source_identity.get("status") != "PREDICTION_SOURCE_IDENTITY_GREEN"
+        ):
+            raise PreflightError("runner startup source identity result diverged")
+        ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
+        if ntp.returncode != 0 or ntp.stdout != "yes":
+            raise PreflightError("NTP is not synchronized for runner startup")
+        mount = str(layout["volume_mount"])
+        mounted = run(["findmnt", "-rn", "-T", mount, "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+        fields = mounted.stdout.split(maxsplit=3)
+        if (
+            mounted.returncode != 0
+            or len(fields) != 4
+            or fields[0] != mount
+            or fields[1] != admitted_source
+            or fields[2] != "ext4"
+            or "rw" not in fields[3].split(",")
+            or "ro" in fields[3].split(",")
+        ):
+            raise PreflightError("runner startup filesystem device or ext4 rw mount diverged")
+        checks = {
+            "capacity": {"deferred_to_ledger_accounted_runner_gate": True},
+            "filesystem": {
+                "filesystem": fields[2],
+                "mount": fields[0],
+                "options": fields[3].split(","),
+                "source": fields[1],
+            },
+            "ntp": {"synchronized": True},
+            "roots": {"campaign": str(campaign), "source": str(source)},
+            "source_identity": source_identity,
+            "transfer_identity": transfer,
+        }
+    except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        errors.append(str(error))
+    return {
+        "boundary": BOUNDARY,
+        "checks": checks,
+        "errors": errors,
+        "recorded_at_utc": _utc_now_text(),
+        "schema_version": 1,
+        "startup_admissible": not errors,
+        "terminal_signal": (
+            "PREDICTION_RUNNER_STARTUP_ADMISSION_GREEN"
+            if not errors
+            else "PREDICTION_RUNNER_STARTUP_ADMISSION_REFUSED"
+        ),
+    }
+
+
 def recovery_initial_admission(handoff_path: Path) -> dict[str, object]:
     """Authenticate why a venue may legitimately have no runtime state yet."""
 
@@ -1169,6 +1703,15 @@ def _parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume")
     resume.add_argument("--handoff", type=Path, required=True)
     resume.add_argument("--report", type=Path, required=True)
+    install_admission = subparsers.add_parser("install-admission")
+    install_admission.add_argument("--handoff", type=Path, required=True)
+    install_admission.add_argument("--host-report", type=Path, required=True)
+    install_admission.add_argument("--fsync-report", type=Path, required=True)
+    install_admission.add_argument("--report", type=Path, required=True)
+    activation_guard = subparsers.add_parser("collector-activation-guard")
+    activation_guard.add_argument("--handoff", type=Path, required=True)
+    activation_guard.add_argument("--install-admission-report", type=Path, required=True)
+    activation_guard.add_argument("--report", type=Path, required=True)
     recovery_admission = subparsers.add_parser("recovery-admission")
     recovery_admission.add_argument("--handoff", type=Path, required=True)
     recovery_admission.add_argument("--report", type=Path, required=True)
@@ -1199,7 +1742,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(canonical_json_bytes(report).decode("utf-8"))
             return 0
-        if arguments.command == "host":
+        if arguments.command == "install-admission":
+            report = install_admission_preflight(
+                arguments.handoff,
+                arguments.host_report,
+                arguments.fsync_report,
+            )
+        elif arguments.command == "collector-activation-guard":
+            report = collector_activation_guard(
+                arguments.handoff,
+                arguments.install_admission_report,
+            )
+        elif arguments.command == "host":
             report = host_preflight(arguments.handoff)
         elif arguments.command == "fsync":
             report = fsync_probe(arguments.handoff)
@@ -1216,6 +1770,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "network" and report["verdict"] != "NETWORK_PREFLIGHT_GREEN":
             return 4
         if arguments.command == "resume" and report["resume_admissible"] is not True:
+            return 4
+        if arguments.command == "install-admission" and report["install_admissible"] is not True:
+            return 4
+        if (
+            arguments.command == "collector-activation-guard"
+            and report["activation_admissible"] is not True
+        ):
             return 4
         return 0
     except (OSError, PreflightError, subprocess.SubprocessError) as error:

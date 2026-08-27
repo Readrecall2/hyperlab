@@ -619,6 +619,7 @@ def test_completed_service_requires_a_loaded_authenticated_unit() -> None:
         properties=properties,
         pid=0,
         command_verified=False,
+        fragment_verified=True,
     )
     assert cockpit.complete_service_is_admissible(
         complete=True,
@@ -627,6 +628,16 @@ def test_completed_service_requires_a_loaded_authenticated_unit() -> None:
         properties={**properties, "LoadState": "loaded"},
         pid=0,
         command_verified=False,
+        fragment_verified=True,
+    )
+    assert not cockpit.complete_service_is_admissible(
+        complete=True,
+        show_returncode=0,
+        system_error=None,
+        properties={**properties, "LoadState": "loaded"},
+        pid=0,
+        command_verified=False,
+        fragment_verified=False,
     )
 
 

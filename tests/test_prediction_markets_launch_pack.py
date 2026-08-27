@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -234,7 +235,25 @@ fi
     _write_fake_command(
         fake_bin,
         "sleep",
-        "printf 'sleep|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n",
+        "printf 'sleep|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n[[ -z ${HYPERLAB_FAKE_SLEEP_SECONDS:-} ]] || /usr/bin/sleep \"$HYPERLAB_FAKE_SLEEP_SECONDS\"\n",
+    )
+    install_preflight_helper = tmp_path / "install-preflight-fixture.py"
+    install_preflight_helper.write_text(
+        """import hashlib,json,os,sys
+args=sys.argv[1:]
+command=args[0]
+report=args[args.index('--report')+1]
+if command=='install-admission':
+ incoming=os.environ['HYPERLAB_INCOMING_WINDOWS']
+ services=json.loads(os.environ['HYPERLAB_SERVICES_JSON'])
+ hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in services.values()}
+ value={'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'evidence':{'unit_sha256':hashes},'install_admissible':True,'recorded_at_utc':'2026-08-27T18:00:00.000000Z','schema_version':1,'terminal_signal':'PREDICTION_INSTALL_ADMISSION_GREEN'}
+else:
+ value={'activation_admissible':True,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'live':{'capacity':{'admitted':True}},'recorded_at_utc':'2026-08-27T18:00:01.000000Z','schema_version':1,'terminal_signal':'PREDICTION_COLLECTOR_ACTIVATION_GUARD_GREEN'}
+with open(report,'xb') as handle: handle.write(json.dumps(value,separators=(',',':'),sort_keys=True).encode()+b'\\n')
+print(json.dumps(value,separators=(',',':'),sort_keys=True))
+""",
+        encoding="utf-8",
     )
     _write_fake_command(
         fake_bin,
@@ -260,6 +279,12 @@ case "${HYPERLAB_FAKE_BASH_MODE:-install}" in
     else
       printf '{"alert":false,"semantic_fingerprint_sha256":"%064d"}\\n' 1
     fi
+    ;;
+  monitor-exit)
+    exit 4
+    ;;
+  monitor-invalid)
+    printf 'SYNTHETIC/FIXTURE invalid monitor payload\n'
     ;;
   recovery)
     [[ ${1:-} == */rollback.sh && ${2:-} == recovery ]] || exit 96
@@ -320,6 +345,7 @@ def _internal_install_fixture(
     tmp_path: Path,
     *,
     suffix: str,
+    eligible_venues: tuple[str, ...] = ("polymarket", "kalshi"),
 ) -> tuple[Path, dict[str, object], Path, Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     handoff = _operator_handoff_for_git_bash(tmp_path, suffix)
@@ -328,10 +354,27 @@ def _internal_install_fixture(
     campaign = Path(str(handoff["campaign_root"]).replace("/c/", "C:/", 1))
     source.joinpath(".venv", "bin").mkdir(parents=True)
     source.joinpath("config", "research").mkdir(parents=True)
+    source_ops = source / "ops" / "prediction_markets_launch_v1"
+    source_ops.mkdir(parents=True)
+    (source_ops / "install.sh").write_bytes((OPS / "install.sh").read_bytes())
     runtime = source / ".venv" / "bin" / "python"
     runtime.write_text(
         """#!/usr/bin/bash
 set -Eeuo pipefail
+if [[ ${1:-} == -I && ${2:-} == - && ${3:-} == */handoff.json && $# == 4 ]]; then
+  "$HYPERLAB_REAL_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(d["source_root"]); print(d["campaign_root"]); print(d["source_commit"]); print(d["services"]["polymarket"]); print(d["services"]["kalshi"]); print(d["services"]["dashboard"])' "$3" | tr -d '\\015'
+  exit "${PIPESTATUS[0]}"
+fi
+if [[ ${1:-} == -I && ${2:-} == - && ${3:-} == */host-preflight-report.json && $# == 3 ]]; then
+  "$HYPERLAB_REAL_PYTHON" "$@" | tr -d '\\015'
+  exit "${PIPESTATUS[0]}"
+fi
+if [[ ${1:-} == -I && ${2:-} == - && $# == 3 ]]; then
+  exit 0
+fi
+if [[ ${1:-} == -I && ${2:-} == */preflight.py ]]; then
+  exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_INSTALL_PREFLIGHT_HELPER" "${@:3}"
+fi
 if [[ ${1:-} == -m && ${4:-} == prediction-prepare ]]; then
   output=''
   while (($#)); do
@@ -343,6 +386,9 @@ if [[ ${1:-} == -m && ${4:-} == prediction-prepare ]]; then
   cp -- "$HYPERLAB_FIXTURE_MANIFEST" "$output/campaign-manifest.json"
   cp -- "$HYPERLAB_FIXTURE_MANIFEST_PIN" "$output/campaign-manifest.sha256"
   exit 0
+fi
+if [[ ${1:-} == - && -e ${HYPERLAB_DASHBOARD_ENABLE_MARKER:-/absent} && ! -e ${HYPERLAB_FIRST_HEALTH_MARKER:-/absent} ]]; then
+  : > "$HYPERLAB_FIRST_HEALTH_MARKER"
 fi
 exec "$HYPERLAB_REAL_PYTHON" "$@"
 """,
@@ -371,11 +417,17 @@ exec "$HYPERLAB_REAL_PYTHON" "$@"
         )
     preflight_report = {
         "boundary": launch_pack.BOUNDARY,
-        "eligible_venues": ["polymarket", "kalshi"],
+        "eligible_venues": list(eligible_venues),
         "installation_admissible": True,
         "network": {
-            "polymarket": {"verdict": "NETWORK_PREFLIGHT_GREEN"},
-            "kalshi": {"verdict": "NETWORK_PREFLIGHT_GREEN"},
+            venue: {
+                "verdict": (
+                    "NETWORK_PREFLIGHT_GREEN"
+                    if venue in eligible_venues
+                    else "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT"
+                )
+            }
+            for venue in ("polymarket", "kalshi")
         },
         "terminal_signal": "PREDICTION_HOST_PREFLIGHT_GREEN",
     }
@@ -389,6 +441,10 @@ exec "$HYPERLAB_REAL_PYTHON" "$@"
     (incoming / "handoff.json").write_bytes(
         preflight.canonical_json_bytes(handoff) + b"\n"
     )
+    (incoming / "handoff.sha256").write_text(
+        f"{preflight.sha256_bytes((incoming / 'handoff.json').read_bytes())}  handoff.json\n",
+        encoding="ascii",
+    )
     return incoming, handoff, campaign, pack
 
 
@@ -398,12 +454,43 @@ def _internal_install_environment(
     handoff: dict[str, object],
     pack: Path,
     failed_service: str | None = None,
+    monitor_failure: str | None = None,
+    collector_guard_failure: bool = False,
+    monitor_eligible_venues: tuple[str, ...] = ("polymarket", "kalshi"),
+    mutate_incoming_eligibility: bool = False,
 ) -> tuple[dict[str, str], Path]:
     fake_bin = tmp_path / "internal-fake-bin"
     fake_bin.mkdir()
     state_root = tmp_path / "systemd-state"
     state_root.mkdir()
+    (state_root / "root-units").mkdir()
     log = tmp_path / "internal-operator.log"
+    install_preflight_helper = tmp_path / "install-preflight-fixture.py"
+    install_preflight_helper.write_text(
+        """import hashlib,json,os,sys
+args=sys.argv[1:]
+command=args[0]
+report=args[args.index('--report')+1]
+if command=='install-admission':
+ incoming=os.environ['HYPERLAB_INCOMING_WINDOWS']
+ services=json.loads(os.environ['HYPERLAB_SERVICES_JSON'])
+ hashes={service:hashlib.sha256(open(os.path.join(incoming,'systemd',service),'rb').read()).hexdigest() for service in services.values()}
+ value={'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':[],'evidence':{'unit_sha256':hashes},'install_admissible':True,'recorded_at_utc':'2026-08-27T18:00:00.000000Z','schema_version':1,'terminal_signal':'PREDICTION_INSTALL_ADMISSION_GREEN'}
+else:
+ refused=os.environ.get('HYPERLAB_COLLECTOR_GUARD_FAILURE')=='1'
+ if os.environ.get('HYPERLAB_MUTATE_INCOMING_ELIGIBILITY')=='1':
+  path=os.path.join(os.environ['HYPERLAB_INCOMING_WINDOWS'],'host-preflight-report.json')
+  host=json.load(open(path,encoding='utf-8'))
+  host['eligible_venues']=['polymarket','kalshi']
+  host['network']={venue:{'verdict':'NETWORK_PREFLIGHT_GREEN'} for venue in ('polymarket','kalshi')}
+  with open(path,'wb') as handle: handle.write(json.dumps(host,separators=(',',':'),sort_keys=True).encode()+b'\\n')
+ value={'activation_admissible':not refused,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','errors':['SYNTHETIC/FIXTURE capacity reservation no longer proven'] if refused else [],'live':{'capacity':{'admitted':not refused}},'recorded_at_utc':'2026-08-27T18:00:01.000000Z','schema_version':1,'terminal_signal':'PREDICTION_COLLECTOR_ACTIVATION_GUARD_REFUSED' if refused else 'PREDICTION_COLLECTOR_ACTIVATION_GUARD_GREEN'}
+with open(report,'xb') as handle: handle.write(json.dumps(value,separators=(',',':'),sort_keys=True).encode()+b'\\n')
+print(json.dumps(value,separators=(',',':'),sort_keys=True))
+if command!='install-admission' and refused: raise SystemExit(4)
+""",
+        encoding="utf-8",
+    )
     _write_fake_command(fake_bin, "id", "[[ ${1:-} == -un ]]\nprintf 'hyperlab\\n'\n")
     _write_fake_command(
         fake_bin,
@@ -441,12 +528,34 @@ fi
     _write_fake_command(
         fake_bin,
         "sleep",
-        "printf 'sleep|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n",
+        "printf 'sleep|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n[[ -z ${HYPERLAB_FAKE_SLEEP_SECONDS:-} ]] || /usr/bin/sleep \"$HYPERLAB_FAKE_SLEEP_SECONDS\"\n",
     )
     _write_fake_command(
         fake_bin,
         "sudo",
         """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
+if [[ ${1:-} == install ]]; then
+  source=${@: -2:1}; target=${@: -1}
+  cp -- "$source" "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$target")"
+  exit 0
+fi
+if [[ ${1:-} == sha256sum ]]; then
+  target=${@: -1}; leaf=$(basename -- "$target")
+  hash=$(sha256sum -- "$HYPERLAB_ROOT_UNIT_STATE/$leaf" | awk '{print $1}')
+  printf '%s  %s\n' "$hash" "$target"
+  exit 0
+fi
+if [[ ${1:-} == ln ]]; then
+  source=${2}; target=${3}
+  cp -- "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$source")" "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$target")"
+  exit 0
+fi
+if [[ ${1:-} == rm ]]; then
+  shift
+  [[ ${1:-} == -- ]] && shift
+  for target in "$@"; do rm -f -- "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$target")"; done
+  exit 0
+fi
 if [[ ${1:-} != systemctl ]]; then exit 0; fi
 shift
 action=${1:-}; shift || true
@@ -454,6 +563,9 @@ if [[ $action == enable && ${1:-} == --now ]]; then
   service=$2
   if [[ -n ${HYPERLAB_FAIL_SERVICE:-} && $service == "$HYPERLAB_FAIL_SERVICE" ]]; then exit 1; fi
   : > "$HYPERLAB_SERVICE_STATE_DIR/$service"
+  if [[ $service == "$HYPERLAB_DASHBOARD_SERVICE" ]]; then
+    : > "$HYPERLAB_DASHBOARD_ENABLE_MARKER"
+  fi
 elif [[ $action == stop ]]; then
   for service in "$@"; do rm -f -- "$HYPERLAB_SERVICE_STATE_DIR/$service"; done
 fi
@@ -466,20 +578,55 @@ handoff=json.load(open(sys.argv[2],encoding='utf-8'))
 mode=sys.argv[3] if len(sys.argv)>3 else 'full'
 dashboard_only=mode in {'dashboard-only','recovery-dashboard'}
 recovery_dashboard=mode=='recovery-dashboard'
-eligible={'polymarket','kalshi'}
+forced=os.environ.get('HYPERLAB_MONITOR_FAILURE','')
+eligible_list=json.loads(os.environ['HYPERLAB_MONITOR_ELIGIBLE_JSON'])
+eligible=set(eligible_list)
 services={}
 failure=False
+data_quality_alert=False
 for name in ('polymarket','kalshi','dashboard'):
  service=handoff['services'][name]
  active=os.path.isfile(os.path.join(os.environ['HYPERLAB_SERVICE_STATE_DIR'],service))
  required=name=='dashboard' or (not dashboard_only and name in eligible)
- properties={'ActiveState':'active' if active else 'inactive','ExecMainStatus':'0','LoadState':'loaded','MainPID':'123' if active else '0','NRestarts':'0','SubState':'running' if active else 'dead'}
+ properties={'ActiveState':'active' if active else 'inactive','ExecMainStatus':'0','FragmentPath':'/etc/systemd/system/'+service,'LoadState':'loaded','MainPID':'123' if active else '0','NRestarts':'0','SubState':'running' if active else 'dead'}
  state=None if name=='dashboard' or not active else {'lifecycle':'WAITING_NEXT_SLOT'}
  status='RUNNING' if active else 'SERVICE_UNAVAILABLE'
- if required and not active: failure=True
+ if forced=='pid-diverged' and name=='dashboard' and dashboard_only:
+  properties['MainPID']='0'
+ if forced=='command-diverged' and name=='dashboard' and dashboard_only:
+  command_verified=False
+ else:
+  command_verified=active
+ fragment_verified=True
+ listener_verified=True if name=='dashboard' and active else None
+ if forced=='dashboard-fragment' and name=='dashboard':
+  properties['FragmentPath']='/etc/systemd/system/foreign.service'
+  fragment_verified=False
+ if forced=='dashboard-listener' and name=='dashboard' and active:
+  listener_verified=False
+ if forced=='collector-fragment' and name=='polymarket' and active and not dashboard_only:
+  properties['FragmentPath']='/etc/systemd/system/foreign.service'
+  fragment_verified=False
+ if forced=='prepared-stale' and name in eligible and active and not dashboard_only:
+  state={'lifecycle':'PREPARED'}
+  status='PREPARED_STALE'
+  failure=True
+ if forced=='public-source-invalid-alert' and name=='polymarket' and active and not dashboard_only:
+  state={'data_quality':{'alert':True,'economic_eligible':False,'error':'ValueError:SYNTHETIC/FIXTURE public source invalid','source_usable':False,'terminal_health':'PUBLIC_SOURCE_INVALID'},'last_terminal':{'terminal_health':'PUBLIC_SOURCE_INVALID'},'lifecycle':'WAITING_NEXT_SLOT'}
+  status='PUBLIC_SOURCE_INVALID'
+  data_quality_alert=True
+ if required and (not active or properties['MainPID']=='0' or not command_verified or not fragment_verified or (name=='dashboard' and listener_verified is not True)): failure=True
  if not required and active and not recovery_dashboard: failure=True
- services[name]={'admission_required':required,'command_verified':active,'properties':properties,'state':state,'venue_status':status}
-value={'activation_admissible':not failure,'alert':failure,'eligible_venues':sorted(eligible),'operational_failure':failure,'preflight_error':None,'services':services}
+ services[name]={'admission_required':required,'command_verified':command_verified,'data_quality_alert':status=='PUBLIC_SOURCE_INVALID','fragment_verified':fragment_verified,'listener_verified':listener_verified,'properties':properties,'state':state,'venue_status':status}
+if forced=='final-operational-failure' and not dashboard_only and all(os.path.isfile(os.path.join(os.environ['HYPERLAB_SERVICE_STATE_DIR'],handoff['services'][venue])) for venue in ('polymarket','kalshi')):
+ failure=True
+failure_class=None
+preflight_error=None
+if forced in {'helper-import','initial-evidence'}:
+ failure=True
+ failure_class='MONITOR_RUNTIME_IMPORT_FAILED' if forced=='helper-import' else 'INITIAL_EVIDENCE_INVALID'
+ preflight_error=('ModuleNotFoundError:SYNTHETIC/FIXTURE helper unavailable' if forced=='helper-import' else 'ValueError:SYNTHETIC/FIXTURE activation proof diverged')
+value={'activation_admissible':not failure,'alert':failure or data_quality_alert,'eligible_venues':eligible_list,'failure_class':failure_class,'operational_failure':failure,'preflight_error':preflight_error,'services':services}
 print(json.dumps(value,separators=(',',':'),sort_keys=True))
 """,
         encoding="utf-8",
@@ -504,13 +651,41 @@ exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_HELPER" "$@"
             "HOME": "/home/hyperlab",
             "HYPERLAB_FAKE_LOG": _git_bash_path(log),
             "HYPERLAB_FAIL_SERVICE": failed_service or "",
+            "HYPERLAB_DASHBOARD_ENABLE_MARKER": _git_bash_path(
+                tmp_path / "dashboard-enabled"
+            ),
+            "HYPERLAB_FIRST_HEALTH_MARKER": _git_bash_path(
+                tmp_path / "first-health-attempt"
+            ),
+            "HYPERLAB_DASHBOARD_SERVICE": str(
+                dict(handoff["services"])["dashboard"]
+            ),
+            "HYPERLAB_MONITOR_FAILURE": monitor_failure or "",
+            "HYPERLAB_MONITOR_ELIGIBLE_JSON": json.dumps(
+                list(monitor_eligible_venues)
+            ),
+            "HYPERLAB_COLLECTOR_GUARD_FAILURE": (
+                "1" if collector_guard_failure else "0"
+            ),
+            "HYPERLAB_MUTATE_INCOMING_ELIGIBILITY": (
+                "1" if mutate_incoming_eligibility else "0"
+            ),
+            "HYPERLAB_FAKE_SLEEP_SECONDS": "0.03",
             "HYPERLAB_FIXTURE_MANIFEST": _git_bash_path(pack / "campaign-manifest.json"),
             "HYPERLAB_FIXTURE_MANIFEST_PIN": _git_bash_path(
                 pack / "campaign-manifest.sha256"
             ),
+            "HYPERLAB_INCOMING_WINDOWS": str(
+                Path(str(handoff["incoming_root"]).replace("/c/", "C:/", 1))
+            ),
+            "HYPERLAB_INSTALL_PREFLIGHT_HELPER": _git_bash_path(
+                install_preflight_helper
+            ),
             "HYPERLAB_MONITOR_HELPER": _git_bash_path(monitor_helper),
             "HYPERLAB_REAL_PYTHON": _git_bash_path(Path(sys.executable)),
+            "HYPERLAB_ROOT_UNIT_STATE": _git_bash_path(state_root / "root-units"),
             "HYPERLAB_SERVICE_STATE_DIR": _git_bash_path(state_root),
+            "HYPERLAB_SERVICES_JSON": json.dumps(handoff["services"]),
             "HYPERLAB_SOURCE_COMMIT": str(handoff["source_commit"]),
             "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
         }
@@ -772,6 +947,7 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     assert "RestartPreventExitStatus=4" not in dashboard
     for unit in units.values():
         assert "User=hyperlab" in unit
+        assert "Environment=USER=hyperlab" in unit
         assert "NoNewPrivileges=yes" in unit
         assert "ProtectSystem=strict" in unit
         assert "CapabilityBoundingSet=" in unit
@@ -808,7 +984,18 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     assert install.startswith("#!/usr/bin/env bash")
     assert '! -L "$SOURCE_ROOT"' in install
     assert '! -L "$CAMPAIGN_ROOT"' in install
+    assert (
+        'bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/install.sh" '
+        '"$INCOMING_ROOT"'
+    ) in install
+    assert 'bash "$INCOMING_ROOT/scripts/install.sh"' not in install
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" in install
+    expected_monitor = (
+        f"bash '{handoff['source_root']}/ops/prediction_markets_launch_v1/monitor.sh' "
+        f"'{handoff['incoming_root']}/handoff.json'"
+    )
+    assert expected_monitor in monitor
+    assert f"{handoff['incoming_root']}/scripts/monitor.sh" not in monitor
     assert "PREDICTION_MONITOR_TRANSITION_OR_ALERT" in monitor
     assert "$SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY" in tunnel
     assert "Resolve-Path -LiteralPath $SshKeyRaw" in tunnel
@@ -996,7 +1183,12 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     assert any(line.startswith("git|clone --no-checkout ") for line in lines)
     assert any("verify-source" in line for line in lines)
     assert any(line.startswith("bash|") and "bootstrap-offline.sh" in line for line in lines)
-    assert any(line.startswith("bash|") and "install.sh" in line for line in lines)
+    expected_install = (
+        f"bash|{green_handoff['source_root']}/ops/prediction_markets_launch_v1/"
+        f"install.sh {green_handoff['incoming_root']}"
+    )
+    assert expected_install in lines
+    assert not any("/scripts/install.sh" in line for line in lines)
 
 
 def test_internal_install_runs_real_script_handles_transient_503_and_isolates_failure(
@@ -1031,11 +1223,29 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             self.end_headers()
             self.wfile.write(payload)
 
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
-    except OSError as error:
-        pytest.skip(f"loopback port 18081 unavailable for operator harness: {error}")
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_holder: list[ThreadingHTTPServer] = []
+    server_started = threading.Event()
+    server_error: list[OSError] = []
+    first_health_marker = tmp_path / "green" / "first-health-attempt"
+
+    def delayed_dashboard() -> None:
+        deadline = time.monotonic() + 10
+        while not first_health_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not first_health_marker.exists():
+            server_error.append(OSError("first dashboard health attempt was not observed"))
+            return
+        time.sleep(1.0)
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
+        except OSError as error:
+            server_error.append(error)
+            return
+        server_holder.append(server)
+        server_started.set()
+        server.serve_forever()
+
+    thread = threading.Thread(target=delayed_dashboard, daemon=True)
     thread.start()
     non_git_cwd = tmp_path / "non-git-cwd"
     non_git_cwd.mkdir()
@@ -1049,13 +1259,24 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             handoff=handoff,
             pack=pack,
         )
+        green_source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
         green = _run_git_bash_script(
-            OPS / "install.sh",
+            green_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
             cwd=non_git_cwd,
             environment=environment,
             arguments=(_git_bash_path(incoming),),
         )
         assert green.returncode == 0, green.stderr
+        assert server_started.is_set(), server_error
+        assert any(
+            signature in green.stderr
+            for signature in (
+                "ConnectionRefusedError",
+                "WinError 10061",
+                "Errno 111",
+                "urlopen error timed out",
+            )
+        ), green.stderr
         assert green.stdout.splitlines()[-1] == "PREDICTION_INSTALL_ACTIVATION_GREEN"
         assert HealthHandler.ready_requests == 3
         manifest = json.loads((pack / "campaign-manifest.json").read_bytes())
@@ -1087,8 +1308,11 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             pack=failed_pack,
             failed_service=str(failed_services["polymarket"]),
         )
+        failed_source = Path(
+            str(failed_handoff["source_root"]).replace("/c/", "C:/", 1)
+        )
         partial = _run_git_bash_script(
-            OPS / "install.sh",
+            failed_source / "ops" / "prediction_markets_launch_v1" / "install.sh",
             cwd=non_git_cwd,
             environment=failed_environment,
             arguments=(_git_bash_path(failed_incoming),),
@@ -1103,6 +1327,220 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         assert f"sudo|systemctl disable {failed_services['polymarket']}" in failed_log
         assert f"sudo|systemctl stop {failed_services['kalshi']}" not in failed_log
         assert f"sudo|systemctl stop {failed_services['dashboard']}" not in failed_log
+    finally:
+        if server_started.is_set():
+            server_holder[0].shutdown()
+            server_holder[0].server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_failure_class", "collector_guard_failure"),
+    [
+        ("helper-import", "MONITOR_RUNTIME_IMPORT_FAILED", False),
+        ("initial-evidence", "INITIAL_EVIDENCE_INVALID", False),
+        ("pid-diverged", None, False),
+        ("command-diverged", None, False),
+        ("dashboard-never", None, False),
+        ("collector-guard", None, True),
+        ("eligible-parser", None, False),
+        ("prepared-stale", None, False),
+    ],
+)
+def test_internal_install_refuses_bootstrap_readiness_and_stale_negatives_without_false_green(
+    tmp_path: Path,
+    failure_mode: str,
+    expected_failure_class: str | None,
+    collector_guard_failure: bool,
+) -> None:
+    class HealthHandler(BaseHTTPRequestHandler):
+        unavailable = failure_mode == "dashboard-never"
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+        def do_GET(self) -> None:
+            status = 503 if type(self).unavailable else 200
+            value = {
+                "mode": "readonly",
+                "orders_enabled": False,
+                "status": "not-ready" if status == 503 else (
+                    "ready" if self.path == "/health/ready" else "alive"
+                ),
+            }
+            payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    case_root = tmp_path / failure_mode
+    non_git_cwd = tmp_path / f"non-git-{failure_mode}"
+    non_git_cwd.mkdir()
+    try:
+        incoming, handoff, _campaign, pack = _internal_install_fixture(
+            case_root,
+            suffix=f"negative-{failure_mode}",
+        )
+        monitor_failure = (
+            failure_mode
+            if failure_mode
+            in {
+                "helper-import",
+                "initial-evidence",
+                "pid-diverged",
+                "command-diverged",
+                "prepared-stale",
+            }
+            else None
+        )
+        environment, log_path = _internal_install_environment(
+            case_root,
+            handoff=handoff,
+            pack=pack,
+            monitor_failure=monitor_failure,
+            collector_guard_failure=collector_guard_failure,
+            monitor_eligible_venues=(
+                ("kalshi", "kalshi")
+                if failure_mode == "eligible-parser"
+                else ("polymarket", "kalshi")
+            ),
+        )
+        environment["HYPERLAB_FAKE_SLEEP_SECONDS"] = ""
+        source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
+        completed = _run_git_bash_script(
+            source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=environment,
+            arguments=(_git_bash_path(incoming),),
+        )
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 4, output
+        assert "NameError" not in output
+        assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in output
+        if expected_failure_class is not None:
+            assert expected_failure_class in output
+        if failure_mode == "eligible-parser":
+            assert "authenticated eligible venue parsing failed" in output
+        services = handoff["services"]
+        assert isinstance(services, dict)
+        log = log_path.read_text(encoding="utf-8")
+        dashboard = str(services["dashboard"])
+        assert f"sudo|systemctl enable --now {dashboard}" in log
+        if failure_mode == "prepared-stale":
+            for venue in ("polymarket", "kalshi"):
+                service = str(services[venue])
+                assert f"sudo|systemctl enable --now {service}" in log
+                assert f"sudo|systemctl stop {service}" in log
+                assert f"sudo|systemctl disable {service}" in log
+            assert "PREDICTION_INSTALL_ACTIVATION_PARTIAL_OR_ALERT" in output
+        else:
+            for venue in ("polymarket", "kalshi"):
+                assert f"sudo|systemctl enable --now {services[venue]}" not in log
+            assert f"sudo|systemctl stop {dashboard}" in log
+            assert f"sudo|systemctl disable {dashboard}" in log
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_internal_install_binds_empty_or_partial_venue_selection_to_authenticated_monitor(
+    tmp_path: Path,
+) -> None:
+    class HealthHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+        def do_GET(self) -> None:
+            value = {
+                "mode": "readonly",
+                "orders_enabled": False,
+                "status": "ready" if self.path == "/health/ready" else "alive",
+            }
+            payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 18081), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    non_git_cwd = tmp_path / "non-git-cwd"
+    non_git_cwd.mkdir()
+
+    def run_case(
+        name: str,
+        *,
+        eligible: tuple[str, ...],
+        mutate_incoming: bool,
+    ) -> tuple[subprocess.CompletedProcess[str], str, dict[str, object], Path]:
+        case_root = tmp_path / name
+        incoming, handoff, _campaign, pack = _internal_install_fixture(
+            case_root,
+            suffix=name,
+            eligible_venues=eligible,
+        )
+        environment, log_path = _internal_install_environment(
+            case_root,
+            handoff=handoff,
+            pack=pack,
+            monitor_eligible_venues=eligible,
+            mutate_incoming_eligibility=mutate_incoming,
+        )
+        environment["HYPERLAB_FAKE_SLEEP_SECONDS"] = ""
+        source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
+        completed = _run_git_bash_script(
+            source / "ops" / "prediction_markets_launch_v1" / "install.sh",
+            cwd=non_git_cwd,
+            environment=environment,
+            arguments=(_git_bash_path(incoming),),
+        )
+        return completed, log_path.read_text(encoding="utf-8"), handoff, incoming
+
+    try:
+        unavailable, unavailable_log, unavailable_handoff, _ = run_case(
+            "both-unavailable",
+            eligible=(),
+            mutate_incoming=False,
+        )
+        assert unavailable.returncode == 0, unavailable.stderr
+        assert "PREDICTION_ELIGIBLE_VENUES=NONE" in unavailable.stdout
+        unavailable_services = unavailable_handoff["services"]
+        assert isinstance(unavailable_services, dict)
+        assert (
+            f"sudo|systemctl enable --now {unavailable_services['dashboard']}"
+            in unavailable_log
+        )
+        for venue in ("polymarket", "kalshi"):
+            assert (
+                f"sudo|systemctl enable --now {unavailable_services[venue]}"
+                not in unavailable_log
+            )
+
+        partial, partial_log, partial_handoff, partial_incoming = run_case(
+            "partial-immutable",
+            eligible=("kalshi",),
+            mutate_incoming=True,
+        )
+        assert partial.returncode == 0, partial.stderr
+        assert "PREDICTION_ELIGIBLE_VENUES=kalshi" in partial.stdout
+        assert json.loads(
+            (partial_incoming / "host-preflight-report.json").read_bytes()
+        )["eligible_venues"] == ["polymarket", "kalshi"]
+        partial_services = partial_handoff["services"]
+        assert isinstance(partial_services, dict)
+        assert f"sudo|systemctl enable --now {partial_services['kalshi']}" in partial_log
+        assert (
+            f"sudo|systemctl enable --now {partial_services['polymarket']}"
+            not in partial_log
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -1133,9 +1571,53 @@ def test_materialized_tabby_c_stops_on_semantic_transition_with_real_json_parser
     assert completed.stdout.count("PREDICTION_MONITOR_TRANSITION_OR_ALERT") == 1
     assert completed.stdout.count('"alert":false') == 2
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert sum("monitor.sh" in line for line in lines if line.startswith("bash|")) == 2
+    expected_monitor = (
+        "bash|"
+        f"{handoff['source_root']}/ops/prediction_markets_launch_v1/monitor.sh "
+        f"{handoff['incoming_root']}/handoff.json"
+    )
+    assert lines.count(expected_monitor) == 2
+    assert not any(
+        line.startswith("bash|")
+        and f"{handoff['incoming_root']}/scripts/monitor.sh" in line
+        for line in lines
+    )
     assert sum(line.startswith("python|-I -c ") for line in lines) == 2
     assert sum(line.startswith("sleep|10") for line in lines) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "diagnostic"),
+    [
+        ("monitor-exit", "PREDICTION_MONITOR_EXECUTION_FAILED"),
+        ("monitor-invalid", "PREDICTION_MONITOR_JSON_INVALID"),
+    ],
+)
+def test_materialized_tabby_c_always_signals_on_monitor_or_json_failure(
+    tmp_path: Path,
+    mode: str,
+    diagnostic: str,
+) -> None:
+    environment, _log = _operator_fake_environment(tmp_path)
+    environment.update(
+        {
+            "HYPERLAB_FAKE_BASH_MODE": mode,
+            "HYPERLAB_FAKE_PYTHON_MODE": "forward",
+        }
+    )
+    handoff = _operator_handoff_for_git_bash(tmp_path, mode)
+    script = tmp_path / f"C-{mode}.sh"
+    script.write_text(launch_pack.render_tabby_monitor(handoff), encoding="utf-8")
+    non_git_cwd = tmp_path / f"{mode}-non-git-cwd"
+    non_git_cwd.mkdir()
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment=environment,
+    )
+    assert completed.returncode == 4
+    assert diagnostic in completed.stderr
+    assert completed.stdout.count("PREDICTION_MONITOR_TRANSITION_OR_ALERT") == 1
 
 
 @pytest.mark.parametrize(
@@ -1366,6 +1848,7 @@ def test_internal_recovery_runs_real_control_flow_and_isolates_start_failure(
         *,
         fail_polymarket: bool,
         retry_after_partial: bool = False,
+        monitor_mode: str | None = None,
     ):
         case_root = tmp_path / case_name
         incoming = case_root / "incoming" / slug
@@ -1430,6 +1913,7 @@ exit "${PIPESTATUS[0]}"
                 if fail_polymarket
                 else None
             ),
+            monitor_failure=monitor_mode,
         )
         preflight_helper = case_root / "recovery-preflight-fixture.py"
         preflight_helper.write_text(
@@ -1545,10 +2029,418 @@ exit "${PIPESTATUS[0]}"
         assert partial_log.count(
             f"sudo|systemctl enable --now {partial_services['kalshi']}"
         ) == 2
+
+        for case_name, slug, monitor_mode in (
+            (
+                "dashboard-fragment",
+                "pm-20260827t235952z-deadbeef",
+                "dashboard-fragment",
+            ),
+            (
+                "dashboard-listener",
+                "pm-20260827t235953z-abcd1234",
+                "dashboard-listener",
+            ),
+        ):
+            refused, refused_retry, refused_log, refused_services = run_case(
+                case_name,
+                slug,
+                fail_polymarket=False,
+                monitor_mode=monitor_mode,
+            )
+            assert refused_retry is None
+            assert refused.returncode == 4
+            assert "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY" not in (
+                refused.stdout + refused.stderr
+            )
+            assert "dashboard recovery readiness failed before any venue start" in (
+                refused.stderr
+            )
+            dashboard = refused_services["dashboard"]
+            assert f"sudo|systemctl stop {dashboard}" in refused_log
+            assert f"sudo|systemctl disable {dashboard}" in refused_log
+            for venue in ("polymarket", "kalshi"):
+                assert (
+                    f"sudo|systemctl enable --now {refused_services[venue]}"
+                    not in refused_log
+                )
+
+        fragment, _, fragment_log, fragment_services = run_case(
+            "collector-fragment",
+            "pm-20260827t235954z-0ddba11a",
+            fail_polymarket=False,
+            monitor_mode="collector-fragment",
+        )
+        assert fragment.returncode == 4
+        assert "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY" in fragment.stderr
+        assert "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY" not in (
+            fragment.stdout + fragment.stderr
+        )
+        assert f"sudo|systemctl stop {fragment_services['polymarket']}" in fragment_log
+        assert f"sudo|systemctl disable {fragment_services['polymarket']}" in fragment_log
+
+        final_failure, _, final_failure_log, final_failure_services = run_case(
+            "final-operational-failure",
+            "pm-20260827t235955z-f00dcafe",
+            fail_polymarket=False,
+            monitor_mode="final-operational-failure",
+        )
+        assert final_failure.returncode == 4
+        assert "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY" in (
+            final_failure.stderr
+        )
+        assert "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY" not in (
+            final_failure.stdout + final_failure.stderr
+        )
+        for venue in ("polymarket", "kalshi"):
+            assert (
+                f"sudo|systemctl enable --now {final_failure_services[venue]}"
+                in final_failure_log
+            )
+
+        public_invalid, _, public_invalid_log, public_invalid_services = run_case(
+            "public-source-invalid",
+            "pm-20260827t235956z-c001d00d",
+            fail_polymarket=False,
+            monitor_mode="public-source-invalid-alert",
+        )
+        assert public_invalid.returncode == 0, public_invalid.stderr
+        assert public_invalid.stdout.count(
+            "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY"
+        ) == 1
+        assert "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY" not in (
+            public_invalid.stdout + public_invalid.stderr
+        )
+        for service in public_invalid_services.values():
+            assert f"sudo|systemctl enable --now {service}" in public_invalid_log
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_materialized_monitor_shell_uses_attested_venv_and_never_masks_primary_error(
+    tmp_path: Path,
+) -> None:
+    source = (tmp_path / "source").resolve()
+    incoming = (tmp_path / "incoming").resolve()
+    campaign = (tmp_path / "campaign").resolve()
+    shutil.copytree(ROOT / "src" / "hyperlab", source / "src" / "hyperlab")
+    shutil.copytree(OPS, source / "ops" / "prediction_markets_launch_v1")
+    runtime = source / ".venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    injector = tmp_path / "monitor-injector.py"
+    injector.write_text(
+        r'''import sys
+source=sys.stdin.read()
+fake=r"""
+_synthetic_mode=os.environ.get('HYPERLAB_MONITOR_PROBE_MODE','green')
+class _SyntheticSystemctlResult:
+ def __init__(self,name):
+  active=name=='dashboard'; pid='703' if active else '0'
+  if _synthetic_mode=='pid-diverged' and name=='dashboard': pid='0'
+  fragment=f'/etc/systemd/system/{services[name]}'
+  if _synthetic_mode=='fragment-diverged' and name=='dashboard': fragment='/etc/systemd/system/foreign.service'
+  self.returncode=0; self.stderr=''
+  self.stdout=f'LoadState=loaded\nActiveState={"active" if active else "inactive"}\nSubState={"running" if active else "dead"}\nMainPID={pid}\nNRestarts=0\nExecMainStatus=0\nFragmentPath={fragment}\n'
+def _synthetic_systemctl(arguments,**_kwargs):
+ name=next(key for key,value in services.items() if value==arguments[2])
+ return _SyntheticSystemctlResult(name)
+def _synthetic_cmdline(pid):
+ assert pid==703
+ command=list(expected['dashboard'])
+ if _synthetic_mode=='command-diverged': command[-1]='18082'
+ return b'\0'.join(part.encode('utf-8') for part in command)+b'\0'
+_real_loopback_listener_owned_by_pid=loopback_listener_owned_by_pid
+def _synthetic_listener(pid,port):
+ if _synthetic_mode in {'proc-green','proc-foreign'}:
+  proc_root=Path(os.environ['HYPERLAB_PROC_FIXTURE'])
+  inode='4242' if _synthetic_mode=='proc-green' else '9999'
+  class _SyntheticLinkMetadata: st_mode=stat.S_IFLNK
+  return _real_loopback_listener_owned_by_pid(pid,port,proc_root=proc_root,readlink=lambda _path:f'socket:[{inode}]',lstat=lambda _path:_SyntheticLinkMetadata())
+ return _synthetic_mode!='listener-diverged' and pid==703 and port==18081
+subprocess.run=_synthetic_systemctl
+bounded_proc_cmdline=_synthetic_cmdline
+loopback_listener_owned_by_pid=_synthetic_listener
+"""
+marker="result={'alert':preflight_error is not None,"
+if source.count(marker)!=1: raise SystemExit('monitor injection marker diverged')
+source=source.replace(marker,fake+'\n'+marker,1)
+exec(compile(source,'materialized-monitor-embedded','exec'),{'__name__':'__main__'})
+''',
+        encoding="utf-8",
+    )
+    runtime.write_text(
+        """#!/usr/bin/bash
+set -Eeuo pipefail
+printf 'venv|%s\n' "$*" >> "$HYPERLAB_RUNTIME_LOG"
+[[ ${1:-} == -I && ${2:-} == - ]]
+shift 2
+exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_INJECTOR" "$@"
+""",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    incoming.mkdir()
+    campaign.joinpath("state").mkdir(parents=True)
+    candidate_pack = (
+        ROOT
+        / "ops"
+        / "prediction_markets_candidate_v1"
+        / "prediction-markets-v1-20260901t000000z-aa60c0ff"
+    )
+    for name in ("campaign-manifest.json", "campaign-manifest.sha256"):
+        (campaign / name).write_bytes((candidate_pack / name).read_bytes())
+    manifest = json.loads((campaign / "campaign-manifest.json").read_bytes())
+    preflight_value = {
+        "boundary": cockpit.BOUNDARY,
+        "eligible_venues": ["polymarket", "kalshi"],
+        "errors": [],
+        "host_admitted": True,
+        "installation_admissible": True,
+        "network": {
+            venue: {"venue": venue, "verdict": "NETWORK_PREFLIGHT_GREEN"}
+            for venue in ("polymarket", "kalshi")
+        },
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_HOST_PREFLIGHT_GREEN",
+    }
+    preflight_raw = runner.canonical_json_bytes(preflight_value) + b"\n"
+    (campaign / "state" / "preflight-report.json").write_bytes(preflight_raw)
+    activation_body = {
+        "boundary": cockpit.BOUNDARY,
+        "campaign_id": manifest["campaign_id"],
+        "campaign_manifest_sha256": manifest["manifest_sha256"],
+        "campaign_root": str(campaign),
+        "dashboard_port": 18081,
+        "economic_evidence_status": cockpit.ECONOMIC_STATUS,
+        "eligible_venues": ["polymarket", "kalshi"],
+        "h1_actions": "NONE",
+        "preflight_report_sha256": runner.sha256_bytes(preflight_raw),
+        "quick_start": True,
+        "recorded_at_utc": "2026-08-27T18:49:10.000000Z",
+        "schema_version": 1,
+        "source_commit": "b" * 40,
+        "starts_at_utc": manifest["starts_at_utc"],
+    }
+    activation = {
+        **activation_body,
+        "receipt_sha256": runner.sha256_bytes(
+            runner.canonical_json_bytes(activation_body)
+        ),
+    }
+    activation_path = campaign / "state" / "activation-receipt.json"
+    activation_raw = runner.canonical_json_bytes(activation) + b"\n"
+    activation_path.write_bytes(activation_raw)
+    services = {
+        name: f"hyperlab-pm-20260827t190000z-cafefeed-{name}.service"
+        for name in ("polymarket", "kalshi", "dashboard")
+    }
+    handoff = {
+        "boundary": cockpit.BOUNDARY,
+        "campaign_root": str(campaign),
+        "dashboard_port": 18081,
+        "incoming_root": str(incoming),
+        "services": services,
+        "source_commit": "b" * 40,
+        "source_root": str(source),
+    }
+    handoff_raw = runner.canonical_json_bytes(handoff) + b"\n"
+    handoff_path = incoming / "handoff.json"
+    handoff_path.write_bytes(handoff_raw)
+    (incoming / "handoff.sha256").write_text(
+        f"{runner.sha256_bytes(handoff_raw)}  handoff.json\n",
+        encoding="ascii",
+    )
+    bare_import = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            (
+                "import sys;"
+                f"sys.path[:0]=[{str(source / 'src')!r},{str(source)!r}];"
+                "import ops.prediction_markets_launch_v1.cockpit"
+            ),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert bare_import.returncode != 0
+    assert "No module named 'numpy'" in bare_import.stderr
+    fake_bin = tmp_path / "monitor-fake-bin"
+    fake_bin.mkdir()
+    runtime_log = tmp_path / "runtime.log"
+    _write_fake_command(
+        fake_bin,
+        "python3.12",
+        "printf 'system-python|%s\\n' \"$*\" >> \"$HYPERLAB_RUNTIME_LOG\"\nexit 91\n",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HYPERLAB_MONITOR_INJECTOR": _git_bash_path(injector),
+            "HYPERLAB_REAL_PYTHON": _git_bash_path(Path(sys.executable)),
+            "HYPERLAB_RUNTIME_LOG": _git_bash_path(runtime_log),
+            "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    non_git_cwd = tmp_path / "non-git-cwd"
+    non_git_cwd.mkdir()
+
+    proc_fixture = tmp_path / "proc-fixture"
+    proc_fixture.joinpath("net").mkdir(parents=True)
+    proc_fixture.joinpath("703", "fd").mkdir(parents=True)
+    proc_fixture.joinpath("703", "fd", "9").write_text(
+        "SYNTHETIC/FIXTURE descriptor placeholder\n", encoding="utf-8"
+    )
+    proc_fixture.joinpath("net", "tcp").write_text(
+        "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+        "0: 0100007F:46A1 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 4242\n",
+        encoding="ascii",
+    )
+    environment["HYPERLAB_PROC_FIXTURE"] = str(proc_fixture)
+
+    def invoke(
+        mode: str = "green",
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        environment["HYPERLAB_MONITOR_PROBE_MODE"] = mode
+        completed = _run_git_bash_script(
+            source / "ops" / "prediction_markets_launch_v1" / "monitor.sh",
+            cwd=non_git_cwd,
+            environment=environment,
+            arguments=(_git_bash_path(handoff_path), "dashboard-only"),
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed, json.loads(completed.stdout)
+
+    completed, green = invoke()
+    assert green["preflight_error"] is None
+    assert green["activation_admissible"] is True
+    assert green["services"]["dashboard"]["listener_verified"] is True  # type: ignore[index]
+    assert "NameError" not in completed.stderr
+    assert "system-python" not in runtime_log.read_text(encoding="utf-8")
+    assert "venv|-I -" in runtime_log.read_text(encoding="utf-8")
+
+    proc_green_completed, proc_green = invoke("proc-green")
+    assert proc_green_completed.returncode == 0
+    assert proc_green["activation_admissible"] is True, json.dumps(
+        proc_green["services"]["dashboard"],  # type: ignore[index]
+        sort_keys=True,
+    )
+    assert proc_green["services"]["dashboard"]["listener_verified"] is True  # type: ignore[index]
+
+    for mode, field in (
+        ("pid-diverged", "command_verified"),
+        ("command-diverged", "command_verified"),
+        ("fragment-diverged", "fragment_verified"),
+        ("listener-diverged", "listener_verified"),
+        ("proc-foreign", "listener_verified"),
+    ):
+        refused_completed, refused = invoke(mode)
+        assert refused_completed.returncode == 0
+        assert refused["activation_admissible"] is False
+        assert refused["operational_failure"] is True
+        assert refused["services"]["dashboard"][field] is False  # type: ignore[index]
+        assert "NameError" not in refused_completed.stderr + refused_completed.stdout
+
+    campaign_alias = tmp_path / "campaign-linked"
+    try:
+        os.symlink(campaign, campaign_alias, target_is_directory=True)
+    except OSError:
+        linked = subprocess.run(
+            [
+                os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(campaign_alias),
+                str(campaign),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert linked.returncode == 0, linked.stderr + linked.stdout
+    linked_activation_body = {
+        key: value for key, value in activation.items() if key != "receipt_sha256"
+    }
+    linked_activation_body["campaign_root"] = str(campaign_alias)
+    linked_activation = {
+        **linked_activation_body,
+        "receipt_sha256": runner.sha256_bytes(
+            runner.canonical_json_bytes(linked_activation_body)
+        ),
+    }
+    activation_path.write_bytes(runner.canonical_json_bytes(linked_activation) + b"\n")
+    linked_handoff = {**handoff, "campaign_root": str(campaign_alias)}
+    linked_handoff_raw = runner.canonical_json_bytes(linked_handoff) + b"\n"
+    handoff_path.write_bytes(linked_handoff_raw)
+    (incoming / "handoff.sha256").write_text(
+        f"{runner.sha256_bytes(linked_handoff_raw)}  handoff.json\n",
+        encoding="ascii",
+    )
+    linked_completed, linked_failure = invoke()
+    assert linked_failure["failure_class"] == "MONITOR_INITIAL_HANDOFF_INVALID"
+    assert linked_failure["activation_admissible"] is False
+    assert linked_failure["operational_failure"] is True
+    assert "symlinked, special, or non-canonical" in str(
+        linked_failure["preflight_error"]
+    )
+    assert "NameError" not in linked_completed.stderr + linked_completed.stdout
+    activation_path.write_bytes(activation_raw)
+    handoff_path.write_bytes(handoff_raw)
+    (incoming / "handoff.sha256").write_text(
+        f"{runner.sha256_bytes(handoff_raw)}  handoff.json\n",
+        encoding="ascii",
+    )
+
+    cockpit_path = source / "ops" / "prediction_markets_launch_v1" / "cockpit.py"
+    cockpit_raw = cockpit_path.read_bytes()
+    cockpit_path.write_text(
+        cockpit_raw.decode("utf-8").replace(
+            "def prepared_state_is_stale(",
+            "def prepared_state_is_stale_REMOVED_FOR_SYNTHETIC_REGRESSION(",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    helper_completed, helper_failure = invoke()
+    assert helper_failure["failure_class"] == "MONITOR_RUNTIME_IMPORT_FAILED"
+    assert "prepared_state_is_stale" in str(helper_failure["preflight_error"])
+    assert helper_failure["operational_failure"] is True
+    assert "NameError" not in helper_completed.stderr + helper_completed.stdout
+    cockpit_path.write_bytes(cockpit_raw)
+
+    corrupted = json.loads(activation_raw)
+    corrupted["campaign_manifest_sha256"] = "f" * 64
+    activation_path.write_bytes(runner.canonical_json_bytes(corrupted) + b"\n")
+    evidence_completed, evidence_failure = invoke()
+    assert evidence_failure["failure_class"] == "INITIAL_EVIDENCE_INVALID"
+    assert "binding diverged" in str(evidence_failure["preflight_error"])
+    assert evidence_failure["activation_admissible"] is False
+    assert "NameError" not in evidence_completed.stderr + evidence_completed.stdout
+    activation_path.write_bytes(activation_raw)
+
+    runtime_backup = runtime.with_name("python.synthetic-backup")
+    runtime.rename(runtime_backup)
+    bootstrap = _run_git_bash_script(
+        source / "ops" / "prediction_markets_launch_v1" / "monitor.sh",
+        cwd=non_git_cwd,
+        environment=environment,
+        arguments=(_git_bash_path(handoff_path), "dashboard-only"),
+    )
+    bootstrap_value = json.loads(bootstrap.stdout)
+    assert bootstrap.returncode == 0
+    assert bootstrap_value["failure_class"] == "MONITOR_BOOTSTRAP_FAILED"
+    assert bootstrap_value["alert"] is True
+    assert "NameError" not in bootstrap.stderr + bootstrap.stdout
 
 
 def test_materialized_monitor_authenticates_activation_and_rejects_rechained_ledger(
@@ -1621,6 +2513,7 @@ def test_materialized_monitor_authenticates_activation_and_rejects_rechained_led
     handoff = {
         "boundary": cockpit.BOUNDARY,
         "campaign_root": str(campaign),
+        "dashboard_port": 18081,
         "incoming_root": str(incoming),
         "services": services,
         "source_commit": "b" * 40,
@@ -1634,14 +2527,14 @@ def test_materialized_monitor_authenticates_activation_and_rejects_rechained_led
         encoding="ascii",
     )
     production = (OPS / "monitor.sh").read_text(encoding="utf-8")
-    marker = "python3.12 -I - \"$HANDOFF\" \"$MODE\" <<'PY'\n"
+    marker = '"$VENV_PYTHON" -I - "$HANDOFF" "$MODE" "$SOURCE_ROOT" <<\'PY\'\n'
     assert production.count(marker) == 1
     embedded = production.split(marker, maxsplit=1)[1].rsplit("\nPY", maxsplit=1)[0]
     strict_external_fake = """
 class _SyntheticSystemctlResult:
  returncode=0
  stderr=''
- stdout='LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nNRestarts=0\\nExecMainStatus=0\\n'
+ stdout='LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nNRestarts=0\\nExecMainStatus=0\\nFragmentPath=\\n'
 def _synthetic_systemctl(arguments,**_kwargs):
  assert arguments[0]=='systemctl' and arguments[1]=='show'
  return _SyntheticSystemctlResult()
@@ -1655,7 +2548,14 @@ subprocess.run=_synthetic_systemctl
     monitor_python = tmp_path / "materialized-monitor.py"
     monitor_python.write_text(embedded, encoding="utf-8")
     completed = subprocess.run(
-        [sys.executable, "-I", str(monitor_python), str(handoff_path), "full"],
+        [
+            sys.executable,
+            "-I",
+            str(monitor_python),
+            str(handoff_path),
+            "full",
+            str(ROOT.resolve()),
+        ],
         capture_output=True,
         check=False,
         cwd=tmp_path,
@@ -1744,7 +2644,7 @@ class _SyntheticActiveResult:
   pid={'polymarket':'101','kalshi':'102','dashboard':'103'}[name]
   self.returncode=0
   self.stderr=''
-  self.stdout=f'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID={pid}\nNRestarts=0\nExecMainStatus=0\n'
+  self.stdout=f'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID={pid}\nNRestarts=0\nExecMainStatus=0\nFragmentPath=/etc/systemd/system/{services[name]}\n'
 def _synthetic_active_systemctl(arguments,**_kwargs):
  assert arguments[0]=='systemctl' and arguments[1]=='show'
  name=next(key for key,value in services.items() if value==arguments[2])
@@ -1754,6 +2654,7 @@ def _synthetic_active_cmdline(pid):
  return b'\0'.join(part.encode('utf-8') for part in expected[name])+b'\0'
 subprocess.run=_synthetic_active_systemctl
 bounded_proc_cmdline=_synthetic_active_cmdline
+loopback_listener_owned_by_pid=lambda pid,port: pid==103 and port==18081
 '''
     stale_embedded = embedded.replace(
         "result={'alert':preflight_error is not None,",
@@ -1770,6 +2671,7 @@ bounded_proc_cmdline=_synthetic_active_cmdline
             str(stale_monitor_python),
             str(handoff_path),
             "full",
+            str(ROOT.resolve()),
         ],
         capture_output=True,
         check=False,
@@ -1962,6 +2864,416 @@ def test_df_portable_parser_uses_df_pb1_column_four() -> None:
     assert preflight._parse_df_available(output) == 199000
     with pytest.raises(preflight.PreflightError):
         preflight._parse_df_available("Filesystem only\n")
+
+
+def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slug = "pm-20260827t235959z-feedface"
+    incoming_parent = tmp_path / "home" / "incoming"
+    volume_base = tmp_path / "volume" / "hyperlab-prediction-markets"
+    volume_mount = tmp_path / "volume"
+    incoming = incoming_parent / slug
+    source_root = volume_base / "sources" / slug
+    campaign_root = volume_base / "campaigns" / slug
+    incoming.joinpath("systemd").mkdir(parents=True)
+    incoming.joinpath("scripts").mkdir()
+    launch_script = incoming / "scripts" / "launch_pack.py"
+    launch_script.write_text(
+        "# SYNTHETIC/FIXTURE source identity verifier target\n",
+        encoding="utf-8",
+    )
+    source_inventory = incoming / "source-inventory.json"
+    source_inventory.write_text(
+        '{"fixture":"SYNTHETIC/FIXTURE source inventory"}\n',
+        encoding="utf-8",
+    )
+    runtime = source_root / ".venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("SYNTHETIC/FIXTURE offline runtime\n", encoding="utf-8")
+    services = {
+        venue: f"hyperlab-pm-{slug.removeprefix('pm-')}-{venue}.service"
+        for venue in ("polymarket", "kalshi", "dashboard")
+    }
+    unit_items: list[dict[str, object]] = []
+    for service in services.values():
+        path = incoming / "systemd" / service
+        path.write_text(
+            "[Unit]\nDescription=SYNTHETIC/FIXTURE admission unit\n",
+            encoding="utf-8",
+        )
+        unit_items.append(
+            {
+                "path": f"systemd/{service}",
+                "sha256": preflight.sha256_bytes(path.read_bytes()),
+                "size": path.stat().st_size,
+            }
+        )
+    transfer = {
+        "files": [
+            *unit_items,
+            {
+                "path": "scripts/launch_pack.py",
+                "sha256": preflight.sha256_bytes(launch_script.read_bytes()),
+                "size": launch_script.stat().st_size,
+            },
+            {
+                "path": "source-inventory.json",
+                "sha256": preflight.sha256_bytes(source_inventory.read_bytes()),
+                "size": source_inventory.stat().st_size,
+            },
+        ],
+        "schema_version": 1,
+    }
+    transfer_raw = preflight.canonical_json_bytes(transfer) + b"\n"
+    (incoming / "transfer-inventory.json").write_bytes(transfer_raw)
+    handoff = {
+        "boundary": preflight.BOUNDARY,
+        "campaign_root": campaign_root.as_posix(),
+        "dashboard_port": 18081,
+        "disk": dict(preflight._DISK_RESERVATION),
+        "incoming_root": incoming.as_posix(),
+        "run_slug": slug,
+        "schema_version": 1,
+        "service_user": "hyperlab",
+        "services": services,
+        "source_commit": "b" * 40,
+        "source_inventory_sha256": "c" * 64,
+        "source_root": source_root.as_posix(),
+        "transfer_inventory_sha256": preflight.sha256_bytes(transfer_raw),
+        "volume_base": volume_base.as_posix(),
+        "volume_mount": volume_mount.as_posix(),
+    }
+    handoff_raw = preflight.canonical_json_bytes(handoff) + b"\n"
+    handoff_path = incoming / "handoff.json"
+    handoff_path.write_bytes(handoff_raw)
+    (incoming / "handoff.sha256").write_text(
+        f"{preflight.sha256_bytes(handoff_raw)}  handoff.json\n",
+        encoding="ascii",
+    )
+    host = {
+        "boundary": preflight.BOUNDARY,
+        "checks": {"filesystem": {"source": "/dev/sdb"}},
+        "eligible_venues": ["polymarket", "kalshi"],
+        "errors": [],
+        "host_admitted": True,
+        "installation_admissible": True,
+        "network": {
+            venue: {"verdict": "NETWORK_PREFLIGHT_GREEN"}
+            for venue in ("polymarket", "kalshi")
+        },
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_HOST_PREFLIGHT_GREEN",
+    }
+    host_path = incoming / "host-preflight-report.json"
+    host_path.write_bytes(preflight.canonical_json_bytes(host) + b"\n")
+    fsync = {
+        "boundary": preflight.BOUNDARY,
+        "filesystem_write_surface": volume_base.as_posix(),
+        "parent_roots": [
+            volume_base.as_posix(),
+            (volume_base / "sources").as_posix(),
+            (volume_base / "campaigns").as_posix(),
+        ],
+        "probe_removed": True,
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_FILESYSTEM_FSYNC_GREEN",
+    }
+    fsync_path = incoming / "filesystem-fsync-report.json"
+    fsync_path.write_bytes(preflight.canonical_json_bytes(fsync) + b"\n")
+    monkeypatch.setattr(preflight, "_INCOMING_PARENT", PurePosixPath(incoming_parent.as_posix()))
+    monkeypatch.setattr(preflight, "_VOLUME_BASE", PurePosixPath(volume_base.as_posix()))
+    with pytest.raises(preflight.PreflightError, match="install handoff path"):
+        preflight.validate_install_layout(
+            {**handoff, "volume_mount": (tmp_path / "other-volume").as_posix()},
+            handoff_path=handoff_path,
+        )
+    monkeypatch.setenv("USER", "hyperlab")
+    monkeypatch.setattr(
+        preflight.Path,
+        "home",
+        classmethod(lambda _cls: Path("/home/hyperlab")),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "resume_preflight",
+        lambda *_args, **_kwargs: {
+            "checks": {"source_identity": {"commit": "b" * 40}},
+            "errors": [],
+            "resume_admissible": True,
+        },
+    )
+    available = 196_391_251_968
+    ntp = "yes"
+    filesystem_source = "/dev/sdb"
+    source_identity_green = True
+
+    def live_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
+        if str(arguments[0]) == str(runtime):
+            if not source_identity_green:
+                return preflight.CommandResult(4, "", "SYNTHETIC/FIXTURE source dirty")
+            return preflight.CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "commit": "b" * 40,
+                        "files": 1,
+                        "inventory_sha256": "c" * 64,
+                        "status": "PREDICTION_SOURCE_IDENTITY_GREEN",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                "",
+            )
+        if arguments[0] == "timedatectl":
+            return preflight.CommandResult(0, ntp, "")
+        if arguments[0] == "findmnt":
+            return preflight.CommandResult(
+                0,
+                f"{volume_mount.as_posix()} {filesystem_source} ext4 rw,relatime,discard",
+                "",
+            )
+        if arguments[0] == "df":
+            return preflight.CommandResult(
+                0,
+                "Filesystem 1-blocks Used Available Capacity Mounted on\n"
+                f"{filesystem_source} 300000000000 1 {available} 1% {volume_mount.as_posix()}",
+                "",
+            )
+        if arguments[0] == "systemctl":
+            return preflight.CommandResult(
+                0,
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0",
+                "",
+            )
+        raise AssertionError(arguments)
+
+    green = preflight.install_admission_preflight(
+        handoff_path,
+        host_path,
+        fsync_path,
+        run=live_command,
+    )
+    assert green["install_admissible"] is True
+    assert green["terminal_signal"] == "PREDICTION_INSTALL_ADMISSION_GREEN"
+    live = green["evidence"]["live"]  # type: ignore[index]
+    assert live["capacity"] == {  # type: ignore[index]
+        "admitted": True,
+        "available_bytes": available,
+        "required_free_bytes": 194_347_270_144,
+    }
+    assert available - 194_347_270_144 == 2_043_981_824
+    asserted_hashes = green["evidence"]["unit_sha256"]  # type: ignore[index]
+    assert set(asserted_hashes) == set(services.values())
+    install_admission_path = (
+        volume_base / "campaigns" / slug / "state" / "install-admission-report.json"
+    )
+    install_admission_path.parent.mkdir(parents=True)
+    install_admission_path.write_bytes(preflight.canonical_json_bytes(green) + b"\n")
+    green_guard = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert green_guard["activation_admissible"] is True
+    startup_green = preflight.runner_startup_admission(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert startup_green["startup_admissible"] is True
+    assert startup_green["checks"]["capacity"] == {  # type: ignore[index]
+        "deferred_to_ledger_accounted_runner_gate": True
+    }
+
+    ntp = "no"
+    startup_ntp_refused = preflight.runner_startup_admission(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert startup_ntp_refused["startup_admissible"] is False
+    assert "NTP is not synchronized" in " ".join(  # type: ignore[arg-type]
+        startup_ntp_refused["errors"]
+    )
+    ntp = "yes"
+
+    source_identity_green = False
+    startup_source_refused = preflight.runner_startup_admission(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert startup_source_refused["startup_admissible"] is False
+    assert "source identity failed" in " ".join(  # type: ignore[arg-type]
+        startup_source_refused["errors"]
+    )
+    source_identity_green = True
+
+    refused_path = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path.with_name("other-install-admission.json"),
+        run=live_command,
+    )
+    assert refused_path["activation_admissible"] is False
+    assert "install admission path diverged" in " ".join(refused_path["errors"])  # type: ignore[arg-type]
+
+    install_admission_raw = install_admission_path.read_bytes()
+    tampered_admission = json.loads(install_admission_raw)
+    tampered_admission["evidence"]["handoff_sha256"] = "f" * 64
+    install_admission_path.write_bytes(
+        preflight.canonical_json_bytes(tampered_admission) + b"\n"
+    )
+    refused_binding = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_binding["activation_admissible"] is False
+    assert "install admission binding diverged" in " ".join(  # type: ignore[arg-type]
+        refused_binding["errors"]
+    )
+
+    tampered_admission = json.loads(install_admission_raw)
+    tampered_admission["evidence"]["layout"]["source_root"] += "-diverged"
+    install_admission_path.write_bytes(
+        preflight.canonical_json_bytes(tampered_admission) + b"\n"
+    )
+    refused_layout = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_layout["activation_admissible"] is False
+    assert "install admission binding diverged" in " ".join(  # type: ignore[arg-type]
+        refused_layout["errors"]
+    )
+
+    install_admission_path.write_text(
+        json.dumps(green, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    refused_noncanonical = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_noncanonical["activation_admissible"] is False
+    assert "not canonical JSON" in " ".join(  # type: ignore[arg-type]
+        refused_noncanonical["errors"]
+    )
+    install_admission_path.write_bytes(install_admission_raw)
+
+    host_raw = host_path.read_bytes()
+    for bad_eligible in ([{}], ["kalshi", "kalshi"]):
+        invalid_host = json.loads(host_raw)
+        invalid_host["eligible_venues"] = bad_eligible
+        host_path.write_bytes(preflight.canonical_json_bytes(invalid_host) + b"\n")
+        refused_host = preflight.install_admission_preflight(
+            handoff_path,
+            host_path,
+            fsync_path,
+            run=live_command,
+        )
+        assert refused_host["install_admissible"] is False
+        assert "host preflight admission evidence diverged" in " ".join(  # type: ignore[arg-type]
+            refused_host["errors"]
+        )
+    host_path.write_bytes(host_raw)
+
+    filesystem_source = "/dev/sdc"
+    startup_device_refused = preflight.runner_startup_admission(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert startup_device_refused["startup_admissible"] is False
+    assert "filesystem device" in " ".join(  # type: ignore[arg-type]
+        startup_device_refused["errors"]
+    )
+    refused_device = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_device["activation_admissible"] is False
+    assert "filesystem device diverged" in " ".join(  # type: ignore[arg-type]
+        refused_device["errors"]
+    )
+    filesystem_source = "/dev/sdb"
+
+    mutated = incoming / "systemd" / services["polymarket"]
+    mutated.write_text("SYNTHETIC/FIXTURE unit mutated after inventory\n", encoding="utf-8")
+    refused_unit = preflight.install_admission_preflight(
+        handoff_path,
+        host_path,
+        fsync_path,
+        run=live_command,
+    )
+    assert refused_unit["install_admissible"] is False
+    assert "transfer file hash diverged" in " ".join(refused_unit["errors"])  # type: ignore[arg-type]
+
+    available = 194_347_270_143
+    refused_capacity = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_capacity["activation_admissible"] is False
+    assert "enlarge or choose another ext4 volume" in " ".join(  # type: ignore[arg-type]
+        refused_capacity["errors"]
+    )
+    ntp = "no"
+    refused_ntp = preflight.collector_activation_guard(
+        handoff_path,
+        install_admission_path,
+        run=live_command,
+    )
+    assert refused_ntp["activation_admissible"] is False
+    assert "NTP is not synchronized" in " ".join(refused_ntp["errors"])  # type: ignore[arg-type]
+
+
+def test_transfer_inventory_refuses_a_linked_parent_directory(tmp_path: Path) -> None:
+    handoff_path = _incoming_handoff(tmp_path)
+    incoming = handoff_path.parent
+    scripts = incoming / "scripts"
+    outside_scripts = tmp_path / "outside-scripts"
+    scripts.rename(outside_scripts)
+    try:
+        try:
+            os.symlink(outside_scripts, scripts, target_is_directory=True)
+        except OSError:
+            if os.name != "nt":
+                pytest.skip("directory symlink creation is unavailable")
+            linked = subprocess.run(
+                [
+                    os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+                    "/d",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(scripts),
+                    str(outside_scripts),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=30,
+            )
+            assert linked.returncode == 0, linked.stderr + linked.stdout
+        handoff = preflight.load_handoff(handoff_path)
+        with pytest.raises(
+            preflight.PreflightError,
+            match="transfer inventory parent directory is unsafe",
+        ):
+            preflight.verify_transfer_inventory(incoming, handoff)
+    finally:
+        if scripts.is_symlink():
+            scripts.unlink()
+        elif scripts.exists():
+            scripts.rmdir()
 
 
 def test_host_preflight_synchronously_proves_ntp_capacity_port_services_and_isolates_venues(

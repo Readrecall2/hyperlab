@@ -31,6 +31,7 @@ from hyperlab.research_data.prediction_candidate import (
 from hyperlab.research_data.prediction_contracts import OfficialPublicContract
 from hyperlab.research_data.prediction_evidence import PredictionRawEvidenceIndex
 from hyperlab.research_data.segments import ResearchSegmentReader
+from ops.prediction_markets_launch_v1.preflight import runner_startup_admission
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 ECONOMIC_STATUS = "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE"
@@ -1110,15 +1111,30 @@ class VenueRunner:
                 total += value
         return total
 
-    def _publish(self, lifecycle: str, *, error: str | None = None, ordinal: int | None = None) -> None:
+    def _publish(
+        self,
+        lifecycle: str,
+        *,
+        error: str | None = None,
+        ordinal: int | None = None,
+        capacity: Mapping[str, object] | None = None,
+    ) -> bool:
         rows = self._ledger()
-        capacity = capacity_snapshot(
-            campaign_root=self.context.campaign_root,
-            h1_reserved_bytes=self.h1_reserved_bytes,
-            prediction_maximum_raw_bytes=self.prediction_maximum_raw_bytes,
-            safety_margin_bytes=self.safety_margin_bytes,
-            accounted_bytes=self._accounted_bytes(),
-        )
+        if capacity is None:
+            capacity = capacity_snapshot(
+                campaign_root=self.context.campaign_root,
+                h1_reserved_bytes=self.h1_reserved_bytes,
+                prediction_maximum_raw_bytes=self.prediction_maximum_raw_bytes,
+                safety_margin_bytes=self.safety_margin_bytes,
+                accounted_bytes=self._accounted_bytes(),
+            )
+        admitted = capacity.get("admitted") is True
+        if lifecycle == "CAPACITY_REFUSED" and admitted:
+            raise RunnerError("CAPACITY_REFUSED requires the exact denied capacity snapshot")
+        if not admitted and lifecycle != "CAPACITY_REFUSED":
+            lifecycle = "CAPACITY_REFUSED"
+            error = "coexistence reservation is no longer proven"
+            ordinal = None
         _atomic_object(
             self.state_path,
             _state(
@@ -1132,6 +1148,7 @@ class VenueRunner:
                 capacity=capacity,
             ),
         )
+        return lifecycle != "CAPACITY_REFUSED"
 
     def _record_missing(self, ordinals: Sequence[int]) -> None:
         rows = self._ledger()
@@ -1146,11 +1163,12 @@ class VenueRunner:
                 )
                 accounted.add(ordinal)
 
-    def _run_slot(self, ordinal: int) -> None:
+    def _run_slot(self, ordinal: int) -> bool:
         slot_start = _slot_start(self.context, ordinal)
         leaf = f"shard-{ordinal:04d}-{slot_start.strftime('%Y%m%dT%H%M%SZ')}"
         output_root = self.runs_root / leaf
-        self._publish("COLLECTING", ordinal=ordinal)
+        if not self._publish("COLLECTING", ordinal=ordinal):
+            return False
         if output_root.exists():
             if (output_root / "reports" / "result.json").exists():
                 result = _validate_result(
@@ -1192,7 +1210,7 @@ class VenueRunner:
                     context=self.context,
                     venue=self.venue,
                 )
-                return
+                return True
         else:
             command = _probe_command(
                 python=self.python,
@@ -1257,7 +1275,7 @@ class VenueRunner:
                     context=self.context,
                     venue=self.venue,
                 )
-                return
+                return True
         append_ledger(
             self.ledger_path,
             _result_entry(
@@ -1270,6 +1288,7 @@ class VenueRunner:
             context=self.context,
             venue=self.venue,
         )
+        return True
 
     def _publish_integrity_failure(self, error: BaseException) -> None:
         _atomic_object(
@@ -1307,25 +1326,31 @@ class VenueRunner:
                 accounted_bytes=self._accounted_bytes(),
             )
             if capacity["admitted"] is not True:
-                self._publish("CAPACITY_REFUSED", error="coexistence reservation is no longer proven")
+                self._publish(
+                    "CAPACITY_REFUSED",
+                    error="coexistence reservation is no longer proven",
+                    capacity=capacity,
+                )
                 return 4
             if decision.action == "COMPLETE_WINDOW":
-                self._publish("COMPLETE_WINDOW")
+                if not self._publish("COMPLETE_WINDOW", capacity=capacity):
+                    return 4
                 return 0
             if decision.action == "RUN_SLOT" and decision.ordinal is not None:
-                self._run_slot(decision.ordinal)
+                if not self._run_slot(decision.ordinal):
+                    return 4
                 continue
             lifecycle = (
                 "PREPARED"
                 if decision.action == "WAIT_FOR_START"
                 else "WAITING_NEXT_SLOT"
             )
-            self._publish(lifecycle)
+            if not self._publish(lifecycle, capacity=capacity):
+                return 4
             deadline = time.monotonic() + min(max(decision.wait_seconds, 0.1), 30.0)
             while not self.stop_requested and time.monotonic() < deadline:
                 time.sleep(min(1.0, deadline - time.monotonic()))
-        self._publish("INTERRUPTED_RECOVERABLE")
-        return 130
+        return 130 if self._publish("INTERRUPTED_RECOVERABLE") else 4
 
     def run(self) -> int:
         self.venue_root.mkdir(parents=True, exist_ok=True)
@@ -1348,6 +1373,19 @@ def run_from_handoff(handoff_path: Path, venue: Venue) -> int:
     handoff = _pinned_object(handoff_path)
     if handoff.get("boundary") != BOUNDARY:
         raise RunnerError("handoff boundary diverged")
+    claimed_campaign_root = Path(str(handoff.get("campaign_root")))
+    startup = runner_startup_admission(
+        handoff_path,
+        claimed_campaign_root / "state" / "install-admission-report.json",
+    )
+    if startup.get("startup_admissible") is not True:
+        startup_errors = startup.get("errors")
+        if not isinstance(startup_errors, list):
+            startup_errors = ["runner startup admission error schema diverged"]
+        raise RunnerError(
+            "runner startup admission refused before slot selection: "
+            + "; ".join(str(item) for item in startup_errors)
+        )
     source_root = Path(str(handoff.get("source_root"))).resolve(strict=True)
     campaign_root = Path(str(handoff.get("campaign_root"))).resolve(strict=True)
     python = source_root / ".venv" / "bin" / "python"

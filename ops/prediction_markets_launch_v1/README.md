@@ -1,7 +1,7 @@
 # Prediction Markets Prospective Launch V1
 
 Verdict technique visé :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_REAL_RECEIPTS_ADMITTED_AWAITING_SINGLE_HUMAN_EXECUTION`.
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_MONITOR_BOOTSTRAP_FIXED_AWAITING_SINGLE_HUMAN_EXECUTION`.
 
 Statut économique permanent avant preuve prospective réelle :
 `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
@@ -55,6 +55,38 @@ l'un de ces contrôles reste `INTEGRITY_FAILED`, code 4, avec
 Une campagne ne contenant que des slots invalides reste
 `INSUFFICIENT_PUBLIC_CORPUS`; ces reçus ne prouvent jamais une source exploitable.
 
+### Correctif du bootstrap moniteur
+
+La tentative historique `pm-20260827t183515z-664bef6e` a prouvé le preflight
+hôte puis a refusé B avant tout démarrage de collecteur. La cause primaire était
+`ModuleNotFoundError: No module named 'numpy'` : `monitor.sh` lançait le Python
+système avec `-I`, alors que le graphe d'import cockpit → runner → candidat →
+backtest exige NumPy, attesté uniquement dans le venv offline. L'exception était
+capturée, puis le moniteur appelait hors du `try` un helper jamais lié et
+affichait le `NameError` secondaire `prepared_state_is_stale`.
+
+Le moniteur est maintenant lié au chemin canonique du script et exécute
+exclusivement `<source_root>/.venv/bin/python -I`. Il lie ce source root au
+handoff authentifié avant tout import. Les imports des helpers et la validation
+des preuves initiales sont deux phases distinctes. Toute absence de runtime,
+erreur d'import ou divergence handoff/preflight/manifest/activation produit un
+JSON borné fail-closed avec `alert=true`, `operational_failure=true`,
+`preflight_error` et une classification explicite, sans traceback masquant la
+cause primaire.
+
+B ne démarre aucun collecteur avant d'avoir simultanément prouvé le endpoint
+loopback readonly, `orders_enabled=false`, le PID et la commande systemd exacts,
+le chemin d'unité exact et que ce PID possède réellement le listener IPv4
+`127.0.0.1:18081`. Le premier refus de connexion ou 503 de démarrage est toléré
+par une attente bornée; l'expiration ou toute preuve divergente désarme
+uniquement le dashboard de cette tentative.
+
+La liste des collecteurs à activer provient ensuite du même JSON moniteur
+authentifié, jamais d'une relecture mutable de l'incoming root. Son parseur
+propage son code d'échec avant tout collecteur. La liste vide reste un état
+honnête `BOTH_UNAVAILABLE` : le dashboard peut rester read-only, les deux unités
+collecteur restent inactives et `PREDICTION_ELIGIBLE_VENUES=NONE` est explicite.
+
 ## Capacité et règle de cohabitation H1
 
 Le preflight exige simultanément :
@@ -72,11 +104,27 @@ octets libres. Si le minimum n'est plus disponible, le verdict est
 `PREDICTION_CAPACITY_REFUSED_COEXISTENCE_NOT_PROVEN` avec recommandation d'un
 hôte ou volume ext4 distinct. Aucun chemin H1 n'est lu pour obtenir ce verdict.
 
+La dernière observation humaine acquise donnait `196 391 251 968` octets libres
+pour `194 347 270 144` requis, soit seulement `2 043 981 824` octets de marge.
+Cette valeur est historique, pas une admission future. Après bootstrap, B
+réauthentifie le handoff, le source, les inventaires et les unités, puis mesure
+à nouveau NTP/montage/capacité avant toute mutation systemd. Il refait encore le
+contrôle NTP/montage/capacité juste avant le premier collecteur. Si la croissance
+H1 a consommé la marge, B doit refuser et demander d'agrandir ou de choisir un
+autre volume ext4; il est interdit de réduire les réserves ou contourner ce gate.
+
 Chaque runner recalcule ensuite la réservation avant chaque créneau. Il ne lit
 que son propre ledger : le budget de l'autre venue reste donc volontairement
 réservé en double dans ce calcul conservateur, et une corruption ou écriture
 concurrente de l'autre venue ne peut pas l'arrêter. Une perte de marge arrête
 uniquement la venue concernée fail-closed.
+
+À chaque démarrage ou redémarrage systemd, avant même la sélection du prochain
+ordinal, le runner réauthentifie le handoff, l'admission d'installation, le
+transfert, le commit/inventaire source, l'utilisateur/HOME, NTP, les racines
+canoniques et le même device ext4 `rw`. Le budget ledger-accounted est contrôlé
+juste après. Un refus sort en code 4 avant tout enfant de collecte et
+`RestartPreventExitStatus=4` interdit la boucle de restart.
 
 ## Construction locale du bundle
 
@@ -142,6 +190,11 @@ désarmement ciblé. E annonce un maximum de 12 minutes afin de couvrir les dél
 d'arrêt bornés des trois unités sans prétendre qu'une interruption les a toutes
 arrêtées. Aucune de ces actions ne supprime les preuves ni ne cible H1.
 
+Le source, l'incoming et la campagne historiques de
+`pm-20260827t183515z-664bef6e` restent des preuves immuables. Le rollback humain
+a rendu `PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED`. Aucun nouveau pack ne peut
+réutiliser ce slug ou l'une de ces racines.
+
 ## Preflight cible
 
 Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
@@ -182,6 +235,9 @@ et incohérences avant/après. Les téléchargements sont une allowlist fixe de 
 artefacts techniques. La readiness exige le preflight et le reçu d'activation
 liés au `campaign_id`, au SHA logique du manifest, au commit et à la racine; le
 moniteur authentifie aussi le ledger et le state avant toute classification.
+Il refuse avant lecture une campagne, `state/` ou un répertoire de venue lié,
+spécial ou non canonique, afin qu'un alias filesystem ne puisse jamais produire
+un faux GREEN.
 Comme la boucle du runner se réveille au plus tard toutes les 30 secondes, un
 state encore `PREPARED` plus de 35 secondes après `starts_at_utc` devient
 `PREPARED_STALE` : le cockpit refuse alors sa readiness et le moniteur publie
@@ -211,6 +267,12 @@ interdisent leur rejeu. Après une reprise partielle, une exécution suivante
 tolère uniquement l'autre collecteur déjà actif si son unité, sa commande, son
 state et son ledger sont tous authentifiés.
 
+La reprise exige aussi le `FragmentPath` exact pour les trois unités, et pour le
+dashboard le PID/commande ainsi que la possession du listener loopback. Son gate
+final exige `activation_admissible=true` et `operational_failure=false`; il ne
+refuse pas une simple alerte de qualité `PUBLIC_SOURCE_INVALID` authentique, mais
+ne peut jamais publier le signal de reprise sur une divergence opérationnelle.
+
 `bash operator/E-recovery-rollback.sh rollback` arrête et désactive uniquement
 ces trois services. Il ne supprime ni unité, source, venv, campagne, raw,
 manifest, ledger, run ou rapport; il ne nomme aucun service H1.
@@ -221,5 +283,8 @@ manifest, ledger, run ou rapport; il ne nomme aucun service H1.
 - Les échecs DNS Windows acquis restent locaux à cet environnement historique.
 - La première disponibilité réelle, les volumes réellement libres, NTP, ports,
   services et imports Linux ne peuvent être attestés qu'au preflight humain.
+- Le parseur borné `/proc/net/tcp` → `/proc/<pid>/fd` est couvert offline avec
+  métadonnées synthétiques; seule l'exécution humaine Linux atteste le `/proc`
+  réel de la nouvelle tentative.
 - `schedule_accounted` et un logiciel opérationnel ne valent pas corpus
   économique complet, alpha, rentabilité, capacité ni autorisation d'ordre.

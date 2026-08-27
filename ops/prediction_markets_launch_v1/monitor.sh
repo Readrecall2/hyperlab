@@ -7,13 +7,28 @@ if (($# < 1 || $# > 2)) || [[ ${2:-} != '' && ${2:-} != dashboard-only && ${2:-}
 fi
 HANDOFF=$1
 MODE=${2:-full}
-python3.12 -I - "$HANDOFF" "$MODE" <<'PY'
+
+bootstrap_refusal() {
+  printf '%s\n' '{"activation_admissible":false,"alert":true,"boundary":"PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY","campaign_root":null,"eligible_venues":[],"failure_class":"MONITOR_BOOTSTRAP_FAILED","operational_failure":true,"preflight_error":"MonitorBootstrapError:authenticated source runtime is absent or unsafe","semantic_fingerprint_sha256":"3faa5c073f14aee12676540730c2f19d8eefdce7e9782cc21ad7424248cc6f86","services":{},"source_commit":null}'
+  exit 0
+}
+
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}") || bootstrap_refusal
+SCRIPT_ROOT=$(dirname -- "$SCRIPT_PATH")
+SOURCE_ROOT=$(readlink -f -- "$SCRIPT_ROOT/../..") || bootstrap_refusal
+VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
+[[ ! -L ${BASH_SOURCE[0]} && ! -L $SOURCE_ROOT && -d $SOURCE_ROOT && -f $VENV_PYTHON && ! -L $VENV_PYTHON && -x $VENV_PYTHON ]] \
+  || bootstrap_refusal
+
+"$VENV_PYTHON" -I - "$HANDOFF" "$MODE" "$SOURCE_ROOT" <<'PY'
 import hashlib,json,os,stat,subprocess,sys,time
 from datetime import UTC,datetime
 from pathlib import Path
 
 MAX_JSON=4*1024*1024
 MAX_CMDLINE=64*1024
+MAX_PROC_TABLE=4*1024*1024
+MAX_PROC_FDS=4096
 
 def bounded(path, maximum):
  before=path.lstat()
@@ -29,7 +44,7 @@ def bounded_proc_cmdline(pid):
  before=path.lstat()
  if path.is_symlink() or not stat.S_ISREG(before.st_mode):
   raise ValueError(f'unsafe proc command line:{path}')
- fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC)
+ fd=os.open(path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
  try:
   opened=os.fstat(fd)
   if (before.st_dev,before.st_ino)!=(opened.st_dev,opened.st_ino) or not stat.S_ISREG(opened.st_mode):
@@ -46,10 +61,57 @@ def bounded_proc_cmdline(pid):
   raise ValueError(f'proc command line framing is invalid:{path}')
  return raw
 
+def bounded_proc_table(path):
+ fd=os.open(path,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
+ try:
+  opened=os.fstat(fd)
+  if not stat.S_ISREG(opened.st_mode): raise ValueError(f'unsafe proc table:{path}')
+  raw=os.read(fd,MAX_PROC_TABLE+1)
+  after=os.fstat(fd)
+ finally:
+  os.close(fd)
+ if len(raw)>MAX_PROC_TABLE: raise ValueError(f'oversized proc table:{path}')
+ if (opened.st_dev,opened.st_ino)!=(after.st_dev,after.st_ino) or not stat.S_ISREG(after.st_mode):
+  raise ValueError(f'proc table identity changed during read:{path}')
+ return raw
+
+def loopback_listener_owned_by_pid(pid,port,*,proc_root=Path('/proc'),readlink=os.readlink,lstat=lambda path:path.lstat()):
+ if type(pid) is not int or pid<=0 or type(port) is not int or not 1024<=port<=65535:
+  raise ValueError('dashboard listener identity arguments are invalid')
+ table=bounded_proc_table(proc_root/'net'/'tcp').decode('ascii')
+ expected_local=f'0100007F:{port:04X}'
+ inodes=set()
+ for line in table.splitlines()[1:]:
+  fields=line.split()
+  if len(fields)<10: raise ValueError('malformed /proc/net/tcp row')
+  if fields[1]==expected_local and fields[2]=='00000000:0000' and fields[3]=='0A':
+   if not fields[9].isdigit(): raise ValueError('dashboard listener inode is invalid')
+   inodes.add(fields[9])
+ if len(inodes)!=1: return False
+ descriptor_root=proc_root/str(pid)/'fd'
+ entries=list(descriptor_root.iterdir())
+ if len(entries)>MAX_PROC_FDS: raise ValueError('dashboard process has too many descriptors')
+ expected=f'socket:[{next(iter(inodes))}]'
+ for entry in entries:
+  if not entry.name.isdigit(): raise ValueError('dashboard descriptor name is invalid')
+  metadata=lstat(entry)
+  if not stat.S_ISLNK(metadata.st_mode): raise ValueError('dashboard descriptor is not a proc symlink')
+  if readlink(entry)==expected: return True
+ return False
+
 def object_at(path):
  value=json.loads(bounded(path,MAX_JSON).decode('utf-8'))
  if not isinstance(value,dict): raise ValueError(f'JSON root is not an object:{path}')
  return value
+
+def exact_directory(path,*,required):
+ if not path.is_absolute(): raise ValueError(f'directory is not absolute:{path}')
+ try: metadata=path.lstat()
+ except FileNotFoundError:
+  if required: raise ValueError(f'required directory is absent:{path}')
+  return
+ if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or path.resolve(strict=True)!=path:
+  raise ValueError(f'directory is symlinked, special, or non-canonical:{path}')
 
 def canonical(value):
  return json.dumps(value,ensure_ascii=False,allow_nan=False,separators=(',',':'),sort_keys=True).encode()
@@ -57,76 +119,115 @@ def canonical(value):
 def sha(value):
  return isinstance(value,str) and len(value)==64 and all(character in '0123456789abcdef' for character in value)
 
-handoff_path=Path(sys.argv[1]); mode=sys.argv[2]; dashboard_only=mode!='full'; recovery_dashboard=mode=='recovery-dashboard'
-handoff_raw=bounded(handoff_path,MAX_JSON)
-pin=bounded(handoff_path.with_suffix('.sha256'),256).decode('ascii').strip().split()
-if len(pin)!=2 or pin[1]!=handoff_path.name or hashlib.sha256(handoff_raw).hexdigest()!=pin[0]:
- raise ValueError('handoff SHA-256 pin diverged')
-handoff=json.loads(handoff_raw.decode('utf-8'))
-if not isinstance(handoff,dict): raise ValueError('handoff root is not an object')
-services=handoff['services']; root=Path(handoff['campaign_root']); source=handoff['source_root']
-sys.path[:0]=[str(Path(source)/'src'),source]
-preflight_path=root/'state'/'preflight-report.json'; preflight_error=None; preflight={}; recovery_network={}; manifest={}
+def emit_initial_failure(error):
+ semantic={'activation_admissible':False,'eligible_venues':[],'operational_failure':True,'services':{}}
+ result={'activation_admissible':False,'alert':True,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','campaign_root':None,'eligible_venues':[],'failure_class':'MONITOR_INITIAL_HANDOFF_INVALID','operational_failure':True,'preflight_error':f'{type(error).__name__}:{error}','services':{},'source_commit':None}
+ result['semantic_fingerprint_sha256']=hashlib.sha256(json.dumps(semantic,ensure_ascii=False,separators=(',',':'),sort_keys=True).encode()).hexdigest()
+ print(json.dumps(result,ensure_ascii=False,separators=(',',':'),sort_keys=True))
+ raise SystemExit(0)
+
+handoff_path=Path(sys.argv[1]); mode=sys.argv[2]; trusted_source=Path(sys.argv[3]); dashboard_only=mode!='full'; recovery_dashboard=mode=='recovery-dashboard'
 try:
- from hyperlab.research_data.envelope import Venue
- from ops.prediction_markets_launch_v1.cockpit import _validate_venue_state,active_optional_service_is_admissible,classify_monitored_service,complete_service_is_admissible,prepared_state_is_stale,validate_activation_evidence
- from ops.prediction_markets_launch_v1.runner import read_ledger,validate_service_ledger_against_manifest
- preflight_raw=bounded(preflight_path,MAX_JSON); preflight=json.loads(preflight_raw.decode('utf-8')); eligible=set(preflight['eligible_venues'])
- if not isinstance(preflight,dict): raise ValueError('preflight root is not an object')
- if not eligible.issubset({'polymarket','kalshi'}): raise ValueError('invalid eligible venue')
- manifest_path=root/'campaign-manifest.json'; manifest_raw=bounded(manifest_path,MAX_JSON); manifest=json.loads(manifest_raw.decode('utf-8'))
- if not isinstance(manifest,dict): raise ValueError('campaign manifest root is not an object')
- manifest_pin=bounded(root/'campaign-manifest.sha256',256).decode('ascii').strip().split()
- if len(manifest_pin)!=2 or manifest_pin[1]!='campaign-manifest.json' or hashlib.sha256(manifest_raw).hexdigest()!=manifest_pin[0]:
-  raise ValueError('campaign manifest physical pin diverged')
- manifest_claimed=manifest.get('manifest_sha256'); manifest_body={key:value for key,value in manifest.items() if key!='manifest_sha256'}
- if not sha(manifest_claimed) or hashlib.sha256(canonical(manifest_body)).hexdigest()!=manifest_claimed:
-  raise ValueError('campaign manifest logical SHA-256 diverged')
- activation_raw=bounded(root/'state'/'activation-receipt.json',MAX_JSON); activation=json.loads(activation_raw.decode('utf-8'))
- if not isinstance(activation,dict): raise ValueError('activation receipt root is not an object')
- validate_activation_evidence(activation,activation_raw=activation_raw,preflight=preflight,preflight_raw=preflight_raw,manifest=manifest,campaign_root=root,expected_source_commit=handoff.get('source_commit'))
- recovery_fields={'boundary','campaign_id','campaign_manifest_sha256','campaign_root','handoff_sha256','initial_preflight_report_sha256','network_report','network_report_sha256','receipt_sha256','recorded_at_utc','schema_version','source_commit','source_root','terminal_signal','venue'}
- for venue in ('polymarket','kalshi'):
-  admission_path=root/'state'/f'recovery-admission-{venue}.json'
-  try: admission_raw=bounded(admission_path,MAX_JSON)
-  except FileNotFoundError: continue
-  admission=json.loads(admission_raw.decode('utf-8'))
-  if not isinstance(admission,dict) or set(admission)!=recovery_fields or admission_raw!=canonical(admission)+b'\n':
-   raise ValueError(f'{venue} recovery admission schema or framing diverged')
-  receipt=admission.get('receipt_sha256'); body={key:value for key,value in admission.items() if key!='receipt_sha256'}
-  network=admission.get('network_report'); network_sha=admission.get('network_report_sha256')
-  recorded=admission.get('recorded_at_utc')
-  parsed=datetime.fromisoformat(recorded.replace('Z','+00:00')) if isinstance(recorded,str) else None
-  initial=preflight.get('network',{}).get(venue,{}) if isinstance(preflight.get('network'),dict) else {}
-  if (
-   not sha(receipt) or hashlib.sha256(canonical(body)).hexdigest()!=receipt
-   or not isinstance(network,dict) or network.get('venue')!=venue or network.get('verdict')!='NETWORK_PREFLIGHT_GREEN'
-   or not sha(network_sha) or hashlib.sha256(canonical(network)+b'\n').hexdigest()!=network_sha
-   or admission.get('boundary')!='PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY'
-   or admission.get('campaign_id')!=manifest.get('campaign_id')
-   or admission.get('campaign_manifest_sha256')!=manifest_claimed
-   or admission.get('campaign_root')!=str(root)
-   or admission.get('handoff_sha256')!=hashlib.sha256(handoff_raw).hexdigest()
-   or admission.get('initial_preflight_report_sha256')!=hashlib.sha256(preflight_raw).hexdigest()
-   or admission.get('schema_version')!=1 or admission.get('source_commit')!=handoff.get('source_commit')
-   or admission.get('source_root')!=source or admission.get('terminal_signal')!='PREDICTION_RECOVERY_NETWORK_ADMISSION_AUTHENTICATED'
-   or admission.get('venue')!=venue or parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None
-   or not isinstance(initial,dict) or initial.get('verdict')!='PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT'
-   or venue in set(preflight.get('eligible_venues',[]))
-  ): raise ValueError(f'{venue} recovery admission binding diverged')
-  eligible.add(venue); recovery_network[venue]=network
+ handoff_raw=bounded(handoff_path,MAX_JSON)
+ pin=bounded(handoff_path.with_suffix('.sha256'),256).decode('ascii').strip().split()
+ if len(pin)!=2 or pin[1]!=handoff_path.name or hashlib.sha256(handoff_raw).hexdigest()!=pin[0]:
+  raise ValueError('handoff SHA-256 pin diverged')
+ handoff=json.loads(handoff_raw.decode('utf-8'))
+ if not isinstance(handoff,dict): raise ValueError('handoff root is not an object')
+ services=handoff.get('services'); source=handoff.get('source_root'); campaign=handoff.get('campaign_root'); incoming=handoff.get('incoming_root')
+ if not isinstance(services,dict) or set(services)!={'polymarket','kalshi','dashboard'} or not all(isinstance(value,str) and value for value in services.values()):
+  raise ValueError('handoff service identity map diverged')
+ if not isinstance(source,str) or Path(source)!=trusted_source or trusted_source.resolve(strict=True)!=trusted_source:
+  raise ValueError('monitor source root binding diverged')
+ if not isinstance(campaign,str) or not Path(campaign).is_absolute() or not isinstance(incoming,str) or not Path(incoming).is_absolute():
+  raise ValueError('handoff runtime roots are invalid')
+ source_commit=handoff.get('source_commit')
+ if handoff_path.resolve(strict=True)!=Path(incoming)/'handoff.json' or handoff.get('boundary')!='PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY' or handoff.get('dashboard_port')!=18081 or not isinstance(source_commit,str) or len(source_commit)!=40 or any(character not in '0123456789abcdef' for character in source_commit):
+  raise ValueError('handoff runtime identity diverged')
+ root=Path(campaign); exact_directory(root,required=True)
 except Exception as error:
- eligible=set(); preflight_error=f'{type(error).__name__}:{error}'
+ emit_initial_failure(error)
+
+sys.path[:0]=[str(trusted_source/'src'),str(trusted_source)]
+preflight_path=root/'state'/'preflight-report.json'; preflight_error=None; failure_class=None; preflight={}; recovery_network={}; manifest={}; eligible=set()
+try:
+ from hyperlab.research_data.envelope import Venue as ImportedVenue
+ from ops.prediction_markets_launch_v1 import cockpit as monitor_cockpit
+ from ops.prediction_markets_launch_v1 import runner as monitor_runner
+ required_helpers=(monitor_cockpit._validate_venue_state,monitor_cockpit.active_optional_service_is_admissible,monitor_cockpit.classify_monitored_service,monitor_cockpit.complete_service_is_admissible,monitor_cockpit.prepared_state_is_stale,monitor_cockpit.validate_activation_evidence,monitor_runner.read_ledger,monitor_runner.validate_service_ledger_against_manifest)
+ if not all(callable(helper) for helper in required_helpers): raise ImportError('monitor runtime helper binding is incomplete')
+ Venue=ImportedVenue
+ _validate_venue_state=monitor_cockpit._validate_venue_state
+ active_optional_service_is_admissible=monitor_cockpit.active_optional_service_is_admissible
+ classify_monitored_service=monitor_cockpit.classify_monitored_service
+ complete_service_is_admissible=monitor_cockpit.complete_service_is_admissible
+ prepared_state_is_stale=monitor_cockpit.prepared_state_is_stale
+ validate_activation_evidence=monitor_cockpit.validate_activation_evidence
+ read_ledger=monitor_runner.read_ledger
+ validate_service_ledger_against_manifest=monitor_runner.validate_service_ledger_against_manifest
+except Exception as error:
+ preflight_error=f'{type(error).__name__}:{error}'; failure_class='MONITOR_RUNTIME_IMPORT_FAILED'
+
+if preflight_error is None:
+ try:
+  exact_directory(root/'state',required=True)
+  for venue in ('polymarket','kalshi'): exact_directory(root/venue,required=False)
+  preflight_raw=bounded(preflight_path,MAX_JSON); preflight=json.loads(preflight_raw.decode('utf-8')); eligible=set(preflight['eligible_venues'])
+  if not isinstance(preflight,dict): raise ValueError('preflight root is not an object')
+  if not eligible.issubset({'polymarket','kalshi'}): raise ValueError('invalid eligible venue')
+  manifest_path=root/'campaign-manifest.json'; manifest_raw=bounded(manifest_path,MAX_JSON); manifest=json.loads(manifest_raw.decode('utf-8'))
+  if not isinstance(manifest,dict): raise ValueError('campaign manifest root is not an object')
+  manifest_pin=bounded(root/'campaign-manifest.sha256',256).decode('ascii').strip().split()
+  if len(manifest_pin)!=2 or manifest_pin[1]!='campaign-manifest.json' or hashlib.sha256(manifest_raw).hexdigest()!=manifest_pin[0]:
+   raise ValueError('campaign manifest physical pin diverged')
+  manifest_claimed=manifest.get('manifest_sha256'); manifest_body={key:value for key,value in manifest.items() if key!='manifest_sha256'}
+  if not sha(manifest_claimed) or hashlib.sha256(canonical(manifest_body)).hexdigest()!=manifest_claimed:
+   raise ValueError('campaign manifest logical SHA-256 diverged')
+  activation_raw=bounded(root/'state'/'activation-receipt.json',MAX_JSON); activation=json.loads(activation_raw.decode('utf-8'))
+  if not isinstance(activation,dict): raise ValueError('activation receipt root is not an object')
+  validate_activation_evidence(activation,activation_raw=activation_raw,preflight=preflight,preflight_raw=preflight_raw,manifest=manifest,campaign_root=root,expected_source_commit=handoff.get('source_commit'))
+  recovery_fields={'boundary','campaign_id','campaign_manifest_sha256','campaign_root','handoff_sha256','initial_preflight_report_sha256','network_report','network_report_sha256','receipt_sha256','recorded_at_utc','schema_version','source_commit','source_root','terminal_signal','venue'}
+  for venue in ('polymarket','kalshi'):
+   admission_path=root/'state'/f'recovery-admission-{venue}.json'
+   try: admission_raw=bounded(admission_path,MAX_JSON)
+   except FileNotFoundError: continue
+   admission=json.loads(admission_raw.decode('utf-8'))
+   if not isinstance(admission,dict) or set(admission)!=recovery_fields or admission_raw!=canonical(admission)+b'\n':
+    raise ValueError(f'{venue} recovery admission schema or framing diverged')
+   receipt=admission.get('receipt_sha256'); body={key:value for key,value in admission.items() if key!='receipt_sha256'}
+   network=admission.get('network_report'); network_sha=admission.get('network_report_sha256')
+   recorded=admission.get('recorded_at_utc')
+   parsed=datetime.fromisoformat(recorded.replace('Z','+00:00')) if isinstance(recorded,str) else None
+   initial=preflight.get('network',{}).get(venue,{}) if isinstance(preflight.get('network'),dict) else {}
+   if (
+    not sha(receipt) or hashlib.sha256(canonical(body)).hexdigest()!=receipt
+    or not isinstance(network,dict) or network.get('venue')!=venue or network.get('verdict')!='NETWORK_PREFLIGHT_GREEN'
+    or not sha(network_sha) or hashlib.sha256(canonical(network)+b'\n').hexdigest()!=network_sha
+    or admission.get('boundary')!='PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY'
+    or admission.get('campaign_id')!=manifest.get('campaign_id')
+    or admission.get('campaign_manifest_sha256')!=manifest_claimed
+    or admission.get('campaign_root')!=str(root)
+    or admission.get('handoff_sha256')!=hashlib.sha256(handoff_raw).hexdigest()
+    or admission.get('initial_preflight_report_sha256')!=hashlib.sha256(preflight_raw).hexdigest()
+    or admission.get('schema_version')!=1 or admission.get('source_commit')!=handoff.get('source_commit')
+    or admission.get('source_root')!=source or admission.get('terminal_signal')!='PREDICTION_RECOVERY_NETWORK_ADMISSION_AUTHENTICATED'
+    or admission.get('venue')!=venue or parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None
+    or not isinstance(initial,dict) or initial.get('verdict')!='PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT'
+    or venue in set(preflight.get('eligible_venues',[]))
+   ): raise ValueError(f'{venue} recovery admission binding diverged')
+   eligible.add(venue); recovery_network[venue]=network
+ except Exception as error:
+  eligible=set(); preflight_error=f'{type(error).__name__}:{error}'; failure_class='INITIAL_EVIDENCE_INVALID'
 expected={
  'polymarket':[source+'/.venv/bin/python',source+'/ops/prediction_markets_launch_v1/runner.py','--handoff',handoff['incoming_root']+'/handoff.json','--venue','polymarket'],
  'kalshi':[source+'/.venv/bin/python',source+'/ops/prediction_markets_launch_v1/runner.py','--handoff',handoff['incoming_root']+'/handoff.json','--venue','kalshi'],
  'dashboard':[source+'/.venv/bin/python',source+'/ops/prediction_markets_launch_v1/cockpit.py','--campaign-root',handoff['campaign_root'],'--host','127.0.0.1','--port','18081'],
 }
-result={'alert':preflight_error is not None,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','campaign_root':str(root),'eligible_venues':sorted(eligible),'operational_failure':preflight_error is not None,'preflight_error':preflight_error,'services':{},'source_commit':handoff['source_commit']}
+result={'alert':preflight_error is not None,'boundary':'PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY','campaign_root':str(root),'eligible_venues':sorted(eligible),'failure_class':failure_class,'operational_failure':preflight_error is not None,'preflight_error':preflight_error,'services':{},'source_commit':handoff['source_commit']}
 for name in ('polymarket','kalshi','dashboard'):
  service=services[name]; props={}; system_error=None
  try:
-  shown=subprocess.run(['systemctl','show',service,'--property=LoadState,ActiveState,SubState,MainPID,NRestarts,ExecMainStatus','--no-pager'],capture_output=True,text=True,check=False,timeout=5)
+  shown=subprocess.run(['systemctl','show',service,'--property=LoadState,ActiveState,SubState,MainPID,NRestarts,ExecMainStatus,FragmentPath','--no-pager'],capture_output=True,text=True,check=False,timeout=5)
   for line in shown.stdout.splitlines():
    key,sep,value=line.partition('=')
    if sep: props[key]=value
@@ -143,6 +244,13 @@ for name in ('polymarket','kalshi','dashboard'):
    command=[part.decode('utf-8') for part in raw[:-1].split(b'\0')]
   except Exception as error:
    system_error=f'{type(error).__name__}:{error}'; result['alert']=True
+ command_verified=bool(pid>0 and command==expected[name])
+ fragment_verified=props.get('FragmentPath')==f'/etc/systemd/system/{service}'
+ listener_verified=None
+ if name=='dashboard' and pid>0 and command_verified:
+  try: listener_verified=loopback_listener_owned_by_pid(pid,handoff['dashboard_port'])
+  except Exception as error:
+   listener_verified=False; system_error=f'{type(error).__name__}:{error}'; result['alert']=True
  state=None; state_error=None; ledger_error=None; invalid_history=False
  network_verdict=None
  if name!='dashboard':
@@ -173,32 +281,34 @@ for name in ('polymarket','kalshi','dashboard'):
   invalid_history=bool(isinstance(data_quality,dict) and data_quality.get('terminal_health')=='PUBLIC_SOURCE_INVALID')
   if lifecycle in {'CAPACITY_REFUSED','INTEGRITY_FAILED','INTERRUPTED_RECOVERABLE'} or invalid_history:
    result['alert']=True
- command_verified=bool(pid>0 and command==expected[name])
  required=name=='dashboard' or (not dashboard_only and name in eligible)
  complete=isinstance(state,dict) and state.get('lifecycle')=='COMPLETE_WINDOW'
  lifecycle=None if state is None else state.get('lifecycle')
  last_terminal=None if state is None else state.get('last_terminal')
- prepared_stale=prepared_state_is_stale(lifecycle=lifecycle,starts_at_utc=manifest.get('starts_at_utc'),now=datetime.now(UTC))
- complete_service_ok=complete_service_is_admissible(complete=complete,show_returncode=None if shown is None else shown.returncode,system_error=system_error,properties=props,pid=pid,command_verified=command_verified)
- venue_status,terminal_condition=classify_monitored_service(name=name,ledger_error=ledger_error,lifecycle=lifecycle,last_terminal=last_terminal,network_verdict=network_verdict,complete_service_ok=complete_service_ok,command_verified=command_verified,active_state=props.get('ActiveState'),prepared_stale=prepared_stale)
+ if preflight_error is None:
+  prepared_stale=prepared_state_is_stale(lifecycle=lifecycle,starts_at_utc=manifest.get('starts_at_utc'),now=datetime.now(UTC))
+  complete_service_ok=complete_service_is_admissible(complete=complete,show_returncode=None if shown is None else shown.returncode,system_error=system_error,properties=props,pid=pid,command_verified=command_verified,fragment_verified=fragment_verified)
+  venue_status,terminal_condition=classify_monitored_service(name=name,ledger_error=ledger_error,lifecycle=lifecycle,last_terminal=last_terminal,network_verdict=network_verdict,complete_service_ok=complete_service_ok,command_verified=command_verified,active_state=props.get('ActiveState'),prepared_stale=prepared_stale)
+ else:
+  prepared_stale=False; complete_service_ok=False; venue_status=failure_class or 'INITIAL_EVIDENCE_INVALID'; terminal_condition=venue_status
  if terminal_condition is not None: result['alert']=True
  if venue_status not in {'RUNNING','COMPLETE_WINDOW'}: result['alert']=True
  if required:
   if complete:
-   if not complete_service_ok:
+   if not complete_service_ok or not fragment_verified:
     result['alert']=True; result['operational_failure']=True
   else:
-   if shown is None or shown.returncode!=0 or props.get('LoadState')!='loaded' or props.get('ActiveState')!='active' or pid<=0 or not command_verified:
+   if shown is None or shown.returncode!=0 or props.get('LoadState')!='loaded' or props.get('ActiveState')!='active' or pid<=0 or not command_verified or not fragment_verified or (name=='dashboard' and listener_verified is not True):
     result['alert']=True; result['operational_failure']=True
    if name!='dashboard' and not isinstance(state,dict):
     result['alert']=True; result['operational_failure']=True
  if venue_status in {'INTEGRITY_FAILED','CAPACITY_REFUSED','INTERRUPTED_RECOVERABLE','PREPARED_STALE','SERVICE_UNAVAILABLE','COMPLETE_WINDOW_SERVICE_FAILED'} and required:
   result['operational_failure']=True
- if not required and (props.get('ActiveState')=='active' or pid>0):
+ if preflight_error is None and not required and (props.get('ActiveState')=='active' or pid>0):
   active_optional_ok=active_optional_service_is_admissible(recovery_dashboard=recovery_dashboard,name=name,eligible=name in eligible,show_returncode=None if shown is None else shown.returncode,load_state=props.get('LoadState'),active_state=props.get('ActiveState'),pid=pid,command_verified=command_verified,state_present=isinstance(state,dict),venue_status=venue_status)
-  if not active_optional_ok:
+  if not active_optional_ok or not fragment_verified:
    result['alert']=True; result['operational_failure']=True
- result['services'][name]={'admission_required':required,'command':command,'command_verified':command_verified,'data_quality_alert':invalid_history,'ledger_error':ledger_error,'network_verdict':network_verdict,'properties':props,'state':state,'state_error':state_error,'system_error':system_error,'terminal_condition':terminal_condition,'venue_status':venue_status}
+ result['services'][name]={'admission_required':required,'command':command,'command_verified':command_verified,'data_quality_alert':invalid_history,'fragment_verified':fragment_verified,'ledger_error':ledger_error,'listener_verified':listener_verified,'network_verdict':network_verdict,'properties':props,'state':state,'state_error':state_error,'system_error':system_error,'terminal_condition':terminal_condition,'venue_status':venue_status}
 result['activation_admissible']=preflight_error is None and result['operational_failure'] is False
 semantic={'activation_admissible':result['activation_admissible'],'eligible_venues':result['eligible_venues'],'operational_failure':result['operational_failure'],'services':{}}
 for name,service in result['services'].items():
@@ -206,7 +316,7 @@ for name,service in result['services'].items():
  props=service['properties']
  capacity=state.get('capacity') if isinstance(state.get('capacity'),dict) else {}
  quality=state.get('data_quality') if isinstance(state.get('data_quality'),dict) else {}
- semantic['services'][name]={'ActiveState':props.get('ActiveState'),'ExecMainStatus':props.get('ExecMainStatus'),'NRestarts':props.get('NRestarts'),'SubState':props.get('SubState'),'capacity_admitted':capacity.get('admitted'),'command_verified':service['command_verified'],'data_quality_terminal':quality.get('terminal_health'),'last_terminal':state.get('last_terminal'),'lifecycle':state.get('lifecycle'),'recorded_slots':state.get('recorded_slots'),'terminal_condition':service['terminal_condition'],'venue_status':service['venue_status']}
+ semantic['services'][name]={'ActiveState':props.get('ActiveState'),'ExecMainStatus':props.get('ExecMainStatus'),'NRestarts':props.get('NRestarts'),'SubState':props.get('SubState'),'capacity_admitted':capacity.get('admitted'),'command_verified':service['command_verified'],'data_quality_terminal':quality.get('terminal_health'),'fragment_verified':service['fragment_verified'],'last_terminal':state.get('last_terminal'),'lifecycle':state.get('lifecycle'),'listener_verified':service['listener_verified'],'recorded_slots':state.get('recorded_slots'),'terminal_condition':service['terminal_condition'],'venue_status':service['venue_status']}
 result['semantic_fingerprint_sha256']=hashlib.sha256(json.dumps(semantic,ensure_ascii=False,separators=(',',':'),sort_keys=True).encode()).hexdigest()
 print(json.dumps(result,ensure_ascii=False,separators=(',',':'),sort_keys=True))
 PY

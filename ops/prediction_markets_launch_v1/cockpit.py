@@ -435,6 +435,7 @@ def complete_service_is_admissible(
     properties: Mapping[str, object],
     pid: int,
     command_verified: bool,
+    fragment_verified: bool,
 ) -> bool:
     """Authenticate the systemd postcondition for a completed venue service."""
 
@@ -443,6 +444,7 @@ def complete_service_is_admissible(
         or show_returncode != 0
         or system_error is not None
         or properties.get("LoadState") != "loaded"
+        or not fragment_verified
     ):
         return False
     return bool(

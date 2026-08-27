@@ -49,6 +49,8 @@ export PYTHONPATH="$SOURCE_ROOT/src:$SOURCE_ROOT"
   || fail 'required offline imports failed'
 "$VENV_PYTHON" -m hyperlab research-data prediction-collect --help >/dev/null \
   || fail 'prediction collector CLI import preflight failed'
+"$VENV_PYTHON" "$SOURCE_ROOT/ops/prediction_markets_launch_v1/runner.py" --help >/dev/null \
+  || fail 'persistent runner import preflight failed'
 "$VENV_PYTHON" "$SOURCE_ROOT/ops/prediction_markets_launch_v1/cockpit.py" --help >/dev/null \
   || fail 'cockpit import preflight failed'
 printf 'PREDICTION_OFFLINE_BOOTSTRAP_GREEN:%s\n' "$VENV_PYTHON"

@@ -1,7 +1,7 @@
 # Prediction Markets Prospective Launch V1
 
-Verdict terminal logiciel :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_AWAITING_HUMAN_EXECUTION`.
+Verdict terminal logiciel après admission des reçus forensics réels :
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_REAL_RECEIPTS_ADMITTED_AWAITING_SINGLE_HUMAN_EXECUTION`.
 
 Verdict économique : `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
 
@@ -37,6 +37,67 @@ restart, un output existant est
 authentifié ou récupéré depuis ses segments publiés; il n'est jamais recollecté.
 Les créneaux écoulés sont `MISSING_SLOT_NO_BACKFILL`.
 
+### Reçu authentique mais source publique invalide
+
+Le runtime sépare désormais deux classes qui ne doivent jamais être confondues :
+
+- une incohérence du reçu, du plan, des identités, des hashes, du manifest raw
+  ou du ledger reste `INTEGRITY_FAILED`, sort avec le code 4 et ne redémarre pas
+  en boucle ;
+- un reçu canonique dont tous ces contrôles sont verts, mais dont le terminal est
+  `PUBLIC_SOURCE_INVALID`, exige une erreur UTF-8 non vide bornée à 2 048 octets.
+  Il est écrit une seule fois dans le ledger avec manifest, root, compteurs et
+  provenance, puis le service passe à `WAITING_NEXT_SLOT` sans rejouer
+  l'ordinal.
+
+Un tel slot reste explicitement `source_usable=false`,
+`economic_eligible=false` et
+`CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS`. Il n'entre dans
+aucun dataset, évaluation ou holdout économique. Le cockpit et le moniteur le
+présentent comme alerte de qualité de donnée propre à la venue, avec
+`command_verified=true` si le service est bien celui attendu ; cela ne transforme
+jamais le runner en succès économique ni la preuve en donnée exploitable.
+Un bundle composé uniquement de tels reçus reste donc
+`INSUFFICIENT_PUBLIC_CORPUS`, jamais `OBSERVED_PUBLICLY`.
+
+La régression metadata-only est liée au forensic réel exporté sans segment raw :
+
+- inventaire forensic :
+  `4f44b2f151e9ed28c2a6ac10dd719de5a096759b3f0d3cc07b8c0f9a29bdae16` ;
+- archive :
+  `6e7c094dfb45d901f2f1b77bde8e53958075e9e67349e5cb9f4d125b1c031ea8` ;
+- source échouée conservée :
+  `6f59caae46e7f473cee9dec00103f4157920f8cb`.
+
+Les deux résultats réels et leurs manifests passent le contrat terminal exact
+sans lecture de raw. Les tests de pipeline complet utilisent, séparément, des
+segments synthétiques marqués comme tels afin de prouver écriture du ledger,
+reprise et absence de rejeu sans présenter ces fixtures comme preuve économique.
+
+### Décision sur les deux parseurs publics
+
+La documentation officielle actuelle Polymarket décrit la réponse compacte CLOB
+V2 de `GET /clob-markets/{condition_id}` avec les identités de tokens sous
+`t[].t` et les outcomes sous `t[].o`. L'adaptateur accepte uniquement ce schéma
+sur ce chemin officiel exact, le lie aux deux paires token/outcome Gamma déjà
+authentifiées et refuse les aliases legacy ou les payloads mixtes. Le forensic
+borné ne contient aucun segment raw : il ne permet donc pas d'attribuer la
+divergence réelle à un schéma précis. Cet alignement documentaire n'est pas
+présenté comme la cause prouvée de l'échec ; il durcit la normalisation sans
+relâcher la chaîne event → market → outcome/token. Désormais, le corps CLOB
+fautif est aussi publié dans l'envelope raw bornée avant que le validateur ne
+lève le terminal `PUBLIC_SOURCE_INVALID`, afin qu'un futur forensic conserve la
+preuve causale authentifiée.
+
+Pour Kalshi, la documentation actuelle de
+`GET /events/{event_ticker}/metadata` expose directement `market_details` et
+`settlement_sources`. L'adaptateur lie cette réponse au chemin réellement appelé
+et exige que le marché sélectionné apparaisse exactement une fois. Le forensic
+ne contient aucun segment raw : il ne permet donc pas d'identifier quelle valeur
+temporelle concrète avait déclenché l'erreur négative. Aucune coercition ni
+tolérance de timestamp n'a été ajoutée ; toute valeur absente reste absente et
+toute valeur présente doit encore être un epoch UTC non négatif et borné.
+
 Le troisième service est un cockpit séparé sur `127.0.0.1:18081`. Les trois
 unités sont non-root, `ProtectSystem=strict`, `NoNewPrivileges`, sans capacité,
 sans secret et avec surfaces d'écriture limitées aux racines de venue.
@@ -47,7 +108,9 @@ Le preflight découvre le volume réel au lieu de supposer le volume Hetzner 200
 GB. Il exige ext4 rw, fsync, NTP, CPython 3.12 x86_64 avec glibc >= 2.28,
 imports offline, wheelhouse multi-tags `manylinux_2_28` + `manylinux_2_17`
 hashé, Git et bundle exacts, port 18081 libre, racines/services absents et
-connectivité publique officielle bornée.
+connectivité publique officielle bornée. Les parents dédiés `sources/` et
+`campaigns/` sont refusés s'ils sont des symlinks ou quittent leur chemin réel,
+puis réattestés avec propriétaire/mode avant tout clone ou préparation.
 
 La cohabitation réserve 144 GiB pour H1, 21 GiB pour les 1 344 shards Prediction
 Markets et 16 GiB de marge, soit 181 GiB libres. Si cette marge n'est pas prouvée,
@@ -56,9 +119,12 @@ le pack refuse et recommande un hôte ou volume distinct sans toucher à H1.
 Une venue DNS/HTTPS/WSS indisponible reçoit son propre verdict; l'autre venue et
 le cockpit restent installables. Kalshi WSS n'est jamais sondé car le contrat
 documenté exige une authentification; la collecte Kalshi V1 reste REST publique.
-Toute reprise revalide d'abord NTP, ext4 `rw`, capacité, racines et imports
-offline, puis refait le preflight public borné venue par venue avant
-réactivation; un nouvel échec reste archivé et ne bloque pas l'autre collecteur.
+Toute reprise revalide d'abord l'inventaire transféré, le HEAD Git exact et
+propre, l'inventaire source, NTP, ext4 `rw`, capacité, racines et imports offline,
+puis refait le preflight public borné venue par venue avant réactivation. Une
+seconde reprise partielle accepte seulement un collecteur déjà actif dont
+l'unité, la commande, le state et le ledger sont authentifiés; un nouvel échec
+reste archivé et ne bloque pas l'autre collecteur.
 
 ## Démarrage et observation
 
@@ -68,7 +134,17 @@ borné à +24 h. Le pack ne contient donc aucune date future artificielle.
 
 Le cockpit expose uniquement GET/HEAD, `mode=readonly` et
 `orders_enabled=false`. Il conserve le holdout `SEALED`, refuse les lectures
-filesystem non sûres et affiche `NON DISPONIBLE` pour toute métrique absente.
+filesystem non sûres et affiche `NON DISPONIBLE` pour toute métrique absente. Sa
+readiness exige le preflight et un reçu d'activation auto-hashé, lié au
+`campaign_id`, au SHA du manifest, au commit et à la racine. Le moniteur lie en
+plus ce reçu au handoff et authentifie ledger/state avant d'afficher une venue.
+Un state `PREPARED` est toléré seulement pendant la fenêtre de réveil bornée du
+runner : après `starts_at_utc + 35 s`, il est affiché `PREPARED_STALE`, la
+readiness devient non verte et le moniteur s'arrête sur alerte sans inventer une
+corruption d'intégrité.
+Ses scénarios synthétiques couvrent aussi les terminaux invalides propres à
+chaque venue, les deux venues invalides, les états mixtes invalid/unavailable et
+`CAPACITY_REFUSED`, sans masquer le dernier état terminal courant.
 
 Le protocole complet, la création du bundle, les cinq fichiers opérateur et les
 règles recovery/rollback sont dans

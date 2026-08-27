@@ -180,8 +180,11 @@ def prediction_raw_records(envelope: PublicDataEnvelope) -> tuple[Mapping[str, A
         ("id" in root and "markets" in root) or "event_ticker" in root
     ):
         return (root,)
+    if envelope.feed_type == "event_metadata":
+        if "event_metadata" in root:
+            raise ValueError("Kalshi event metadata wrapper is not part of the current contract")
+        return (root,)
     singular_keys = {
-        "event_metadata": ("event_metadata",),
         "events": ("event",),
         "historical_markets": ("market",),
         "markets": ("market",),

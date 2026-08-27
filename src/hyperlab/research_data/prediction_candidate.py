@@ -25,6 +25,7 @@ from .prediction_contracts import (
     EvidenceClassification,
     OfficialPublicContract,
     PredictionIdentityGraph,
+    normalize_polymarket_clob_v2_market,
     revalidate_prediction_graph,
 )
 from .prediction_evidence import (
@@ -1882,8 +1883,18 @@ def build_polymarket_fee_schedule_from_raw(
             )
         clob = record.get("fd")
         if isinstance(clob, Mapping):
-            if str(record.get("condition_id") or record.get("conditionId") or "") != graph.market_id:
-                raise ValueError("Polymarket fee CLOB market identity diverged")
+            normalized_clob = normalize_polymarket_clob_v2_market(
+                record,
+                provenance=envelope.provenance,
+                expected_condition_id=graph.market_id,
+                expected_token_outcomes=tuple(
+                    (item.outcome_id, item.outcome_label.upper())
+                    for item in graph.outcomes
+                ),
+            )
+            clob = _mapping(
+                normalized_clob.get("fd"), label="Polymarket CLOB fee details"
+            )
             clob_values.append(
                 (
                     _decimal(clob.get("r"), label="Polymarket CLOB fee rate"),

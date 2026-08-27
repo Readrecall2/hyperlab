@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -100,6 +101,7 @@ _EXCLUDED_SLOT_TERMINALS = {
 }
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
+_TERMINAL_ERROR_MAX_UTF8_BYTES = 2_048
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +118,179 @@ class PredictionBundleSource:
             raw_root=collection_root / "raw",
             manifest_sha256=binding.raw_manifest_sha256,
             collection_root=collection_root,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionPublicSourceInvalidReceipt:
+    """Authenticated receipt metadata only; never sufficient for economic admission."""
+
+    binding: PredictionCollectionBinding
+    result_payload: Mapping[str, CanonicalValue]
+    terminal_result_sha256: str
+    terminal_error: str
+    frame_count: int
+    byte_count: int
+    segment_count: int
+    elapsed_ms: int
+    network_calls: int
+    raw_manifest_sha256: str
+    raw_root_sha256: str
+    classification: str = CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+    source_usable: bool = False
+    economic_eligible: bool = False
+
+    @classmethod
+    def from_report_bytes(
+        cls,
+        *,
+        probe_config_raw: bytes,
+        terminal_result_raw: bytes,
+    ) -> PredictionPublicSourceInvalidReceipt:
+        config_value = decode_canonical_json(probe_config_raw, require_canonical=True)
+        if not isinstance(config_value, Mapping):
+            raise ValueError("prediction invalid-source probe config must be an object")
+        binding = PredictionCollectionBinding.from_bytes(probe_config_raw)
+        result_value = decode_canonical_json(terminal_result_raw, require_canonical=True)
+        if not isinstance(result_value, Mapping):
+            raise ValueError("prediction invalid-source terminal result must be an object")
+        result = cast(Mapping[str, Any], result_value)
+        expected_result_fields = {
+            "boundary",
+            "bytes",
+            "campaign_manifest_sha256",
+            "candidate_config_sha256",
+            "collection_id",
+            "connection_attempts",
+            "duplicates",
+            "elapsed_ms",
+            "error",
+            "frames",
+            "gaps",
+            "limitations",
+            "manifest_sha256",
+            "network_calls",
+            "official_contract_sha256",
+            "probe_binding_sha256",
+            "queue_high_water",
+            "reconnects",
+            "requested_duration_seconds",
+            "root_sha256",
+            "schema_version",
+            "segments",
+            "source_timestamp_max_ns",
+            "source_timestamp_min_ns",
+            "terminal_health",
+            "venue",
+        }
+        if set(result) != expected_result_fields:
+            raise ValueError("prediction invalid-source terminal fields differ from schema v1")
+        duration = binding.payload.get("duration_seconds")
+        max_bytes = binding.payload.get("max_bytes")
+        max_frames = binding.payload.get("max_frames")
+        max_network_calls = binding.payload.get("max_network_calls")
+        max_segments = binding.payload.get("max_segments")
+        frame_count = result.get("frames")
+        byte_count = result.get("bytes")
+        segment_count = result.get("segments")
+        elapsed_ms = result.get("elapsed_ms")
+        network_calls = result.get("network_calls")
+        terminal_error = result.get("error")
+        manifest_sha256 = result.get("manifest_sha256")
+        root_sha256 = result.get("root_sha256")
+        limitations = result.get("limitations")
+        connection_attempts = result.get("connection_attempts")
+        source_min = result.get("source_timestamp_min_ns")
+        source_max = result.get("source_timestamp_max_ns")
+        if (
+            result.get("boundary") != BOUNDARY
+            or result.get("schema_version") != 1
+            or result.get("terminal_health") != "PUBLIC_SOURCE_INVALID"
+            or result.get("venue") != binding.venue.value
+            or result.get("collection_id") != binding.collection_id
+            or result.get("campaign_manifest_sha256")
+            != binding.campaign_manifest_sha256
+            or result.get("candidate_config_sha256") != binding.candidate_config_sha256
+            or result.get("official_contract_sha256")
+            != binding.official_contract_sha256
+            or result.get("probe_binding_sha256") != binding.probe_binding_sha256
+            or type(duration) is not int
+            or duration <= 0
+            or result.get("requested_duration_seconds") != duration
+            or type(frame_count) is not int
+            or frame_count <= 0
+            or type(byte_count) is not int
+            or byte_count <= 0
+            or type(segment_count) is not int
+            or segment_count <= 0
+            or type(elapsed_ms) is not int
+            or elapsed_ms < 0
+            or elapsed_ms > duration * 1_000
+            or type(network_calls) is not int
+            or network_calls < 0
+            or any(
+                type(limit) is not int or limit <= 0
+                for limit in (max_bytes, max_frames, max_network_calls, max_segments)
+            )
+            or frame_count > cast(int, max_frames)
+            or byte_count > cast(int, max_bytes)
+            or network_calls > cast(int, max_network_calls)
+            or segment_count > cast(int, max_segments)
+            or type(terminal_error) is not str
+            or not terminal_error.strip()
+            or len(terminal_error.encode("utf-8")) > _TERMINAL_ERROR_MAX_UTF8_BYTES
+            or type(manifest_sha256) is not str
+            or type(root_sha256) is not str
+            or any(
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in (manifest_sha256, root_sha256)
+            )
+            or not isinstance(limitations, list)
+            or any(type(item) is not str or not item for item in limitations)
+            or not isinstance(connection_attempts, list)
+            or any(not isinstance(item, Mapping) for item in connection_attempts)
+            or any(
+                type(result.get(key)) is not int or cast(int, result.get(key)) < 0
+                for key in ("duplicates", "gaps", "queue_high_water", "reconnects")
+            )
+            or any(
+                value is not None and (type(value) is not int or value < 0)
+                for value in (source_min, source_max)
+            )
+            or ((source_min is None) != (source_max is None))
+            or (
+                type(source_min) is int
+                and type(source_max) is int
+                and source_min > source_max
+            )
+        ):
+            raise ValueError("prediction invalid-source terminal result is not admissible")
+        canonical_result = cast(Mapping[str, CanonicalValue], result_value)
+        return cls(
+            binding=binding,
+            result_payload=canonical_result,
+            terminal_result_sha256=_sha256(terminal_result_raw),
+            terminal_error=terminal_error,
+            frame_count=frame_count,
+            byte_count=byte_count,
+            segment_count=segment_count,
+            elapsed_ms=elapsed_ms,
+            network_calls=network_calls,
+            raw_manifest_sha256=manifest_sha256,
+            raw_root_sha256=root_sha256,
+        )
+
+    @classmethod
+    def from_probe_reports(cls, probe_root: Path) -> PredictionPublicSourceInvalidReceipt:
+        reports_root = probe_root / "reports"
+        return cls.from_report_bytes(
+            probe_config_raw=_read_stable_regular_bytes(
+                reports_root / "probe-config.json"
+            ),
+            terminal_result_raw=_read_stable_regular_bytes(
+                reports_root / "result.json"
+            ),
         )
 
 
@@ -140,10 +315,22 @@ class PredictionUnavailableSource:
     def from_probe_output(cls, probe_root: Path) -> PredictionUnavailableSource:
         config_path = probe_root / "reports" / "probe-config.json"
         result_path = probe_root / "reports" / "result.json"
-        config_raw = config_path.read_bytes()
-        result_raw = result_path.read_bytes()
-        config = _read_canonical_mapping(config_path, label="unavailable probe config")
-        result = _read_canonical_mapping(result_path, label="unavailable probe result")
+        config_raw = _read_stable_regular_bytes(config_path)
+        result_raw = _read_stable_regular_bytes(result_path)
+        config = _canonical_mapping_from_bytes(
+            config_raw, label="unavailable probe config"
+        )
+        result = _canonical_mapping_from_bytes(
+            result_raw, label="unavailable probe result"
+        )
+        invalid_receipt = (
+            PredictionPublicSourceInvalidReceipt.from_report_bytes(
+                probe_config_raw=config_raw,
+                terminal_result_raw=result_raw,
+            )
+            if result.get("terminal_health") == "PUBLIC_SOURCE_INVALID"
+            else None
+        )
         expected_config_fields = {
             "boundary",
             "campaign_manifest_sha256",
@@ -194,6 +381,16 @@ class PredictionUnavailableSource:
             "source_timestamp_min_ns",
             "terminal_health",
             "venue",
+        }
+        terminal_error = result.get("error")
+        error_required = {
+            "BACKPRESSURE_LIMIT_REACHED",
+            "INTERRUPTED_RECOVERED",
+            "MAX_BYTES_REACHED",
+            "PUBLIC_SOURCE_INVALID",
+            "PUBLIC_SOURCE_UNAVAILABLE",
+            "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+            "RECOVERED_AFTER_PROCESS_ERROR",
         }
         if (
             frozenset(config)
@@ -296,27 +493,38 @@ class PredictionUnavailableSource:
                 for key in ("duplicates", "gaps", "queue_high_water", "reconnects")
             )
             or any(
-                result.get(key) is not None and type(result.get(key)) is not int
+                result.get(key) is not None
+                and (
+                    type(result.get(key)) is not int
+                    or cast(int, result.get(key)) < 0
+                )
                 for key in ("source_timestamp_max_ns", "source_timestamp_min_ns")
             )
             or (
-                result.get("error") is not None
+                (result.get("source_timestamp_min_ns") is None)
+                != (result.get("source_timestamp_max_ns") is None)
+            )
+            or (
+                type(result.get("source_timestamp_min_ns")) is int
+                and type(result.get("source_timestamp_max_ns")) is int
+                and cast(int, result.get("source_timestamp_min_ns"))
+                > cast(int, result.get("source_timestamp_max_ns"))
+            )
+            or (
+                terminal_error is not None
                 and (
-                    type(result.get("error")) is not str
-                    or not str(result.get("error")).strip()
+                    type(terminal_error) is not str
+                    or not terminal_error.strip()
+                    or len(terminal_error.encode("utf-8"))
+                    > _TERMINAL_ERROR_MAX_UTF8_BYTES
                 )
             )
         ):
             raise ValueError("unavailable prediction probe terminal invariants diverged")
-        error_required = {
-            "BACKPRESSURE_LIMIT_REACHED",
-            "INTERRUPTED_RECOVERED",
-            "PUBLIC_SOURCE_INVALID",
-            "PUBLIC_SOURCE_UNAVAILABLE",
-            "RECOVERED_AFTER_PROCESS_ERROR",
-        }
-        if terminal_health in error_required and type(result.get("error")) is not str:
+        if terminal_health in error_required and type(terminal_error) is not str:
             raise ValueError("prediction excluded slot terminal lacks its causal error")
+        if terminal_health not in error_required and terminal_error is not None:
+            raise ValueError("prediction terminal unexpectedly carries an error")
         if terminal_health in {
             "CONTINUITY_BROKEN_FROZEN",
             "CONTINUITY_UNKNOWN_AFTER_RECONNECT_FROZEN",
@@ -398,6 +606,37 @@ class PredictionUnavailableSource:
             ):
                 raise ValueError("excluded slot terminal result diverges from authenticated raw")
             envelopes = reader.replay()
+            observed_duplicates = sum(int(envelope.state.duplicate) for envelope in envelopes)
+            observed_gaps = sum(int(envelope.state.gap_detected) for envelope in envelopes)
+            observed_reconnect_boundaries = sum(
+                int(envelope.state.reconnect) for envelope in envelopes
+            )
+            observed_websocket = any(
+                envelope.provenance.transport == "PUBLIC_WEBSOCKET"
+                for envelope in envelopes
+            )
+            queue_high_water = cast(int, result.get("queue_high_water"))
+            reconnects = cast(int, result.get("reconnects"))
+            if (
+                result.get("duplicates") != observed_duplicates
+                or result.get("gaps") != observed_gaps
+                or result.get("connection_attempts") != []
+            ):
+                raise ValueError("excluded slot counters diverge from authenticated raw")
+            if venue is Venue.KALSHI and (queue_high_water != 0 or reconnects != 0):
+                raise ValueError("Kalshi excluded slot carries impossible queue or reconnect counters")
+            if venue is Venue.POLYMARKET and (
+                queue_high_water != int(observed_websocket)
+                or reconnects != observed_reconnect_boundaries
+            ):
+                raise ValueError("Polymarket excluded slot queue or reconnect counters diverge")
+            source_timestamps = [
+                envelope.source_timestamp_ns
+                for envelope in envelopes
+                if envelope.source_timestamp_ns is not None
+            ]
+            observed_source_min = min(source_timestamps) if source_timestamps else None
+            observed_source_max = max(source_timestamps) if source_timestamps else None
             session_prefix = f"probe-binding-{claimed_binding}:"
             if any(
                 envelope.venue is not venue
@@ -407,6 +646,11 @@ class PredictionUnavailableSource:
                 for envelope in envelopes
             ):
                 raise ValueError("excluded slot raw provenance diverges from its probe binding")
+            if (
+                result.get("source_timestamp_min_ns") != observed_source_min
+                or result.get("source_timestamp_max_ns") != observed_source_max
+            ):
+                raise ValueError("excluded slot source timestamp bounds diverge from raw")
             try:
                 PredictionCollectionBinding.from_probe_output(probe_root)
             except ValueError as binding_error:
@@ -431,8 +675,20 @@ class PredictionUnavailableSource:
                         "prediction excluded slot terminal is not allowlisted"
                     ) from binding_error
             else:
-                raise ValueError("admissible raw collection cannot be relabeled as an excluded slot")
+                if terminal_health != PublicSourceStatus.PUBLIC_SOURCE_UNAVAILABLE.value:
+                    raise ValueError(
+                        "admissible raw collection cannot be relabeled as an excluded slot"
+                    )
             classification = CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+        if invalid_receipt is not None and (
+            classification != invalid_receipt.classification
+            or venue is not invalid_receipt.binding.venue
+            or collection_id != invalid_receipt.binding.collection_id
+            or _sha256(result_raw) != invalid_receipt.terminal_result_sha256
+            or raw_manifest != invalid_receipt.raw_manifest_sha256
+            or raw_root != invalid_receipt.raw_root_sha256
+        ):
+            raise ValueError("prediction invalid-source receipt diverged during raw authentication")
         return cls(
             probe_root=probe_root,
             venue=venue,
@@ -670,12 +926,47 @@ def _canonical_mapping(value: object, *, label: str) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], value)
 
 
-def _read_canonical_mapping(path: Path, *, label: str) -> Mapping[str, Any]:
-    raw = path.read_bytes()
+def _read_stable_regular_bytes(path: Path, *, maximum_bytes: int = 8 * 1024 * 1024) -> bytes:
+    before = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_size > maximum_bytes:
+        raise ValueError(f"prediction report is unsafe or oversized: {path}")
+    with path.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        raw = handle.read(maximum_bytes + 1)
+        opened_after = os.fstat(handle.fileno())
+    after = path.lstat()
+    identities = (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
+        (
+            opened_before.st_dev,
+            opened_before.st_ino,
+            opened_before.st_size,
+            opened_before.st_mtime_ns,
+        ),
+        (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+        ),
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+    )
+    if len(raw) > maximum_bytes or len(set(identities)) != 1 or len(raw) != before.st_size:
+        raise ValueError(f"prediction report changed during read: {path}")
+    return raw
+
+
+def _canonical_mapping_from_bytes(raw: bytes, *, label: str) -> Mapping[str, Any]:
     if raw.endswith(b"\n"):
         raw = raw[:-1]
     decoded = decode_canonical_json(raw, require_canonical=True)
     return _canonical_mapping(decoded, label=label)
+
+
+def _read_canonical_mapping(path: Path, *, label: str) -> Mapping[str, Any]:
+    return _canonical_mapping_from_bytes(
+        _read_stable_regular_bytes(path), label=label
+    )
 
 
 def _safe_relative(value: str) -> Path:
@@ -801,17 +1092,17 @@ def _discover_graphs(
                 if event_id:
                     events[event_id] = entry
                     attempt_all()
-            elif entry.envelope.feed_type == "metadata" and (
-                record.get("tokens") is not None or record.get("token_id") is not None
-            ):
-                market_id = str(record.get("condition_id") or record.get("conditionId") or "")
-                if market_id:
-                    direct_token = str(record.get("token_id") or record.get("tokenId") or "")
-                    key = direct_token or "FULL"
-                    if key == "FULL":
-                        clob[market_id] = {"FULL": entry}
-                    else:
-                        clob.setdefault(market_id, {})[key] = entry
+            elif entry.envelope.feed_type == "metadata" and record.get("t") is not None:
+                parsed = urlsplit(entry.envelope.provenance.source_url)
+                prefixes = ("/clob-markets/", "/polymarket/clob-markets/")
+                matching = [prefix for prefix in prefixes if parsed.path.startswith(prefix)]
+                market_id = (
+                    ""
+                    if len(matching) != 1
+                    else parsed.path.removeprefix(matching[0])
+                )
+                if market_id and "/" not in market_id:
+                    clob[market_id] = {"FULL": entry}
                     attempt_all()
     else:
         kalshi_markets: dict[str, _RawEntry] = {}
@@ -860,9 +1151,17 @@ def _discover_graphs(
             elif entry.envelope.feed_type == "events" and record.get("event_ticker"):
                 kalshi_events[str(record["event_ticker"])] = entry
                 attempt_all()
-            elif entry.envelope.feed_type == "event_metadata" and record.get("event_ticker"):
-                kalshi_metadata[str(record["event_ticker"])] = entry
-                attempt_all()
+            elif entry.envelope.feed_type == "event_metadata":
+                parsed = urlsplit(entry.envelope.provenance.source_url)
+                parts = tuple(part for part in parsed.path.split("/") if part)
+                event_id = ""
+                if len(parts) == 5 and parts[:3] == ("trade-api", "v2", "events") and parts[4] == "metadata":
+                    event_id = parts[3]
+                elif len(parts) == 4 and parts[:2] == ("kalshi", "events") and parts[3] == "metadata":
+                    event_id = parts[2]
+                if event_id:
+                    kalshi_metadata[event_id] = entry
+                    attempt_all()
             elif entry.envelope.feed_type == "series":
                 series_id = str(record.get("ticker") or record.get("series_ticker") or "")
                 if series_id:
@@ -3225,7 +3524,7 @@ def build_prediction_research_bundle(
             venue_receipts = [item for item in unavailable_sources if item.venue is venue]
             if venue_shards and all(item.synthetic for item in venue_shards):
                 statuses[venue.value] = SYNTHETIC_SOURCE_STATUS
-            elif venue_shards or any(item.frame_count > 0 for item in venue_receipts):
+            elif venue_shards:
                 statuses[venue.value] = PublicSourceStatus.OBSERVED_PUBLICLY.value
             elif venue_receipts and all(
                 item.classification
@@ -3419,7 +3718,7 @@ def verify_prediction_research_bundle(
             if venue_receipts:
                 raise ValueError("prediction bundle includes and marks a venue unavailable")
             expected_statuses[venue] = SYNTHETIC_SOURCE_STATUS
-        elif venue_shards or any(item.frame_count > 0 for item in venue_receipts):
+        elif venue_shards:
             if any(item.classification == UNBOUND_AVAILABILITY_OBSERVATION for item in venue_receipts):
                 raise ValueError("public campaign bundle contains unbound availability evidence")
             expected_statuses[venue] = PublicSourceStatus.OBSERVED_PUBLICLY.value
@@ -3621,6 +3920,7 @@ __all__ = [
     "MODEL_VERSION",
     "UNBOUND_AVAILABILITY_OBSERVATION",
     "PredictionBundleSource",
+    "PredictionPublicSourceInvalidReceipt",
     "PredictionUnavailableSource",
     "VerifiedPredictionResearchBundle",
     "build_prediction_research_bundle",

@@ -27,19 +27,24 @@ from hyperlab.research_data.segments import ResearchDataCapacityError
 from ops.prediction_markets_launch_v1 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
-CANDIDATE_PACK = (
-    ROOT
-    / "ops"
-    / "prediction_markets_candidate_v1"
-    / "prediction-markets-v1-20260901t000000z-aa60c0ff"
-)
-
-
 def _campaign(tmp_path: Path) -> runner.CampaignContext:
     campaign = tmp_path / "campaign"
-    campaign.mkdir()
-    for name in ("campaign-manifest.json", "campaign-manifest.sha256"):
-        (campaign / name).write_bytes((CANDIDATE_PACK / name).read_bytes())
+    candidate = CandidatePreregistration.from_path(
+        ROOT / "config/research/prediction-markets-candidate-v1.json"
+    )
+    contracts = tuple(
+        OfficialPublicContract.from_path(
+            ROOT / f"config/research/{venue}-public-contract-v1.json"
+        )
+        for venue in ("polymarket", "kalshi")
+    )
+    prepare_prediction_campaign(
+        output_root=campaign,
+        campaign_id="synthetic-fixture-current-contract-campaign-v1",
+        starts_at_utc="2026-09-01T00:00:00Z",
+        preregistration=candidate,
+        contracts=contracts,
+    )
     return runner.load_campaign_context(campaign, ROOT)
 
 
@@ -97,6 +102,76 @@ def _synthetic_capacity_transport(config, **kwargs):
     raise ResearchDataCapacityError("SYNTHETIC/FIXTURE bounded raw-byte budget reached")
 
 
+def _synthetic_public_source_invalid_transport(config, **kwargs):
+    factory = kwargs["factory"]
+    writer = kwargs["writer"]
+    counters = kwargs["counters"]
+    for index, feed in enumerate(config.feeds, start=1):
+        payload = canonical_json_bytes(
+            {
+                "feed": feed,
+                "fixture_label": SYNTHETIC_FIXTURE_LABEL,
+                "public_source_invalid_oracle": True,
+                "venue": config.venue.value,
+            }
+        )
+        envelope = factory.make(
+            feed_type=feed,
+            instrument_id=f"SYNTHETIC-{config.venue.value}-INSTRUMENT",
+            market_id=f"SYNTHETIC-{config.venue.value}-MARKET",
+            source_timestamp_ns=None,
+            receive_timestamp_utc_ns=time.time_ns(),
+            receive_monotonic_ns=time.monotonic_ns(),
+            source_event_id=f"SYNTHETIC-INVALID-{feed}-{index}",
+            raw_payload=payload,
+            provenance=CaptureProvenance(
+                factory.provenance.collection_id,
+                f"fixture://prediction-markets/{config.venue.value.lower()}/{feed}",
+                "FIXTURE",
+                SYNTHETIC_FIXTURE_LABEL,
+            ),
+        )
+        writer.append(envelope)
+        counters.observe(envelope)
+    if config.venue is Venue.KALSHI:
+        raise ValueError("source timestamp must be absent or a non-negative UTC epoch value")
+    raise ValueError("Polymarket CLOB market-info identity graph diverged")
+
+
+def _synthetic_late_public_source_unavailable_transport(config, **kwargs):
+    factory = kwargs["factory"]
+    writer = kwargs["writer"]
+    counters = kwargs["counters"]
+    for index, feed in enumerate(config.feeds, start=1):
+        payload = canonical_json_bytes(
+            {
+                "feed": feed,
+                "fixture_label": SYNTHETIC_FIXTURE_LABEL,
+                "late_public_source_unavailable": True,
+                "venue": config.venue.value,
+            }
+        )
+        envelope = factory.make(
+            feed_type=feed,
+            instrument_id=f"SYNTHETIC-{config.venue.value}-INSTRUMENT",
+            market_id=f"SYNTHETIC-{config.venue.value}-MARKET",
+            source_timestamp_ns=None,
+            receive_timestamp_utc_ns=time.time_ns(),
+            receive_monotonic_ns=time.monotonic_ns(),
+            source_event_id=f"SYNTHETIC-LATE-UNAVAILABLE-{feed}-{index}",
+            raw_payload=payload,
+            provenance=CaptureProvenance(
+                factory.provenance.collection_id,
+                f"fixture://prediction-markets/{config.venue.value.lower()}/{feed}",
+                "FIXTURE",
+                SYNTHETIC_FIXTURE_LABEL,
+            ),
+        )
+        writer.append(envelope)
+        counters.observe(envelope)
+    raise ConnectionError("SYNTHETIC/FIXTURE late public source disconnect")
+
+
 def test_campaign_context_reuses_authenticated_candidate_and_672_slot_schedule(tmp_path: Path) -> None:
     context = _campaign(tmp_path)
     assert context.manifest["candidate_config_sha256"] == (
@@ -147,10 +222,14 @@ def test_terminal_ledger_is_append_only_hash_chained_and_rejects_tamper(tmp_path
     first = runner.append_ledger(
         ledger,
         runner._missed_entry(context, Venue.POLYMARKET, 0, context.start),
+        context=context,
+        venue=Venue.POLYMARKET,
     )
     second = runner.append_ledger(
         ledger,
         runner._missed_entry(context, Venue.POLYMARKET, 1, context.start + timedelta(hours=1)),
+        context=context,
+        venue=Venue.POLYMARKET,
     )
     assert second["previous_entry_sha256"] == first["entry_sha256"]
     assert [row["ordinal"] for row in runner.read_ledger(ledger)] == [0, 1]
@@ -158,14 +237,58 @@ def test_terminal_ledger_is_append_only_hash_chained_and_rejects_tamper(tmp_path
         runner.append_ledger(
             ledger,
             runner._missed_entry(context, Venue.POLYMARKET, 1, context.start),
+            context=context,
+            venue=Venue.POLYMARKET,
         )
     lines = ledger.read_text(encoding="utf-8").splitlines()
     value = json.loads(lines[0])
     value["terminal_health"] = "COMPLETE"
     lines[0] = json.dumps(value, separators=(",", ":"), sort_keys=True)
-    ledger.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ledger.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
     with pytest.raises(runner.RunnerError, match="chain diverged"):
         runner.read_ledger(ledger)
+
+
+def test_service_ledger_rejects_cross_venue_and_rechained_semantic_tamper(
+    tmp_path: Path,
+) -> None:
+    context = _campaign(tmp_path)
+    polymarket = tmp_path / "semantic" / "polymarket.jsonl"
+    runner.append_ledger(
+        polymarket,
+        runner._missed_entry(context, Venue.POLYMARKET, 0, context.start),
+        context=context,
+        venue=Venue.POLYMARKET,
+    )
+    rows = runner.read_ledger(polymarket)
+    with pytest.raises(runner.RunnerError, match="campaign binding"):
+        runner._validate_service_ledger(rows, context=context, venue=Venue.KALSHI)
+
+    body = runner._ledger_body(rows[0])
+    body["source_usable"] = True
+    body["economic_eligible"] = True
+    altered = {
+        **body,
+        "entry_sha256": runner.sha256_bytes(runner.canonical_json_bytes(body)),
+    }
+    rechained = tmp_path / "semantic" / "rechained.jsonl"
+    rechained.write_bytes(runner.canonical_json_bytes(altered) + b"\n")
+    assert len(runner.read_ledger(rechained)) == 1
+    with pytest.raises(runner.RunnerError, match="missing-slot ledger"):
+        runner._validate_service_ledger(
+            runner.read_ledger(rechained),
+            context=context,
+            venue=Venue.POLYMARKET,
+        )
+
+    crlf = tmp_path / "semantic" / "crlf.jsonl"
+    crlf.write_bytes(polymarket.read_bytes().replace(b"\n", b"\r\n"))
+    with pytest.raises(runner.RunnerError, match="physical framing"):
+        runner.read_ledger(crlf)
+    noncanonical = tmp_path / "semantic" / "noncanonical.jsonl"
+    noncanonical.write_bytes((json.dumps(rows[0], sort_keys=True) + "\n").encode("utf-8"))
+    with pytest.raises(runner.RunnerError, match="not canonical JSON"):
+        runner.read_ledger(noncanonical)
 
 
 def test_missing_slot_metrics_are_unknown_not_invented_zero(tmp_path: Path) -> None:
@@ -399,6 +522,279 @@ def test_two_venue_cli_runner_authenticates_capacity_receipts_and_resume_never_r
             resume_patch.setattr(runner, "schedule_decision", stop_after_resume_decision)
             assert resumed.run() == 130
         assert runner.read_ledger(previous.ledger_path)[0]["ordinal"] == 0
+    assert len(invocations) == 2
+
+
+def test_two_real_error_shapes_are_terminally_ledgered_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _current_synthetic_campaign(tmp_path)
+
+    class Usage:
+        total = 400 * 1024**3
+        used = 100 * 1024**3
+        free = 300 * 1024**3
+
+    class ClosedFixtureSession:
+        def get(self, *_args, **_kwargs):  # pragma: no cover - fail-closed guard
+            raise AssertionError("invalid-source fixture attempted public HTTP")
+
+        post = get
+
+        def close(self) -> None:
+            return None
+
+    actual_run_public_probe = probe_module.run_public_probe
+
+    def fixture_run_public_probe(config, **_kwargs):
+        return actual_run_public_probe(config, http_session_factory=ClosedFixtureSession)
+
+    monkeypatch.setattr(
+        probe_module,
+        "_polymarket_probe",
+        _synthetic_public_source_invalid_transport,
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "_kalshi_probe",
+        _synthetic_public_source_invalid_transport,
+    )
+    monkeypatch.setattr(research_cli, "run_public_probe", fixture_run_public_probe)
+    monkeypatch.setattr(runner.shutil, "disk_usage", lambda _path: Usage())
+    invocations: list[tuple[str, ...]] = []
+    child_exit_codes: list[int] = []
+
+    class CliProcess:
+        def __init__(self, command, *, cwd, env):
+            assert Path(cwd) == ROOT
+            assert env["PYTHONNOUSERSITE"] == "1"
+            arguments = tuple(str(item) for item in command)
+            invocations.append(arguments)
+            completed = CliRunner().invoke(app, list(arguments[3:]))
+            self.returncode = completed.exit_code
+            child_exit_codes.append(completed.exit_code)
+
+        def wait(self) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def send_signal(self, _signal: int) -> None:  # pragma: no cover
+            raise AssertionError("completed invalid-source fixture received a signal")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", CliProcess)
+    services: dict[Venue, runner.VenueRunner] = {}
+    for venue in (Venue.POLYMARKET, Venue.KALSHI):
+        service = runner.VenueRunner(
+            context=context,
+            source_root=ROOT,
+            python=Path("/synthetic-fixture/.venv/bin/python"),
+            venue=venue,
+            h1_reserved_bytes=144 * 1024**3,
+            prediction_maximum_raw_bytes=21 * 1024**3,
+            safety_margin_bytes=16 * 1024**3,
+        )
+        service._run_slot(0)
+        service._publish("WAITING_NEXT_SLOT")
+        rows = service._ledger()
+        assert len(rows) == 1
+        assert rows[0]["terminal_health"] == "PUBLIC_SOURCE_INVALID"
+        assert rows[0]["receipt_classification"] == (
+            "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+        )
+        assert rows[0]["source_usable"] is False
+        assert rows[0]["economic_eligible"] is False
+        assert rows[0]["frames"] > 0
+        assert len(str(rows[0]["manifest_sha256"])) == 64
+        state = json.loads(service.state_path.read_text(encoding="utf-8"))
+        assert state["lifecycle"] == "WAITING_NEXT_SLOT"
+        assert state["recorded_slots"] == 1
+        assert state["data_quality"] == {
+            "alert": True,
+            "count": 1,
+            "error": rows[0]["error"],
+            "latest_ordinal": 0,
+            "source_usable": False,
+            "terminal_health": "PUBLIC_SOURCE_INVALID",
+            "terminal_result_sha256": rows[0]["terminal_result_sha256"],
+        }
+        services[venue] = service
+
+    assert child_exit_codes == [4, 4]
+    assert len(invocations) == 2
+    original_schedule_decision = runner.schedule_decision
+    for venue, previous in services.items():
+        resumed = runner.VenueRunner(
+            context=context,
+            source_root=ROOT,
+            python=Path("/synthetic-fixture/.venv/bin/python"),
+            venue=venue,
+            h1_reserved_bytes=144 * 1024**3,
+            prediction_maximum_raw_bytes=21 * 1024**3,
+            safety_margin_bytes=16 * 1024**3,
+        )
+
+        def stop_after_resume_decision(
+            resume_context,
+            ledger,
+            *,
+            now,
+            resumed_service=resumed,
+        ):
+            del now
+            decision = original_schedule_decision(
+                resume_context,
+                ledger,
+                now=resume_context.start + timedelta(seconds=10),
+            )
+            assert decision.action == "WAIT_NEXT_SLOT"
+            resumed_service.stop_requested = True
+            return decision
+
+        with monkeypatch.context() as resume_patch:
+            resume_patch.setattr(runner, "schedule_decision", stop_after_resume_decision)
+            assert resumed.run() == 130
+        assert previous._ledger()[0]["ordinal"] == 0
+    assert len(invocations) == 2
+
+
+def test_late_public_source_unavailability_is_terminally_excluded_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _current_synthetic_campaign(tmp_path)
+
+    class Usage:
+        total = 400 * 1024**3
+        used = 100 * 1024**3
+        free = 300 * 1024**3
+
+    class ClosedFixtureSession:
+        def get(self, *_args, **_kwargs):  # pragma: no cover - fail-closed guard
+            raise AssertionError("late-unavailability fixture attempted public HTTP")
+
+        post = get
+
+        def close(self) -> None:
+            return None
+
+    actual_run_public_probe = probe_module.run_public_probe
+
+    def fixture_run_public_probe(config, **_kwargs):
+        return actual_run_public_probe(config, http_session_factory=ClosedFixtureSession)
+
+    monkeypatch.setattr(
+        probe_module,
+        "_polymarket_probe",
+        _synthetic_late_public_source_unavailable_transport,
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "_kalshi_probe",
+        _synthetic_late_public_source_unavailable_transport,
+    )
+    monkeypatch.setattr(research_cli, "run_public_probe", fixture_run_public_probe)
+    monkeypatch.setattr(runner.shutil, "disk_usage", lambda _path: Usage())
+    invocations: list[tuple[str, ...]] = []
+    child_exit_codes: list[int] = []
+
+    class CliProcess:
+        def __init__(self, command, *, cwd, env):
+            assert Path(cwd) == ROOT
+            assert env["PYTHONNOUSERSITE"] == "1"
+            arguments = tuple(str(item) for item in command)
+            invocations.append(arguments)
+            completed = CliRunner().invoke(app, list(arguments[3:]))
+            self.returncode = completed.exit_code
+            child_exit_codes.append(completed.exit_code)
+
+        def wait(self) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def send_signal(self, _signal: int) -> None:  # pragma: no cover
+            raise AssertionError("completed unavailable-source fixture received a signal")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", CliProcess)
+    services: dict[Venue, runner.VenueRunner] = {}
+    for venue in (Venue.POLYMARKET, Venue.KALSHI):
+        service = runner.VenueRunner(
+            context=context,
+            source_root=ROOT,
+            python=Path("/synthetic-fixture/.venv/bin/python"),
+            venue=venue,
+            h1_reserved_bytes=144 * 1024**3,
+            prediction_maximum_raw_bytes=21 * 1024**3,
+            safety_margin_bytes=16 * 1024**3,
+        )
+        service._run_slot(0)
+        service._publish("WAITING_NEXT_SLOT")
+        rows = service._ledger()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["terminal_health"] == "PUBLIC_SOURCE_UNAVAILABLE"
+        assert row["receipt_classification"] == (
+            "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+        )
+        assert row["source_usable"] is False
+        assert row["economic_eligible"] is False
+        assert row["frames"] > 0
+        assert row["bytes"] > 0
+        assert row["segments"] > 0
+        for field in (
+            "manifest_sha256",
+            "probe_binding_sha256",
+            "root_sha256",
+            "terminal_result_sha256",
+        ):
+            assert len(str(row[field])) == 64
+        assert isinstance(row["error"], str) and row["error"]
+        state = json.loads(service.state_path.read_text(encoding="utf-8"))
+        assert state["lifecycle"] == "WAITING_NEXT_SLOT"
+        assert state["recorded_slots"] == 1
+        assert state["last_terminal"] == "PUBLIC_SOURCE_UNAVAILABLE"
+        assert state["data_quality"] is None
+        services[venue] = service
+
+    assert child_exit_codes == [3, 3]
+    assert len(invocations) == 2
+    original_schedule_decision = runner.schedule_decision
+    for venue, previous in services.items():
+        resumed = runner.VenueRunner(
+            context=context,
+            source_root=ROOT,
+            python=Path("/synthetic-fixture/.venv/bin/python"),
+            venue=venue,
+            h1_reserved_bytes=144 * 1024**3,
+            prediction_maximum_raw_bytes=21 * 1024**3,
+            safety_margin_bytes=16 * 1024**3,
+        )
+
+        def stop_after_resume_decision(
+            resume_context,
+            ledger,
+            *,
+            now,
+            resumed_service=resumed,
+        ):
+            del now
+            decision = original_schedule_decision(
+                resume_context,
+                ledger,
+                now=resume_context.start + timedelta(seconds=10),
+            )
+            assert decision.action == "WAIT_NEXT_SLOT"
+            resumed_service.stop_requested = True
+            return decision
+
+        with monkeypatch.context() as resume_patch:
+            resume_patch.setattr(runner, "schedule_decision", stop_after_resume_decision)
+            assert resumed.run() == 130
+        assert previous._ledger()[0]["ordinal"] == 0
     assert len(invocations) == 2
 
 

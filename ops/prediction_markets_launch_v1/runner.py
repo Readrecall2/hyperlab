@@ -17,10 +17,16 @@ from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
 from hyperlab.research_data.envelope import Venue
+from hyperlab.research_data.prediction_bundle import (
+    CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT,
+    CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT,
+    PredictionUnavailableSource,
+)
 from hyperlab.research_data.prediction_candidate import (
     CandidatePreregistration,
     PredictionCollectionBinding,
     validate_prediction_campaign_manifest,
+    verify_prediction_collection_plan_payload,
 )
 from hyperlab.research_data.prediction_contracts import OfficialPublicContract
 from hyperlab.research_data.prediction_evidence import PredictionRawEvidenceIndex
@@ -30,6 +36,46 @@ BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 ECONOMIC_STATUS = "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE"
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_LEDGER_BYTES = 8 * 1024 * 1024
+_ADMISSIBLE_COLLECTION_TERMINALS = {
+    "COMPLETE",
+    "MAX_BYTES_REACHED",
+    "MAX_DURATION_REACHED",
+    "MAX_FRAMES_REACHED",
+    "MAX_NETWORK_CALLS_REACHED",
+    "MAX_SEGMENTS_REACHED",
+    "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+}
+_ADMISSIBLE_RECEIPT = "AUTHENTICATED_COLLECTION_ADMISSIBLE_FOR_DERIVATION"
+_NO_RECEIPT_CLASSIFICATION = (
+    "SCHEDULED_SLOT_WITHOUT_AUTHENTICATED_RECEIPT_EXCLUDED_FROM_ECONOMICS"
+)
+_LEDGER_BODY_FIELDS = {
+    "boundary",
+    "bytes",
+    "campaign_manifest_sha256",
+    "candidate_config_sha256",
+    "collection_id",
+    "duplicates",
+    "economic_eligible",
+    "error",
+    "frames",
+    "gaps",
+    "manifest_sha256",
+    "official_contract_sha256",
+    "ordinal",
+    "probe_binding_sha256",
+    "previous_entry_sha256",
+    "receipt_classification",
+    "reconnects",
+    "recorded_at_utc",
+    "root_sha256",
+    "scheduled_start_utc",
+    "segments",
+    "source_usable",
+    "terminal_health",
+    "terminal_result_sha256",
+    "venue",
+}
 
 
 class RunnerError(RuntimeError):
@@ -196,6 +242,8 @@ def read_ledger(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     raw = _regular_file_bytes(path, maximum_bytes=_MAX_LEDGER_BYTES)
+    if raw and (not raw.endswith(b"\n") or b"\r" in raw):
+        raise RunnerError("ledger physical framing is not canonical LF-delimited JSON")
     rows: list[dict[str, Any]] = []
     previous = "0" * 64
     seen: set[int] = set()
@@ -206,6 +254,8 @@ def read_ledger(path: Path) -> list[dict[str, Any]]:
             raise RunnerError(f"ledger line {index} is invalid") from error
         if not isinstance(value, dict):
             raise RunnerError(f"ledger line {index} is not an object")
+        if line != canonical_json_bytes(value):
+            raise RunnerError(f"ledger line {index} is not canonical JSON")
         ordinal = value.get("ordinal")
         claimed = value.get("entry_sha256")
         if (
@@ -223,8 +273,18 @@ def read_ledger(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def append_ledger(path: Path, body: Mapping[str, object]) -> dict[str, object]:
+def append_ledger(
+    path: Path,
+    body: Mapping[str, object],
+    *,
+    context: CampaignContext | None = None,
+    venue: Venue | None = None,
+) -> dict[str, object]:
+    if (context is None) != (venue is None):
+        raise RunnerError("ledger semantic context is partial")
     rows = read_ledger(path)
+    if context is not None and venue is not None:
+        _validate_service_ledger(rows, context=context, venue=venue)
     ordinal = body.get("ordinal")
     if type(ordinal) is not int or ordinal < 0:
         raise RunnerError("ledger ordinal is invalid")
@@ -233,6 +293,8 @@ def append_ledger(path: Path, body: Mapping[str, object]) -> dict[str, object]:
     previous = "0" * 64 if not rows else str(rows[-1]["entry_sha256"])
     chained = {**body, "previous_entry_sha256": previous}
     entry = {**chained, "entry_sha256": sha256_bytes(canonical_json_bytes(chained))}
+    if context is not None and venue is not None:
+        _validate_service_ledger([*rows, entry], context=context, venue=venue)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab", buffering=0) as handle:
         handle.write(canonical_json_bytes(entry) + b"\n")
@@ -318,22 +380,332 @@ def _slot_start(context: CampaignContext, ordinal: int) -> datetime:
     return context.start + timedelta(seconds=ordinal * context.cadence_seconds)
 
 
+def _expected_collection_id(
+    context: CampaignContext,
+    venue: Venue,
+    ordinal: int,
+) -> str:
+    plan = context.preregistration.collection_plans[venue]
+    campaign_sha256 = str(context.manifest["manifest_sha256"])
+    return context.preregistration.prospective_shard_policy.collection_id(
+        base_collection_id=plan.collection_id(str(context.manifest["campaign_id"])),
+        campaign_manifest_sha256=campaign_sha256,
+        venue=venue,
+        ordinal=ordinal,
+        scheduled_start=_slot_start(context, ordinal),
+    )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _ledger_manifest_contract(
+    campaign_manifest: Mapping[str, object],
+    *,
+    venue: Venue,
+) -> tuple[str, str, str, str, datetime, int, int]:
+    manifest_sha256 = campaign_manifest.get("manifest_sha256")
+    manifest_body = {
+        key: value
+        for key, value in campaign_manifest.items()
+        if key != "manifest_sha256"
+    }
+    if (
+        campaign_manifest.get("boundary") != BOUNDARY
+        or not _is_sha256(manifest_sha256)
+        or sha256_bytes(canonical_json_bytes(manifest_body)) != manifest_sha256
+    ):
+        raise RunnerError("ledger campaign manifest authentication diverged")
+    candidate_sha256 = campaign_manifest.get("candidate_config_sha256")
+    contracts = campaign_manifest.get("contracts")
+    collection_plans = campaign_manifest.get("collection_plans")
+    policy = campaign_manifest.get("prospective_shard_policy")
+    if (
+        not _is_sha256(candidate_sha256)
+        or not isinstance(contracts, Mapping)
+        or not isinstance(collection_plans, Mapping)
+        or not isinstance(policy, Mapping)
+    ):
+        raise RunnerError("ledger campaign identity is incomplete")
+    contract_sha256 = contracts.get(venue.value)
+    plan = collection_plans.get(venue.value)
+    if not _is_sha256(contract_sha256) or not isinstance(plan, Mapping):
+        raise RunnerError("ledger venue campaign binding is incomplete")
+    policy_sha256 = campaign_manifest.get("prospective_shard_policy_sha256")
+    cadence_seconds = policy.get("cadence_seconds")
+    expected_slots = policy.get("expected_shards_per_venue")
+    duration_seconds = policy.get("collection_duration_seconds")
+    if (
+        not _is_sha256(policy_sha256)
+        or sha256_bytes(canonical_json_bytes(policy)) != policy_sha256
+        or type(cadence_seconds) is not int
+        or cadence_seconds <= 0
+        or type(expected_slots) is not int
+        or expected_slots <= 0
+        or type(duration_seconds) is not int
+        or duration_seconds <= 0
+        or duration_seconds > cadence_seconds
+        or policy.get("identity_scheme")
+        != "SHA256_CAMPAIGN_VENUE_ORDINAL_SCHEDULED_START_V1"
+        or policy.get("missed_slot_policy") != "RECORD_GAP_NO_BACKFILL"
+        or policy.get("overlap_policy") != "STRICT_NON_OVERLAP"
+        or policy.get("retry_policy") != "NO_RETRY_AFTER_TERMINAL_RESULT"
+    ):
+        raise RunnerError("ledger prospective shard policy diverged")
+    campaign_id = campaign_manifest.get("campaign_id")
+    attempt_id = plan.get("attempt_id")
+    base_collection_id = plan.get("collection_id")
+    if (
+        type(campaign_id) is not str
+        or not campaign_id
+        or type(attempt_id) is not str
+        or not attempt_id
+        or type(base_collection_id) is not str
+        or base_collection_id != f"{campaign_id}-{attempt_id}"
+        or plan.get("venue") != venue.value
+        or plan.get("duration_seconds") != duration_seconds
+    ):
+        raise RunnerError("ledger collection plan binding diverged")
+    starts_at = _parse_utc(
+        campaign_manifest.get("starts_at_utc"),
+        label="ledger campaign start",
+    )
+    assert isinstance(manifest_sha256, str)
+    assert isinstance(candidate_sha256, str)
+    assert isinstance(contract_sha256, str)
+    return (
+        manifest_sha256,
+        candidate_sha256,
+        contract_sha256,
+        base_collection_id,
+        starts_at,
+        cadence_seconds,
+        expected_slots,
+    )
+
+
+def _manifest_collection_id(
+    *,
+    base_collection_id: str,
+    campaign_manifest_sha256: str,
+    venue: Venue,
+    ordinal: int,
+    scheduled_start: datetime,
+) -> str:
+    identity = {
+        "campaign_manifest_sha256": campaign_manifest_sha256,
+        "ordinal": ordinal,
+        "scheduled_start_utc": _utc_text(scheduled_start),
+        "venue": venue.value,
+    }
+    digest = sha256_bytes(canonical_json_bytes(identity))
+    return f"{base_collection_id}-shard-{ordinal:04d}-{digest[:16]}"
+
+
+def validate_service_ledger_against_manifest(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    campaign_manifest: Mapping[str, object],
+    venue: Venue,
+) -> None:
+    (
+        campaign_sha256,
+        candidate_sha256,
+        contract_sha256,
+        base_collection_id,
+        campaign_start,
+        cadence_seconds,
+        expected_slots,
+    ) = _ledger_manifest_contract(campaign_manifest, venue=venue)
+    previous_ordinal = -1
+    for index, row in enumerate(rows, start=1):
+        body = _ledger_body(row)
+        ordinal = row.get("ordinal")
+        if set(body) != _LEDGER_BODY_FIELDS:
+            raise RunnerError(f"ledger semantic schema diverged at line {index}")
+        if type(ordinal) is not int:
+            raise RunnerError(f"ledger ordinal diverged at line {index}")
+        scheduled_start = campaign_start + timedelta(seconds=ordinal * cadence_seconds)
+        if (
+            ordinal <= previous_ordinal
+            or ordinal < 0
+            or ordinal >= expected_slots
+            or row.get("boundary") != BOUNDARY
+            or row.get("venue") != venue.value
+            or row.get("campaign_manifest_sha256") != campaign_sha256
+            or row.get("candidate_config_sha256") != candidate_sha256
+            or row.get("official_contract_sha256") != contract_sha256
+            or row.get("collection_id")
+            != _manifest_collection_id(
+                base_collection_id=base_collection_id,
+                campaign_manifest_sha256=campaign_sha256,
+                venue=venue,
+                ordinal=ordinal,
+                scheduled_start=scheduled_start,
+            )
+            or row.get("scheduled_start_utc") != _utc_text(scheduled_start)
+        ):
+            raise RunnerError(f"ledger campaign binding diverged at line {index}")
+        previous_ordinal = ordinal
+        _parse_utc(row.get("recorded_at_utc"), label=f"ledger line {index} record time")
+        terminal = row.get("terminal_health")
+        source_usable = row.get("source_usable")
+        economic_eligible = row.get("economic_eligible")
+        classification = row.get("receipt_classification")
+        error = row.get("error")
+        counters = tuple(
+            row.get(field)
+            for field in ("bytes", "duplicates", "frames", "gaps", "reconnects", "segments")
+        )
+        receipt_hashes = tuple(
+            row.get(field)
+            for field in (
+                "manifest_sha256",
+                "probe_binding_sha256",
+                "root_sha256",
+                "terminal_result_sha256",
+            )
+        )
+        if terminal == "PUBLIC_SOURCE_INVALID":
+            if (
+                source_usable is not False
+                or economic_eligible is not False
+                or classification != CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+                or type(error) is not str
+                or not error.strip()
+                or len(error.encode("utf-8")) > 2_048
+                or any(type(value) is not int or value < 0 for value in counters)
+                or any(
+                    type(value) is not int or value <= 0
+                    for value in (
+                        row.get("bytes"),
+                        row.get("frames"),
+                        row.get("segments"),
+                    )
+                )
+                or any(not _is_sha256(value) for value in receipt_hashes)
+            ):
+                raise RunnerError(f"invalid-source ledger receipt diverged at line {index}")
+            continue
+        if terminal == "PUBLIC_SOURCE_UNAVAILABLE":
+            common_invalid = (
+                source_usable is not False
+                or economic_eligible is not False
+                or type(error) is not str
+                or not error.strip()
+                or len(error.encode("utf-8")) > 2_048
+                or any(type(value) is not int or value < 0 for value in counters)
+                or not _is_sha256(row.get("terminal_result_sha256"))
+            )
+            no_raw = classification == CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+            partial_raw = classification == CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+            no_raw_invalid = no_raw and (
+                any(row.get(field) != 0 for field in ("bytes", "frames", "segments"))
+                or row.get("manifest_sha256") is not None
+                or row.get("probe_binding_sha256") is not None
+                or row.get("root_sha256") is not None
+            )
+            partial_raw_invalid = partial_raw and (
+                any(
+                    type(value) is not int or value <= 0
+                    for value in (
+                        row.get("bytes"),
+                        row.get("frames"),
+                        row.get("segments"),
+                    )
+                )
+                or any(not _is_sha256(value) for value in receipt_hashes)
+            )
+            if (
+                common_invalid
+                or (not no_raw and not partial_raw)
+                or no_raw_invalid
+                or partial_raw_invalid
+            ):
+                raise RunnerError(f"unavailable-source ledger receipt diverged at line {index}")
+            continue
+        if terminal in _ADMISSIBLE_COLLECTION_TERMINALS:
+            error_required = terminal in {
+                "MAX_BYTES_REACHED",
+                "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+            }
+            if (
+                source_usable is not True
+                or economic_eligible is not True
+                or classification != _ADMISSIBLE_RECEIPT
+                or any(type(value) is not int or value < 0 for value in counters)
+                or any(not _is_sha256(value) for value in receipt_hashes)
+                or (
+                    error_required
+                    and (
+                        type(error) is not str
+                        or not error.strip()
+                        or len(error.encode("utf-8")) > 2_048
+                    )
+                )
+                or (not error_required and error is not None)
+            ):
+                raise RunnerError(f"usable ledger receipt diverged at line {index}")
+            continue
+        if terminal in {"MISSING_SLOT_NO_BACKFILL", "PROCESS_ERROR_NO_TERMINAL_RECEIPT"}:
+            if (
+                source_usable is not False
+                or economic_eligible is not False
+                or classification != _NO_RECEIPT_CLASSIFICATION
+                or type(error) is not str
+                or not error.strip()
+                or len(error.encode("utf-8")) > 2_048
+                or any(value is not None for value in counters)
+                or any(value is not None for value in receipt_hashes)
+            ):
+                raise RunnerError(f"missing-slot ledger receipt diverged at line {index}")
+            continue
+        raise RunnerError(f"ledger terminal is not allowlisted at line {index}")
+
+
+def _validate_service_ledger(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    context: CampaignContext,
+    venue: Venue,
+) -> None:
+    validate_service_ledger_against_manifest(
+        rows,
+        campaign_manifest=context.manifest,
+        venue=venue,
+    )
+
+
 def _missed_entry(context: CampaignContext, venue: Venue, ordinal: int, now: datetime) -> dict[str, object]:
     return {
         "boundary": BOUNDARY,
         "bytes": None,
+        "campaign_manifest_sha256": context.manifest["manifest_sha256"],
+        "candidate_config_sha256": context.preregistration.config_sha256,
+        "collection_id": _expected_collection_id(context, venue, ordinal),
         "duplicates": None,
+        "economic_eligible": False,
         "error": "scheduled slot elapsed without an admitted full collection window",
         "frames": None,
         "gaps": None,
         "manifest_sha256": None,
+        "official_contract_sha256": context.contracts[venue].contract_sha256,
         "ordinal": ordinal,
+        "probe_binding_sha256": None,
+        "receipt_classification": _NO_RECEIPT_CLASSIFICATION,
         "reconnects": None,
         "recorded_at_utc": _utc_text(now),
         "root_sha256": None,
         "scheduled_start_utc": _utc_text(_slot_start(context, ordinal)),
         "segments": None,
+        "source_usable": False,
         "terminal_health": "MISSING_SLOT_NO_BACKFILL",
+        "terminal_result_sha256": None,
         "venue": venue.value,
     }
 
@@ -346,21 +718,46 @@ def _result_entry(
     *,
     now: datetime,
 ) -> dict[str, object]:
+    terminal_health = result.get("terminal_health")
+    source_usable = terminal_health in _ADMISSIBLE_COLLECTION_TERMINALS
+    unavailable_without_raw = (
+        terminal_health == "PUBLIC_SOURCE_UNAVAILABLE"
+        and result.get("frames") == 0
+        and result.get("manifest_sha256") is None
+        and result.get("root_sha256") is None
+    )
+    receipt_classification = (
+        _ADMISSIBLE_RECEIPT
+        if source_usable
+        else (
+            CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+            if unavailable_without_raw
+            else CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+        )
+    )
     return {
         "boundary": BOUNDARY,
         "bytes": result.get("bytes"),
+        "campaign_manifest_sha256": context.manifest["manifest_sha256"],
+        "candidate_config_sha256": context.preregistration.config_sha256,
+        "collection_id": _expected_collection_id(context, venue, ordinal),
         "duplicates": result.get("duplicates"),
+        "economic_eligible": source_usable,
         "error": result.get("error"),
         "frames": result.get("frames"),
         "gaps": result.get("gaps"),
         "manifest_sha256": result.get("manifest_sha256"),
+        "official_contract_sha256": context.contracts[venue].contract_sha256,
         "ordinal": ordinal,
+        "probe_binding_sha256": result.get("probe_binding_sha256"),
+        "receipt_classification": receipt_classification,
         "reconnects": result.get("reconnects"),
         "recorded_at_utc": _utc_text(now),
         "root_sha256": result.get("root_sha256"),
         "scheduled_start_utc": _utc_text(_slot_start(context, ordinal)),
         "segments": result.get("segments"),
-        "terminal_health": result.get("terminal_health"),
+        "source_usable": source_usable,
+        "terminal_health": terminal_health,
         "terminal_result_sha256": sha256_bytes(canonical_json_bytes(result)),
         "venue": venue.value,
     }
@@ -378,11 +775,30 @@ def _state(
     capacity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     latest = None if not ledger else ledger[-1]
+    invalid_rows = [
+        row for row in ledger if row.get("terminal_health") == "PUBLIC_SOURCE_INVALID"
+    ]
+    latest_invalid = None if not invalid_rows else invalid_rows[-1]
     return {
         "active_ordinal": active_ordinal,
         "boundary": BOUNDARY,
         "campaign_id": context.manifest["campaign_id"],
         "capacity": capacity,
+        "data_quality": (
+            None
+            if latest_invalid is None
+            else {
+                "alert": True,
+                "count": len(invalid_rows),
+                "error": latest_invalid.get("error"),
+                "latest_ordinal": latest_invalid.get("ordinal"),
+                "terminal_result_sha256": latest_invalid.get(
+                    "terminal_result_sha256"
+                ),
+                "source_usable": False,
+                "terminal_health": "PUBLIC_SOURCE_INVALID",
+            }
+        ),
         "economic_evidence_status": ECONOMIC_STATUS,
         "error": error,
         "expected_slots": context.expected_slots,
@@ -518,45 +934,94 @@ def _validate_result(
     ordinal: int,
 ) -> dict[str, Any]:
     try:
-        binding = PredictionCollectionBinding.from_probe_output(output_root)
+        result = _object(output_root / "reports" / "result.json")
         plan = context.preregistration.collection_plans[venue]
-        binding.verify_collection_plan(plan)
         campaign_sha256 = str(context.manifest["manifest_sha256"])
         contract = context.contracts[venue]
         scheduled_start = _slot_start(context, ordinal)
-        expected_collection_id = context.preregistration.prospective_shard_policy.collection_id(
-            base_collection_id=plan.collection_id(str(context.manifest["campaign_id"])),
-            campaign_manifest_sha256=campaign_sha256,
-            venue=venue,
-            ordinal=ordinal,
-            scheduled_start=scheduled_start,
-        )
+        expected_collection_id = _expected_collection_id(context, venue, ordinal)
         expected_cutoff = _datetime_utc_ns(scheduled_start) + context.cadence_seconds * 1_000_000_000
-        if (
-            binding.venue is not venue
-            or binding.campaign_manifest_sha256 != campaign_sha256
-            or binding.candidate_config_sha256 != context.preregistration.config_sha256
-            or binding.official_contract_sha256 != contract.contract_sha256
-            or binding.collection_id != expected_collection_id
-            or binding.payload.get("collection_cutoff_utc_ns_exclusive") != expected_cutoff
-        ):
-            raise ValueError("prediction terminal collection identity diverged from the scheduled slot")
-        if binding.raw_manifest_sha256 is None:
-            raise ValueError("prediction terminal collection lacks its raw manifest identity")
-        reader = ResearchSegmentReader(
-            output_root / "raw",
-            manifest_sha256=binding.raw_manifest_sha256,
-        )
-        index = PredictionRawEvidenceIndex(reader, contracts=context.contracts)
-        binding.verify(index, contract=contract)
-        if any(
-            envelope.receive_timestamp_utc_ns >= expected_cutoff
-            for envelope in index.envelopes
-        ):
-            raise ValueError("prediction terminal collection contains post-cutoff raw evidence")
+        terminal_health = result.get("terminal_health")
+        binding: PredictionCollectionBinding | None = None
+        if terminal_health in {"PUBLIC_SOURCE_INVALID", "PUBLIC_SOURCE_UNAVAILABLE"}:
+            excluded = PredictionUnavailableSource.from_probe_output(output_root)
+            verify_prediction_collection_plan_payload(excluded.probe_payload, plan)
+            expected_classification = (
+                CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+                if terminal_health == "PUBLIC_SOURCE_INVALID"
+                or excluded.frame_count > 0
+                else CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+            )
+            expected_raw = expected_classification == CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+            if (
+                excluded.classification != expected_classification
+                or excluded.venue is not venue
+                or excluded.campaign_manifest_sha256 != campaign_sha256
+                or excluded.candidate_config_sha256 != context.preregistration.config_sha256
+                or excluded.official_contract_sha256 != contract.contract_sha256
+                or excluded.collection_id != expected_collection_id
+                or excluded.probe_payload.get("collection_cutoff_utc_ns_exclusive")
+                != expected_cutoff
+                or excluded.terminal_result_sha256
+                != sha256_bytes(canonical_json_bytes(result))
+                or (
+                    expected_raw
+                    and (
+                        excluded.raw_manifest_sha256 is None
+                        or excluded.raw_root_sha256 is None
+                    )
+                )
+                or (
+                    not expected_raw
+                    and (
+                        excluded.raw_manifest_sha256 is not None
+                        or excluded.raw_root_sha256 is not None
+                    )
+                )
+            ):
+                raise ValueError(
+                    "prediction excluded terminal identity diverged from the scheduled slot"
+                )
+            raw_manifest_sha256 = excluded.raw_manifest_sha256
+        else:
+            binding = PredictionCollectionBinding.from_probe_output(output_root)
+            binding.verify_collection_plan(plan)
+            if (
+                binding.venue is not venue
+                or binding.campaign_manifest_sha256 != campaign_sha256
+                or binding.candidate_config_sha256 != context.preregistration.config_sha256
+                or binding.official_contract_sha256 != contract.contract_sha256
+                or binding.collection_id != expected_collection_id
+                or binding.payload.get("collection_cutoff_utc_ns_exclusive")
+                != expected_cutoff
+                or binding.terminal_result_sha256
+                != sha256_bytes(canonical_json_bytes(result))
+            ):
+                raise ValueError(
+                    "prediction terminal collection identity diverged from the scheduled slot"
+                )
+            if binding.raw_manifest_sha256 is None:
+                raise ValueError("prediction terminal collection lacks its raw manifest identity")
+            raw_manifest_sha256 = binding.raw_manifest_sha256
+        if raw_manifest_sha256 is not None:
+            reader = ResearchSegmentReader(
+                output_root / "raw",
+                manifest_sha256=raw_manifest_sha256,
+            )
+            index = PredictionRawEvidenceIndex(reader, contracts=context.contracts)
+            if binding is not None:
+                binding.verify(index, contract=contract)
+            expected_start = _datetime_utc_ns(scheduled_start)
+            if any(
+                envelope.receive_timestamp_utc_ns < expected_start
+                or envelope.receive_timestamp_utc_ns >= expected_cutoff
+                for envelope in index.envelopes
+            ):
+                raise ValueError(
+                    "prediction terminal collection raw evidence escaped its slot window"
+                )
     except (OSError, ValueError) as error:
         raise RunnerError(f"terminal collection receipt failed authentication: {error}") from error
-    result = _object(output_root / "reports" / "result.json")
     if result.get("venue") != venue.value or result.get("terminal_health") is None:
         raise RunnerError("terminal result venue or health diverged")
     return result
@@ -624,6 +1089,11 @@ class VenueRunner:
         self.stop_requested = False
         self.child: subprocess.Popen[bytes] | None = None
 
+    def _ledger(self) -> list[dict[str, Any]]:
+        rows = read_ledger(self.ledger_path)
+        _validate_service_ledger(rows, context=self.context, venue=self.venue)
+        return rows
+
     def request_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
         if self.child is not None and self.child.poll() is None:
@@ -634,14 +1104,14 @@ class VenueRunner:
         # Deliberately read only this venue's ledger. The global reservation is
         # therefore conservative, while corruption or a concurrent append in
         # the other venue can never terminate this independent service.
-        for row in read_ledger(self.ledger_path):
+        for row in self._ledger():
             value = row.get("bytes")
             if type(value) is int and value >= 0:
                 total += value
         return total
 
     def _publish(self, lifecycle: str, *, error: str | None = None, ordinal: int | None = None) -> None:
-        rows = read_ledger(self.ledger_path)
+        rows = self._ledger()
         capacity = capacity_snapshot(
             campaign_root=self.context.campaign_root,
             h1_reserved_bytes=self.h1_reserved_bytes,
@@ -664,13 +1134,15 @@ class VenueRunner:
         )
 
     def _record_missing(self, ordinals: Sequence[int]) -> None:
-        rows = read_ledger(self.ledger_path)
+        rows = self._ledger()
         accounted = {int(row["ordinal"]) for row in rows}
         for ordinal in ordinals:
             if ordinal not in accounted:
                 append_ledger(
                     self.ledger_path,
                     _missed_entry(self.context, self.venue, ordinal, datetime.now(UTC)),
+                    context=self.context,
+                    venue=self.venue,
                 )
                 accounted.add(ordinal)
 
@@ -717,6 +1189,8 @@ class VenueRunner:
                         "error": "existing shard root has no terminal receipt or recoverable segment",
                         "terminal_health": "PROCESS_ERROR_NO_TERMINAL_RECEIPT",
                     },
+                    context=self.context,
+                    venue=self.venue,
                 )
                 return
         else:
@@ -780,6 +1254,8 @@ class VenueRunner:
                         "error": f"collector process exit={return_code} without terminal receipt",
                         "terminal_health": "PROCESS_ERROR_NO_TERMINAL_RECEIPT",
                     },
+                    context=self.context,
+                    venue=self.venue,
                 )
                 return
         append_ledger(
@@ -791,6 +1267,8 @@ class VenueRunner:
                 result,
                 now=datetime.now(UTC),
             ),
+            context=self.context,
+            venue=self.venue,
         )
 
     def _publish_integrity_failure(self, error: BaseException) -> None:
@@ -818,7 +1296,7 @@ class VenueRunner:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
         while not self.stop_requested:
-            rows = read_ledger(self.ledger_path)
+            rows = self._ledger()
             decision = schedule_decision(self.context, rows, now=datetime.now(UTC))
             self._record_missing(decision.missing_ordinals)
             capacity = capacity_snapshot(

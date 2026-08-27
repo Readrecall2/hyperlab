@@ -197,11 +197,10 @@ def test_polymarket_reconnect_reauthenticates_before_subscription_and_book(
             payload = {"markets": [gamma_market], "next_cursor": None}
         elif "/clob-markets/" in request.url:
             payload = {
-                "condition_id": "fixture-condition",
                 "fixture_label": SYNTHETIC_FIXTURE_LABEL,
-                "tokens": [
-                    {"outcome": "YES", "token_id": "fixture-token-yes"},
-                    {"outcome": "NO", "token_id": "fixture-token-no"},
+                "t": [
+                    {"o": "YES", "t": "fixture-token-yes"},
+                    {"o": "NO", "t": "fixture-token-no"},
                 ],
             }
         elif "/events/" in request.url:
@@ -399,6 +398,123 @@ def test_polymarket_reconnect_reauthenticates_before_subscription_and_book(
     )
 
 
+def test_polymarket_invalid_clob_graph_is_preserved_before_terminal_rejection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    collection_id = "fixture-polymarket-invalid-clob"
+    factory = SessionEnvelopeFactory(
+        venue=Venue.POLYMARKET,
+        collector_identity="fixture-polymarket-probe",
+        session_identity="fixture-polymarket-invalid-clob-session",
+        source_metadata_version=POLYMARKET_METADATA_VERSION,
+        provenance=CaptureProvenance(
+            collection_id,
+            "fixture://polymarket-invalid-clob",
+            "FIXTURE",
+            SYNTHETIC_FIXTURE_LABEL,
+        ),
+    )
+    writer = ResearchSegmentWriter(
+        tmp_path / "raw",
+        collection_id=collection_id,
+        max_segment_bytes=100_000,
+        rotation_seconds=30,
+        max_total_bytes=1_000_000,
+    )
+    config = ProbeConfig(
+        output_root=tmp_path / "unused",
+        venue=Venue.POLYMARKET,
+        feeds=("metadata",),
+        instruments=("fixture-token-yes",),
+        census_limit=0,
+        duration_seconds=5,
+        max_bytes=1_000_000,
+        max_segment_bytes=100_000,
+        rotation_seconds=30,
+        progress_interval_seconds=30,
+        max_frames=100,
+        max_segments=10,
+        max_network_calls=10,
+    )
+    gamma_market = {
+        "clobTokenIds": ["fixture-token-yes", "fixture-token-no"],
+        "conditionId": "fixture-condition",
+        "outcomes": ["YES", "NO"],
+        "questionID": "fixture-question",
+    }
+    invalid_clob = {
+        "t": [
+            {"o": "NO", "t": "fixture-token-yes"},
+            {"o": "YES", "t": "fixture-token-no"},
+        ]
+    }
+
+    def fake_execute_http(
+        _session,
+        request,
+        *,
+        deadline,
+        max_response_bytes,
+        budget,
+    ):
+        assert probe_module.time.monotonic() < deadline
+        assert max_response_bytes > 0
+        budget.consume()
+        if "/markets-by-token/" in request.url:
+            payload = {"condition_id": "fixture-condition"}
+        elif request.url == f"{POLYMARKET_GAMMA_PUBLIC_URL}/markets/keyset":
+            payload = {"markets": [gamma_market], "next_cursor": None}
+        elif "/clob-markets/" in request.url:
+            payload = invalid_clob
+        else:  # pragma: no cover - an unexpected public path is causal
+            raise AssertionError(request.url)
+        return canonical_json_bytes(payload)
+
+    original_provenance = probe_module._request_provenance
+
+    def fixture_provenance(factory_value, request):
+        if "/clob-markets/" in request.url:
+            return CaptureProvenance(
+                collection_id,
+                "fixture://prediction-markets-v1/polymarket/clob-markets/fixture-condition",
+                "FIXTURE",
+                SYNTHETIC_FIXTURE_LABEL,
+            )
+        return original_provenance(factory_value, request)
+
+    monkeypatch.setattr(probe_module, "_execute_http", fake_execute_http)
+    monkeypatch.setattr(probe_module, "_request_provenance", fixture_provenance)
+    with pytest.raises(
+        ValueError,
+        match="Polymarket Gamma/CLOB V2 token-outcome relation diverged",
+    ):
+        _polymarket_probe(
+            config,
+            factory=factory,
+            writer=writer,
+            counters=_Counters(),
+            deadline=time.monotonic() + 5,
+            stop_requested=lambda: False,
+            progress=lambda _count: None,
+            session=object(),
+        )
+    manifest = writer.close()
+    assert manifest is not None
+    envelopes = ResearchSegmentReader(
+        tmp_path / "raw",
+        manifest_sha256=manifest.manifest_sha256,
+    ).replay()
+    assert len(envelopes) == 3
+    captured = envelopes[-1]
+    assert captured.raw_payload == canonical_json_bytes(invalid_clob)
+    assert captured.provenance.transport == "FIXTURE"
+    assert captured.provenance.source_url == (
+        "fixture://prediction-markets-v1/polymarket/clob-markets/fixture-condition"
+    )
+    assert captured.provenance.fixture_label == SYNTHETIC_FIXTURE_LABEL
+
+
 def test_polymarket_websocket_selection_handles_repeated_and_unselected_events() -> None:
     factory = SessionEnvelopeFactory(
         venue=Venue.POLYMARKET,
@@ -560,10 +676,10 @@ def test_polymarket_disconnect_and_partial_rebootstrap_fail_closed(
         max_network_calls=50,
     )
     gamma_market = {
-        "clobTokenIds": ["fixture-token"],
+        "clobTokenIds": ["fixture-token", "fixture-token-no"],
         "conditionId": "fixture-condition",
         "events": [{"id": "fixture-event"}],
-        "outcomes": ["YES"],
+        "outcomes": ["YES", "NO"],
         "questionID": "fixture-question",
     }
 
@@ -578,8 +694,10 @@ def test_polymarket_disconnect_and_partial_rebootstrap_fail_closed(
             payload = {"markets": [gamma_market], "next_cursor": None}
         elif "/clob-markets/" in request.url:
             payload = {
-                "condition_id": "fixture-condition",
-                "tokens": [{"outcome": "YES", "token_id": "fixture-token"}],
+                "t": [
+                    {"o": "YES", "t": "fixture-token"},
+                    {"o": "NO", "t": "fixture-token-no"},
+                ],
             }
         elif request.url.endswith("/book"):
             payload = {

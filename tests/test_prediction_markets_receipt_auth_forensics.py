@@ -90,6 +90,21 @@ def _tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _failed_source_blob(relative: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{SOURCE_COMMIT}:{relative}"],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"failed source blob is unavailable: {relative}: "
+            f"{completed.stderr.decode(errors='replace')}"
+        )
+    return completed.stdout
+
+
 def _synthetic_capacity_transport(config, **kwargs):
     factory = kwargs["factory"]
     writer = kwargs["writer"]
@@ -151,8 +166,9 @@ def _materialize_failed_campaign(
         "polymarket-public-contract-v1.json",
         "kalshi-public-contract-v1.json",
     ):
+        relative = f"config/research/{name}"
         (source / "config" / "research" / name).write_bytes(
-            (ROOT / "config" / "research" / name).read_bytes()
+            _failed_source_blob(relative)
         )
     handoff = {
         "boundary": forensics.BOUNDARY,

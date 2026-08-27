@@ -150,14 +150,22 @@
     "edges": [
       "event.id -> event.markets[].id",
       "market.id -> market.conditionId",
-      "market.conditionId -> CLOB market.condition_id",
+      "market.conditionId -> GET /clob-markets/{condition_id} path",
       "market.clobTokenIds[index] -> market.outcomes[index]",
+      "market (clobTokenIds[index], outcomes[index]) pair -> CLOB V2 (t[].t, t[].o) exact pair",
       "market.questionID -> resolution question"
     ],
     "index_contract": {
       "clobTokenIds[0]": "YES",
       "clobTokenIds[1]": "NO",
       "outcomes_and_tokens_same_length_required": true
+    },
+    "clob_v2_contract": {
+      "condition_identity_authority": "AUTHENTICATED_REQUEST_PATH_ONLY",
+      "legacy_condition_or_tokens_aliases": "REFUSED",
+      "outcome_field": "t[].o",
+      "token_field": "t[].t",
+      "token_outcome_mapping": "EXACT_GAMMA_PAIR_MAPPING_REQUIRED_ORDER_INDEPENDENT"
     },
     "required_market_fields": [
       "id",

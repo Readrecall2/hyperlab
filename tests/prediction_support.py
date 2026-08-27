@@ -194,6 +194,7 @@ def build_polymarket_fixture(
         utc_ns: int,
         instrument_id: str | None = None,
         market_id: str | None = "fixture-condition",
+        source_url: str | None = None,
     ) -> PublicDataEnvelope:
         envelope = factory.make(
             feed_type=feed_type,
@@ -205,6 +206,16 @@ def build_polymarket_fixture(
             raw_payload=_raw(payload),
             source_event_id=f"fixture-{feed_type}-{len(envelopes) + 1}",
             infer_source_sequence_continuity=False,
+            provenance=(
+                None
+                if source_url is None
+                else CaptureProvenance(
+                    provenance.collection_id,
+                    source_url,
+                    "FIXTURE",
+                    SYNTHETIC_FIXTURE_LABEL,
+                )
+            ),
         )
         envelopes.append(envelope)
         return envelope
@@ -239,15 +250,17 @@ def build_polymarket_fixture(
     clob_envelope = add(
         "metadata",
         {
-            "condition_id": "fixture-condition",
             "fd": {"e": "1", "r": "0", "to": True},
-            "tokens": [
-                {"outcome": "YES", "token_id": "fixture-token-yes"},
-                {"outcome": "NO", "token_id": "fixture-token-no"},
+            "t": [
+                {"o": "YES", "t": "fixture-token-yes"},
+                {"o": "NO", "t": "fixture-token-no"},
             ],
         },
         monotonic_ns=300,
         utc_ns=BASE_UTC_NS - 700,
+        source_url=(
+            "fixture://prediction-markets-v1/polymarket/clob-markets/fixture-condition"
+        ),
     )
 
     tick_envelope: PublicDataEnvelope | None = None

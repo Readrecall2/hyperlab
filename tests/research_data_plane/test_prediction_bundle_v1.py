@@ -54,6 +54,7 @@ from hyperlab.research_data.prediction_bundle import (
     verify_prediction_research_bundle,
 )
 from hyperlab.research_data.prediction_candidate import (
+    INSUFFICIENT_PUBLIC_CORPUS,
     PredictionCollectionBinding,
     PublicSourceStatus,
     _book_projections,
@@ -1549,8 +1550,44 @@ def test_positive_raw_fail_closed_receipt_is_copied_but_never_replayed(
     assert coverage["economic_corpus_complete"] is False
     assert verified.campaign_runner is None
     assert verified.source_status_by_venue[Venue.POLYMARKET] == (
-        PublicSourceStatus.OBSERVED_PUBLICLY.value
+        INSUFFICIENT_PUBLIC_CORPUS
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("duplicates", 1), ("gaps", 1), ("queue_high_water", 1), ("reconnects", 1)),
+)
+def test_positive_raw_excluded_receipt_rejects_counter_substitution(
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    fixture = build_polymarket_fixture(tmp_path / "fixture")
+    campaign = prepare_prediction_campaign(
+        output_root=tmp_path / "campaign",
+        campaign_id="prediction-counter-substitution-fixture",
+        starts_at_utc="2026-09-01T00:00:00Z",
+        preregistration=fixture.preregistration,
+        contracts=tuple(fixture.contracts.values()),
+    )
+    receipt = _campaign_bound_terminal_receipt(
+        tmp_path / "receipt",
+        fixture=fixture,
+        campaign=campaign,
+        venue=Venue.POLYMARKET,
+        ordinal=0,
+        positive_raw=True,
+    )
+    result_path = receipt.probe_root / "reports" / "result.json"
+    result = json.loads(result_path.read_bytes())
+    result[field] = value
+    result_path.write_bytes(canonical_json_bytes(result))
+    with pytest.raises(
+        ValueError,
+        match=r"counters diverge|queue or reconnect counters diverge",
+    ):
+        PredictionUnavailableSource.from_probe_output(receipt.probe_root)
 
 
 def test_bundle_verification_requires_exact_external_pin(tmp_path: Path) -> None:
@@ -1685,7 +1722,8 @@ def test_unavailable_receipt_rejects_zero_frame_or_budget_tamper(
         ValueError,
         match=(
             r"terminal invariants diverged|zero-frame prediction slot receipt|"
-            r"requires campaign binding|lacks direct evidence"
+            r"requires campaign binding|lacks direct evidence|"
+            r"terminal unexpectedly carries an error"
         ),
     ):
         PredictionUnavailableSource.from_probe_output(root)

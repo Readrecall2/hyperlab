@@ -11,7 +11,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .canonical import CanonicalValue, canonical_json_bytes, canonical_value
-from .envelope import Venue
+from .envelope import SYNTHETIC_FIXTURE_LABEL, CaptureProvenance, Venue
 from .prediction import (
     MarketRuleVersion,
     OutcomeIdentity,
@@ -37,6 +37,164 @@ _OFFICIAL_HOSTS = {
         "kalshi.com",
     },
 }
+_POLYMARKET_CLOB_HOST = "clob.polymarket.com"
+_KALSHI_PUBLIC_HOST = "external-api.kalshi.com"
+
+
+def polymarket_gamma_token_outcomes(
+    market: Mapping[str, object],
+) -> tuple[tuple[str, str], ...]:
+    """Return the exact binary Gamma token/outcome relation."""
+
+    labels = _json_array(market.get("outcomes"), label="Polymarket outcomes")
+    tokens = _json_array(market.get("clobTokenIds"), label="Polymarket CLOB tokens")
+    if len(labels) != 2 or len(tokens) != 2:
+        raise ValueError("Polymarket binary outcome/token relation is incomplete")
+    normalized_labels = tuple(
+        _text(label, label="Polymarket outcome label").upper() for label in labels
+    )
+    normalized_tokens = tuple(
+        _text(token, label="Polymarket token id") for token in tokens
+    )
+    if normalized_labels != ("YES", "NO") or len(set(normalized_tokens)) != 2:
+        raise ValueError("Polymarket binary token/outcome identities diverged")
+    return tuple(zip(normalized_tokens, normalized_labels, strict=True))
+
+
+def normalize_polymarket_clob_v2_market(
+    record: Mapping[str, object],
+    *,
+    provenance: CaptureProvenance,
+    expected_condition_id: str,
+    expected_token_outcomes: Sequence[tuple[str, str]],
+) -> Mapping[str, object]:
+    """Authenticate the current compact CLOB V2 body against its path and Gamma graph."""
+
+    parsed = urlsplit(provenance.source_url)
+    public_path = (
+        provenance.transport == "PUBLIC_HTTP"
+        and provenance.fixture_label is None
+        and parsed.scheme == "https"
+        and parsed.hostname == _POLYMARKET_CLOB_HOST
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.path == f"/clob-markets/{expected_condition_id}"
+    )
+    fixture_path = (
+        provenance.transport == "FIXTURE"
+        and provenance.fixture_label == SYNTHETIC_FIXTURE_LABEL
+        and parsed.scheme == "fixture"
+        and parsed.netloc == "prediction-markets-v1"
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.path == f"/polymarket/clob-markets/{expected_condition_id}"
+    )
+    if not public_path and not fixture_path:
+        raise ValueError("Polymarket CLOB V2 provenance path diverged")
+    legacy_aliases = {"condition_id", "conditionId", "tokens", "token_id", "tokenId"}
+    if legacy_aliases.intersection(record):
+        raise ValueError("Polymarket CLOB V2 record mixes legacy identity aliases")
+    raw_tokens = _sequence(record.get("t"), label="Polymarket CLOB V2 tokens")
+    if len(raw_tokens) != 2:
+        raise ValueError("Polymarket CLOB V2 binary token list is incomplete")
+    observed: list[tuple[str, str]] = []
+    for raw_token in raw_tokens:
+        token = _mapping(raw_token, label="Polymarket CLOB V2 token")
+        if set(token) != {"o", "t"}:
+            raise ValueError("Polymarket CLOB V2 token fields diverged")
+        token_id = _text(token.get("t"), label="Polymarket CLOB V2 token id")
+        outcome = _text(token.get("o"), label="Polymarket CLOB V2 outcome").upper()
+        if len(token_id) > 128 or outcome not in {"YES", "NO"}:
+            raise ValueError("Polymarket CLOB V2 token identity is invalid")
+        observed.append((token_id, outcome))
+    expected = tuple(expected_token_outcomes)
+    if (
+        len(set(observed)) != 2
+        or {item[0] for item in observed} != {item[0] for item in expected}
+        or dict(observed) != dict(expected)
+    ):
+        raise ValueError("Polymarket Gamma/CLOB V2 token-outcome relation diverged")
+    return {
+        "condition_id": expected_condition_id,
+        "fd": record.get("fd"),
+        "tokens": [
+            {"outcome": outcome, "token_id": token_id}
+            for token_id, outcome in observed
+        ],
+    }
+
+
+def normalize_kalshi_event_metadata(
+    record: Mapping[str, object],
+    *,
+    provenance: CaptureProvenance,
+    expected_event_ticker: str,
+    expected_market_ticker: str,
+) -> Mapping[str, object]:
+    """Bind the direct official metadata response to its event path."""
+
+    parsed = urlsplit(provenance.source_url)
+    expected_path = f"/trade-api/v2/events/{expected_event_ticker}/metadata"
+    public_path = (
+        provenance.transport == "PUBLIC_HTTP"
+        and provenance.fixture_label is None
+        and parsed.scheme == "https"
+        and parsed.hostname == _KALSHI_PUBLIC_HOST
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.path == expected_path
+    )
+    fixture_path = (
+        provenance.transport == "FIXTURE"
+        and provenance.fixture_label == SYNTHETIC_FIXTURE_LABEL
+        and parsed.scheme == "fixture"
+        and parsed.netloc == "prediction-markets-v1"
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.path == f"/kalshi/events/{expected_event_ticker}/metadata"
+    )
+    if not public_path and not fixture_path:
+        raise ValueError("Kalshi event metadata provenance path diverged")
+    if "event_metadata" in record or "event_ticker" in record:
+        raise ValueError("Kalshi direct event metadata mixes legacy identity fields")
+    market_details = _sequence(
+        record.get("market_details"), label="Kalshi event metadata market details"
+    )
+    settlement_sources = _sequence(
+        record.get("settlement_sources"), label="Kalshi settlement sources"
+    )
+    if not market_details or not settlement_sources:
+        raise ValueError("Kalshi settlement sources are incomplete")
+    if len(market_details) > 1_000 or len(settlement_sources) > 100:
+        raise ValueError("Kalshi event metadata arrays exceed their bounded contract")
+    market_tickers: list[str] = []
+    for item in market_details:
+        detail = _mapping(item, label="Kalshi event metadata market detail")
+        ticker = _text(detail.get("market_ticker"), label="Kalshi metadata market ticker")
+        if len(ticker) > 128:
+            raise ValueError("Kalshi metadata market ticker is oversized")
+        market_tickers.append(ticker)
+    if len(set(market_tickers)) != len(market_tickers):
+        raise ValueError("Kalshi event metadata market ticker is duplicated")
+    if market_tickers.count(expected_market_ticker) != 1:
+        raise ValueError("Kalshi event metadata does not bind the selected market")
+    for item in settlement_sources:
+        source = _mapping(item, label="Kalshi settlement source")
+        name = _text(source.get("name"), label="Kalshi settlement source name")
+        url = _text(source.get("url"), label="Kalshi settlement source URL")
+        if len(name.encode("utf-8")) > 512 or len(url.encode("utf-8")) > 2_048:
+            raise ValueError("Kalshi settlement source is oversized")
+    return {
+        "event_ticker": expected_event_ticker,
+        "market_details": list(market_details),
+        "settlement_sources": list(settlement_sources),
+    }
 
 
 class EvidenceClassification(StrEnum):
@@ -322,18 +480,14 @@ class PredictionIdentityGraph:
             isinstance(item, Mapping) and str(item.get("id")) == gamma_market_id for item in event_markets
         ):
             raise ValueError("Polymarket event does not reference the Gamma market")
-        labels = _json_array(market.get("outcomes"), label="Polymarket outcomes")
-        tokens = _json_array(market.get("clobTokenIds"), label="Polymarket CLOB tokens")
-        if len(labels) != len(tokens) or len(tokens) != 2:
-            raise ValueError("Polymarket binary outcome/token relation is incomplete")
-        if len({_text(item, label="Polymarket token id") for item in tokens}) != 2:
-            raise ValueError("Polymarket binary token identities must be unique")
-        if [str(item).upper() for item in labels] != ["YES", "NO"]:
-            raise ValueError("Polymarket binary outcome ordering is not YES/NO")
+        token_outcomes = polymarket_gamma_token_outcomes(market)
+        tokens = tuple(item[0] for item in token_outcomes)
+        labels = tuple(item[1] for item in token_outcomes)
         if not clob_markets:
             raise ValueError("Polymarket graph requires authenticated CLOB market identity")
         clob_conditions: set[str] = set()
         clob_tokens: set[str] = set()
+        clob_token_outcomes: dict[str, str] = {}
         for clob_market in clob_markets:
             raw_condition = clob_market.get("condition_id", clob_market.get("conditionId"))
             clob_conditions.add(_text(raw_condition, label="Polymarket CLOB condition id"))
@@ -341,17 +495,27 @@ class PredictionIdentityGraph:
             if isinstance(raw_tokens, list):
                 for raw_token in raw_tokens:
                     token_mapping = _mapping(raw_token, label="Polymarket CLOB token")
-                    clob_tokens.add(
-                        _text(
-                            token_mapping.get("token_id", token_mapping.get("tokenId")),
-                            label="Polymarket CLOB token id",
-                        )
+                    token_id = _text(
+                        token_mapping.get("token_id", token_mapping.get("tokenId")),
+                        label="Polymarket CLOB token id",
                     )
+                    clob_tokens.add(token_id)
+                    outcome = _text(
+                        token_mapping.get("outcome"),
+                        label="Polymarket CLOB token outcome",
+                    ).upper()
+                    if token_id in clob_token_outcomes:
+                        raise ValueError("Polymarket CLOB token identity is duplicated")
+                    clob_token_outcomes[token_id] = outcome
             direct_token = clob_market.get("token_id", clob_market.get("tokenId"))
             if direct_token is not None:
                 clob_tokens.add(_text(direct_token, label="Polymarket CLOB token id"))
-        expected_tokens = {_text(item, label="Polymarket token id") for item in tokens}
-        if clob_conditions != {market_id} or clob_tokens != expected_tokens:
+        expected_tokens = set(tokens)
+        if (
+            clob_conditions != {market_id}
+            or clob_tokens != expected_tokens
+            or clob_token_outcomes != dict(token_outcomes)
+        ):
             raise ValueError("Polymarket Gamma/CLOB market-token identity diverged")
         neg_risk = market.get("negRisk")
         enable_neg_risk = market.get("enableNegRisk")
@@ -503,6 +667,20 @@ class PredictionIdentityGraph:
         settlement_sources = event_metadata.get("settlement_sources")
         if not isinstance(settlement_sources, list) or not settlement_sources:
             raise ValueError("Kalshi settlement sources are incomplete")
+        market_details = event_metadata.get("market_details")
+        if not isinstance(market_details, list):
+            raise ValueError("Kalshi event metadata market details are incomplete")
+        metadata_markets = tuple(
+            _text(
+                _mapping(item, label="Kalshi event metadata market detail").get(
+                    "market_ticker"
+                ),
+                label="Kalshi metadata market ticker",
+            )
+            for item in market_details
+        )
+        if len(set(metadata_markets)) != len(metadata_markets) or market_id not in metadata_markets:
+            raise ValueError("Kalshi event metadata does not bind the selected market")
         outcomes = (
             OutcomeIdentity(Venue.KALSHI, market_id, f"{market_id}:YES", "YES"),
             OutcomeIdentity(Venue.KALSHI, market_id, f"{market_id}:NO", "NO"),
@@ -516,6 +694,7 @@ class PredictionIdentityGraph:
             },
             "event_metadata": {
                 "event_ticker": event_metadata.get("event_ticker"),
+                "market_tickers": list(metadata_markets),
                 "settlement_sources": settlement_sources,
             },
             "market": {
@@ -778,7 +957,9 @@ def build_prediction_graph_from_raw(
             raise ValueError("Polymarket graph does not accept Kalshi event metadata")
         if not clob_market_refs:
             raise ValueError("Polymarket graph requires CLOB market references")
-        clob_records: list[Mapping[str, Any]] = []
+        market_id = _text(market.get("conditionId"), label="Polymarket condition id")
+        token_outcomes = polymarket_gamma_token_outcomes(market)
+        clob_records: list[Mapping[str, object]] = []
         for reference in clob_market_refs:
             clob_envelope, clob_record = index.require_record(
                 reference,
@@ -788,7 +969,14 @@ def build_prediction_graph_from_raw(
             if clob_envelope.source_metadata_version != market_envelope.source_metadata_version:
                 raise ValueError("prediction graph CLOB metadata version diverged")
             references.append(reference)
-            clob_records.append(clob_record)
+            clob_records.append(
+                normalize_polymarket_clob_v2_market(
+                    clob_record,
+                    provenance=clob_envelope.provenance,
+                    expected_condition_id=market_id,
+                    expected_token_outcomes=token_outcomes,
+                )
+            )
         return PredictionIdentityGraph.from_polymarket(
             market=market,
             event=event,
@@ -808,6 +996,16 @@ def build_prediction_graph_from_raw(
     if metadata_envelope.source_metadata_version != market_envelope.source_metadata_version:
         raise ValueError("prediction graph event metadata version diverged")
     references.append(event_metadata_ref)
+    event_metadata = normalize_kalshi_event_metadata(
+        event_metadata,
+        provenance=metadata_envelope.provenance,
+        expected_event_ticker=_text(
+            event.get("event_ticker"), label="Kalshi event ticker"
+        ),
+        expected_market_ticker=_text(
+            market.get("ticker"), label="Kalshi market ticker"
+        ),
+    )
     series_envelope, series = index.require_record(
         series_ref,
         venue=venue,
@@ -861,10 +1059,17 @@ def revalidate_prediction_graph(
         ]
         clob_matches = [
             (reference, record)
-            for reference, (_envelope, record) in zip(graph.source_refs, resolved, strict=True)
-            if str(record.get("condition_id") or record.get("conditionId") or "") == graph.market_id
-            and (record.get("tokens") is not None or record.get("token_id") is not None)
+            for reference, (envelope, record) in zip(graph.source_refs, resolved, strict=True)
+            if envelope.feed_type == "metadata"
+            and record.get("t") is not None
             and record.get("clobTokenIds") is None
+            and (
+                urlsplit(envelope.provenance.source_url).path
+                in {
+                    f"/clob-markets/{graph.market_id}",
+                    f"/polymarket/clob-markets/{graph.market_id}",
+                }
+            )
         ]
         if len(market_matches) != 1 or len(event_matches) != 1 or not clob_matches:
             raise ValueError("Polymarket graph raw roles are ambiguous")
@@ -889,9 +1094,10 @@ def revalidate_prediction_graph(
         ]
         metadata_matches = [
             (reference, record)
-            for reference, (_envelope, record) in zip(graph.source_refs, resolved, strict=True)
-            if str(record.get("event_ticker") or "") == graph.event_id
+            for reference, (envelope, record) in zip(graph.source_refs, resolved, strict=True)
+            if envelope.feed_type == "event_metadata"
             and isinstance(record.get("settlement_sources"), list)
+            and isinstance(record.get("market_details"), list)
         ]
         series_matches = [
             (reference, record)

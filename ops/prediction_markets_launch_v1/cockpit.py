@@ -15,18 +15,29 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from ops.prediction_markets_launch_v1.runner import canonical_json_bytes
+from hyperlab.research_data.envelope import Venue
+from ops.prediction_markets_launch_v1.runner import (
+    RunnerError,
+    canonical_json_bytes,
+    validate_service_ledger_against_manifest,
+)
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 ECONOMIC_STATUS = "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE"
 MODE = "readonly"
 FIXTURE_LABEL = "SYNTHETIC/FIXTURE — NOT ALPHA OR ECONOMIC EVIDENCE"
+CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT = (
+    "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+)
 FIXTURES = (
     "PREPARED",
     "BOTH_RUNNING",
     "POLYMARKET_UNAVAILABLE_KALSHI_RUNNING",
     "KALSHI_UNAVAILABLE_POLYMARKET_RUNNING",
     "BOTH_UNAVAILABLE",
+    "POLYMARKET_SOURCE_INVALID_KALSHI_RUNNING",
+    "KALSHI_SOURCE_INVALID_POLYMARKET_RUNNING",
+    "BOTH_SOURCE_INVALID",
     "STALE_RECONNECTING",
     "INTEGRITY_FAILED",
     "INTERRUPTED_RECOVERABLE",
@@ -43,6 +54,7 @@ DOWNLOAD_ALLOWLIST = {
 }
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _MAX_LEDGER_BYTES = 8 * 1024 * 1024
+PREPARED_START_GRACE_SECONDS = 35
 
 
 class CockpitError(RuntimeError):
@@ -87,6 +99,23 @@ def _parse_utc(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def prepared_state_is_stale(
+    *,
+    lifecycle: object,
+    starts_at_utc: object,
+    now: datetime,
+) -> bool:
+    """Flag PREPARED only after the runner's bounded 30-second wake interval."""
+
+    if lifecycle != "PREPARED":
+        return False
+    starts_at = _parse_utc(starts_at_utc)
+    if starts_at is None or now.tzinfo is None or now.utcoffset() is None:
+        raise CockpitIntegrityError("campaign start time is not an aware UTC instant")
+    elapsed = (now.astimezone(UTC) - starts_at).total_seconds()
+    return elapsed > PREPARED_START_GRACE_SECONDS
 
 
 def _identity(path: Path) -> _Identity:
@@ -212,6 +241,8 @@ def _decode_object(read: _Read, *, label: str) -> dict[str, Any]:
 def _ledger(read: _Read | None, *, venue: str) -> list[dict[str, Any]]:
     if read is None:
         return []
+    if read.payload and (not read.payload.endswith(b"\n") or b"\r" in read.payload):
+        raise CockpitIntegrityError(f"{venue} ledger framing is not canonical")
     rows: list[dict[str, Any]] = []
     previous = "0" * 64
     seen: set[int] = set()
@@ -222,6 +253,8 @@ def _ledger(read: _Read | None, *, venue: str) -> list[dict[str, Any]]:
             raise CockpitIntegrityError(f"{venue} ledger line {index} is invalid") from error
         if not isinstance(value, dict):
             raise CockpitIntegrityError(f"{venue} ledger line {index} is not an object")
+        if line != canonical_json_bytes(value):
+            raise CockpitIntegrityError(f"{venue} ledger line {index} is not canonical JSON")
         ordinal = value.get("ordinal")
         claimed = value.get("entry_sha256")
         body = {key: item for key, item in value.items() if key != "entry_sha256"}
@@ -256,6 +289,460 @@ def _metric(value: object, *, provenance: str) -> dict[str, object]:
     return {"available": value is not None, "provenance": provenance, "value": value}
 
 
+_VENUE_STATE_FIELDS = {
+    "active_ordinal",
+    "boundary",
+    "campaign_id",
+    "capacity",
+    "data_quality",
+    "economic_evidence_status",
+    "error",
+    "expected_slots",
+    "holdout",
+    "last_terminal",
+    "lifecycle",
+    "recorded_slots",
+    "schema_version",
+    "updated_at_utc",
+    "venue",
+}
+_INTEGRITY_STATE_FIELDS = _VENUE_STATE_FIELDS - {"data_quality"}
+_VENUE_LIFECYCLES = {
+    "CAPACITY_REFUSED",
+    "COLLECTING",
+    "COMPLETE_WINDOW",
+    "INTERRUPTED_RECOVERABLE",
+    "PREPARED",
+    "WAITING_NEXT_SLOT",
+}
+_CAPACITY_FIELDS = {
+    "admitted",
+    "available_bytes",
+    "h1_reserved_bytes",
+    "prediction_remaining_bytes",
+    "required_free_bytes",
+    "safety_margin_bytes",
+}
+_RECOVERY_ADMISSION_FIELDS = {
+    "boundary",
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "campaign_root",
+    "handoff_sha256",
+    "initial_preflight_report_sha256",
+    "network_report",
+    "network_report_sha256",
+    "receipt_sha256",
+    "recorded_at_utc",
+    "schema_version",
+    "source_commit",
+    "source_root",
+    "terminal_signal",
+    "venue",
+}
+_ACTIVATION_FIELDS = {
+    "boundary",
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "campaign_root",
+    "dashboard_port",
+    "economic_evidence_status",
+    "eligible_venues",
+    "h1_actions",
+    "preflight_report_sha256",
+    "quick_start",
+    "receipt_sha256",
+    "recorded_at_utc",
+    "schema_version",
+    "source_commit",
+    "starts_at_utc",
+}
+
+
+def _is_sha256_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_activation_evidence(
+    activation: Mapping[str, object],
+    *,
+    activation_raw: bytes,
+    preflight: Mapping[str, object],
+    preflight_raw: bytes,
+    manifest: Mapping[str, object],
+    campaign_root: Path,
+    expected_source_commit: str | None = None,
+) -> None:
+    if (
+        set(activation) != _ACTIVATION_FIELDS
+        or activation_raw != canonical_json_bytes(activation) + b"\n"
+    ):
+        raise CockpitIntegrityError("activation receipt schema or framing diverged")
+    body = {key: value for key, value in activation.items() if key != "receipt_sha256"}
+    eligible = activation.get("eligible_venues")
+    preflight_eligible = preflight.get("eligible_venues")
+    source_commit = activation.get("source_commit")
+    starts_at = activation.get("starts_at_utc")
+    recorded_at = activation.get("recorded_at_utc")
+    if (
+        not _is_sha256_text(activation.get("receipt_sha256"))
+        or hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+        != activation.get("receipt_sha256")
+        or activation.get("boundary") != BOUNDARY
+        or activation.get("campaign_id") != manifest.get("campaign_id")
+        or activation.get("campaign_manifest_sha256") != manifest.get("manifest_sha256")
+        or activation.get("campaign_root") != str(campaign_root)
+        or activation.get("dashboard_port") != 18081
+        or activation.get("economic_evidence_status") != ECONOMIC_STATUS
+        or activation.get("h1_actions") != "NONE"
+        or activation.get("preflight_report_sha256")
+        != hashlib.sha256(preflight_raw).hexdigest()
+        or type(activation.get("quick_start")) is not bool
+        or activation.get("schema_version") != 1
+        or type(source_commit) is not str
+        or len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+        or (
+            expected_source_commit is not None
+            and source_commit != expected_source_commit
+        )
+        or _parse_utc(starts_at) is None
+        or _parse_utc(recorded_at) is None
+        or manifest.get("starts_at_utc") != starts_at
+        or not isinstance(eligible, list)
+        or any(item not in {"polymarket", "kalshi"} for item in eligible)
+        or len(set(eligible)) != len(eligible)
+        or eligible != preflight_eligible
+        or preflight.get("boundary") != BOUNDARY
+        or preflight.get("host_admitted") is not True
+        or preflight.get("installation_admissible") is not True
+        or preflight.get("errors") != []
+        or preflight.get("schema_version") != 1
+        or preflight.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+    ):
+        raise CockpitIntegrityError("activation receipt binding diverged")
+
+
+def complete_service_is_admissible(
+    *,
+    complete: bool,
+    show_returncode: int | None,
+    system_error: str | None,
+    properties: Mapping[str, object],
+    pid: int,
+    command_verified: bool,
+) -> bool:
+    """Authenticate the systemd postcondition for a completed venue service."""
+
+    if (
+        not complete
+        or show_returncode != 0
+        or system_error is not None
+        or properties.get("LoadState") != "loaded"
+    ):
+        return False
+    return bool(
+        (
+            properties.get("ActiveState") == "active"
+            and pid > 0
+            and command_verified
+        )
+        or (
+            properties.get("ActiveState") == "inactive"
+            and properties.get("SubState") == "dead"
+            and pid == 0
+            and properties.get("ExecMainStatus") == "0"
+        )
+    )
+
+
+def classify_monitored_service(
+    *,
+    name: str,
+    ledger_error: str | None,
+    lifecycle: object,
+    last_terminal: object,
+    network_verdict: object,
+    complete_service_ok: bool,
+    command_verified: bool,
+    active_state: object,
+    prepared_stale: bool,
+) -> tuple[str, str | None]:
+    """Return service status plus any preserved terminal data-quality condition."""
+
+    current_invalid = last_terminal == "PUBLIC_SOURCE_INVALID"
+    runtime_unavailable = isinstance(last_terminal, str) and last_terminal.startswith(
+        "PUBLIC_SOURCE_UNAVAILABLE"
+    )
+    terminal_condition = (
+        "PUBLIC_SOURCE_INVALID"
+        if current_invalid
+        else "PUBLIC_SOURCE_UNAVAILABLE_RUNTIME"
+        if runtime_unavailable
+        else None
+    )
+    complete = lifecycle == "COMPLETE_WINDOW"
+    if name == "dashboard":
+        status = (
+            "RUNNING"
+            if command_verified and active_state == "active"
+            else "SERVICE_UNAVAILABLE"
+        )
+    elif ledger_error is not None or lifecycle == "INTEGRITY_FAILED":
+        status = "INTEGRITY_FAILED"
+    elif lifecycle == "CAPACITY_REFUSED":
+        status = "CAPACITY_REFUSED"
+    elif lifecycle == "INTERRUPTED_RECOVERABLE":
+        status = "INTERRUPTED_RECOVERABLE"
+    elif prepared_stale:
+        status = "PREPARED_STALE"
+    elif complete_service_ok:
+        status = "COMPLETE_WINDOW"
+    elif complete:
+        status = "COMPLETE_WINDOW_SERVICE_FAILED"
+    elif current_invalid:
+        status = "PUBLIC_SOURCE_INVALID"
+    elif runtime_unavailable:
+        status = "PUBLIC_SOURCE_UNAVAILABLE_RUNTIME"
+    elif isinstance(network_verdict, str) and network_verdict.startswith(
+        "PUBLIC_SOURCE_UNAVAILABLE"
+    ):
+        status = "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT"
+    elif command_verified and active_state == "active":
+        status = "RUNNING"
+    else:
+        status = "SERVICE_UNAVAILABLE"
+    return status, terminal_condition
+
+
+def active_optional_service_is_admissible(
+    *,
+    recovery_dashboard: bool,
+    name: str,
+    eligible: bool,
+    show_returncode: int | None,
+    load_state: object,
+    active_state: object,
+    pid: int,
+    command_verified: bool,
+    state_present: bool,
+    venue_status: str,
+) -> bool:
+    """Allow only an authenticated healthy collector preserved by partial recovery."""
+
+    return bool(
+        recovery_dashboard
+        and name in {"polymarket", "kalshi"}
+        and eligible
+        and show_returncode == 0
+        and load_state == "loaded"
+        and active_state == "active"
+        and pid > 0
+        and command_verified
+        and state_present
+        and venue_status
+        in {
+            "RUNNING",
+            "PUBLIC_SOURCE_INVALID",
+            "PUBLIC_SOURCE_UNAVAILABLE_RUNTIME",
+            "COMPLETE_WINDOW",
+        }
+    )
+
+
+def _recovery_connectivity(
+    read: _Read | None,
+    *,
+    root: Path,
+    venue: str,
+    manifest: Mapping[str, object],
+    preflight: Mapping[str, object] | None,
+    preflight_read: _Read | None,
+    activation: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if read is None:
+        return None
+    if preflight is None or preflight_read is None or activation is None:
+        raise CockpitIntegrityError(f"{venue} recovery admission lacks its initial evidence")
+    record = _decode_object(read, label=f"{venue} recovery admission")
+    if set(record) != _RECOVERY_ADMISSION_FIELDS or read.payload != canonical_json_bytes(record) + b"\n":
+        raise CockpitIntegrityError(f"{venue} recovery admission schema or framing diverged")
+    body = {key: value for key, value in record.items() if key != "receipt_sha256"}
+    network = record.get("network_report")
+    initial_network = preflight.get("network")
+    initial = (
+        initial_network.get(venue)
+        if isinstance(initial_network, Mapping)
+        else None
+    )
+    eligible = preflight.get("eligible_venues")
+    source_root = record.get("source_root")
+    recorded_at = record.get("recorded_at_utc")
+    if (
+        not _is_sha256_text(record.get("receipt_sha256"))
+        or hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+        != record.get("receipt_sha256")
+        or not isinstance(network, Mapping)
+        or network.get("venue") != venue
+        or network.get("verdict") != "NETWORK_PREFLIGHT_GREEN"
+        or not _is_sha256_text(record.get("network_report_sha256"))
+        or hashlib.sha256(canonical_json_bytes(network) + b"\n").hexdigest()
+        != record.get("network_report_sha256")
+        or record.get("boundary") != BOUNDARY
+        or record.get("campaign_id") != manifest.get("campaign_id")
+        or record.get("campaign_manifest_sha256") != manifest.get("manifest_sha256")
+        or record.get("campaign_root") != str(root)
+        or not _is_sha256_text(record.get("handoff_sha256"))
+        or record.get("initial_preflight_report_sha256")
+        != hashlib.sha256(preflight_read.payload).hexdigest()
+        or record.get("schema_version") != 1
+        or record.get("source_commit") != activation.get("source_commit")
+        or type(source_root) is not str
+        or not source_root
+        or record.get("terminal_signal")
+        != "PREDICTION_RECOVERY_NETWORK_ADMISSION_AUTHENTICATED"
+        or record.get("venue") != venue
+        or _parse_utc(recorded_at) is None
+        or not isinstance(initial, Mapping)
+        or initial.get("verdict") != "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT"
+        or not isinstance(eligible, list)
+        or venue in eligible
+    ):
+        raise CockpitIntegrityError(f"{venue} recovery admission binding diverged")
+    return network
+
+
+def _validate_venue_state(
+    state: Mapping[str, object] | None,
+    rows: Sequence[Mapping[str, object]],
+    manifest: Mapping[str, object],
+    *,
+    venue: str,
+) -> None:
+    if state is None:
+        if rows:
+            raise CockpitIntegrityError(f"{venue} ledger exists without venue state")
+        return
+    lifecycle = state.get("lifecycle")
+    expected_fields = (
+        _INTEGRITY_STATE_FIELDS
+        if lifecycle == "INTEGRITY_FAILED"
+        else _VENUE_STATE_FIELDS
+    )
+    policy = manifest.get("prospective_shard_policy")
+    if not isinstance(policy, Mapping):
+        raise CockpitIntegrityError("campaign shard policy is absent")
+    expected_slots = policy.get("expected_shards_per_venue")
+    if (
+        set(state) != expected_fields
+        or state.get("boundary") != BOUNDARY
+        or state.get("campaign_id") != manifest.get("campaign_id")
+        or state.get("economic_evidence_status") != ECONOMIC_STATUS
+        or state.get("expected_slots") != expected_slots
+        or state.get("holdout") != {"access": "SEALED", "metrics_exposed": False}
+        or state.get("schema_version") != 1
+        or state.get("venue") != venue
+        or _parse_utc(state.get("updated_at_utc")) is None
+    ):
+        raise CockpitIntegrityError(f"{venue} state campaign binding diverged")
+    if lifecycle == "INTEGRITY_FAILED":
+        error = state.get("error")
+        if (
+            state.get("active_ordinal") is not None
+            or state.get("capacity") is not None
+            or state.get("last_terminal") is not None
+            or state.get("recorded_slots") is not None
+            or type(error) is not str
+            or not error.strip()
+            or len(error.encode("utf-8")) > 2_048
+        ):
+            raise CockpitIntegrityError(f"{venue} integrity-failure state diverged")
+        return
+    if lifecycle not in _VENUE_LIFECYCLES:
+        raise CockpitIntegrityError(f"{venue} lifecycle is not allowlisted")
+    latest = None if not rows else rows[-1]
+    active_ordinal = state.get("active_ordinal")
+    if lifecycle == "COLLECTING":
+        if (
+            type(active_ordinal) is not int
+            or type(expected_slots) is not int
+            or active_ordinal != len(rows)
+            or active_ordinal >= expected_slots
+        ):
+            raise CockpitIntegrityError(f"{venue} active ordinal diverged")
+    elif active_ordinal is not None:
+        raise CockpitIntegrityError(f"{venue} inactive lifecycle carries an ordinal")
+    error = state.get("error")
+    if lifecycle == "CAPACITY_REFUSED":
+        if type(error) is not str or not error.strip() or len(error.encode("utf-8")) > 2_048:
+            raise CockpitIntegrityError(f"{venue} capacity refusal lacks its error")
+    elif error is not None:
+        raise CockpitIntegrityError(f"{venue} non-failure state carries an error")
+    capacity = state.get("capacity")
+    if not isinstance(capacity, Mapping) or set(capacity) != _CAPACITY_FIELDS:
+        raise CockpitIntegrityError(f"{venue} capacity state diverged")
+    available = capacity.get("available_bytes")
+    h1_reserved = capacity.get("h1_reserved_bytes")
+    prediction_remaining = capacity.get("prediction_remaining_bytes")
+    required = capacity.get("required_free_bytes")
+    safety_margin = capacity.get("safety_margin_bytes")
+    admitted = capacity.get("admitted")
+    if (
+        type(available) is not int
+        or available < 0
+        or type(h1_reserved) is not int
+        or h1_reserved < 0
+        or type(prediction_remaining) is not int
+        or prediction_remaining < 0
+        or type(required) is not int
+        or required < 0
+        or type(safety_margin) is not int
+        or safety_margin < 0
+        or type(admitted) is not bool
+    ):
+        raise CockpitIntegrityError(f"{venue} capacity arithmetic diverged")
+    if (
+        required != h1_reserved + prediction_remaining + safety_margin
+        or admitted is not (available >= required)
+        or (lifecycle == "CAPACITY_REFUSED") is not (admitted is False)
+    ):
+        raise CockpitIntegrityError(f"{venue} capacity arithmetic diverged")
+    invalid_rows = [
+        row for row in rows if row.get("terminal_health") == "PUBLIC_SOURCE_INVALID"
+    ]
+    latest_invalid = None if not invalid_rows else invalid_rows[-1]
+    expected_quality: object = None
+    if latest_invalid is not None:
+        expected_quality = {
+            "alert": True,
+            "count": len(invalid_rows),
+            "error": latest_invalid.get("error"),
+            "latest_ordinal": latest_invalid.get("ordinal"),
+            "source_usable": False,
+            "terminal_health": "PUBLIC_SOURCE_INVALID",
+            "terminal_result_sha256": latest_invalid.get("terminal_result_sha256"),
+        }
+    if (
+        state.get("recorded_slots") != len(rows)
+        or state.get("last_terminal")
+        != (None if latest is None else latest.get("terminal_health"))
+        or state.get("data_quality") != expected_quality
+    ):
+        raise CockpitIntegrityError(f"{venue} state and authenticated ledger diverged")
+    if (
+        type(expected_slots) is not int
+        or len(rows) > expected_slots
+        or (lifecycle == "PREPARED" and rows)
+        or (lifecycle == "WAITING_NEXT_SLOT" and len(rows) >= expected_slots)
+        or (lifecycle == "COMPLETE_WINDOW" and len(rows) != expected_slots)
+    ):
+        raise CockpitIntegrityError(f"{venue} lifecycle and slot plan diverged")
+
+
 def _venue_snapshot(
     venue: str,
     rows: Sequence[Mapping[str, object]],
@@ -263,24 +750,48 @@ def _venue_snapshot(
     connectivity: Mapping[str, object] | None,
     *,
     now: datetime,
+    starts_at_utc: object,
 ) -> dict[str, object]:
     updated = None if state is None else _parse_utc(state.get("updated_at_utc"))
     freshness = None if updated is None else max(0, int((now - updated).total_seconds()))
     latest = None if not rows else rows[-1]
+    usable_rows = [
+        row
+        for row in rows
+        if row.get("source_usable") is True
+        and row.get("economic_eligible") is True
+        and row.get("receipt_classification")
+        == "AUTHENTICATED_COLLECTION_ADMISSIBLE_FOR_DERIVATION"
+    ]
+    invalid_rows = [
+        row for row in rows if row.get("terminal_health") == "PUBLIC_SOURCE_INVALID"
+    ]
+    latest_invalid = None if not invalid_rows else invalid_rows[-1]
     lifecycle = None if state is None else state.get("lifecycle")
+    prepared_stale = prepared_state_is_stale(
+        lifecycle=lifecycle,
+        starts_at_utc=starts_at_utc,
+        now=now,
+    )
     verdict = None if connectivity is None else connectivity.get("verdict")
     runtime_terminal = None if latest is None else latest.get("terminal_health")
     if runtime_terminal is not None and "PUBLIC_SOURCE_UNAVAILABLE" in str(runtime_terminal):
         verdict = "PUBLIC_SOURCE_UNAVAILABLE_RUNTIME"
+    elif runtime_terminal == "PUBLIC_SOURCE_INVALID":
+        verdict = "PUBLIC_SOURCE_INVALID_RUNTIME"
     return {
         "collection": {
-            "bytes": _metric(_sum(rows, "bytes"), provenance="AUTHENTICATED_SLOT_LEDGER"),
-            "duplicates": _metric(_sum(rows, "duplicates"), provenance="AUTHENTICATED_SLOT_LEDGER"),
-            "frames": _metric(_sum(rows, "frames"), provenance="AUTHENTICATED_SLOT_LEDGER"),
-            "gaps": _metric(_sum(rows, "gaps"), provenance="AUTHENTICATED_SLOT_LEDGER"),
-            "reconnects": _metric(_sum(rows, "reconnects"), provenance="AUTHENTICATED_SLOT_LEDGER"),
-            "segments": _metric(_sum(rows, "segments"), provenance="AUTHENTICATED_SLOT_LEDGER"),
+            "bytes": _metric(_sum(usable_rows, "bytes"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
+            "duplicates": _metric(_sum(usable_rows, "duplicates"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
+            "frames": _metric(_sum(usable_rows, "frames"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
+            "gaps": _metric(_sum(usable_rows, "gaps"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
+            "reconnects": _metric(_sum(usable_rows, "reconnects"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
+            "segments": _metric(_sum(usable_rows, "segments"), provenance="AUTHENTICATED_USABLE_SLOT_LEDGER"),
             "slots_recorded": _metric(len(rows) if rows else None, provenance="AUTHENTICATED_SLOT_LEDGER"),
+            "usable_slots": _metric(
+                len(usable_rows) if usable_rows else None,
+                provenance="AUTHENTICATED_USABLE_SLOT_LEDGER",
+            ),
         },
         "connectivity": {
             "dns": None if connectivity is None else connectivity.get("dns"),
@@ -288,6 +799,22 @@ def _venue_snapshot(
             "verdict": verdict,
         },
         "freshness_seconds": freshness,
+        "data_quality": (
+            None
+            if latest_invalid is None
+            else {
+                "alert": True,
+                "count": len(invalid_rows),
+                "error": latest_invalid.get("error"),
+                "latest_ordinal": latest_invalid.get("ordinal"),
+                "receipt_classification": latest_invalid.get("receipt_classification"),
+                "source_usable": False,
+                "terminal_result_sha256": latest_invalid.get(
+                    "terminal_result_sha256"
+                ),
+                "terminal_health": "PUBLIC_SOURCE_INVALID",
+            }
+        ),
         "last_manifest_sha256": None if latest is None else latest.get("manifest_sha256"),
         "last_root_sha256": None if latest is None else latest.get("root_sha256"),
         "last_terminal_health": None if latest is None else latest.get("terminal_health"),
@@ -296,7 +823,7 @@ def _venue_snapshot(
             if latest is not None and "INTERRUPTED" in str(latest.get("terminal_health"))
             else "NO_RECOVERY_PENDING"
         ),
-        "service_state": lifecycle,
+        "service_state": "PREPARED_STALE" if prepared_stale else lifecycle,
         "venue": venue,
     }
 
@@ -313,8 +840,12 @@ def _state_code(
     kalshi = venues["kalshi"]
     lifecycles = {poly.get("service_state"), kalshi.get("service_state")}
     terminals = {poly.get("last_terminal_health"), kalshi.get("last_terminal_health")}
-    if any(value in {"CAPACITY_REFUSED", "INTEGRITY_FAILED"} for value in lifecycles):
+    if "INTEGRITY_FAILED" in lifecycles:
         return "INTEGRITY_FAILED"
+    if "CAPACITY_REFUSED" in lifecycles:
+        return "CAPACITY_REFUSED"
+    if "PREPARED_STALE" in lifecycles:
+        return "PREPARED_STALE"
     if lifecycles == {"PREPARED"}:
         return "PREPARED"
     if lifecycles == {"COMPLETE_WINDOW"}:
@@ -324,27 +855,40 @@ def _state_code(
         for value in (*lifecycles, *terminals)
     ):
         return "INTERRUPTED_RECOVERABLE"
-    freshness_values = [value.get("freshness_seconds") for value in venues.values()]
-    if any(type(value) is int and value > 120 for value in freshness_values):
-        return "STALE_RECONNECTING"
     unavailable: set[str] = set()
+    invalid: set[str] = set()
     for name, value in venues.items():
         connectivity = value.get("connectivity")
-        if isinstance(connectivity, Mapping) and str(
-            connectivity.get("verdict")
-        ).startswith("PUBLIC_SOURCE_UNAVAILABLE"):
-            unavailable.add(name)
+        if isinstance(connectivity, Mapping):
+            verdict = str(connectivity.get("verdict"))
+            if verdict.startswith("PUBLIC_SOURCE_UNAVAILABLE"):
+                unavailable.add(name)
+            if verdict == "PUBLIC_SOURCE_INVALID_RUNTIME":
+                invalid.add(name)
     missing = {
         name for name, value in venues.items() if value.get("service_state") is None
     }
     if activated and any(name not in unavailable for name in missing):
         return "SERVICE_STATE_UNAVAILABLE"
+    if invalid == {"polymarket"} and unavailable == {"kalshi"}:
+        return "POLYMARKET_SOURCE_INVALID_KALSHI_UNAVAILABLE"
+    if invalid == {"kalshi"} and unavailable == {"polymarket"}:
+        return "KALSHI_SOURCE_INVALID_POLYMARKET_UNAVAILABLE"
     if unavailable == {"polymarket", "kalshi"}:
         return "BOTH_UNAVAILABLE"
     if unavailable == {"polymarket"}:
         return "POLYMARKET_UNAVAILABLE_KALSHI_RUNNING"
     if unavailable == {"kalshi"}:
         return "KALSHI_UNAVAILABLE_POLYMARKET_RUNNING"
+    if invalid == {"polymarket", "kalshi"}:
+        return "BOTH_SOURCE_INVALID"
+    if invalid == {"polymarket"}:
+        return "POLYMARKET_SOURCE_INVALID_KALSHI_RUNNING"
+    if invalid == {"kalshi"}:
+        return "KALSHI_SOURCE_INVALID_POLYMARKET_RUNNING"
+    freshness_values = [value.get("freshness_seconds") for value in venues.values()]
+    if any(type(value) is int and value > 120 for value in freshness_values):
+        return "STALE_RECONNECTING"
     if all(value.get("service_state") is None for value in venues.values()):
         return "SERVICE_STATE_UNAVAILABLE" if activated else "PREPARED"
     return "BOTH_RUNNING"
@@ -372,6 +916,9 @@ def fixture_snapshot(name: str, *, now: datetime | None = None) -> dict[str, Any
         "BOTH_RUNNING",
         "POLYMARKET_UNAVAILABLE_KALSHI_RUNNING",
         "KALSHI_UNAVAILABLE_POLYMARKET_RUNNING",
+        "POLYMARKET_SOURCE_INVALID_KALSHI_RUNNING",
+        "KALSHI_SOURCE_INVALID_POLYMARKET_RUNNING",
+        "BOTH_SOURCE_INVALID",
         "STALE_RECONNECTING",
         "HOLDOUT_SEALED",
     }
@@ -379,9 +926,15 @@ def fixture_snapshot(name: str, *, now: datetime | None = None) -> dict[str, Any
         "polymarket": name in {"POLYMARKET_UNAVAILABLE_KALSHI_RUNNING", "BOTH_UNAVAILABLE"},
         "kalshi": name in {"KALSHI_UNAVAILABLE_POLYMARKET_RUNNING", "BOTH_UNAVAILABLE"},
     }
+    invalid = {
+        "polymarket": name
+        in {"POLYMARKET_SOURCE_INVALID_KALSHI_RUNNING", "BOTH_SOURCE_INVALID"},
+        "kalshi": name
+        in {"KALSHI_SOURCE_INVALID_POLYMARKET_RUNNING", "BOTH_SOURCE_INVALID"},
+    }
     venues: dict[str, Any] = {}
     for index, venue in enumerate(("polymarket", "kalshi"), start=1):
-        available = running and not unavailable[venue]
+        available = running and not unavailable[venue] and not invalid[venue]
         metrics = {
             "bytes": _metric(8_388_608 * index if available else None, provenance=FIXTURE_LABEL),
             "duplicates": _metric(2 * index if available else None, provenance=FIXTURE_LABEL),
@@ -389,22 +942,63 @@ def fixture_snapshot(name: str, *, now: datetime | None = None) -> dict[str, Any
             "gaps": _metric(0 if available else None, provenance=FIXTURE_LABEL),
             "reconnects": _metric(1 if name == "STALE_RECONNECTING" and available else (0 if available else None), provenance=FIXTURE_LABEL),
             "segments": _metric(12 * index if available else None, provenance=FIXTURE_LABEL),
-            "slots_recorded": _metric(21 * index if available else None, provenance=FIXTURE_LABEL),
+            "slots_recorded": _metric(
+                1 if invalid[venue] else (21 * index if available else None),
+                provenance=FIXTURE_LABEL,
+            ),
+            "usable_slots": _metric(
+                21 * index if available else None,
+                provenance=FIXTURE_LABEL,
+            ),
         }
         venues[venue] = {
             "collection": metrics,
             "connectivity": {
                 "dns": None if unavailable[venue] else {f"{venue}.official.example": ["203.0.113.10"]},
-                "errors": ["SYNTHETIC DNS FAILURE"] if unavailable[venue] else [],
-                "verdict": "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT" if unavailable[venue] else "NETWORK_PREFLIGHT_GREEN",
+                "errors": (
+                    ["SYNTHETIC DNS FAILURE"]
+                    if unavailable[venue]
+                    else (["SYNTHETIC PUBLIC PAYLOAD INVALID"] if invalid[venue] else [])
+                ),
+                "verdict": (
+                    "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT"
+                    if unavailable[venue]
+                    else (
+                        "PUBLIC_SOURCE_INVALID_RUNTIME"
+                        if invalid[venue]
+                        else "NETWORK_PREFLIGHT_GREEN"
+                    )
+                ),
             },
+            "data_quality": (
+                {
+                    "alert": True,
+                    "count": 1,
+                    "error": "SYNTHETIC/FIXTURE public source payload invalid",
+                    "latest_ordinal": 0,
+                    "receipt_classification": CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT,
+                    "source_usable": False,
+                    "terminal_result_sha256": "e" * 64,
+                    "terminal_health": "PUBLIC_SOURCE_INVALID",
+                }
+                if invalid[venue]
+                else None
+            ),
             "freshness_seconds": 420 if name == "STALE_RECONNECTING" and available else (7 if available else None),
-            "last_manifest_sha256": (str(index) * 64) if available else None,
-            "last_root_sha256": (str(index + 2) * 64) if available else None,
+            "last_manifest_sha256": (
+                (str(index) * 64) if available or invalid[venue] else None
+            ),
+            "last_root_sha256": (
+                (str(index + 2) * 64) if available or invalid[venue] else None
+            ),
             "last_terminal_health": (
-                "INTERRUPTED_RECOVERABLE"
-                if name == "INTERRUPTED_RECOVERABLE"
-                else ("COMPLETE" if name == "COMPLETE_WINDOW" else None)
+                "PUBLIC_SOURCE_INVALID"
+                if invalid[venue]
+                else (
+                    "INTERRUPTED_RECOVERABLE"
+                    if name == "INTERRUPTED_RECOVERABLE"
+                    else ("COMPLETE" if name == "COMPLETE_WINDOW" else None)
+                )
             ),
             "recovery": "INTERRUPTED_RECOVERABLE" if name == "INTERRUPTED_RECOVERABLE" else "NO_RECOVERY_PENDING",
             "service_state": (
@@ -441,7 +1035,18 @@ def fixture_snapshot(name: str, *, now: datetime | None = None) -> dict[str, Any
         "state": {
             "code": state_name,
             "integrity": "FAILED" if name == "INTEGRITY_FAILED" else "SYNTHETIC_AUTHENTIC",
-            "severity": "critical" if name == "INTEGRITY_FAILED" else ("warning" if "UNAVAILABLE" in name or "STALE" in name or "INTERRUPTED" in name else "ok"),
+            "severity": (
+                "critical"
+                if name == "INTEGRITY_FAILED"
+                else (
+                    "warning"
+                    if any(
+                        marker in name
+                        for marker in ("UNAVAILABLE", "SOURCE_INVALID", "STALE", "INTERRUPTED")
+                    )
+                    else "ok"
+                )
+            ),
         },
         "venues": venues,
     }
@@ -475,30 +1080,73 @@ def _snapshot_once(root: Path, *, now: datetime) -> dict[str, Any]:
         raise CockpitIntegrityError("campaign safety boundary diverged")
     preflight_read = _optional_read(root, PurePosixPath("state/preflight-report.json"), maximum_bytes=_MAX_JSON_BYTES)
     activation_read = _optional_read(root, PurePosixPath("state/activation-receipt.json"), maximum_bytes=_MAX_JSON_BYTES)
-    if preflight_read is not None:
-        reads.append(preflight_read)
-    if activation_read is not None:
-        reads.append(activation_read)
-    preflight = None if preflight_read is None else _decode_object(preflight_read, label="preflight report")
-    activation = None if activation_read is None else _decode_object(activation_read, label="activation receipt")
+    if preflight_read is None or activation_read is None:
+        raise CockpitIntegrityError("campaign lacks authenticated preflight or activation evidence")
+    reads.extend((preflight_read, activation_read))
+    preflight = _decode_object(preflight_read, label="preflight report")
+    activation = _decode_object(activation_read, label="activation receipt")
+    validate_activation_evidence(
+        activation,
+        activation_raw=activation_read.payload,
+        preflight=preflight,
+        preflight_raw=preflight_read.payload,
+        manifest=manifest,
+        campaign_root=root,
+    )
     venue_values: dict[str, dict[str, object]] = {}
     venue_states: dict[str, Mapping[str, object] | None] = {}
     for venue in ("polymarket", "kalshi"):
+        recovery_read = _optional_read(
+            root,
+            PurePosixPath(f"state/recovery-admission-{venue}.json"),
+            maximum_bytes=_MAX_JSON_BYTES,
+        )
         ledger_read = _optional_read(root, PurePosixPath(f"{venue}/ledger.jsonl"), maximum_bytes=_MAX_LEDGER_BYTES)
         state_read = _optional_read(root, PurePosixPath(f"{venue}/state.json"), maximum_bytes=_MAX_JSON_BYTES)
         if ledger_read is not None:
             reads.append(ledger_read)
         if state_read is not None:
             reads.append(state_read)
-        rows = _ledger(ledger_read, venue=venue.upper())
+        if recovery_read is not None:
+            reads.append(recovery_read)
+        rows = _ledger(ledger_read, venue=venue)
+        try:
+            validate_service_ledger_against_manifest(
+                rows,
+                campaign_manifest=manifest,
+                venue=Venue(venue),
+            )
+        except (RunnerError, ValueError) as error:
+            raise CockpitIntegrityError(
+                f"{venue} ledger semantic authentication failed: {error}"
+            ) from error
         state = None if state_read is None else _decode_object(state_read, label=f"{venue} state")
+        _validate_venue_state(state, rows, manifest, venue=venue)
         venue_states[venue] = state
         network = None
         if preflight is not None and isinstance(preflight.get("network"), Mapping):
             selected = preflight["network"].get(venue)
             if isinstance(selected, Mapping):
                 network = selected
-        venue_values[venue] = _venue_snapshot(venue, rows, state, network, now=now)
+        recovery_network = _recovery_connectivity(
+            recovery_read,
+            root=root,
+            venue=venue,
+            manifest=manifest,
+            preflight=preflight,
+            preflight_read=preflight_read,
+            activation=activation,
+        )
+        if recovery_network is not None:
+            network = recovery_network
+        venue_values[venue] = _venue_snapshot(
+            venue,
+            rows,
+            state,
+            network,
+            now=now,
+            starts_at_utc=manifest.get("starts_at_utc"),
+        )
     for read in reads:
         try:
             current = _identity(read.path)
@@ -525,10 +1173,19 @@ def _snapshot_once(root: Path, *, now: datetime) -> dict[str, Any]:
     )
     severity = (
         "critical"
-        if code in {"INTEGRITY_FAILED", "SERVICE_STATE_UNAVAILABLE"}
+        if code
+        in {
+            "CAPACITY_REFUSED",
+            "INTEGRITY_FAILED",
+            "PREPARED_STALE",
+            "SERVICE_STATE_UNAVAILABLE",
+        }
         else (
             "warning"
-            if "UNAVAILABLE" in code or "STALE" in code or "INTERRUPTED" in code
+            if any(
+                marker in code
+                for marker in ("UNAVAILABLE", "SOURCE_INVALID", "STALE", "INTERRUPTED")
+            )
             else "ok"
         )
     )
@@ -601,7 +1258,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const short=v=>v?`${String(v).slice(0,12)}…${String(v).slice(-8)}`:'NON DISPONIBLE';
 const fmt=v=>v===null||v===undefined?'NON DISPONIBLE':new Intl.NumberFormat('fr-FR').format(v);
 function metric(label,m){const na=!m||!m.available;return `<div class="metric"><span>${label}</span><strong class="${na?'na':''}">${na?'NON DISPONIBLE':fmt(m.value)}</strong></div>`}
-function venue(id,v){const e=document.getElementById(id);const c=v.collection||{};e.querySelector('.status').innerHTML=`SERVICE · ${esc(v.service_state||'NON DISPONIBLE')}<br>NETWORK · ${esc(v.connectivity?.verdict||'NON DISPONIBLE')}<br>FRESHNESS · ${v.freshness_seconds===null||v.freshness_seconds===undefined?'NON DISPONIBLE':fmt(v.freshness_seconds)+' s'}`;e.querySelector('.metrics').innerHTML=metric('FRAMES',c.frames)+metric('SEGMENTS',c.segments)+metric('OCTETS',c.bytes)+metric('GAPS',c.gaps)+metric('DUPLICATES',c.duplicates)+metric('RECONNECTS',c.reconnects);e.querySelector('.hashes').innerHTML=`MANIFEST ${esc(short(v.last_manifest_sha256))}<br>ROOT ${esc(short(v.last_root_sha256))}<br>RECOVERY ${esc(v.recovery||'NON DISPONIBLE')}`;const good=v.connectivity?.verdict==='NETWORK_PREFLIGHT_GREEN';e.querySelector('.dot').style.background=good?'var(--mint)':'var(--red)'}
+function venue(id,v){const e=document.getElementById(id);const c=v.collection||{};const dq=v.data_quality;const quality=dq?.alert?`<br>DATA QUALITY · ${esc(dq.terminal_health)}<br>ERROR · ${esc(dq.error||'NON DISPONIBLE')}`:'';e.querySelector('.status').innerHTML=`SERVICE · ${esc(v.service_state||'NON DISPONIBLE')}<br>NETWORK · ${esc(v.connectivity?.verdict||'NON DISPONIBLE')}<br>FRESHNESS · ${v.freshness_seconds===null||v.freshness_seconds===undefined?'NON DISPONIBLE':fmt(v.freshness_seconds)+' s'}${quality}`;e.querySelector('.metrics').innerHTML=metric('FRAMES',c.frames)+metric('SEGMENTS',c.segments)+metric('OCTETS',c.bytes)+metric('GAPS',c.gaps)+metric('DUPLICATES',c.duplicates)+metric('RECONNECTS',c.reconnects);e.querySelector('.hashes').innerHTML=`MANIFEST ${esc(short(v.last_manifest_sha256))}<br>ROOT ${esc(short(v.last_root_sha256))}<br>RECOVERY ${esc(v.recovery||'NON DISPONIBLE')}`;const good=v.connectivity?.verdict==='NETWORK_PREFLIGHT_GREEN';e.querySelector('.dot').style.background=good?'var(--mint)':(dq?.alert?'var(--amber)':'var(--red)')}
 function dl(obj){return Object.entries(obj).map(([k,v])=>`<dt>${esc(k.replaceAll('_',' ').toUpperCase())}</dt><dd>${esc(v===null||v===undefined?'NON DISPONIBLE':typeof v==='boolean'?String(v).toUpperCase():typeof v==='number'?fmt(v):short(v))}</dd>`).join('')}
 fetch(url,{headers:{Accept:'application/json'}}).then(async r=>{const d=await r.json();if(!r.ok)throw d;document.body.classList.add(d.state.severity);document.getElementById('state').textContent=d.state.code;document.getElementById('summary').textContent=d.state.integrity==='AUTHENTICATED'?'Snapshot cohérent, fichiers bornés et identité revalidée avant/après lecture.':'État synthétique de QA — aucune preuve de marché.';document.getElementById('holdout').textContent=d.holdout.access;venue('polymarket',d.venues.polymarket);venue('kalshi',d.venues.kalshi);document.getElementById('identity').innerHTML=dl(d.identity);document.getElementById('capacity').innerHTML=dl(d.capacity||{});document.getElementById('clock').textContent=d.generated_at_utc;if(d.fixture){const f=document.getElementById('fixture');f.classList.remove('hidden');f.textContent=d.fixture_label+' · '+d.fixture_name}}).catch(e=>{document.body.classList.add('critical');document.getElementById('state').textContent='INTEGRITY_FAILED';document.getElementById('summary').textContent='Lecture refusée: '+(e.error||e.detail||'snapshot indisponible')});
 """

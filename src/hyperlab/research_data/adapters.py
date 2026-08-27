@@ -1035,7 +1035,6 @@ class KalshiPublicAdapter:
                 "events": "event",
                 "markets": "market",
                 "order_book": "orderbook_fp",
-                "event_metadata": "event_metadata",
             }
             singular_key = singular_keys.get(feed_type)
             if singular_key and isinstance(decoded.get(singular_key), Mapping):

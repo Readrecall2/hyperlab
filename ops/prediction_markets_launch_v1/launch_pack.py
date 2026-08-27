@@ -343,6 +343,56 @@ WantedBy=multi-user.target
     return units
 
 
+def render_operator_readme(handoff: Mapping[str, object]) -> str:
+    services = handoff["services"]
+    assert isinstance(services, Mapping)
+    return f"""# Prediction Markets — exécution humaine unique
+
+Ce pack est strictement `{BOUNDARY}`. Il ne contient aucun ordre, wallet,
+signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
+économique est `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
+
+## Ordre des blocs
+
+1. Sur Windows PowerShell, exécuter
+   `operator/A-windows-bundle-verify-transfer.ps1`. Signal attendu :
+   `PREDICTION_WINDOWS_TRANSFER_VERIFIED`.
+2. Dans un premier onglet Tabby/VPS, exécuter
+   `operator/B-tabby-preflight-install-activate.sh`. Il refuse avant activation
+   si identité, capacité, NTP, filesystem, port, service ou dépendance diverge.
+   Signal attendu : `PREDICTION_INSTALL_ACTIVATION_GREEN`.
+3. Dans un second onglet Tabby, exécuter
+   `operator/C-tabby-readonly-monitor.sh`. Il s'arrête à la première transition
+   ou alerte avec `PREDICTION_MONITOR_TRANSITION_OR_ALERT`.
+4. Sur Windows PowerShell, exécuter
+   `operator/D-windows-dashboard-tunnel.ps1`. Ouvrir l'URL seulement après
+   `PREDICTION_TUNNEL_READY http://127.0.0.1:18081`.
+5. `operator/E-recovery-rollback.sh recovery|rollback` reprend sans rejouer un
+   slot terminal, ou arrête/désactive uniquement les trois services ci-dessous.
+   Aucun raw, manifest, ledger, run ou rapport n'est supprimé.
+
+Les blocs Windows lisent `HYPERLAB_PM_SSH_TARGET` et `HYPERLAB_PM_SSH_KEY` dans
+le shell opérateur. Aucune valeur de connexion n'est enregistrée dans ce pack.
+
+## Identité et isolation de cette tentative
+
+- run : `{handoff['run_slug']}`
+- commit source : `{handoff['source_commit']}`
+- incoming root : `{handoff['incoming_root']}`
+- source root : `{handoff['source_root']}`
+- campaign root : `{handoff['campaign_root']}`
+- collecteur Polymarket : `{services['polymarket']}`
+- collecteur Kalshi : `{services['kalshi']}`
+- cockpit : `{services['dashboard']}` sur `127.0.0.1:18081`
+
+Polymarket et Kalshi sont indépendants. Un reçu authentique
+`PUBLIC_SOURCE_INVALID` est comptabilisé comme slot terminal de qualité de
+donnée, mais reste `source_usable=false`, `economic_eligible=false` et n'est
+jamais rejoué. Une divergence de reçu, plan, identité, hash, manifest ou ledger
+reste `INTEGRITY_FAILED` et ne redémarre pas en boucle.
+"""
+
+
 def render_windows_transfer(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     bundle = handoff["bundle_filename"]
@@ -470,8 +520,10 @@ def render_tabby_install(handoff: Mapping[str, object]) -> str:
     bundle = handoff["bundle_filename"]
     return f"""#!/usr/bin/env bash
 # Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 5-15 min; maximum: 35 min.
-# Prompts: sudo peut demander le mot de passe; aucun pip réseau. Ctrl+C avant activation
-# laisse seulement de nouvelles racines isolées. Signal terminal: PREDICTION_INSTALL_ACTIVATION_GREEN.
+# Prompts: sudo peut demander le mot de passe; aucun pip réseau. Ctrl+C avant la
+# première activation laisse seulement de nouvelles racines isolées. Après activation,
+# les services déjà démarrés peuvent rester actifs: utiliser E rollback pour les arrêter.
+# Signal terminal exact: PREDICTION_INSTALL_ACTIVATION_GREEN.
 set -Eeuo pipefail
 umask 077
 INCOMING_ROOT='{incoming}'
@@ -482,15 +534,14 @@ VOLUME_BASE='{base}'
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" host --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/host-preflight-report.json"
 sudo install -d -o hyperlab -g hyperlab -m 0700 "$VOLUME_BASE" "$VOLUME_BASE/sources" "$VOLUME_BASE/campaigns"
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" fsync --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/filesystem-fsync-report.json"
-[[ ! -e "$SOURCE_ROOT" && ! -e "$CAMPAIGN_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:attempt_roots_must_be_new\n' >&2; exit 4; }}
+[[ ! -e "$SOURCE_ROOT" && ! -L "$SOURCE_ROOT" && ! -e "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:attempt_roots_must_be_new\n' >&2; exit 4; }}
 git clone --no-checkout "$INCOMING_ROOT/{bundle}" "$SOURCE_ROOT"
 git -C "$SOURCE_ROOT" checkout --detach '{commit}'
 python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
 bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROOT/wheelhouse"
-bash "$INCOMING_ROOT/scripts/install.sh" "$INCOMING_ROOT"
-printf 'PREDICTION_INSTALL_ACTIVATION_GREEN\n'
 printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
 printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
+bash "$INCOMING_ROOT/scripts/install.sh" "$INCOMING_ROOT"
 """
 
 
@@ -506,8 +557,7 @@ PREVIOUS=''
 while :; do
   CURRENT=$(bash '{source}/ops/prediction_markets_launch_v1/monitor.sh' '{incoming}/handoff.json')
   printf '%s\n' "$CURRENT"
-  FINGERPRINT=$(printf '%s' "$CURRENT" | sha256sum | awk '{{print $1}}')
-  ALERT=$(printf '%s' "$CURRENT" | python3.12 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if d["alert"] else "no")')
+  read -r FINGERPRINT ALERT < <(printf '%s' "$CURRENT" | python3.12 -I -c 'import json,re,sys; d=json.load(sys.stdin); f=d.get("semantic_fingerprint_sha256"); assert isinstance(f,str) and re.fullmatch(r"[0-9a-f]{{64}}",f); print(f,"yes" if d["alert"] else "no")')
   if [[ $ALERT == yes || ( -n $PREVIOUS && $FINGERPRINT != "$PREVIOUS" ) ]]; then
     printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
     break
@@ -524,13 +574,14 @@ def render_windows_tunnel(handoff: Mapping[str, object]) -> str:
 # Signal: ouvrir http://127.0.0.1:18081 après l'affichage PREDICTION_TUNNEL_READY.
 $ErrorActionPreference = 'Stop'
 $SshTarget = $env:HYPERLAB_PM_SSH_TARGET
-if ([string]::IsNullOrWhiteSpace($SshTarget)) { throw 'Set HYPERLAB_PM_SSH_TARGET, for example hyperlab@host.' }
+if ([string]::IsNullOrWhiteSpace($SshTarget) -or $SshTarget -notmatch '^[a-z0-9._-]+@[a-z0-9.-]+$') { throw 'Set HYPERLAB_PM_SSH_TARGET to user@host.' }
 $SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY
 if ([string]::IsNullOrWhiteSpace($SshKeyRaw)) { throw 'Set HYPERLAB_PM_SSH_KEY to the dedicated private-key path.' }
 $SshKeyPath = (Resolve-Path -LiteralPath $SshKeyRaw).Path
 if (-not (Test-Path -LiteralPath $SshKeyPath -PathType Leaf)) { throw 'HYPERLAB_PM_SSH_KEY is not a regular file.' }
-Write-Output 'PREDICTION_TUNNEL_READY http://127.0.0.1:18081'
-ssh -i $SshKeyPath -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18081:127.0.0.1:18081 $SshTarget
+$ReadyCommand = 'cmd.exe /d /c echo PREDICTION_TUNNEL_READY http://127.0.0.1:18081'
+ssh -i $SshKeyPath -N -o ExitOnForwardFailure=yes -o PermitLocalCommand=yes -o "LocalCommand=$ReadyCommand" -L 127.0.0.1:18081:127.0.0.1:18081 $SshTarget
+if ($LASTEXITCODE -ne 0) { throw 'Dashboard tunnel failed before or after authenticated establishment.' }
 """
 
 
@@ -538,8 +589,9 @@ def render_recovery_rollback(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     source = handoff["source_root"]
     return f"""#!/usr/bin/env bash
-# Lieu: Tabby/VPS Bash. Durée attendue: <2 min; maximum: 5 min.
-# Prompts: sudo peut demander le mot de passe. Ctrl+C ne supprime aucune preuve.
+# Lieu: Tabby/VPS Bash. Durée attendue: 1-4 min; maximum: 12 min.
+# Prompts: sudo peut demander le mot de passe. Ctrl+C ne supprime aucune preuve,
+# mais peut laisser un sous-ensemble des trois services Prediction Markets actif.
 # RECOVERY redémarre seulement les services Prediction Markets admissibles.
 # ROLLBACK arrête/désactive seulement ces trois services et préserve tous les raw/manifests/runs.
 set -Eeuo pipefail
@@ -687,6 +739,10 @@ def finalize(
         "volume_mount": remote["volume_mount"],
         "wheelhouse_manifest_sha256": sha256_bytes(wheelhouse_payload),
     }
+    _write_new(
+        output_root / "README.md",
+        render_operator_readme(handoff_base).encode("utf-8"),
+    )
     units = render_units(handoff_base)
     for name, content in units.items():
         _write_new(output_root / "systemd" / name, content.encode("utf-8"))
@@ -701,6 +757,7 @@ def finalize(
         _write_new(output_root / "operator" / name, content.encode("utf-8"), executable=name.endswith(".sh"))
     transfer_paths = [
         bundle_path.name,
+        "README.md",
         "source-inventory.json",
         "wheelhouse.sha256",
         *[f"scripts/{name}" for name in _SCRIPTS],

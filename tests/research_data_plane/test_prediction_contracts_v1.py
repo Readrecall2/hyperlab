@@ -7,18 +7,28 @@ import pytest
 
 from hyperlab.research_data.adapters import (
     KALSHI_METADATA_VERSION,
+    KALSHI_PUBLIC_HTTP_URL,
     POLYMARKET_METADATA_VERSION,
     KalshiPublicAdapter,
     PolymarketPublicAdapter,
     _iso_to_ns,
 )
-from hyperlab.research_data.envelope import Venue
+from hyperlab.research_data.canonical import canonical_json_bytes
+from hyperlab.research_data.envelope import (
+    SYNTHETIC_FIXTURE_LABEL,
+    CaptureProvenance,
+    SessionEnvelopeFactory,
+    Venue,
+)
 from hyperlab.research_data.prediction_contracts import (
     BoundedCursorPager,
     EvidenceClassification,
     OfficialPublicContract,
     PredictionIdentityGraph,
+    normalize_kalshi_event_metadata,
+    normalize_polymarket_clob_v2_market,
 )
+from hyperlab.research_data.prediction_evidence import prediction_raw_records
 from hyperlab.research_data.probe import _polymarket_token_parameter_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -143,8 +153,8 @@ def test_polymarket_identity_graph_authenticates_outcome_token_indices() -> None
             {
                 "condition_id": "condition-1",
                 "tokens": [
-                    {"token_id": "token-yes"},
-                    {"token_id": "token-no"},
+                    {"outcome": "YES", "token_id": "token-yes"},
+                    {"outcome": "NO", "token_id": "token-no"},
                 ],
             },
         ),
@@ -161,13 +171,229 @@ def test_polymarket_identity_graph_authenticates_outcome_token_indices() -> None
                 {
                     "condition_id": "condition-1",
                     "tokens": [
-                        {"token_id": "token-yes"},
-                        {"token_id": "token-no"},
+                        {"outcome": "YES", "token_id": "token-yes"},
+                        {"outcome": "NO", "token_id": "token-no"},
                     ],
                 },
             ),
             source_metadata_version=POLYMARKET_METADATA_VERSION,
         )
+
+
+def test_polymarket_clob_v2_normalizer_is_path_bound_and_alias_fail_closed() -> None:
+    provenance = CaptureProvenance(
+        "fixture",
+        "fixture://prediction-markets-v1/polymarket/clob-markets/condition-1",
+        "FIXTURE",
+        fixture_label=SYNTHETIC_FIXTURE_LABEL,
+    )
+    expected = (("token-yes", "YES"), ("token-no", "NO"))
+    reordered = {
+        "fd": {"e": 2, "r": 0.02, "to": True},
+        "t": [
+            {"o": "No", "t": "token-no"},
+            {"o": "Yes", "t": "token-yes"},
+        ],
+    }
+    normalized = normalize_polymarket_clob_v2_market(
+        reordered,
+        provenance=provenance,
+        expected_condition_id="condition-1",
+        expected_token_outcomes=expected,
+    )
+    assert normalized["condition_id"] == "condition-1"
+    assert normalized["tokens"] == [
+        {"outcome": "NO", "token_id": "token-no"},
+        {"outcome": "YES", "token_id": "token-yes"},
+    ]
+    public_provenance = CaptureProvenance(
+        "fixture-public-path",
+        "https://clob.polymarket.com/clob-markets/condition-1",
+        "PUBLIC_HTTP",
+    )
+    assert normalize_polymarket_clob_v2_market(
+        reordered,
+        provenance=public_provenance,
+        expected_condition_id="condition-1",
+        expected_token_outcomes=expected,
+    )["condition_id"] == "condition-1"
+
+    with pytest.raises(ValueError, match="legacy identity aliases"):
+        normalize_polymarket_clob_v2_market(
+            {**reordered, "condition_id": "contradictory"},
+            provenance=provenance,
+            expected_condition_id="condition-1",
+            expected_token_outcomes=expected,
+        )
+    with pytest.raises(ValueError, match="relation diverged"):
+        normalize_polymarket_clob_v2_market(
+            {
+                **reordered,
+                "t": [
+                    {"o": "No", "t": "token-yes"},
+                    {"o": "Yes", "t": "token-no"},
+                ],
+            },
+            provenance=provenance,
+            expected_condition_id="condition-1",
+            expected_token_outcomes=expected,
+        )
+    with pytest.raises(ValueError, match="provenance path"):
+        normalize_polymarket_clob_v2_market(
+            reordered,
+            provenance=CaptureProvenance(
+                "fixture",
+                "fixture://prediction-markets-v1/polymarket/clob-markets/other",
+                "FIXTURE",
+                fixture_label=SYNTHETIC_FIXTURE_LABEL,
+            ),
+            expected_condition_id="condition-1",
+            expected_token_outcomes=expected,
+        )
+    for source_url in (
+        "https://example.invalid/clob-markets/condition-1",
+        "https://clob.polymarket.com/clob-markets/condition-1?unexpected=true",
+        "https://user:password@clob.polymarket.com/clob-markets/condition-1",
+    ):
+        with pytest.raises(ValueError, match="provenance path"):
+            normalize_polymarket_clob_v2_market(
+                reordered,
+                provenance=CaptureProvenance(
+                    "fixture-public-negative",
+                    source_url,
+                    "PUBLIC_HTTP",
+                ),
+                expected_condition_id="condition-1",
+                expected_token_outcomes=expected,
+            )
+
+
+def test_kalshi_direct_event_metadata_is_path_and_market_bound() -> None:
+    provenance = CaptureProvenance(
+        "fixture",
+        "fixture://prediction-markets-v1/kalshi/events/KXEVENT/metadata",
+        "FIXTURE",
+        fixture_label=SYNTHETIC_FIXTURE_LABEL,
+    )
+    direct = {
+        "market_details": [{"market_ticker": "KXEVENT-YES"}],
+        "settlement_sources": [{"name": "Official source", "url": "official-source-id"}],
+    }
+    normalized = normalize_kalshi_event_metadata(
+        direct,
+        provenance=provenance,
+        expected_event_ticker="KXEVENT",
+        expected_market_ticker="KXEVENT-YES",
+    )
+    assert normalized["event_ticker"] == "KXEVENT"
+    assert normalized["market_details"] == direct["market_details"]
+    public_provenance = CaptureProvenance(
+        "fixture-public-path",
+        f"{KALSHI_PUBLIC_HTTP_URL}/events/KXEVENT/metadata",
+        "PUBLIC_HTTP",
+    )
+    assert normalize_kalshi_event_metadata(
+        direct,
+        provenance=public_provenance,
+        expected_event_ticker="KXEVENT",
+        expected_market_ticker="KXEVENT-YES",
+    )["event_ticker"] == "KXEVENT"
+
+    for corrupted in (
+        {"event_metadata": direct},
+        {**direct, "event_ticker": "OTHER"},
+        {**direct, "market_details": [{"market_ticker": "OTHER"}]},
+    ):
+        with pytest.raises(ValueError):
+            normalize_kalshi_event_metadata(
+                corrupted,
+                provenance=provenance,
+                expected_event_ticker="KXEVENT",
+                expected_market_ticker="KXEVENT-YES",
+            )
+    with pytest.raises(ValueError, match="provenance path"):
+        normalize_kalshi_event_metadata(
+            direct,
+            provenance=CaptureProvenance(
+                "fixture",
+                "fixture://prediction-markets-v1/kalshi/events/OTHER/metadata",
+                "FIXTURE",
+                fixture_label=SYNTHETIC_FIXTURE_LABEL,
+            ),
+            expected_event_ticker="KXEVENT",
+            expected_market_ticker="KXEVENT-YES",
+        )
+    for source_url in (
+        "https://example.invalid/trade-api/v2/events/KXEVENT/metadata",
+        f"{KALSHI_PUBLIC_HTTP_URL}/events/KXEVENT/metadata?unexpected=true",
+        "https://user:password@external-api.kalshi.com/trade-api/v2/events/KXEVENT/metadata",
+    ):
+        with pytest.raises(ValueError, match="provenance path"):
+            normalize_kalshi_event_metadata(
+                direct,
+                provenance=CaptureProvenance(
+                    "fixture-public-negative",
+                    source_url,
+                    "PUBLIC_HTTP",
+                ),
+                expected_event_ticker="KXEVENT",
+                expected_market_ticker="KXEVENT-YES",
+            )
+
+
+def test_kalshi_direct_metadata_adapter_preserves_absent_source_time_and_root() -> None:
+    adapter = KalshiPublicAdapter()
+    request = next(
+        item
+        for item in adapter.requests_for_market(
+            ticker="KXEVENT-YES",
+            event_ticker="KXEVENT",
+            series_ticker=None,
+            feeds=("event_metadata",),
+        )
+        if item.url.endswith("/events/KXEVENT/metadata")
+    )
+    provenance = CaptureProvenance(
+        "fixture-kalshi-direct-metadata",
+        request.url,
+        "PUBLIC_HTTP",
+    )
+    factory = SessionEnvelopeFactory(
+        venue=Venue.KALSHI,
+        collector_identity="fixture-kalshi-probe",
+        session_identity="fixture-kalshi-direct-metadata-session",
+        source_metadata_version=KALSHI_METADATA_VERSION,
+        provenance=provenance,
+    )
+    direct = {
+        "market_details": [{"market_ticker": "KXEVENT-YES"}],
+        "settlement_sources": [
+            {"name": "SYNTHETIC/FIXTURE official source", "url": "fixture-source-id"}
+        ],
+    }
+    envelope = adapter.envelope_from_http(
+        canonical_json_bytes(direct),
+        feed_type="event_metadata",
+        ticker="KXEVENT",
+        factory=factory,
+        receive_timestamp_utc_ns=1_800_000_000_000_000_000,
+        receive_monotonic_ns=42,
+        provenance=provenance,
+    )
+    assert envelope.source_timestamp_ns is None
+    assert envelope.provenance == provenance
+    assert prediction_raw_records(envelope) == (direct,)
+    normalized = normalize_kalshi_event_metadata(
+        prediction_raw_records(envelope)[0],
+        provenance=envelope.provenance,
+        expected_event_ticker="KXEVENT",
+        expected_market_ticker="KXEVENT-YES",
+    )
+    assert normalized == {
+        "event_ticker": "KXEVENT",
+        "market_details": direct["market_details"],
+        "settlement_sources": direct["settlement_sources"],
+    }
 
 
 def test_kalshi_identity_graph_refuses_mve_and_silent_rule_change() -> None:
@@ -186,7 +412,10 @@ def test_kalshi_identity_graph_refuses_mve_and_silent_rule_change() -> None:
     }
     metadata = {
         "event_ticker": "KXEVENT",
-        "settlement_sources": [{"name": "Official source"}],
+        "market_details": [{"market_ticker": "KXEVENT-YES"}],
+        "settlement_sources": [
+            {"name": "Official source", "url": "https://fixture.invalid/settlement"}
+        ],
     }
     series = {"ticker": "KXSERIES"}
     first = PredictionIdentityGraph.from_kalshi(

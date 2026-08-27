@@ -1,7 +1,7 @@
 # Prediction Markets Prospective Launch V1
 
 Verdict technique visé :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_AWAITING_HUMAN_EXECUTION`.
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_REAL_RECEIPTS_ADMITTED_AWAITING_SINGLE_HUMAN_EXECUTION`.
 
 Statut économique permanent avant preuve prospective réelle :
 `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
@@ -44,6 +44,16 @@ Le démarrage par défaut est immédiat après installation réussie. Pour un d�
 explicite, définir `HYPERLAB_PM_START_AT_UTC` dans le shell Tabby avant le bloc B.
 La valeur doit être UTC, comprise entre maintenant et +24 h. Elle ne permet
 jamais un backfill.
+
+Un reçu `PUBLIC_SOURCE_INVALID` n'est admis que si son JSON canonique, son plan,
+ses identités, ses compteurs, son cutoff, son manifest/root raw et sa provenance
+sont tous authentiques. Son champ `error` doit être non vide et borné. Le slot
+est alors terminalement comptabilisé, exclu des données et de toute évaluation
+économique, puis le service attend le slot suivant sans rejeu. Une corruption de
+l'un de ces contrôles reste `INTEGRITY_FAILED`, code 4, avec
+`RestartPreventExitStatus=4`.
+Une campagne ne contenant que des slots invalides reste
+`INSUFFICIENT_PUBLIC_CORPUS`; ces reçus ne prouvent jamais une source exploitable.
 
 ## Capacité et règle de cohabitation H1
 
@@ -96,6 +106,10 @@ Chaque tentative exige un nouveau `run_slug`, un nouvel output local, un nouvel
 incoming root, un nouveau clone et une nouvelle campaign root. Aucun ancien run
 n'est supprimé, écrasé ou réutilisé.
 
+Le pack final contient également un `README.md` non expert lié au run, au commit,
+aux trois racines et aux trois services exacts. Il fait partie de
+`transfer-inventory.json` et est donc vérifié avant activation.
+
 ## Blocs opérateur générés, dans l'ordre
 
 Le répertoire final contient cinq fichiers distincts, avec chemins, services et
@@ -122,6 +136,12 @@ ou clé n'est inscrite dans le bundle. Chaque
 fichier annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal
 terminal.
 
+Dans B, un Ctrl+C après la première activation peut laisser uniquement les
+services Prediction Markets déjà démarrés actifs ; E `rollback` est alors le
+désarmement ciblé. E annonce un maximum de 12 minutes afin de couvrir les délais
+d'arrêt bornés des trois unités sans prétendre qu'une interruption les a toutes
+arrêtées. Aucune de ces actions ne supprime les preuves ni ne cible H1.
+
 ## Preflight cible
 
 Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
@@ -130,6 +150,8 @@ Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
 - CPython 3.12 x86_64, glibc >= 2.28 et primitives stdlib/venv/SSL ;
 - wheelhouse complet et hashé, sans environnement système ;
 - utilisateur `hyperlab`, HOME et chemins réels ;
+- parents dédiés `volume_base`, `sources/`, `campaigns/` non-symlinks, chemins
+  réels exacts, propriétaire `hyperlab` et mode `0700` réattestés avant clone ;
 - ext4 réel `rw`, capacité avec réservation H1, NTP ;
 - port loopback 18081 et absence des trois services/racines exacts ;
 - DNS officiel via un processus `getent` borné à 3 s par host, puis TLS/HTTPS
@@ -157,24 +179,37 @@ jamais zéro.
 Le holdout reste `SEALED`, sans lecture ni téléchargement de métrique dérivée.
 Les lectures refusent symlinks, fichiers spéciaux, traversées, payloads trop gros
 et incohérences avant/après. Les téléchargements sont une allowlist fixe de six
-artefacts techniques.
+artefacts techniques. La readiness exige le preflight et le reçu d'activation
+liés au `campaign_id`, au SHA logique du manifest, au commit et à la racine; le
+moniteur authentifie aussi le ledger et le state avant toute classification.
+Comme la boucle du runner se réveille au plus tard toutes les 30 secondes, un
+state encore `PREPARED` plus de 35 secondes après `starts_at_utc` devient
+`PREPARED_STALE` : le cockpit refuse alors sa readiness et le moniteur publie
+une alerte opérationnelle au lieu d'afficher `RUNNING`. Ce blocage n'est pas
+confondu avec une corruption `INTEGRITY_FAILED`.
 
 Fixtures synthétiques de QA : `PREPARED`, `BOTH_RUNNING`,
 `POLYMARKET_UNAVAILABLE_KALSHI_RUNNING`,
 `KALSHI_UNAVAILABLE_POLYMARKET_RUNNING`, `BOTH_UNAVAILABLE`,
 `STALE_RECONNECTING`, `INTEGRITY_FAILED`, `INTERRUPTED_RECOVERABLE`,
-`COMPLETE_WINDOW`, `HOLDOUT_SEALED`. Elles ne constituent aucune preuve
-économique.
+`COMPLETE_WINDOW`, `HOLDOUT_SEALED`, `POLYMARKET_PUBLIC_SOURCE_INVALID`,
+`KALSHI_PUBLIC_SOURCE_INVALID`, `BOTH_PUBLIC_SOURCE_INVALID`, états mixtes
+invalid/unavailable et `CAPACITY_REFUSED`. Elles ne constituent aucune preuve
+économique. Toute métrique issue d'un slot invalide reste `NON DISPONIBLE` même
+si son reçu conserve honnêtement des compteurs, un manifest et un root.
 
 ## Recovery et rollback
 
 `bash operator/E-recovery-rollback.sh recovery` revalide d'abord le handoff,
-NTP, ext4 `rw`, la réserve de capacité, les racines et imports offline. Il
+l'inventaire transféré, le HEAD Git propre, l'inventaire source, NTP, ext4 `rw`,
+la réserve de capacité, les racines et imports offline. Il
 redémarre ensuite le cockpit, refait un preflight public borné séparé pour
 Polymarket et Kalshi, puis ne redémarre que les collecteurs de ce handoff dont le
 nouveau verdict est vert. Les rapports de refus sont conservés dans l'incoming
 root. Les ledgers authentifiés déterminent les créneaux déjà terminaux et
-interdisent leur rejeu.
+interdisent leur rejeu. Après une reprise partielle, une exécution suivante
+tolère uniquement l'autre collecteur déjà actif si son unité, sa commande, son
+state et son ledger sont tous authentifiés.
 
 `bash operator/E-recovery-rollback.sh rollback` arrête et désactive uniquement
 ces trois services. Il ne supprime ni unité, source, venv, campagne, raw,

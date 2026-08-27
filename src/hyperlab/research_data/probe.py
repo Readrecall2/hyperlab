@@ -37,7 +37,12 @@ from .lighter import (
     LighterPublicAdapter,
     lighter_market_census,
 )
-from .prediction_contracts import BoundedCursorPager
+from .prediction_contracts import (
+    BoundedCursorPager,
+    normalize_kalshi_event_metadata,
+    normalize_polymarket_clob_v2_market,
+    polymarket_gamma_token_outcomes,
+)
 from .prediction_time import prediction_rfc3339_to_ns
 from .segments import (
     SEGMENT_SUFFIX,
@@ -46,6 +51,25 @@ from .segments import (
     ResearchSegmentWriter,
     decode_segment,
 )
+
+_TERMINAL_ERROR_MAX_UTF8_BYTES = 2_048
+
+
+def _bounded_terminal_error(value: str) -> str:
+    """Return deterministic non-empty UTF-8 text within the receipt contract."""
+
+    normalized = value.strip() or "UNSPECIFIED_PUBLIC_COLLECTION_ERROR"
+    raw = normalized.encode("utf-8")
+    if len(raw) <= _TERMINAL_ERROR_MAX_UTF8_BYTES:
+        return normalized
+    suffix = "...[TRUNCATED]"
+    prefix = raw[: _TERMINAL_ERROR_MAX_UTF8_BYTES - len(suffix)]
+    while prefix:
+        try:
+            return prefix.decode("utf-8") + suffix
+        except UnicodeDecodeError as error:
+            prefix = prefix[: error.start]
+    return suffix
 
 
 class HttpResponse(Protocol):
@@ -552,33 +576,15 @@ def _polymarket_tokens(census_payload: bytes, *, limit: int) -> tuple[tuple[str,
         if not isinstance(market, Mapping):
             continue
         market_id = str(market.get("conditionId") or "")
-        raw_tokens = market.get("clobTokenIds")
-        if isinstance(raw_tokens, str):
-            try:
-                raw_tokens = json.loads(raw_tokens)
-            except json.JSONDecodeError:
-                raw_tokens = None
-        raw_outcomes = market.get("outcomes")
-        if isinstance(raw_outcomes, str):
-            try:
-                raw_outcomes = json.loads(raw_outcomes)
-            except json.JSONDecodeError:
-                raw_outcomes = None
         if (
             not market_id
             or not market.get("questionID")
-            or not isinstance(raw_tokens, list)
-            or len(raw_tokens) != 2
-            or len({str(item) for item in raw_tokens if item}) != 2
-            or not isinstance(raw_outcomes, list)
-            or [str(item).upper() for item in raw_outcomes] != ["YES", "NO"]
         ):
             raise ValueError("Polymarket census market identity graph is incomplete")
-        for token in raw_tokens:
-            if token:
-                selected.append((str(token), market_id))
-                if len(selected) >= limit:
-                    return tuple(selected)
+        for token, _outcome in polymarket_gamma_token_outcomes(market):
+            selected.append((token, market_id))
+            if len(selected) >= limit:
+                return tuple(selected)
     return tuple(selected)
 
 
@@ -665,17 +671,19 @@ def _kalshi_series(event_payload: bytes, *, expected_event_ticker: str | None = 
 def _kalshi_event_metadata_record(
     payload: bytes,
     *,
+    provenance: CaptureProvenance,
     expected_event_ticker: str,
+    expected_market_ticker: str,
 ) -> Mapping[str, object]:
     decoded = json.loads(payload.decode("utf-8"))
-    if not isinstance(decoded, Mapping) or not isinstance(
-        decoded.get("event_metadata"), Mapping
-    ):
+    if not isinstance(decoded, Mapping) or "event_metadata" in decoded:
         raise ValueError("Kalshi event metadata payload is invalid")
-    metadata = cast(Mapping[str, object], decoded["event_metadata"])
-    if str(metadata.get("event_ticker") or "") != expected_event_ticker:
-        raise ValueError("Kalshi event metadata returned another event ticker")
-    return metadata
+    return normalize_kalshi_event_metadata(
+        cast(Mapping[str, object], decoded),
+        provenance=provenance,
+        expected_event_ticker=expected_event_ticker,
+        expected_market_ticker=expected_market_ticker,
+    )
 
 
 def _kalshi_series_record(
@@ -1142,13 +1150,11 @@ def _polymarket_rebootstrap_selected_markets(
         if len(gamma_markets) != 1:
             raise ValueError("Polymarket rebootstrap requires one Gamma market")
         gamma_market = gamma_markets[0]
-        gamma_tokens = gamma_market.get("clobTokenIds")
-        if isinstance(gamma_tokens, str):
-            gamma_tokens = json.loads(gamma_tokens)
+        gamma_token_outcomes = polymarket_gamma_token_outcomes(gamma_market)
+        gamma_tokens = {item[0] for item in gamma_token_outcomes}
         if (
             str(gamma_market.get("conditionId") or "") != market
-            or not isinstance(gamma_tokens, list)
-            or {str(item) for item in gamma_tokens} != expected_tokens
+            or not gamma_tokens.issuperset(expected_tokens)
         ):
             raise ValueError("Polymarket rebootstrap Gamma identity graph diverged")
         event_id = _polymarket_event_id(gamma_market)
@@ -1180,29 +1186,7 @@ def _polymarket_rebootstrap_selected_markets(
             max_response_bytes=_http_response_bound(config),
             budget=budget,
         )
-        clob_decoded = json.loads(clob_raw.decode("utf-8"))
-        if not isinstance(clob_decoded, Mapping):
-            raise ValueError("Polymarket rebootstrap CLOB market-info must be an object")
-        raw_clob_tokens = clob_decoded.get("tokens")
-        observed_tokens = (
-            {
-                str(item.get("token_id") or item.get("tokenId") or "")
-                for item in raw_clob_tokens
-                if isinstance(item, Mapping)
-            }
-            if isinstance(raw_clob_tokens, list)
-            else set()
-        )
-        if (
-            str(
-                clob_decoded.get("condition_id")
-                or clob_decoded.get("conditionId")
-                or ""
-            )
-            != market
-            or observed_tokens != expected_tokens
-        ):
-            raise ValueError("Polymarket rebootstrap CLOB identity graph diverged")
+        clob_provenance = _request_provenance(factory, clob_request)
         clob_envelope = adapter.envelope_from_http(
             clob_raw,
             feed_type="metadata",
@@ -1211,9 +1195,18 @@ def _polymarket_rebootstrap_selected_markets(
             factory=factory,
             receive_timestamp_utc_ns=time.time_ns(),
             receive_monotonic_ns=time.monotonic_ns(),
-            provenance=_request_provenance(factory, clob_request),
+            provenance=clob_provenance,
         )
         _append_probe_bounded(writer, counters, clob_envelope, config)
+        clob_decoded = json.loads(clob_raw.decode("utf-8"))
+        if not isinstance(clob_decoded, Mapping):
+            raise ValueError("Polymarket rebootstrap CLOB market-info must be an object")
+        normalize_polymarket_clob_v2_market(
+            cast(Mapping[str, object], clob_decoded),
+            provenance=clob_provenance,
+            expected_condition_id=market,
+            expected_token_outcomes=gamma_token_outcomes,
+        )
 
     if "events" in selected_feeds:
         event_ids = current_event_ids | resolved_event_ids
@@ -1291,6 +1284,7 @@ def _polymarket_probe(
     adapter = PolymarketPublicAdapter()
     selected_feeds = set(config.feeds)
     limitations: list[str] = []
+    market_token_outcomes: dict[str, tuple[tuple[str, str], ...]] = {}
     if config.instruments:
         resolved: list[tuple[str, str]] = []
         resolved_event_ids: set[str] = set()
@@ -1332,15 +1326,16 @@ def _polymarket_probe(
                 raise ValueError("Polymarket token must resolve to exactly one Gamma market")
             gamma_market = gamma_markets[0]
             gamma_condition = str(gamma_market.get("conditionId") or "")
-            gamma_tokens = gamma_market.get("clobTokenIds")
-            if isinstance(gamma_tokens, str):
-                gamma_tokens = json.loads(gamma_tokens)
+            gamma_token_outcomes = polymarket_gamma_token_outcomes(gamma_market)
+            gamma_tokens = {item[0] for item in gamma_token_outcomes}
             if (
                 gamma_condition != market
-                or not isinstance(gamma_tokens, list)
-                or token not in {str(item) for item in gamma_tokens}
+                or token not in gamma_tokens
             ):
                 raise ValueError("Polymarket CLOB/Gamma token identity graph diverged")
+            previous = market_token_outcomes.setdefault(market, gamma_token_outcomes)
+            if previous != gamma_token_outcomes:
+                raise ValueError("Polymarket Gamma token/outcome graph changed during census")
             gamma_envelope = adapter.envelope_from_http(
                 gamma_raw,
                 feed_type="metadata",
@@ -1403,6 +1398,12 @@ def _polymarket_probe(
                     resolved_event_ids.add(event_id)
                 single_page = _raw_json({"markets": [census_market], "next_cursor": None})
                 selected_token_markets.extend(_polymarket_tokens(single_page, limit=2))
+                token_outcomes = polymarket_gamma_token_outcomes(census_market)
+                previous = market_token_outcomes.setdefault(
+                    str(census_market["conditionId"]), token_outcomes
+                )
+                if previous != token_outcomes:
+                    raise ValueError("Polymarket Gamma token/outcome graph is duplicated")
             if next_cursor is None or pager.items >= config.census_limit:
                 break
             cursor = next_cursor
@@ -1410,7 +1411,9 @@ def _polymarket_probe(
     if not token_markets:
         raise LookupError("Polymarket census returned no public CLOB token")
     for market in sorted({item[1] for item in token_markets}):
-        expected_tokens = {token for token, known_market in token_markets if known_market == market}
+        expected_token_outcomes = market_token_outcomes.get(market)
+        if expected_token_outcomes is None:
+            raise ValueError("Polymarket Gamma token/outcome graph is absent")
         clob_request = adapter.clob_market_request(market)
         clob_raw = _execute_http(
             session,
@@ -1419,20 +1422,7 @@ def _polymarket_probe(
             max_response_bytes=_http_response_bound(config),
             budget=budget,
         )
-        clob_decoded = json.loads(clob_raw.decode("utf-8"))
-        if not isinstance(clob_decoded, Mapping):
-            raise ValueError("Polymarket CLOB market-info must be an object")
-        clob_condition = str(
-            clob_decoded.get("condition_id") or clob_decoded.get("conditionId") or ""
-        )
-        raw_clob_tokens = clob_decoded.get("tokens")
-        observed_tokens = {
-            str(item.get("token_id") or item.get("tokenId") or "")
-            for item in raw_clob_tokens
-            if isinstance(item, Mapping)
-        } if isinstance(raw_clob_tokens, list) else set()
-        if clob_condition != market or observed_tokens != expected_tokens:
-            raise ValueError("Polymarket CLOB market-info identity graph diverged")
+        clob_provenance = _request_provenance(factory, clob_request)
         clob_envelope = adapter.envelope_from_http(
             clob_raw,
             feed_type="metadata",
@@ -1441,9 +1431,18 @@ def _polymarket_probe(
             factory=factory,
             receive_timestamp_utc_ns=time.time_ns(),
             receive_monotonic_ns=time.monotonic_ns(),
-            provenance=_request_provenance(factory, clob_request),
+            provenance=clob_provenance,
         )
         _append_probe_bounded(writer, counters, clob_envelope, config)
+        clob_decoded = json.loads(clob_raw.decode("utf-8"))
+        if not isinstance(clob_decoded, Mapping):
+            raise ValueError("Polymarket CLOB market-info must be an object")
+        normalize_polymarket_clob_v2_market(
+            cast(Mapping[str, object], clob_decoded),
+            provenance=clob_provenance,
+            expected_condition_id=market,
+            expected_token_outcomes=expected_token_outcomes,
+        )
     if "events" in selected_feeds:
         if resolved_event_ids:
             for event_id in sorted(resolved_event_ids):
@@ -2001,7 +2000,9 @@ def _kalshi_probe(
             )
             _kalshi_event_metadata_record(
                 metadata_raw,
+                provenance=_request_provenance(factory, metadata_request),
                 expected_event_ticker=event_ticker,
+                expected_market_ticker=ticker,
             )
             series_request = adapter.requests_for_market(
                 ticker=ticker,
@@ -2063,7 +2064,9 @@ def _kalshi_probe(
             )
             _kalshi_event_metadata_record(
                 metadata_raw,
+                provenance=_request_provenance(factory, metadata_request),
                 expected_event_ticker=event_ticker,
+                expected_market_ticker=ticker,
             )
             series_request = adapter.requests_for_market(
                 ticker=ticker,
@@ -2474,20 +2477,20 @@ def run_public_probe(
         manifest = writer.close()
     except ResearchDataCapacityError as caught:
         terminal = "MAX_BYTES_REACHED"
-        error = str(caught)
+        error = _bounded_terminal_error(str(caught))
         manifest = writer.close()
     except BufferError as caught:
         terminal = "BACKPRESSURE_LIMIT_REACHED"
         counters.gaps += 1
-        error = f"{type(caught).__name__}:{caught}"
+        error = _bounded_terminal_error(f"{type(caught).__name__}:{caught}")
         manifest = writer.close()
     except (ConnectionError, LookupError, TimeoutError, OSError) as caught:
         terminal = "PUBLIC_SOURCE_UNAVAILABLE"
-        error = f"{type(caught).__name__}:{caught}"
+        error = _bounded_terminal_error(f"{type(caught).__name__}:{caught}")
         manifest = writer.close()
     except ValueError as caught:
         terminal = "PUBLIC_SOURCE_INVALID"
-        error = f"{type(caught).__name__}:{caught}"
+        error = _bounded_terminal_error(f"{type(caught).__name__}:{caught}")
         manifest = writer.close()
     except BaseException:
         writer.abort()
@@ -2575,6 +2578,7 @@ def recover_public_probe_output(
         raise ValueError("recovery terminal health cannot claim a normal or green run")
     if not error:
         raise ValueError("recovery requires the preserved process error")
+    error = _bounded_terminal_error(error)
     if (reports_root / "result.json").exists():
         raise ValueError("recovery refuses an output that already has a terminal result")
     try:

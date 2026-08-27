@@ -460,14 +460,28 @@ def _systemd_collision(service: str, run: CommandRunner) -> dict[str, object]:
             "--no-pager",
         ]
     )
+    if result.returncode != 0:
+        raise PreflightError(
+            f"systemd service identity check failed: {service}: {result.stderr or 'no diagnostic'}"
+        )
     values: dict[str, str] = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if separator:
             values[key] = value
-    load = values.get("LoadState", "not-found")
-    active = values.get("ActiveState", "inactive")
-    if load not in {"", "not-found"} or active == "active":
+    expected = {"LoadState", "ActiveState", "SubState", "MainPID"}
+    if set(values) != expected:
+        raise PreflightError(f"systemd service identity is incomplete: {service}")
+    load = values["LoadState"]
+    active = values["ActiveState"]
+    sub = values["SubState"]
+    main_pid = values["MainPID"]
+    if (
+        load != "not-found"
+        or active != "inactive"
+        or sub != "dead"
+        or main_pid != "0"
+    ):
         raise PreflightError(f"service collision: {service} load={load} active={active}")
     return {"active_state": active, "load_state": load, "service": service}
 
@@ -489,6 +503,23 @@ def host_preflight(
             raise PreflightError("preflight must run as the dedicated service user")
         if Path.home().as_posix() != f"/home/{handoff.get('service_user')}":
             raise PreflightError("service user HOME diverged")
+        volume_base = Path(str(handoff["volume_base"]))
+        expected_parents = {
+            "volume_base": volume_base,
+            "source_parent": Path(str(handoff["source_root"])).parent,
+            "campaign_parent": Path(str(handoff["campaign_root"])).parent,
+        }
+        if (
+            expected_parents["source_parent"] != volume_base / "sources"
+            or expected_parents["campaign_parent"] != volume_base / "campaigns"
+        ):
+            raise PreflightError("attempt parent roots leave the dedicated Prediction Markets tree")
+        for label, candidate in expected_parents.items():
+            if candidate.is_symlink() or (
+                candidate.exists()
+                and (not candidate.is_dir() or candidate.resolve(strict=True) != candidate)
+            ):
+                raise PreflightError(f"{label} is an unsafe existing path")
         for name in (
             "df",
             "findmnt",
@@ -539,6 +570,8 @@ def host_preflight(
         if "rw" not in options or "ro" in options:
             raise PreflightError("campaign filesystem is not read-write")
         capacity = run(["df", "-PB1", mount])
+        if capacity.returncode != 0:
+            raise PreflightError(f"campaign capacity check failed: {capacity.stderr}")
         available = _parse_df_available(capacity.stdout)
         disk = handoff.get("disk")
         if not isinstance(disk, Mapping):
@@ -561,7 +594,7 @@ def host_preflight(
         }
         for key in ("source_root", "campaign_root"):
             candidate = Path(str(handoff[key]))
-            if candidate.exists():
+            if candidate.exists() or candidate.is_symlink():
                 raise PreflightError(f"unique {key} already exists")
         dashboard_port = handoff.get("dashboard_port")
         if type(dashboard_port) is not int or not 1024 <= dashboard_port <= 65535:
@@ -615,11 +648,18 @@ def host_preflight(
 def fsync_probe(handoff_path: Path) -> dict[str, object]:
     handoff = load_handoff(handoff_path)
     base = Path(str(handoff["volume_base"]))
-    if base.is_symlink() or not base.is_dir() or base.resolve(strict=True) != base:
-        raise PreflightError("dedicated Prediction Markets volume base is absent or unsafe")
     getuid = getattr(os, "getuid", lambda: -1)
-    if base.stat().st_uid != getuid() or (base.stat().st_mode & 0o777) != 0o700:
-        raise PreflightError("dedicated volume base ownership or mode diverged")
+    roots = (base, base / "sources", base / "campaigns")
+    for root in roots:
+        if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
+            raise PreflightError(
+                "dedicated Prediction Markets parent root is absent or unsafe"
+            )
+        identity = root.stat()
+        if identity.st_uid != getuid() or (identity.st_mode & 0o777) != 0o700:
+            raise PreflightError(
+                "dedicated Prediction Markets parent ownership or mode diverged"
+            )
     probe = base / f".prediction-fsync-probe-{uuid4().hex}"
     descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -640,6 +680,7 @@ def fsync_probe(handoff_path: Path) -> dict[str, object]:
     return {
         "boundary": BOUNDARY,
         "filesystem_write_surface": str(base),
+        "parent_roots": [str(root) for root in roots],
         "probe_removed": not probe.exists(),
         "recorded_at_utc": _utc_now_text(),
         "schema_version": 1,
@@ -675,6 +716,51 @@ def resume_preflight(
         runtime = source / ".venv" / "bin" / "python"
         if runtime.is_symlink() or not runtime.is_file():
             raise PreflightError("resume offline Python is absent or unsafe")
+        incoming = Path(str(handoff["incoming_root"]))
+        transfer = verify_transfer_inventory(incoming, handoff)
+        source_commit = handoff.get("source_commit")
+        source_inventory_sha256 = _validate_sha256(
+            handoff.get("source_inventory_sha256"),
+            label="resume source inventory hash",
+        )
+        if (
+            type(source_commit) is not str
+            or len(source_commit) != 40
+            or any(character not in _SHA256 for character in source_commit)
+        ):
+            raise PreflightError("resume source commit is invalid")
+        identity_command = run(
+            [
+                str(runtime),
+                "-I",
+                str(incoming / "scripts" / "launch_pack.py"),
+                "verify-source",
+                "--source-root",
+                str(source),
+                "--inventory",
+                str(incoming / "source-inventory.json"),
+                "--expected-commit",
+                source_commit,
+            ]
+        )
+        if identity_command.returncode != 0:
+            raise PreflightError(
+                f"resume source identity failed: {identity_command.stderr}"
+            )
+        try:
+            source_identity = json.loads(identity_command.stdout)
+        except json.JSONDecodeError as error:
+            raise PreflightError("resume source identity output is invalid") from error
+        if (
+            not isinstance(source_identity, dict)
+            or set(source_identity) != {"commit", "files", "inventory_sha256", "status"}
+            or source_identity.get("commit") != source_commit
+            or type(source_identity.get("files")) is not int
+            or int(source_identity["files"]) <= 0
+            or source_identity.get("inventory_sha256") != source_inventory_sha256
+            or source_identity.get("status") != "PREDICTION_SOURCE_IDENTITY_GREEN"
+        ):
+            raise PreflightError("resume source identity result diverged")
         imported = run(
             [
                 str(runtime),
@@ -707,6 +793,8 @@ def resume_preflight(
         ):
             raise PreflightError("resume filesystem is not the admitted ext4 rw mount")
         capacity = run(["df", "-PB1", mount])
+        if capacity.returncode != 0:
+            raise PreflightError(f"resume capacity check failed: {capacity.stderr}")
         available = _parse_df_available(capacity.stdout)
         disk = handoff.get("disk")
         if not isinstance(disk, Mapping) or type(disk.get("required_free_bytes")) is not int:
@@ -727,6 +815,8 @@ def resume_preflight(
             "ntp": {"synchronized": True},
             "offline_imports": {"verified": True},
             "roots": {"campaign": str(campaign), "source": str(source)},
+            "source_identity": source_identity,
+            "transfer_identity": transfer,
         }
     except (OSError, PreflightError, subprocess.SubprocessError) as error:
         errors.append(str(error))
@@ -743,6 +833,308 @@ def resume_preflight(
             else "PREDICTION_RESUME_PREFLIGHT_REFUSED"
         ),
     }
+
+
+def recovery_initial_admission(handoff_path: Path) -> dict[str, object]:
+    """Authenticate why a venue may legitimately have no runtime state yet."""
+
+    handoff = load_handoff(handoff_path)
+    campaign_root = Path(str(handoff.get("campaign_root") or ""))
+    if not campaign_root.is_absolute():
+        raise PreflightError("recovery campaign root is not absolute")
+    state_root = campaign_root / "state"
+    manifest_path = campaign_root / "campaign-manifest.json"
+    manifest_raw = _safe_regular_bytes(manifest_path)
+    manifest = _object(manifest_path)
+    manifest_pin = (
+        _safe_regular_bytes(campaign_root / "campaign-manifest.sha256", maximum_bytes=256)
+        .decode("ascii")
+        .strip()
+        .split()
+    )
+    claimed_manifest = _validate_sha256(
+        manifest.get("manifest_sha256"), label="campaign manifest logical hash"
+    )
+    manifest_body = {
+        key: value for key, value in manifest.items() if key != "manifest_sha256"
+    }
+    if (
+        manifest_raw != canonical_json_bytes(manifest) + b"\n"
+        or sha256_bytes(canonical_json_bytes(manifest_body)) != claimed_manifest
+        or len(manifest_pin) != 2
+        or manifest_pin[1] != "campaign-manifest.json"
+        or sha256_bytes(manifest_raw) != manifest_pin[0]
+    ):
+        raise PreflightError("campaign manifest authentication failed during recovery")
+    activation_path = state_root / "activation-receipt.json"
+    preflight_path = state_root / "preflight-report.json"
+    activation_raw = _safe_regular_bytes(activation_path)
+    preflight_raw = _safe_regular_bytes(preflight_path)
+    try:
+        activation = json.loads(activation_raw.decode("utf-8"))
+        preflight = json.loads(preflight_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError("recovery admission JSON is invalid") from error
+    if not isinstance(activation, dict) or not isinstance(preflight, dict):
+        raise PreflightError("recovery admission roots must be objects")
+    if activation_raw != canonical_json_bytes(activation) + b"\n":
+        raise PreflightError("activation receipt is not canonical JSON with LF")
+    if preflight_raw != canonical_json_bytes(preflight) + b"\n":
+        raise PreflightError("initial preflight report is not canonical JSON with LF")
+    expected_activation_fields = {
+        "boundary",
+        "campaign_id",
+        "campaign_manifest_sha256",
+        "campaign_root",
+        "dashboard_port",
+        "eligible_venues",
+        "economic_evidence_status",
+        "h1_actions",
+        "preflight_report_sha256",
+        "quick_start",
+        "receipt_sha256",
+        "recorded_at_utc",
+        "schema_version",
+        "source_commit",
+        "starts_at_utc",
+    }
+    if set(activation) != expected_activation_fields:
+        raise PreflightError("activation receipt fields diverged")
+    claimed_receipt = _validate_sha256(
+        activation.get("receipt_sha256"), label="activation receipt hash"
+    )
+    activation_body = {
+        key: value for key, value in activation.items() if key != "receipt_sha256"
+    }
+    if sha256_bytes(canonical_json_bytes(activation_body)) != claimed_receipt:
+        raise PreflightError("activation receipt self-hash diverged")
+    if (
+        activation.get("boundary") != BOUNDARY
+        or activation.get("schema_version") != 1
+        or activation.get("campaign_id") != manifest.get("campaign_id")
+        or activation.get("campaign_manifest_sha256") != claimed_manifest
+        or activation.get("starts_at_utc") != manifest.get("starts_at_utc")
+        or activation.get("campaign_root") != str(campaign_root)
+        or activation.get("source_commit") != handoff.get("source_commit")
+        or activation.get("dashboard_port") != handoff.get("dashboard_port")
+        or activation.get("economic_evidence_status")
+        != "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE"
+        or activation.get("h1_actions") != "NONE"
+        or type(activation.get("quick_start")) is not bool
+    ):
+        raise PreflightError("activation receipt binding diverged")
+    for field in ("recorded_at_utc", "starts_at_utc"):
+        value = activation.get(field)
+        if not isinstance(value, str):
+            raise PreflightError(f"activation {field} is absent")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise PreflightError(f"activation {field} is invalid") from error
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise PreflightError(f"activation {field} is not timezone-aware")
+    expected_preflight_sha = _validate_sha256(
+        activation.get("preflight_report_sha256"),
+        label="activation preflight report hash",
+    )
+    if sha256_bytes(preflight_raw) != expected_preflight_sha:
+        raise PreflightError("initial preflight report hash diverged")
+    eligible = activation.get("eligible_venues")
+    if (
+        not isinstance(eligible, list)
+        or any(
+            not isinstance(item, str) or item not in {"polymarket", "kalshi"}
+            for item in eligible
+        )
+        or len(set(eligible)) != len(eligible)
+        or preflight.get("eligible_venues") != eligible
+        or preflight.get("boundary") != BOUNDARY
+        or preflight.get("installation_admissible") is not True
+        or preflight.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+    ):
+        raise PreflightError("initial preflight admission fields diverged")
+    network = preflight.get("network")
+    if not isinstance(network, dict) or set(network) != {"polymarket", "kalshi"}:
+        raise PreflightError("initial per-venue network admission is absent")
+    admission: dict[str, object] = {}
+    for venue in ("polymarket", "kalshi"):
+        record = network.get(venue)
+        if not isinstance(record, dict) or not isinstance(record.get("verdict"), str):
+            raise PreflightError(f"initial {venue} network verdict is invalid")
+        verdict = record["verdict"]
+        admitted = venue in eligible
+        if admitted != (verdict == "NETWORK_PREFLIGHT_GREEN"):
+            raise PreflightError(f"initial {venue} eligibility and network verdict diverged")
+        if not admitted and verdict != "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT":
+            raise PreflightError(f"initial {venue} refusal is not a public-source verdict")
+        admission[venue] = {"eligible": admitted, "network_verdict": verdict}
+    return {
+        "admission_by_venue": admission,
+        "boundary": BOUNDARY,
+        "campaign_root": str(campaign_root),
+        "schema_version": 1,
+        "source_commit": handoff["source_commit"],
+        "terminal_signal": "PREDICTION_RECOVERY_INITIAL_ADMISSION_AUTHENTICATED",
+    }
+
+
+_RECOVERY_NETWORK_ADMISSION_FIELDS = {
+    "boundary",
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "campaign_root",
+    "handoff_sha256",
+    "initial_preflight_report_sha256",
+    "network_report",
+    "network_report_sha256",
+    "receipt_sha256",
+    "recorded_at_utc",
+    "schema_version",
+    "source_commit",
+    "source_root",
+    "terminal_signal",
+    "venue",
+}
+
+
+def validate_recovery_network_admission(
+    record: Mapping[str, object],
+    *,
+    handoff: Mapping[str, object],
+    handoff_sha256: str,
+    initial_preflight_sha256: str,
+    campaign_id: str,
+    campaign_manifest_sha256: str,
+    venue: str,
+) -> None:
+    if set(record) != _RECOVERY_NETWORK_ADMISSION_FIELDS:
+        raise PreflightError("recovery network admission fields diverged")
+    claimed_receipt = _validate_sha256(
+        record.get("receipt_sha256"), label="recovery admission receipt hash"
+    )
+    body = {key: value for key, value in record.items() if key != "receipt_sha256"}
+    network = record.get("network_report")
+    network_sha256 = _validate_sha256(
+        record.get("network_report_sha256"), label="recovery network report hash"
+    )
+    recorded_at = record.get("recorded_at_utc")
+    try:
+        parsed_at = datetime.fromisoformat(str(recorded_at).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise PreflightError("recovery network admission time is invalid") from error
+    if (
+        sha256_bytes(canonical_json_bytes(body)) != claimed_receipt
+        or not isinstance(network, Mapping)
+        or network.get("venue") != venue
+        or network.get("verdict") != "NETWORK_PREFLIGHT_GREEN"
+        or sha256_bytes(canonical_json_bytes(network) + b"\n") != network_sha256
+        or record.get("boundary") != BOUNDARY
+        or record.get("campaign_id") != campaign_id
+        or record.get("campaign_manifest_sha256") != campaign_manifest_sha256
+        or record.get("campaign_root") != handoff.get("campaign_root")
+        or record.get("handoff_sha256") != handoff_sha256
+        or record.get("initial_preflight_report_sha256") != initial_preflight_sha256
+        or record.get("schema_version") != 1
+        or record.get("source_commit") != handoff.get("source_commit")
+        or record.get("source_root") != handoff.get("source_root")
+        or record.get("terminal_signal")
+        != "PREDICTION_RECOVERY_NETWORK_ADMISSION_AUTHENTICATED"
+        or record.get("venue") != venue
+        or not isinstance(recorded_at, str)
+        or parsed_at.tzinfo is None
+        or parsed_at.utcoffset() is None
+    ):
+        raise PreflightError("recovery network admission binding diverged")
+
+
+def recovery_network_admission(
+    handoff_path: Path,
+    network_report_path: Path,
+    *,
+    venue: str,
+    output_path: Path,
+) -> dict[str, object]:
+    if venue not in {"polymarket", "kalshi"}:
+        raise PreflightError("recovery admission venue is invalid")
+    handoff_raw = _safe_regular_bytes(handoff_path)
+    handoff = load_handoff(handoff_path)
+    campaign_root = Path(str(handoff.get("campaign_root") or "")).resolve(strict=True)
+    expected_output = campaign_root / "state" / f"recovery-admission-{venue}.json"
+    if output_path != expected_output or output_path.parent.is_symlink():
+        raise PreflightError("recovery admission output escaped its fixed campaign state path")
+    preflight_path = campaign_root / "state" / "preflight-report.json"
+    preflight_raw = _safe_regular_bytes(preflight_path)
+    preflight = _object(preflight_path)
+    initial_network = preflight.get("network")
+    eligible = preflight.get("eligible_venues")
+    if (
+        not isinstance(initial_network, Mapping)
+        or not isinstance(initial_network.get(venue), Mapping)
+        or initial_network[venue].get("verdict") != "PUBLIC_SOURCE_UNAVAILABLE_PREFLIGHT"
+        or not isinstance(eligible, list)
+        or venue in eligible
+    ):
+        raise PreflightError("recovery admission is not for an initially unavailable venue")
+    network_raw = _safe_regular_bytes(network_report_path)
+    network = _object(network_report_path)
+    if network_raw != canonical_json_bytes(network) + b"\n":
+        raise PreflightError("recovery network report is not canonical JSON with LF")
+    if network.get("venue") != venue or network.get("verdict") != "NETWORK_PREFLIGHT_GREEN":
+        raise PreflightError("recovery network report is not a GREEN verdict for the venue")
+    manifest_path = campaign_root / "campaign-manifest.json"
+    manifest = _object(manifest_path)
+    claimed_manifest = _validate_sha256(
+        manifest.get("manifest_sha256"), label="campaign manifest logical hash"
+    )
+    manifest_body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if sha256_bytes(canonical_json_bytes(manifest_body)) != claimed_manifest:
+        raise PreflightError("campaign manifest logical hash diverged during recovery admission")
+    handoff_sha256 = sha256_bytes(handoff_raw)
+    initial_preflight_sha256 = sha256_bytes(preflight_raw)
+    campaign_id = str(manifest.get("campaign_id") or "")
+    if output_path.exists() or output_path.is_symlink():
+        existing_raw = _safe_regular_bytes(output_path)
+        existing = _object(output_path)
+        if existing_raw != canonical_json_bytes(existing) + b"\n":
+            raise PreflightError("recovery network admission is not canonical JSON with LF")
+        validate_recovery_network_admission(
+            existing,
+            handoff=handoff,
+            handoff_sha256=handoff_sha256,
+            initial_preflight_sha256=initial_preflight_sha256,
+            campaign_id=campaign_id,
+            campaign_manifest_sha256=claimed_manifest,
+            venue=venue,
+        )
+        return existing
+    body: dict[str, object] = {
+        "boundary": BOUNDARY,
+        "campaign_id": campaign_id,
+        "campaign_manifest_sha256": claimed_manifest,
+        "campaign_root": str(campaign_root),
+        "handoff_sha256": handoff_sha256,
+        "initial_preflight_report_sha256": initial_preflight_sha256,
+        "network_report": network,
+        "network_report_sha256": sha256_bytes(network_raw),
+        "recorded_at_utc": _utc_now_text(),
+        "schema_version": 1,
+        "source_commit": handoff["source_commit"],
+        "source_root": handoff["source_root"],
+        "terminal_signal": "PREDICTION_RECOVERY_NETWORK_ADMISSION_AUTHENTICATED",
+        "venue": venue,
+    }
+    record = {**body, "receipt_sha256": sha256_bytes(canonical_json_bytes(body))}
+    validate_recovery_network_admission(
+        record,
+        handoff=handoff,
+        handoff_sha256=handoff_sha256,
+        initial_preflight_sha256=initial_preflight_sha256,
+        campaign_id=campaign_id,
+        campaign_manifest_sha256=claimed_manifest,
+        venue=venue,
+    )
+    _atomic_report(output_path, record)
+    return record
 
 
 def _atomic_report(path: Path, report: Mapping[str, object]) -> None:
@@ -777,6 +1169,16 @@ def _parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume")
     resume.add_argument("--handoff", type=Path, required=True)
     resume.add_argument("--report", type=Path, required=True)
+    recovery_admission = subparsers.add_parser("recovery-admission")
+    recovery_admission.add_argument("--handoff", type=Path, required=True)
+    recovery_admission.add_argument("--report", type=Path, required=True)
+    recovery_network = subparsers.add_parser("recovery-network-admit")
+    recovery_network.add_argument("--handoff", type=Path, required=True)
+    recovery_network.add_argument("--network-report", type=Path, required=True)
+    recovery_network.add_argument(
+        "--venue", choices=("polymarket", "kalshi"), required=True
+    )
+    recovery_network.add_argument("--report", type=Path, required=True)
     return parser
 
 
@@ -788,12 +1190,23 @@ def _fail(message: str) -> NoReturn:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        if arguments.command == "recovery-network-admit":
+            report = recovery_network_admission(
+                arguments.handoff,
+                arguments.network_report,
+                venue=arguments.venue,
+                output_path=arguments.report,
+            )
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
         if arguments.command == "host":
             report = host_preflight(arguments.handoff)
         elif arguments.command == "fsync":
             report = fsync_probe(arguments.handoff)
         elif arguments.command == "resume":
             report = resume_preflight(arguments.handoff)
+        elif arguments.command == "recovery-admission":
+            report = recovery_initial_admission(arguments.handoff)
         else:
             report = probe_venue_connectivity(arguments.venue)
         _atomic_report(arguments.report, report)

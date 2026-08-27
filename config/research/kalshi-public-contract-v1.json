@@ -177,10 +177,17 @@
     "edges": [
       "series.series_ticker -> event.series_ticker",
       "event.event_ticker -> market.event_ticker",
+      "event.event_ticker -> GET /events/{event_ticker}/metadata path",
+      "event metadata market_details[].market_ticker -> market.ticker",
       "market.ticker -> trade.ticker",
       "market.ticker -> orderbook market"
     ],
     "identifiers": ["series_ticker", "event_ticker", "ticker", "trade_id"],
+    "event_metadata_contract": {
+      "event_identity_authority": "AUTHENTICATED_REQUEST_PATH_ONLY",
+      "legacy_event_metadata_wrapper": "REFUSED",
+      "response_shape": "DIRECT_ROOT_OBJECT"
+    },
     "required_rule_fields": [
       "rules_primary",
       "rules_secondary",

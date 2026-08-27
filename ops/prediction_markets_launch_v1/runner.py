@@ -23,6 +23,8 @@ from hyperlab.research_data.prediction_candidate import (
     validate_prediction_campaign_manifest,
 )
 from hyperlab.research_data.prediction_contracts import OfficialPublicContract
+from hyperlab.research_data.prediction_evidence import PredictionRawEvidenceIndex
+from hyperlab.research_data.segments import ResearchSegmentReader
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 ECONOMIC_STATUS = "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE"
@@ -497,10 +499,61 @@ def _recover_command(
     ]
 
 
-def _validate_result(output_root: Path, context: CampaignContext, venue: Venue) -> dict[str, Any]:
+def _datetime_utc_ns(value: datetime) -> int:
+    normalized = value.astimezone(UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = normalized - epoch
+    return (
+        delta.days * 86_400_000_000_000
+        + delta.seconds * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+def _validate_result(
+    output_root: Path,
+    context: CampaignContext,
+    venue: Venue,
+    *,
+    ordinal: int,
+) -> dict[str, Any]:
     try:
         binding = PredictionCollectionBinding.from_probe_output(output_root)
-        binding.verify_collection_plan(context.preregistration.collection_plans[venue])
+        plan = context.preregistration.collection_plans[venue]
+        binding.verify_collection_plan(plan)
+        campaign_sha256 = str(context.manifest["manifest_sha256"])
+        contract = context.contracts[venue]
+        scheduled_start = _slot_start(context, ordinal)
+        expected_collection_id = context.preregistration.prospective_shard_policy.collection_id(
+            base_collection_id=plan.collection_id(str(context.manifest["campaign_id"])),
+            campaign_manifest_sha256=campaign_sha256,
+            venue=venue,
+            ordinal=ordinal,
+            scheduled_start=scheduled_start,
+        )
+        expected_cutoff = _datetime_utc_ns(scheduled_start) + context.cadence_seconds * 1_000_000_000
+        if (
+            binding.venue is not venue
+            or binding.campaign_manifest_sha256 != campaign_sha256
+            or binding.candidate_config_sha256 != context.preregistration.config_sha256
+            or binding.official_contract_sha256 != contract.contract_sha256
+            or binding.collection_id != expected_collection_id
+            or binding.payload.get("collection_cutoff_utc_ns_exclusive") != expected_cutoff
+        ):
+            raise ValueError("prediction terminal collection identity diverged from the scheduled slot")
+        if binding.raw_manifest_sha256 is None:
+            raise ValueError("prediction terminal collection lacks its raw manifest identity")
+        reader = ResearchSegmentReader(
+            output_root / "raw",
+            manifest_sha256=binding.raw_manifest_sha256,
+        )
+        index = PredictionRawEvidenceIndex(reader, contracts=context.contracts)
+        binding.verify(index, contract=contract)
+        if any(
+            envelope.receive_timestamp_utc_ns >= expected_cutoff
+            for envelope in index.envelopes
+        ):
+            raise ValueError("prediction terminal collection contains post-cutoff raw evidence")
     except (OSError, ValueError) as error:
         raise RunnerError(f"terminal collection receipt failed authentication: {error}") from error
     result = _object(output_root / "reports" / "result.json")
@@ -628,7 +681,12 @@ class VenueRunner:
         self._publish("COLLECTING", ordinal=ordinal)
         if output_root.exists():
             if (output_root / "reports" / "result.json").exists():
-                result = _validate_result(output_root, self.context, self.venue)
+                result = _validate_result(
+                    output_root,
+                    self.context,
+                    self.venue,
+                    ordinal=ordinal,
+                )
             elif any((output_root / "raw" / "segments").glob("*.rdpseg")):
                 command = _recover_command(
                     python=self.python,
@@ -640,7 +698,12 @@ class VenueRunner:
                 completed = subprocess.run(command, check=False, cwd=self.source_root)
                 if completed.returncode != 0:
                     raise RunnerError("authenticated recovery command failed")
-                result = _validate_result(output_root, self.context, self.venue)
+                result = _validate_result(
+                    output_root,
+                    self.context,
+                    self.venue,
+                    ordinal=ordinal,
+                )
             else:
                 append_ledger(
                     self.ledger_path,
@@ -677,7 +740,12 @@ class VenueRunner:
             return_code = self.child.wait()
             self.child = None
             if (output_root / "reports" / "result.json").exists():
-                result = _validate_result(output_root, self.context, self.venue)
+                result = _validate_result(
+                    output_root,
+                    self.context,
+                    self.venue,
+                    ordinal=ordinal,
+                )
             elif any((output_root / "raw" / "segments").glob("*.rdpseg")):
                 recovery = subprocess.run(
                     _recover_command(
@@ -693,7 +761,12 @@ class VenueRunner:
                 )
                 if recovery.returncode != 0:
                     raise RunnerError("authenticated recovery command failed")
-                result = _validate_result(output_root, self.context, self.venue)
+                result = _validate_result(
+                    output_root,
+                    self.context,
+                    self.venue,
+                    ordinal=ordinal,
+                )
             else:
                 append_ledger(
                     self.ledger_path,

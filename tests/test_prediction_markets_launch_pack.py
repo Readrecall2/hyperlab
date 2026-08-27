@@ -362,6 +362,9 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     assert "ReadWritePaths=" in kalshi and "/kalshi" in kalshi
     assert "ReadWritePaths=" not in dashboard
     assert "--host 127.0.0.1 --port 18081" in dashboard
+    for collector in (polymarket, kalshi):
+        assert "RestartPreventExitStatus=4" in collector
+    assert "RestartPreventExitStatus=4" not in dashboard
     for unit in units.values():
         assert "User=hyperlab" in unit
         assert "NoNewPrivileges=yes" in unit

@@ -905,7 +905,10 @@ class PredictionCollectionBinding:
             max_segment_bytes,
             max_segments,
         )
-        recovered = terminal_health == "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED"
+        error_required = terminal_health in {
+            "MAX_BYTES_REACHED",
+            "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+        }
         accepted_terminal = {
             "COMPLETE",
             "MAX_BYTES_REACHED",
@@ -943,8 +946,14 @@ class PredictionCollectionBinding:
                 for character in value
             )
             or terminal_health not in accepted_terminal
-            or (recovered and not isinstance(result.get("error"), str))
-            or (not recovered and result.get("error") is not None)
+            or (
+                error_required
+                and (
+                    type(result.get("error")) is not str
+                    or not cast(str, result.get("error")).strip()
+                )
+            )
+            or (not error_required and result.get("error") is not None)
             or result.get("probe_binding_sha256") != binding.probe_binding_sha256
             or result.get("campaign_manifest_sha256") != binding.campaign_manifest_sha256
             or result.get("candidate_config_sha256") != binding.candidate_config_sha256

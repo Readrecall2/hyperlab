@@ -317,6 +317,7 @@ SendSIGKILL=no
 Restart=on-failure
 RestartSec=60
 SuccessExitStatus=0 130
+RestartPreventExitStatus=4
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+{
+  "base_commit": "3f188b9c28c9fec406b904a9e3307b43f54243e8",
+  "access_bundle_sha256": "965a42f2169c16201323477c0eb1ba7a8b540b24109c1d9252d5d9fcce55bbe5",
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "campaign_manifest_sha256": "c9eb654d077ba1c3cf4cf709c2633077f40fc55d5f9533ce82d498564cd66388",
+  "campaign_pack_path": "ops/prediction_markets_candidate_v1/prediction-markets-v1-20260901t000000z-aa60c0ff",
+  "candidate_config_sha256": "aa60c0ff0ef95813d79f56b6ea93a31952061b562905dc9729162f7b16e41964",
+  "dashboard_port": 18081,
+  "disk": {
+    "h1_reserved_bytes": 154618822656,
+    "prediction_maximum_raw_bytes": 22548578304,
+    "safety_margin_bytes": 17179869184,
+    "required_free_bytes": 194347270144
+  },
+  "economic_evidence_status": "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE",
+  "expected_branch": "codex/prediction-markets-prospective-launch-v1",
+  "expected_shards_per_venue": 672,
+  "incoming_staging_max_bytes": 1073741824,
+  "pack_id": "prediction-markets-prospective-launch-v1",
+  "python": {
+    "implementation": "CPython",
+    "major": 3,
+    "minimum_glibc": "2.28",
+    "minor": 12,
+    "target_architecture": "x86_64"
+  },
+  "remote": {
+    "home_parent": "/home/hyperlab/hyperlab-prediction-markets/incoming",
+    "volume_base": "/mnt/HC_Volume_106716684/hyperlab-prediction-markets",
+    "volume_mount": "/mnt/HC_Volume_106716684"
+  },
+  "schema_version": 1,
+  "service_user": "hyperlab"
+}

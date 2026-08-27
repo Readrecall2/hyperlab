@@ -236,6 +236,12 @@ porte :
 Ce pack est du texte opérateur local. Il n'a pas été lancé et ne doit jamais
 viser le chemin H1 actif.
 
+Le successeur opérationnel réutilisant ce candidat sans le dupliquer est décrit
+dans [`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1.md`](PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1.md).
+Il ajoute uniquement le packaging humain, les services séparés, le preflight
+fail-closed, la persistance/reprise et le cockpit loopback; les adaptateurs,
+segments/manifests, contrats, replay et identités du candidat restent canoniques.
+
 ## CLI locale
 
 Préparer une nouvelle campagne, sans réseau :

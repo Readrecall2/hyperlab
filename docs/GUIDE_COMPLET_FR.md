@@ -48,6 +48,12 @@ Testnet, ni Gate E, n'est déclaré accompli par la seule présence du logiciel.
 
 C'est volontaire. La première version doit construire une base que l'on peut auditer, pas une boîte noire autorisée à risquer de l'argent.
 
+Le candidat Prediction Markets dispose en outre d'un pack prospectif séparé,
+strictement public/Ghost/Paper, avec services Polymarket/Kalshi indépendants et
+cockpit loopback 18081. Il ne partage aucun service, port ou répertoire H1 et
+n'est lancé que par un humain après preflight fail-closed. Voir
+[`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1.md`](PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1.md).
+
 ---
 
 ## 2. Architecture retenue

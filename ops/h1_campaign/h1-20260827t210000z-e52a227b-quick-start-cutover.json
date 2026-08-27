@@ -1,0 +1,17 @@
+{
+  "campaign_slug": "h1-20260827t210000z-e52a227b",
+  "cutover_status": "V8_CUTOVER_PLANNED_V7_DISABLE_NOT_YET_EXECUTED",
+  "evidence_source": "USER_ATTESTED_VPS_STATE_AT_2026-08-27T00:05:12Z",
+  "observed_health": {
+    "manifest_sha256": null,
+    "raw_root_sha256": null,
+    "terminal_health": "PREPARED_NOT_STARTED"
+  },
+  "observed_systemd": {
+    "active_state": "active",
+    "main_pid": 113548,
+    "n_restarts": 0,
+    "sub_state": "running"
+  },
+  "execution_evidence": "NO_RAW_NO_NETWORK_COLLECTION_V7_STOP_DISABLE_PENDING_HUMAN_EXECUTION"
+}

@@ -8,11 +8,13 @@ fail() {
 }
 trap 'fail "line=$LINENO exit=$?"' ERR
 
-if (($# != 1)); then
-  fail 'usage: vps-install.sh INCOMING_ROOT'
+if (($# != 2)); then
+  fail 'usage: vps-install.sh INCOMING_ROOT prepare|activate'
 fi
 
 INCOMING_ROOT=$1
+MODE=$2
+case "$MODE" in prepare|activate) ;; *) fail 'mode must be prepare or activate' ;; esac
 [[ $(id -un) == hyperlab ]] || fail 'run as hyperlab'
 [[ $HOME == /home/hyperlab ]] || fail 'HOME must be /home/hyperlab'
 case "$INCOMING_ROOT" in
@@ -86,9 +88,16 @@ case "$CAMPAIGN_ROOT" in "$VOLUME_ROOT"/campaigns/*) ;; *) fail 'campaign root l
 [[ $(readlink -f -- "$SOURCE_ROOT") == "$SOURCE_ROOT" ]] || fail 'source root real path differs'
 [[ $(git rev-parse HEAD) == "$SOURCE_COMMIT" ]] || fail 'source HEAD differs'
 [[ -z $(git status --porcelain) ]] || fail 'source clone is not clean'
-[[ ! -e "$CAMPAIGN_ROOT" ]] || fail 'campaign root must be new'
-[[ $(readlink -m -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] \
-  || fail 'campaign root is not canonical'
+if [[ $MODE == prepare ]]; then
+  [[ ! -e "$CAMPAIGN_ROOT" ]] || fail 'campaign root must be new'
+  [[ $(readlink -m -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] \
+    || fail 'campaign root is not canonical'
+else
+  [[ -d "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] \
+    || fail 'prepared campaign root is absent or unsafe'
+  [[ $(readlink -f -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] \
+    || fail 'prepared campaign root real path differs'
+fi
 
 INCOMING_BYTES=$(du -sb -- "$INCOMING_ROOT" | awk '{print $1}')
 [[ $INCOMING_BYTES =~ ^[0-9]+$ ]] || fail 'cannot measure incoming staging bytes'
@@ -152,30 +161,42 @@ SERVICE_LOAD_STATE=$(systemctl show "$SERVICE" --property=LoadState --value 2>/d
 [[ $(systemctl is-active "$SERVICE" 2>/dev/null || true) != active ]] \
   || fail 'systemd service name is already active'
 
-bash "$SOURCE_ROOT/ops/h1_campaign/bootstrap-linux.sh" "$SOURCE_ROOT"
-
-install -d -m 0700 "$CAMPAIGN_ROOT" "$CAMPAIGN_ROOT/state" "$CAMPAIGN_ROOT/operator"
-[[ $(readlink -f -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] || fail 'campaign root real path differs'
-install -m 0600 "$INCOMING_ROOT/campaign-seed/campaign-manifest.json" "$CAMPAIGN_ROOT/campaign-manifest.json"
-install -m 0600 "$INCOMING_ROOT/campaign-seed/campaign-manifest.sha256" "$CAMPAIGN_ROOT/campaign-manifest.sha256"
-install -m 0600 "$INCOMING_ROOT/campaign-seed/state/health.json" "$CAMPAIGN_ROOT/state/health.json"
-
 VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 export PYTHONPATH="$SOURCE_ROOT/src"
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
+UNIT_RENDERED="$INCOMING_ROOT/rendered-$SERVICE"
+
+if [[ $MODE == prepare ]]; then
+  bash "$SOURCE_ROOT/ops/h1_campaign/bootstrap-linux.sh" "$SOURCE_ROOT"
+  install -d -m 0700 "$CAMPAIGN_ROOT" "$CAMPAIGN_ROOT/state" "$CAMPAIGN_ROOT/operator"
+  [[ $(readlink -f -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] \
+    || fail 'campaign root real path differs'
+  install -m 0600 "$INCOMING_ROOT/campaign-seed/campaign-manifest.json" "$CAMPAIGN_ROOT/campaign-manifest.json"
+  install -m 0600 "$INCOMING_ROOT/campaign-seed/campaign-manifest.sha256" "$CAMPAIGN_ROOT/campaign-manifest.sha256"
+  install -m 0600 "$INCOMING_ROOT/campaign-seed/state/health.json" "$CAMPAIGN_ROOT/state/health.json"
+  [[ ! -e "$UNIT_RENDERED" ]] || fail 'rendered unit path already exists'
+fi
+
+[[ -x "$VENV_PYTHON" ]] || fail 'prepared virtual environment is absent'
 "$VENV_PYTHON" "$SOURCE_ROOT/ops/h1_campaign/launch_pack.py" \
   vps-preflight --handoff "$HANDOFF" --mode start
 
-UNIT_RENDERED="$INCOMING_ROOT/rendered-$SERVICE"
-[[ ! -e "$UNIT_RENDERED" ]] || fail 'rendered unit path already exists'
-"$VENV_PYTHON" "$SOURCE_ROOT/ops/h1_campaign/launch_pack.py" \
-  render-unit --handoff "$HANDOFF" --output "$UNIT_RENDERED"
+if [[ $MODE == prepare ]]; then
+  "$VENV_PYTHON" "$SOURCE_ROOT/ops/h1_campaign/launch_pack.py" \
+    render-unit --handoff "$HANDOFF" --output "$UNIT_RENDERED"
+fi
+[[ -f "$UNIT_RENDERED" && ! -L "$UNIT_RENDERED" ]] || fail 'rendered unit is absent or unsafe'
 [[ $(sha256sum "$UNIT_RENDERED" | awk '{print $1}') == "$SYSTEMD_UNIT_SHA256" ]] \
   || fail 'rendered systemd unit differs from handoff'
 cmp --silent "$UNIT_RENDERED" "$INCOMING_ROOT/systemd/$SERVICE" \
   || fail 'transferred and canonical systemd units differ'
 systemd-analyze verify "$UNIT_RENDERED"
+
+if [[ $MODE == prepare ]]; then
+  printf 'H1_V8_PREPARED_FOR_CUTOVER_NO_SYSTEMD_CHANGE\n'
+  exit 0
+fi
 
 UNIT_TARGET="/etc/systemd/system/$SERVICE"
 UNIT_TEMP="/etc/systemd/system/.$SERVICE.$SOURCE_COMMIT.tmp"

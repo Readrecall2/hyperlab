@@ -7,10 +7,10 @@ data or order execution. The permanent boundary is
 
 ## Frozen launch identity
 
-- start: `2026-08-27T21:00:00Z`;
-- operator arm deadline: `2026-08-27T20:30:00Z`;
-- unique slug: `h1-20260827t210000z-e52a227b`;
-- service: `hyperlab-h1-20260827t210000z-e52a227b.service`;
+- start: `2026-08-27T00:45:00Z`;
+- operator arm deadline: `2026-08-27T00:40:00Z`;
+- unique slug: `h1-20260827t004500z-5973abde`;
+- service: `hyperlab-h1-20260827t004500z-5973abde.service`;
 - raw ceiling: 137,438,953,472 bytes (128 GiB);
 - reserved safety margin: 17,179,869,184 bytes (16 GiB);
 - initial free-space admission: 154,618,822,656 bytes (144 GiB).
@@ -66,8 +66,8 @@ containing:
 - `campaign-seed/campaign-manifest.json` and its pin;
 - `campaign-seed/state/health.json` in `PREPARED_NOT_STARTED`.
 - the byte-pinned systemd unit, operator scripts, source/policy inventory, and
-  four shell-separated human blocks: V6 preservation/disable, V7 volume
-  preparation, Windows transfer, and V7 installation/arming.
+  two shell-separated human blocks: V8 Windows transfer and the authenticated
+  V7-to-V8 Tabby cutover.
 
 The handoff binds the final commit, bundle, launch plan, canonical policy hash,
 raw policy file, fee artifact, fee review, runtime lock, campaign manifest,
@@ -120,11 +120,10 @@ that exits before health publication all fail closed.
 ## Human-only boundary
 
 Codex does not execute `vps-install.sh`, SSH, SCP, SFTP, systemd, or the H1
-collector. The V6 preservation/disable block is followed by the exact V7
-volume-preparation Tabby block, Windows PowerShell transfer block, and
-installation/arming Tabby block; all are generated only after the final commit
-and artifact hashes exist. The volume block validates the already-mounted
-volume and uses only `sudo install -d` to prepare its HyperLab base directories.
+collector. V8 emits only a Windows transfer block and one Tabby cutover block.
+The latter prepares V8 while V7 is still authenticated and waiting, then stops
+and disables V7 before installing or enabling V8. A post-withdrawal failure is
+reported as recoverable and preserves every old and partial root.
 The Windows block uses SFTP only to create the unique home incoming directory
 and SCP for transfer. The final Bash block revalidates the volume before any
 campaign root is created.

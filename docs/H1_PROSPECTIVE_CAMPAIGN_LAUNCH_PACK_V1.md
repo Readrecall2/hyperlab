@@ -1,7 +1,7 @@
 # H1 Prospective Campaign Launch Pack V1
 
 Technical readiness target:
-`H1_PROSPECTIVE_CAMPAIGN_LAUNCH_PACK_V1_GREEN_SYSTEMD_PREFLIGHT_AWAITING_HUMAN_EXECUTION`.
+`H1_PROSPECTIVE_CAMPAIGN_V8_QUICK_START_GREEN_AWAITING_IMMEDIATE_HUMAN_EXECUTION`.
 
 Economic status remains `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`. Nothing in this
 pack demonstrates alpha, profitability, capacity, or permission for real
@@ -14,14 +14,14 @@ The pack stages the first prospective H1 observation window under the existing
 BTC/ETH/SOL/HYPE universe, all registered variants, train days 0–7, validation
 days 7–10, sealed holdout days 10–14, and every existing economic gate.
 
-The V7 replacement campaign is armed for `2026-08-27T21:00:00Z`. Complete the human transfer
-and systemd installation no later than `2026-08-27T20:30:00Z`. Before the
+The V8 quick-start campaign is armed for `2026-08-27T00:45:00Z`. Complete the human transfer
+and systemd cutover no later than `2026-08-27T00:40:00Z`. Before the
 frozen start the service only waits locally; it does not open the public
 collector. A first launch after the frozen start is refused. A later restart is
 allowed only when the same authenticated raw root already exists.
 
 The official Hyperliquid fee page was reviewed at
-`2026-08-26T20:53:53Z`, less than 24 hours before the start. Base tier-0
+`2026-08-26T22:30:48Z`, less than 24 hours before the start. Base tier-0
 standard perpetual fees remain 1.5 bps maker and 4.5 bps taker. The review
 receipt is append-only; the historical 2026-08-16 artifact and H1 policy were
 not rewritten.
@@ -78,9 +78,14 @@ V6 `h1-20260827t210000z-c0043345` passed the physical-volume and identity gates,
 then its reused host preflight saw the intentionally read-only parent namespace
 created by `ProtectSystem=strict`. The unit remained loaded and enabled but
 inactive/dead with MainPID 0, NRestarts 0, initial health and no raw root;
-`ExecStart` and collection never occurred. V7 first authenticates those exact
-facts, disables V6 without deleting its unit or roots, and records
+`ExecStart` and collection never occurred. V7 authenticated those exact facts,
+disabled V6 without deleting its unit or roots, and records
 `SYSTEMD_EXEC_CONDITION_SANDBOX_FALSE_READ_ONLY_NO_EXECSTART_NO_COLLECTION`.
+
+For V8, the operator authenticates V7 as active/running but still
+`PREPARED_NOT_STARTED` with no raw root. V8 is fully prepared before V7 is
+stopped and disabled; V8 is installed and enabled only afterward, so both
+campaigns can never collect simultaneously.
 
 ## Runtime and observability
 

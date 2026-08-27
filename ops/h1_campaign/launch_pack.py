@@ -222,10 +222,11 @@ def validate_plan(plan: Mapping[str, object]) -> dict[str, object]:
     deadline = _parse_utc(plan.get("arm_deadline_utc"), label="arm_deadline_utc")
     if reviewed >= starts or starts - reviewed > timedelta(hours=24):
         raise LaunchPackError("fee review must precede start by no more than 24 hours")
-    if deadline >= starts or starts - deadline > timedelta(hours=1):
-        raise LaunchPackError("arm deadline must be in the final hour before starts_at_utc")
-    if starts.minute != 0 or starts.second != 0 or starts.microsecond != 0:
-        raise LaunchPackError("starts_at_utc must be rounded to the UTC hour")
+    deadline_margin = starts - deadline
+    if not timedelta(minutes=5) <= deadline_margin <= timedelta(minutes=15):
+        raise LaunchPackError("arm deadline must precede starts_at_utc by 5-15 minutes")
+    if starts.minute % 5 != 0 or starts.second != 0 or starts.microsecond != 0:
+        raise LaunchPackError("starts_at_utc must use deterministic five-minute UTC granularity")
     disk = plan.get("disk")
     if not isinstance(disk, dict):
         raise LaunchPackError("disk plan must be an object")
@@ -678,7 +679,7 @@ def render_windows_operator_block(
     slug = str(checked["campaign_slug"])
     bundle_name = str(bundle["filename"])
     return rf"""# LOCATION: Windows PowerShell local, from {worktree}
-# EXPECTED_DURATION: 5-15 minutes; MAXIMUM_DURATION: 30 minutes.
+# EXPECTED_DURATION: 2-4 minutes; MAXIMUM_DURATION: 5 minutes.
 # PROMPTS: first SSH host-key trust and SSH-key passphrase may prompt; HyperLab has no prompt.
 # MONITORING: Get-FileHash locally, Test-NetConnection, then SFTP/SCP exit codes.
 # CTRL+C: stops only the local transfer; a partial remote incoming root is abandoned, never reused.
@@ -773,10 +774,10 @@ def render_tabby_operator_block(handoff: Mapping[str, object]) -> str:
     service = str(checked["service_name"])
     bundle_name = str(bundle["filename"])
     return rf"""# LOCATION: Tabby - VPS, Bash, logged in as hyperlab.
-# EXPECTED_DURATION: 10-25 minutes to arm; MAXIMUM_DURATION: 45 minutes.
+# EXPECTED_DURATION: 6-12 minutes end-to-end; MAXIMUM_DURATION: 15 minutes.
 # PROMPTS: sudo may request the hyperlab password; pip is non-interactive and bounded.
 # MONITORING: command output, then the exact second-Tabby watch command printed at the end.
-# CTRL+C: stops this foreground block only; after enable, systemd persists and must be inspected separately.
+# CTRL+C: before V7 withdrawal leaves V7 armed; after withdrawal prints an inspection/recovery state.
 # TERMINAL_SIGNAL: H1_SERVICE_ARMED_OR_RUNNING_GREEN plus the exact H1_* identity lines.
 set -Eeuo pipefail
 umask 077
@@ -796,8 +797,82 @@ H1_VOLUME_ROOT='{remote['volume_root']}'
 H1_VOLUME_FS='{volume['filesystem']}'
 H1_VOLUME_MODEL='{volume['model']}'
 H1_VOLUME_SERIAL='{volume['serial']}'
+V7_COMMIT='3117f836c02d98e31a5903cba5a71715fdfca801'
+V7_SERVICE='hyperlab-h1-20260827t210000z-e52a227b.service'
+V7_INCOMING_ROOT='/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-e52a227b'
+V7_SOURCE_ROOT='/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-e52a227b'
+V7_CAMPAIGN_ROOT='/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t210000z-e52a227b'
+V7_UNIT='/etc/systemd/system/hyperlab-h1-20260827t210000z-e52a227b.service'
+V7_UNIT_SHA256='0888b502a99670a94d63163c5387f468018d5b5a83fc10cfd3e5f482ac825aa5'
+V7_HANDOFF_SHA256='f2ecabf2c229248fd898740007757a5cca6a56b674890407389ac8efbc41fe44'
+V7_MANIFEST_SHA256='44e7e163d65bce034aad49f87f9189bec25a00670bf016fa58937cc9b8f14ae5'
+V7_EXPECTED_MAIN_PID='113548'
+CUTOVER_STAGE='BEFORE_V7_WITHDRAWAL'
+
+cutover_failure() {{
+  code=$?
+  if [[ $CUTOVER_STAGE == BEFORE_V7_WITHDRAWAL ]]; then
+    printf 'H1_V8_CUTOVER_REFUSED_V7_REMAINS_ARMED\n' >&2
+  elif [[ $CUTOVER_STAGE == V7_DISABLED_V8_NOT_GREEN ]]; then
+    printf 'H1_V8_CUTOVER_RECOVERABLE_V7_DISABLED_V8_NOT_GREEN_PRESERVE_ALL_ROOTS\n' >&2
+  else
+    printf 'H1_V8_CUTOVER_STATE_REQUIRES_OPERATOR_INSPECTION stage=%s\n' "$CUTOVER_STAGE" >&2
+  fi
+  exit "$code"
+}}
+cutover_interrupted() {{
+  printf 'H1_V8_CUTOVER_INTERRUPTED stage=%s; inspect both services; preserve all roots\n' \
+    "$CUTOVER_STAGE" >&2
+  exit 130
+}}
+trap cutover_failure ERR
+trap cutover_interrupted INT TERM
+
+authenticate_v7_waiting() {{
+  [[ -f "$V7_UNIT" && ! -L "$V7_UNIT" ]]
+  [[ $(sha256sum "$V7_UNIT" | awk '{{print $1}}') == "$V7_UNIT_SHA256" ]]
+  [[ $(sha256sum "$V7_INCOMING_ROOT/handoff.json" | awk '{{print $1}}') == "$V7_HANDOFF_SHA256" ]]
+  [[ $(sha256sum "$V7_CAMPAIGN_ROOT/campaign-manifest.json" | awk '{{print $1}}') == "$V7_MANIFEST_SHA256" ]]
+  [[ $(git -C "$V7_SOURCE_ROOT" rev-parse HEAD) == "$V7_COMMIT" ]]
+  [[ -z $(git -C "$V7_SOURCE_ROOT" status --porcelain) ]]
+  [[ $(systemctl is-enabled "$V7_SERVICE" 2>/dev/null) == enabled ]]
+  declare -A state=()
+  while IFS='=' read -r key value; do state["$key"]=$value; done < <(
+    systemctl show "$V7_SERVICE" --property=LoadState --property=ActiveState \
+      --property=SubState --property=MainPID --property=NRestarts --property=FragmentPath
+  )
+  [[ ${{state[LoadState]}} == loaded ]]
+  [[ ${{state[ActiveState]}} == active ]]
+  [[ ${{state[SubState]}} == running ]]
+  [[ ${{state[MainPID]}} == "$V7_EXPECTED_MAIN_PID" ]]
+  [[ ${{state[NRestarts]}} == 0 ]]
+  [[ ${{state[FragmentPath]}} == "$V7_UNIT" ]]
+  V7_CMD=$(tr '\0' ' ' < "/proc/${{state[MainPID]}}/cmdline")
+  [[ $V7_CMD == *"$V7_SOURCE_ROOT/ops/h1_campaign/run_collector.sh"* ]]
+  [[ $V7_CMD == *"$V7_INCOMING_ROOT/handoff.json"* ]]
+  python3.12 -I - "$V7_CAMPAIGN_ROOT/state/health.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    health = json.load(handle)
+expected = {{
+    "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+    "campaign_id": "h1-d56ea6960208968e3efa03c5",
+    "manifest_sha256": None,
+    "monitoring": "state/health.json",
+    "raw_root_sha256": None,
+    "terminal_health": "PREPARED_NOT_STARTED",
+}}
+if health != expected:
+    raise SystemExit("H1_V7_WAITING_HEALTH_REFUSED")
+PY
+  [[ ! -e "$V7_CAMPAIGN_ROOT/raw" ]]
+  printf 'H1_V7_ACTIVE_WAITING_AUTHENTICATED_NO_COLLECTION\n'
+}}
 
 [[ $(id -un) == hyperlab && $HOME == /home/hyperlab ]]
+authenticate_v7_waiting
 case "$H1_INCOMING_ROOT" in
   "$HOME"/hyperlab-h1/incoming/*) ;;
   *) printf 'H1_INCOMING_PATH_REFUSED:%s\n' "$H1_INCOMING_ROOT" >&2; exit 4 ;;
@@ -863,7 +938,25 @@ git -C "$H1_SOURCE_ROOT" checkout --detach "$H1_COMMIT"
 [[ $(git -C "$H1_SOURCE_ROOT" rev-parse HEAD) == "$H1_COMMIT" ]]
 [[ -z $(git -C "$H1_SOURCE_ROOT" status --porcelain) ]]
 cd "$H1_SOURCE_ROOT"
-bash ops/h1_campaign/vps-install.sh "$H1_INCOMING_ROOT"
+bash ops/h1_campaign/vps-install.sh "$H1_INCOMING_ROOT" prepare
+
+authenticate_v7_waiting
+CUTOVER_STAGE='WITHDRAWING_V7'
+sudo systemctl stop "$V7_SERVICE"
+[[ $(systemctl is-active "$V7_SERVICE" 2>/dev/null || true) == inactive ]]
+[[ $(systemctl show "$V7_SERVICE" --property=MainPID --value) == 0 ]]
+[[ $(systemctl show "$V7_SERVICE" --property=NRestarts --value) == 0 ]]
+[[ ! -e "$V7_CAMPAIGN_ROOT/raw" ]]
+sudo systemctl disable "$V7_SERVICE"
+[[ $(systemctl is-enabled "$V7_SERVICE" 2>/dev/null || true) == disabled ]]
+[[ -f "$V7_UNIT" && -d "$V7_SOURCE_ROOT" && -d "$V7_CAMPAIGN_ROOT" ]]
+printf 'H1_V7_STOPPED_DISABLED_PRESERVED_NO_COLLECTION\n'
+
+CUTOVER_STAGE='V7_DISABLED_V8_NOT_GREEN'
+timeout --signal=INT --kill-after=30s 10m \
+  bash ops/h1_campaign/vps-install.sh "$H1_INCOMING_ROOT" activate
+CUTOVER_STAGE='V8_GREEN'
+trap - ERR INT TERM
 
 # POINT STATUS (read-only):
 # bash '{source}/ops/h1_campaign/monitor.sh' '{incoming}/handoff.json'
@@ -986,9 +1079,9 @@ def finalize_launch_pack(
     created = (created_at or datetime.now(tz=UTC)).astimezone(UTC)
     starts = _parse_utc(plan["starts_at_utc"], label="starts_at_utc")
     lead = starts - created
-    if not timedelta(hours=18) <= lead <= timedelta(hours=22):
+    if not timedelta(minutes=20) <= lead <= timedelta(minutes=40):
         raise LaunchPackError(
-            "final package must be created 18-22 hours before starts_at_utc; "
+            "quick-start package must be created 20-40 minutes before starts_at_utc; "
             f"actual_seconds={int(lead.total_seconds())}"
         )
     if not bundle_path.is_file():
@@ -1078,8 +1171,6 @@ def finalize_launch_pack(
     operator_root = output_root / "operator"
     windows_path = operator_root / "windows-powershell.txt"
     tabby_path = operator_root / "tabby-vps-bash.txt"
-    volume_path = operator_root / "tabby-vps-volume-preparation.txt"
-    disable_v6_path = operator_root / "tabby-vps-disable-v6.txt"
     _write_exclusive(
         windows_path,
         render_windows_operator_block(handoff, output_root=output_root, repo_root=repo_root).encode(
@@ -1087,8 +1178,6 @@ def finalize_launch_pack(
         ),
     )
     _write_exclusive(tabby_path, render_tabby_operator_block(handoff).encode("utf-8"))
-    _write_exclusive(volume_path, render_volume_preparation_block(handoff).encode("utf-8"))
-    _write_exclusive(disable_v6_path, render_v6_disable_block().encode("utf-8"))
     launch_files = {
         bundle_path.name: sha256_file(bundle_path),
         "campaign-seed/campaign-manifest.json": sha256_file(manifest_path),
@@ -1098,8 +1187,6 @@ def finalize_launch_pack(
         "handoff.sha256": sha256_file(output_root / "handoff.sha256"),
         "inventory/source-policy-readiness.json": sha256_file(inventory_path),
         "operator/tabby-vps-bash.txt": sha256_file(tabby_path),
-        "operator/tabby-vps-volume-preparation.txt": sha256_file(volume_path),
-        "operator/tabby-vps-disable-v6.txt": sha256_file(disable_v6_path),
         "operator/windows-powershell.txt": sha256_file(windows_path),
         f"systemd/{handoff['service_name']}": sha256_file(systemd_path),
     }

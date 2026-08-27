@@ -75,9 +75,9 @@ def _volume_snapshot() -> dict[str, object]:
 def test_launch_plan_freezes_unique_roots_times_and_full_disk_budget() -> None:
     plan = launch_pack.validate_plan(_plan())
     assert plan["boundary"] == "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-    assert plan["campaign_slug"] == "h1-20260827t210000z-e52a227b"
-    assert plan["starts_at_utc"] == "2026-08-27T21:00:00Z"
-    assert plan["arm_deadline_utc"] == "2026-08-27T20:30:00Z"
+    assert plan["campaign_slug"] == "h1-20260827t004500z-5973abde"
+    assert plan["starts_at_utc"] == "2026-08-27T00:45:00Z"
+    assert plan["arm_deadline_utc"] == "2026-08-27T00:40:00Z"
     disk = plan["disk"]
     assert isinstance(disk, dict)
     assert disk["maximum_raw_bytes"] == 128 * 1024**3
@@ -108,6 +108,21 @@ def test_launch_plan_freezes_unique_roots_times_and_full_disk_budget() -> None:
     assert "hyperliquid-h1-001" not in json.dumps(plan)
 
 
+def test_quick_start_uses_five_minute_granularity_and_real_deadline_margin() -> None:
+    plan = _plan()
+    assert launch_pack.validate_plan(plan)["starts_at_utc"] == "2026-08-27T00:45:00Z"
+    with pytest.raises(launch_pack.LaunchPackError, match="five-minute"):
+        launch_pack.validate_plan(
+            {
+                **plan,
+                "starts_at_utc": "2026-08-27T00:46:00Z",
+                "arm_deadline_utc": "2026-08-27T00:41:00Z",
+            }
+        )
+    with pytest.raises(launch_pack.LaunchPackError, match="5-15 minutes"):
+        launch_pack.validate_plan({**plan, "arm_deadline_utc": "2026-08-27T00:25:00Z"})
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -123,7 +138,7 @@ def test_incoming_path_validation_refuses_escape_or_reuse(path: str) -> None:
 
 
 def test_remote_path_validation_accepts_only_split_home_and_volume_roots() -> None:
-    slug = "h1-20260827t210000z-e52a227b"
+    slug = "h1-20260827t004500z-5973abde"
     assert launch_pack.validate_remote_path(
         f"/home/hyperlab/hyperlab-h1/incoming/{slug}", category="incoming", slug=slug
     )
@@ -268,6 +283,27 @@ def test_v6_systemd_sandbox_failure_receipt_is_append_only_and_no_execstart() ->
             "n_restarts": 0,
             "sub_state": "dead",
         },
+    }
+
+
+def test_v7_quick_start_cutover_receipt_is_attested_and_not_prematurely_disabled() -> None:
+    receipt = json.loads(
+        (OPS / "h1-20260827t210000z-e52a227b-quick-start-cutover.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["cutover_status"] == "V8_CUTOVER_PLANNED_V7_DISABLE_NOT_YET_EXECUTED"
+    assert receipt["evidence_source"] == "USER_ATTESTED_VPS_STATE_AT_2026-08-27T00:05:12Z"
+    assert receipt["observed_systemd"] == {
+        "active_state": "active",
+        "main_pid": 113548,
+        "n_restarts": 0,
+        "sub_state": "running",
+    }
+    assert receipt["observed_health"] == {
+        "manifest_sha256": None,
+        "raw_root_sha256": None,
+        "terminal_health": "PREPARED_NOT_STARTED",
     }
 
 
@@ -582,7 +618,7 @@ def test_systemd_render_is_persistent_bounded_hardened_and_graceful() -> None:
     read_write_lines = [line for line in unit.splitlines() if line.startswith("ReadWritePaths=")]
     assert read_write_lines == [
         "ReadWritePaths=/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/"
-        "h1-20260827t210000z-e52a227b"
+        "h1-20260827t004500z-5973abde"
     ]
     assert "/mnt/HC_Volume_106716684/hyperlab-h1/sources/" not in read_write_lines[0]
     assert "ExecCondition=" in unit.split("ExecStart=", maxsplit=1)[0]
@@ -603,8 +639,8 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     }
     waiting_cmd = (
         "/usr/bin/bash /mnt/HC_Volume_106716684/hyperlab-h1/sources/"
-        "h1-20260827t210000z-e52a227b/ops/h1_campaign/run_collector.sh "
-        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t210000z-e52a227b/handoff.json"
+        "h1-20260827t004500z-5973abde/ops/h1_campaign/run_collector.sh "
+        "/home/hyperlab/hyperlab-h1/incoming/h1-20260827t004500z-5973abde/handoff.json"
     )
     armed = launch_pack.evaluate_monitor(
         active_state="active",
@@ -617,7 +653,7 @@ def test_monitor_distinguishes_armed_running_terminal_and_false_pid() -> None:
     assert armed["status"] == "H1_SERVICE_ARMED_PREPARED_NOT_STARTED"
     running_health = {**prepared_health, "terminal_health": "RUNNING"}
     collect_cmd = (
-        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t210000z-e52a227b/.venv/bin/python "
+        "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t004500z-5973abde/.venv/bin/python "
         "-m hyperlab research-data h1-collect "
         f"--campaign-root {campaign} --config /home/hyperlab/config.json"
     )
@@ -668,6 +704,8 @@ def test_runtime_scripts_have_exact_public_collector_resume_and_no_private_route
     assert "findmnt -rn -T" in installer
     assert "vps-preflight --handoff" in installer
     assert "service-preflight --handoff" not in installer
+    assert "prepare|activate" in installer
+    assert "H1_V8_PREPARED_FOR_CUTOVER_NO_SYSTEMD_CHANGE" in installer
     assert "H1_ARM_DEADLINE_MISSED" in installer
     assert 'VOLUME_DEVICE=${VALUES[12]}' in installer
     assert 'VOLUME_FS=${VALUES[13]}' in installer
@@ -738,12 +776,21 @@ def test_final_operator_blocks_are_exact_and_never_mix_shells(tmp_path: Path) ->
     assert "findmnt -rn -T" in tabby
     assert "H1_VOLUME_DEVICE='/dev/sdb'" in tabby
     assert "H1_VOLUME_MOUNT='/mnt/HC_Volume_106716684'" in tabby
-    assert "H1_ARM_DEADLINE_UTC='2026-08-27T20:30:00Z'" in tabby
+    assert "H1_ARM_DEADLINE_UTC='2026-08-27T00:40:00Z'" in tabby
     assert "git clone --no-checkout" in tabby
     assert "checkout --detach" in tabby
     assert r"printf '%s  %s\n'" in tabby
     assert "watch -n 10" in tabby
     assert "sudo systemctl stop" in tabby and "sudo systemctl start" in tabby
+    assert "H1_V7_ACTIVE_WAITING_AUTHENTICATED_NO_COLLECTION" in tabby
+    assert "H1_V7_STOPPED_DISABLED_PRESERVED_NO_COLLECTION" in tabby
+    assert "H1_V8_CUTOVER_RECOVERABLE_V7_DISABLED_V8_NOT_GREEN_PRESERVE_ALL_ROOTS" in tabby
+    assert tabby.index('vps-install.sh "$H1_INCOMING_ROOT" prepare') < tabby.index(
+        'sudo systemctl stop "$V7_SERVICE"'
+    )
+    assert tabby.index('sudo systemctl disable "$V7_SERVICE"') < tabby.index(
+        'vps-install.sh "$H1_INCOMING_ROOT" activate'
+    )
     assert "Test-NetConnection" not in tabby
     assert "$env:" not in tabby
     assert "LOCATION: Tabby/VPS - unique volume preparation" in volume

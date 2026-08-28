@@ -194,6 +194,30 @@ def _git(repo_root: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _authenticate_source_branch(
+    repo_root: Path,
+    *,
+    expected_branch: str,
+    source_commit: str,
+) -> None:
+    try:
+        checked_branch = _git(
+            repo_root,
+            "check-ref-format",
+            "--branch",
+            expected_branch,
+        )
+    except LaunchPackError as error:
+        raise LaunchPackError("expected branch is invalid") from error
+    if checked_branch != expected_branch:
+        raise LaunchPackError("expected branch is invalid")
+    if (
+        _git(repo_root, "rev-parse", "--verify", f"refs/heads/{expected_branch}")
+        != source_commit
+    ):
+        raise LaunchPackError("target branch differs from requested final commit")
+
+
 def _git_blob(repo_root: Path, commit: str, relative_path: str) -> bytes:
     if _COMMIT.fullmatch(commit) is None:
         raise LaunchPackError("source commit is invalid")
@@ -1202,14 +1226,18 @@ def finalize(
     bundle_path: Path,
     source_commit: str,
     run_slug: str,
+    expected_branch: str = EXPECTED_BRANCH,
 ) -> dict[str, object]:
     plan = validate_plan(_object(plan_path))
     if _COMMIT.fullmatch(source_commit) is None:
         raise LaunchPackError("source commit is invalid")
     if _git(repo_root, "rev-parse", "HEAD") != source_commit:
         raise LaunchPackError("source HEAD differs from requested final commit")
-    if _git(repo_root, "rev-parse", f"refs/heads/{EXPECTED_BRANCH}") != source_commit:
-        raise LaunchPackError("target branch differs from requested final commit")
+    _authenticate_source_branch(
+        repo_root,
+        expected_branch=expected_branch,
+        source_commit=source_commit,
+    )
     if _git(repo_root, "status", "--porcelain"):
         raise LaunchPackError("launch worktree must be clean before finalization")
     if not _git_is_ancestor(repo_root, str(plan["base_commit"]), source_commit):
@@ -1362,6 +1390,7 @@ def _parser() -> argparse.ArgumentParser:
     final.add_argument("--bundle", type=Path, required=True)
     final.add_argument("--source-commit", required=True)
     final.add_argument("--run-slug", required=True)
+    final.add_argument("--expected-branch", default=EXPECTED_BRANCH)
     verify = subparsers.add_parser("verify-source")
     verify.add_argument("--source-root", type=Path, required=True)
     verify.add_argument("--inventory", type=Path, required=True)
@@ -1388,6 +1417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bundle_path=arguments.bundle.resolve(strict=True),
                 source_commit=arguments.source_commit,
                 run_slug=arguments.run_slug,
+                expected_branch=arguments.expected_branch,
             )
         elif arguments.command == "verify-source":
             result = verify_source(

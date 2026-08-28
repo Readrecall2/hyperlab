@@ -166,6 +166,49 @@ def _create_real_git_bundle(tmp_path: Path, bundle: Path) -> None:
     _run_git("bundle", "create", str(bundle), "HEAD", cwd=source)
 
 
+def test_launch_pack_branch_override_authenticates_exact_local_ref(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "synthetic-branch-source"
+    _run_git("init", "--quiet", str(source))
+    _run_git("config", "user.email", "synthetic-fixture@invalid.example", cwd=source)
+    _run_git("config", "user.name", "Synthetic Fixture", cwd=source)
+    (source / "SYNTHETIC_FIXTURE.txt").write_text(
+        "SYNTHETIC/FIXTURE only; no economic evidence.\n",
+        encoding="utf-8",
+    )
+    _run_git("add", ".", cwd=source)
+    _run_git("commit", "--quiet", "-m", "synthetic branch fixture", cwd=source)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        check=True,
+        cwd=source,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    branch = "codex/prediction-markets-v3-independent-audit"
+    _run_git("branch", branch, commit, cwd=source)
+
+    launch_pack._authenticate_source_branch(
+        source,
+        expected_branch=branch,
+        source_commit=commit,
+    )
+    with pytest.raises(launch_pack.LaunchPackError, match="target branch differs"):
+        launch_pack._authenticate_source_branch(
+            source,
+            expected_branch=branch,
+            source_commit="f" * 40,
+        )
+    with pytest.raises(launch_pack.LaunchPackError, match="expected branch is invalid"):
+        launch_pack._authenticate_source_branch(
+            source,
+            expected_branch="-unsafe",
+            source_commit=commit,
+        )
+
+
 def test_python_isolated_mode_ignores_pythonpath_for_hyperlab(tmp_path: Path) -> None:
     fake = tmp_path / "fake-pythonpath"
     fake.mkdir()

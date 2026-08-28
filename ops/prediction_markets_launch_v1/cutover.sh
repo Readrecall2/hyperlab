@@ -117,8 +117,14 @@ OLD_PYTHON="$OLD_SOURCE/.venv/bin/python"
 [[ -z $(git -C "$OLD_SOURCE" status --porcelain) ]] || fail 'old source checkout is not clean'
 
 authenticate_old_evidence() {
+  timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+    "$OLD_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" runtime-import-admission \
+    --handoff "$OLD_INCOMING/handoff.json" \
+    --source-root "$OLD_SOURCE" \
+    --source-inventory "$OLD_INCOMING/source-inventory.json" \
+    || fail 'old runtime isolated import admission failed'
   timeout --signal=TERM --kill-after=5s 180s env \
-    PYTHONPATH="$OLD_SOURCE/src:$OLD_SOURCE" PYTHONNOUSERSITE=1 \
+    PYTHONNOUSERSITE=1 \
     "$OLD_PYTHON" -I - "$OLD_CAMPAIGN" "$OLD_SOURCE" <<'PY'
 from datetime import datetime
 from pathlib import Path

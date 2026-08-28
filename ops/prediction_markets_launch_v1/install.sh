@@ -26,6 +26,12 @@ TRUSTED_SOURCE_ROOT=$(readlink -f -- "$SCRIPT_ROOT/../..") || fail 'install sour
 [[ -d "$TRUSTED_SOURCE_ROOT" && ! -L "$TRUSTED_SOURCE_ROOT" ]] || fail 'install source root is unsafe'
 VENV_PYTHON="$TRUSTED_SOURCE_ROOT/.venv/bin/python"
 [[ -f "$VENV_PYTHON" && ! -L "$VENV_PYTHON" && -x "$VENV_PYTHON" ]] || fail 'offline runtime is absent or unsafe'
+timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" runtime-import-admission \
+  --handoff "$INCOMING_ROOT/handoff.json" \
+  --source-root "$TRUSTED_SOURCE_ROOT" \
+  --source-inventory "$INCOMING_ROOT/source-inventory.json" \
+  || fail 'isolated runtime import admission failed before installation'
 
 mapfile -t VALUES < <("$VENV_PYTHON" -I - "$INCOMING_ROOT/handoff.json" "$TRUSTED_SOURCE_ROOT" <<'PY'
 from pathlib import Path
@@ -61,25 +67,10 @@ KALSHI_NAMESPACE_PROBE_SERVICE=${VALUES[7]}
 [[ -z $(git status --porcelain) ]] || fail 'source checkout is not clean'
 [[ ! -e "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || fail 'campaign root must be new'
 export HOME=/home/hyperlab
-export PYTHONPATH="$SOURCE_ROOT/src:$SOURCE_ROOT"
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export TZ=UTC
-
-if ! "$VENV_PYTHON" -I - "$SOURCE_ROOT" <<'PY'
-from pathlib import Path
-import sys
-source=Path(sys.argv[1]); sys.path[:0]=[str(source/'src'),str(source)]
-from hyperlab.research_data.envelope import Venue
-from ops.prediction_markets_launch_v1 import cockpit,runner
-required=(cockpit._validate_venue_state,cockpit.active_optional_service_is_admissible,cockpit.classify_monitored_service,cockpit.complete_service_is_admissible,cockpit.prepared_state_is_stale,cockpit.validate_activation_evidence,runner.read_ledger,runner.validate_service_ledger_against_manifest)
-if not Venue or not all(callable(value) for value in required):
- raise SystemExit('monitor-runtime-helper-self-check:required-symbol-unavailable')
-PY
-then
-  fail 'monitor runtime helper import self-check failed before campaign preparation'
-fi
 
 START_AT_UTC=${HYPERLAB_PM_START_AT_UTC:-}
 if [[ -z $START_AT_UTC ]]; then

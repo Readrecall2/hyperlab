@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+export PYTHONNOUSERSITE=1
 
 fail() {
   printf 'PREDICTION_RECOVERY_ROLLBACK_REFUSED:%s\n' "$1" >&2
@@ -272,7 +273,7 @@ RECOVERY_FAILED_VENUES=()
 recovery_service_status() {
   local venue=$1 expected_service=$2 monitor_json
   monitor_json=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$HANDOFF") || return 1
-  MONITOR_JSON="$monitor_json" "$VENV_PYTHON" - "$venue" "$expected_service" <<'PY'
+  MONITOR_JSON="$monitor_json" "$VENV_PYTHON" -I - "$venue" "$expected_service" <<'PY'
 import json,os,sys
 value=json.loads(os.environ['MONITOR_JSON'])
 def require(condition,label):

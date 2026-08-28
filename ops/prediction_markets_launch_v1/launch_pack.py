@@ -381,6 +381,12 @@ def render_units(handoff: Mapping[str, object]) -> dict[str, str]:
     if not isinstance(services, Mapping):
         raise LaunchPackError("service map is absent")
     python = f"{source_root}/.venv/bin/python"
+    runtime_import_admission = (
+        f"{python} -I {source_root}/ops/prediction_markets_launch_v1/preflight.py "
+        f"runtime-import-admission --handoff {incoming_root}/handoff.json "
+        f"--source-root {source_root} "
+        f"--source-inventory {incoming_root}/source-inventory.json"
+    )
     common = _common_unit(
         service_user,
         source_root,
@@ -406,7 +412,9 @@ StartLimitBurst=3
 [Service]
 Type=simple
 {common}ReadWritePaths={campaign_root}/{venue}
+ExecStartPre={runtime_import_admission}
 ExecStart={python} {source_root}/ops/prediction_markets_launch_v1/runner.py --handoff {incoming_root}/handoff.json --venue {venue}
+TimeoutStartSec=180
 KillSignal=SIGINT
 TimeoutStopSec=180
 SendSIGKILL=no
@@ -445,7 +453,9 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-{common}ExecStart={python} {source_root}/ops/prediction_markets_launch_v1/cockpit.py --campaign-root {campaign_root} --host 127.0.0.1 --port 18081
+{common}ExecStartPre={runtime_import_admission}
+ExecStart={python} {source_root}/ops/prediction_markets_launch_v1/cockpit.py --campaign-root {campaign_root} --host 127.0.0.1 --port 18081
+TimeoutStartSec=180
 Restart=on-failure
 RestartSec=30
 
@@ -503,6 +513,15 @@ cinq unités immédiatement avant le cutover. Un échec de préparation n'appell
 jamais `disarm-old` et ne demande pas E. Après cette authentification, B et E
 n'emploient que `sudo -n`; chaque mutation systemd est bornée et annonce son
 opération et son service avant/après.
+
+L'import runtime n'est jamais confié au cwd ou à `PYTHONPATH` sous `python -I`.
+B exécute avant cutover le contrat isolé `runtime-import-admission` : il lie le
+venv au source root/commit/inventaire exacts, insère explicitement les deux
+racines source et refuse tout module provenant du user-site, du système global,
+d'un ancien source ou d'un chemin symlinké. Son unique signal terminal est
+`PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN`. Le même contrat précède install,
+monitor et chaque démarrage des services; aucun pip editable/réseau ou retrait
+de `-I` n'est admis.
 
 ## Diagnostic read-only puis reprise de restore-old
 
@@ -855,7 +874,15 @@ bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROO
 VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 [[ -x "$VENV_PYTHON" && ! -L "$VENV_PYTHON" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_runtime_absent_or_unsafe\n' >&2; exit 4; }}
 "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
-PYTHONPATH="$SOURCE_ROOT/src:$SOURCE_ROOT" "$VENV_PYTHON" -I -c 'import fastapi,hyperlab,requests,uvicorn,websocket; from ops.prediction_markets_launch_v1 import cockpit,preflight,runner; assert cockpit and preflight and runner'
+RUNTIME_IMPORT_REPORT="$INCOMING_ROOT/runtime-import-admission.json"
+timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" runtime-import-admission \
+  --handoff "$INCOMING_ROOT/handoff.json" \
+  --source-root "$SOURCE_ROOT" \
+  --source-inventory "$INCOMING_ROOT/source-inventory.json" \
+  --report "$RUNTIME_IMPORT_REPORT"
+[[ -s "$RUNTIME_IMPORT_REPORT" && ! -L "$RUNTIME_IMPORT_REPORT" ]] \
+  || {{ printf 'PREDICTION_TABBY_REFUSED:runtime_import_admission_report_absent_or_unsafe\n' >&2; exit 4; }}
 printf 'PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER\n'
 printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
 printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
@@ -893,7 +920,7 @@ while :; do
     exit 4
   fi
   set +e
-  PROOF=$(CURRENT="$CURRENT" PYTHONPATH='{source}/src:{source}' '{source}/.venv/bin/python' -I - '{campaign}' '{source}' <<'PY'
+  PROOF=$(CURRENT="$CURRENT" '{source}/.venv/bin/python' -I - '{campaign}' '{source}' <<'PY'
 from datetime import datetime
 from pathlib import Path
 import json,os,sys

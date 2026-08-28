@@ -44,13 +44,5 @@ timeout --signal=INT --kill-after=60s 30m \
   --requirement "$SOURCE_ROOT/requirements-runtime.lock" \
   || fail 'offline hash-locked dependency installation failed'
 "$VENV_PYTHON" -m pip check || fail 'offline dependency graph is inconsistent'
-export PYTHONPATH="$SOURCE_ROOT/src:$SOURCE_ROOT"
-"$VENV_PYTHON" -c 'import fastapi,hyperlab,requests,uvicorn,websocket; print("PREDICTION_IMPORT_PREFLIGHT_GREEN")' \
-  || fail 'required offline imports failed'
-"$VENV_PYTHON" -m hyperlab research-data prediction-collect --help >/dev/null \
-  || fail 'prediction collector CLI import preflight failed'
-"$VENV_PYTHON" "$SOURCE_ROOT/ops/prediction_markets_launch_v1/runner.py" --help >/dev/null \
-  || fail 'persistent runner import preflight failed'
-"$VENV_PYTHON" "$SOURCE_ROOT/ops/prediction_markets_launch_v1/cockpit.py" --help >/dev/null \
-  || fail 'cockpit import preflight failed'
+printf 'PREDICTION_OFFLINE_DEPENDENCY_GRAPH_GREEN\n'
 printf 'PREDICTION_OFFLINE_BOOTSTRAP_GREEN:%s\n' "$VENV_PYTHON"

@@ -142,8 +142,8 @@ limitées aux racines de venue.
 
 Le preflight découvre le volume réel au lieu de supposer le volume Hetzner 200
 GB. Il exige ext4 rw, fsync, NTP, CPython 3.12 x86_64 avec glibc >= 2.28,
-imports offline, wheelhouse multi-tags `manylinux_2_28` + `manylinux_2_17`
-hashé, Git et bundle exacts, port 18081 libre, racines/services absents et
+wheelhouse multi-tags `manylinux_2_28` + `manylinux_2_17` hashé, admission
+d'import isolée, Git et bundle exacts, racines/services absents et
 connectivité publique officielle bornée. Les parents dédiés `sources/` et
 `campaigns/` sont refusés s'ils sont des symlinks ou quittent leur chemin réel,
 puis réattestés avec propriétaire/mode avant tout clone ou préparation.
@@ -169,6 +169,26 @@ ext4 avant de sélectionner un ordinal. Le contrôle de capacité conservateur
 lié au ledger reste ensuite exécuté immédiatement avant le créneau. Un échec de
 cette admission sort avec le code 4, avant tout enfant de collecte, et
 `RestartPreventExitStatus=4` empêche une boucle de redémarrage.
+
+La tentative historique `pm-20260828t161704z-2624806a` a prouvé le bootstrap
+offline et le venv, puis a refusé avant toute mutation : `python -I` ignorait le
+`PYTHONPATH` utilisé par un test d'import ad hoc, tandis que le projet n'était
+volontairement pas installé dans le venv. Son incoming et son source partiel ne
+sont jamais réutilisés. Le contrat `runtime-import-admission` insère désormais
+de façon explicite et bornée les deux racines source depuis le processus isolé,
+authentifie commit/inventaire/device/chemins, puis vérifie l'origine exacte de
+chaque module source, dépendance venv et module stdlib chargé. Il refuse cwd,
+user-site, ancien source, site-packages global, symlink et origine hors racines,
+et produit un JSON canonique auto-hashé avec le signal unique
+`PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN`. Il est exécuté avant cutover, avant
+installation et monitor, au démarrage systemd, et dans les admissions de
+recovery/runner. `-I` et `PYTHONNOUSERSITE=1` restent obligatoires; aucune
+installation editable/réseau ou exposition des paquets système n'est permise.
+
+Avant cutover, le port 18081 n'est pas exigé libre : B authentifie qu'il est
+occupé exactement par l'ancien dashboard attendu. Il ne doit devenir libre
+qu'après la réauthentification finale et le désarmement borné de l'ancien slug,
+immédiatement avant l'activation du nouveau dashboard.
 
 L'admission hôte continue d'exiger la vue interactive du volume ext4 `rw`. Sous
 `ProtectSystem=strict`, le target volume admis est exact et read-only. systemd

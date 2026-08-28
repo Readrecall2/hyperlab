@@ -19,6 +19,13 @@ SOURCE_ROOT=$(readlink -f -- "$SCRIPT_ROOT/../..") || bootstrap_refusal
 VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 [[ ! -L ${BASH_SOURCE[0]} && ! -L $SOURCE_ROOT && -d $SOURCE_ROOT && -f $VENV_PYTHON && ! -L $VENV_PYTHON && -x $VENV_PYTHON ]] \
   || bootstrap_refusal
+INCOMING_ROOT=$(dirname -- "$HANDOFF")
+timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
+  --handoff "$HANDOFF" \
+  --source-root "$SOURCE_ROOT" \
+  --source-inventory "$INCOMING_ROOT/source-inventory.json" \
+  >/dev/null || bootstrap_refusal
 
 "$VENV_PYTHON" -I - "$HANDOFF" "$MODE" "$SOURCE_ROOT" <<'PY'
 import hashlib,json,os,stat,subprocess,sys,time

@@ -127,6 +127,39 @@ port libre, puis active le nouveau. Tout échec antérieur laisse l'ancienne
 campagne active et n'émet pas la demande E; tout échec postérieur émet exactement
 `PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD`.
 
+### Correctif runtime pack V3 : admission d'import Python isolée
+
+La tentative `pm-20260828t161704z-2624806a` reste intégralement immuable, y
+compris son incoming et son source root partiel. Elle a terminé le bootstrap LF
+et créé le venv, puis a échoué avant cutover avec `No module named 'hyperlab'`.
+La commande fautive combinait `PYTHONPATH=SOURCE_ROOT/src:SOURCE_ROOT` et
+`python -I`; le mode isolé ignore volontairement `PYTHONPATH`. Le bootstrap
+n'installe pas HyperLab comme wheel ou paquet editable : cet import était donc
+impossible par construction. L'ancienne campagne étant restée active, aucune
+restauration E n'était requise pour cette tentative.
+
+Le sous-contrat `runtime-import-admission` conserve `-I` et
+`PYTHONNOUSERSITE=1`. Il authentifie le handoff, le commit, l'inventaire Git
+complet et propre, les racines canoniques non symlinkées et leur device, puis
+insère explicitement et uniquement `SOURCE_ROOT/src` et `SOURCE_ROOT` dans
+`sys.path`. Il importe les modules HyperLab/ops nécessaires et les dépendances
+runtime, vérifie les helpers utilisés par le runner et le cockpit, puis contrôle
+chaque `module.__file__` chargé : fichiers HyperLab exacts sous le source,
+dépendances sous le `site-packages` du venv, stdlib seulement sous ses racines
+interpréteur. Cwd implicite, user-site, site-packages global, ancien source,
+symlink ou origine hors allowlist sont refusés. Le résultat est un unique JSON
+canonique auto-hashé, lié au commit/inventaire et terminé par
+`PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN`.
+
+B exécute réellement ce contrat avec le venv frais, depuis l'incoming
+authentifié et sous une borne de 180 secondes, avant `verify-old` et
+`disarm-old`. Le même contrat précède l'installation, chaque monitor, le
+démarrage des trois services, le resume/recovery et l'admission runner; la
+réauthentification de l'ancienne campagne l'utilise aussi avant sa preuve de
+ledger. Les unités bornent leur phase de démarrage à 180 secondes. Aucun retrait
+de `-I`, aucune installation réseau/editable, aucun system-site-packages et
+aucune confiance implicite dans le cwd ou `PYTHONPATH` ne sont admis.
+
 La restauration historique qui a dépassé trente minutes était bloquée avant
 toute mutation dans une substitution de commande
 `timeout 5 sudo systemctl show ...` : `sudo` et son `timeout` parent étaient tous

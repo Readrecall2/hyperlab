@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import importlib
 import ipaddress
 import json
 import os
@@ -15,6 +16,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -41,6 +43,39 @@ _DISK_RESERVATION = {
     "prediction_maximum_raw_bytes": 22_548_578_304,
     "required_free_bytes": 194_347_270_144,
     "safety_margin_bytes": 17_179_869_184,
+}
+_RUNTIME_SOURCE_MODULES = (
+    "hyperlab",
+    "ops.prediction_markets_launch_v1.cockpit",
+    "ops.prediction_markets_launch_v1.preflight",
+    "ops.prediction_markets_launch_v1.runner",
+)
+_RUNTIME_SOURCE_RELATIVE_FILES = {
+    "hyperlab": Path("src/hyperlab/__init__.py"),
+    "ops.prediction_markets_launch_v1.cockpit": Path(
+        "ops/prediction_markets_launch_v1/cockpit.py"
+    ),
+    "ops.prediction_markets_launch_v1.preflight": Path(
+        "ops/prediction_markets_launch_v1/preflight.py"
+    ),
+    "ops.prediction_markets_launch_v1.runner": Path(
+        "ops/prediction_markets_launch_v1/runner.py"
+    ),
+}
+_RUNTIME_VENV_MODULES = ("fastapi", "requests", "uvicorn", "websocket")
+_RUNTIME_HELPERS = {
+    "ops.prediction_markets_launch_v1.cockpit": (
+        "_validate_venue_state",
+        "active_optional_service_is_admissible",
+        "classify_monitored_service",
+        "complete_service_is_admissible",
+        "prepared_state_is_stale",
+        "validate_activation_evidence",
+    ),
+    "ops.prediction_markets_launch_v1.runner": (
+        "read_ledger",
+        "validate_service_ledger_against_manifest",
+    ),
 }
 
 
@@ -134,6 +169,456 @@ def load_handoff(path: Path) -> dict[str, Any]:
     if handoff.get("boundary") != BOUNDARY or handoff.get("schema_version") != 1:
         raise PreflightError("handoff boundary or schema diverged")
     return handoff
+
+
+def _runtime_exact_directory(path: Path, *, label: str) -> Path:
+    if not path.is_absolute():
+        raise PreflightError(f"{label} is not absolute")
+    try:
+        identity = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PreflightError(f"{label} is absent or unreadable") from error
+    if path.is_symlink() or not stat.S_ISDIR(identity.st_mode) or resolved != path:
+        raise PreflightError(f"{label} is symlinked, special, or non-canonical")
+    return resolved
+
+
+def _runtime_path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _runtime_git(source_root: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_root), *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PreflightError("runtime source Git authentication could not execute") from error
+    if completed.returncode != 0:
+        raise PreflightError(
+            completed.stderr.strip() or "runtime source Git authentication failed"
+        )
+    return completed.stdout.strip()
+
+
+def _runtime_source_inventory(source_root: Path, commit: str) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    output = _runtime_git(source_root, "ls-tree", "-r", "--long", commit)
+    for line in output.splitlines():
+        metadata, separator, relative_path = line.partition("\t")
+        fields = metadata.split()
+        if (
+            not separator
+            or len(fields) != 4
+            or fields[1] != "blob"
+            or not fields[3].isdigit()
+        ):
+            raise PreflightError("runtime source Git inventory line is malformed")
+        rows.append(
+            {
+                "blob_sha1": fields[2],
+                "mode": fields[0],
+                "path": relative_path,
+                "size": int(fields[3]),
+            }
+        )
+    if not rows:
+        raise PreflightError("runtime source Git inventory is empty")
+    body: dict[str, object] = {
+        "boundary": BOUNDARY,
+        "commit": commit,
+        "files": rows,
+        "schema_version": 1,
+    }
+    return {**body, "inventory_sha256": sha256_bytes(canonical_json_bytes(body))}
+
+
+def _runtime_module_file(module: object, *, name: str) -> Path:
+    value = getattr(module, "__file__", None)
+    if not isinstance(value, str) or not value:
+        raise PreflightError(f"runtime module has no concrete __file__: {name}")
+    path = Path(value)
+    if not path.is_absolute():
+        raise PreflightError(f"runtime module __file__ is not absolute: {name}")
+    try:
+        identity = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PreflightError(f"runtime module __file__ is unreadable: {name}") from error
+    if path.is_symlink() or not stat.S_ISREG(identity.st_mode) or resolved != path:
+        raise PreflightError(f"runtime module __file__ is symlinked or non-canonical: {name}")
+    return resolved
+
+
+def _runtime_reported_file(value: object, *, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise PreflightError(f"{label} is absent")
+    path = Path(value)
+    if not path.is_absolute():
+        raise PreflightError(f"{label} is not absolute")
+    try:
+        identity = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PreflightError(f"{label} is unreadable") from error
+    if path.is_symlink() or not stat.S_ISREG(identity.st_mode) or resolved != path:
+        raise PreflightError(f"{label} is symlinked, special, or non-canonical")
+    return resolved
+
+
+def _runtime_module_class(
+    path: Path,
+    *,
+    source_root: Path,
+    venv_root: Path,
+    stdlib_roots: Sequence[Path],
+) -> str:
+    if _runtime_path_within(path, venv_root):
+        return "venv"
+    if _runtime_path_within(path, source_root):
+        return "source"
+    if "site-packages" in path.parts or "dist-packages" in path.parts:
+        raise PreflightError(f"runtime module escaped the venv site-packages: {path}")
+    if any(_runtime_path_within(path, root) for root in stdlib_roots):
+        return "stdlib"
+    raise PreflightError(f"runtime module escaped source, venv, and stdlib roots: {path}")
+
+
+def validate_runtime_import_admission(
+    report: Mapping[str, object],
+    *,
+    source_root: Path,
+    source_commit: str,
+    inventory_sha256: str,
+) -> None:
+    expected_fields = {
+        "admission_sha256",
+        "boundary",
+        "inventory_sha256",
+        "isolated",
+        "loaded_module_files_validated",
+        "modules",
+        "no_user_site",
+        "python_executable",
+        "schema_version",
+        "source_commit",
+        "source_root",
+        "terminal_signal",
+        "venv_root",
+    }
+    if set(report) != expected_fields:
+        raise PreflightError("runtime import admission fields diverged")
+    claimed = _validate_sha256(
+        report.get("admission_sha256"), label="runtime import admission hash"
+    )
+    body = {key: value for key, value in report.items() if key != "admission_sha256"}
+    modules = report.get("modules")
+    expected_modules = set(_RUNTIME_SOURCE_MODULES) | set(_RUNTIME_VENV_MODULES)
+    loaded_module_files = report.get("loaded_module_files_validated")
+    if type(loaded_module_files) is not int:
+        raise PreflightError("runtime import admission file count diverged")
+    assert isinstance(loaded_module_files, int)
+    if (
+        sha256_bytes(canonical_json_bytes(body)) != claimed
+        or report.get("boundary") != BOUNDARY
+        or report.get("inventory_sha256") != inventory_sha256
+        or report.get("isolated") is not True
+        or report.get("no_user_site") is not True
+        or loaded_module_files < len(expected_modules)
+        or not isinstance(modules, Mapping)
+        or set(modules) != expected_modules
+        or report.get("schema_version") != 1
+        or report.get("source_commit") != source_commit
+        or report.get("source_root") != str(source_root)
+        or report.get("terminal_signal")
+        != "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN"
+        or report.get("venv_root") != str(source_root / ".venv")
+    ):
+        raise PreflightError("runtime import admission binding diverged")
+    venv_root = source_root / ".venv"
+    executable = _runtime_reported_file(
+        report.get("python_executable"), label="runtime Python executable"
+    )
+    if not _runtime_path_within(executable, venv_root):
+        raise PreflightError("runtime Python executable escaped the admitted venv")
+    for name, expected_class in (
+        *((name, "source") for name in _RUNTIME_SOURCE_MODULES),
+        *((name, "venv") for name in _RUNTIME_VENV_MODULES),
+    ):
+        row = modules.get(name)
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"class", "file"}
+            or row.get("class") != expected_class
+            or not isinstance(row.get("file"), str)
+            or not row.get("file")
+        ):
+            raise PreflightError(f"runtime import module binding diverged: {name}")
+        module_path = _runtime_reported_file(
+            row.get("file"), label=f"runtime import module file: {name}"
+        )
+        if expected_class == "source":
+            expected_path = (source_root / _RUNTIME_SOURCE_RELATIVE_FILES[name]).resolve(
+                strict=True
+            )
+            if module_path != expected_path:
+                raise PreflightError(f"runtime source module path diverged: {name}")
+        elif (
+            not _runtime_path_within(module_path, venv_root)
+            or "site-packages" not in module_path.parts
+        ):
+            raise PreflightError(f"runtime dependency escaped venv site-packages: {name}")
+
+
+def runtime_import_admission(
+    handoff_path: Path,
+    source_root: Path,
+    source_inventory_path: Path,
+) -> dict[str, object]:
+    """Authenticate an isolated venv and every runtime module origin."""
+
+    handoff = load_handoff(handoff_path)
+    slug = handoff.get("run_slug")
+    if not isinstance(slug, str) or _RUN_SLUG.fullmatch(slug) is None:
+        raise PreflightError("runtime import admission run slug is invalid")
+    incoming_root = handoff_path.parent
+    volume_mount = Path(str(handoff.get("volume_mount") or ""))
+    volume_base = Path(str(handoff.get("volume_base") or ""))
+    campaign_root = Path(str(handoff.get("campaign_root") or ""))
+    expected_source = volume_base / "sources" / slug
+    expected_campaign = volume_base / "campaigns" / slug
+    expected_inventory = incoming_root / "source-inventory.json"
+    if (
+        not handoff_path.is_absolute()
+        or handoff_path != incoming_root / "handoff.json"
+        or Path(str(handoff.get("incoming_root") or "")) != incoming_root
+        or Path(str(handoff.get("source_root") or "")) != source_root
+        or source_root != expected_source
+        or campaign_root != expected_campaign
+        or source_inventory_path != expected_inventory
+    ):
+        raise PreflightError("runtime import admission path binding diverged")
+    source_root = _runtime_exact_directory(source_root, label="runtime source root")
+    source_directory = _runtime_exact_directory(
+        source_root / "src", label="runtime source package root"
+    )
+    _runtime_exact_directory(volume_mount, label="runtime volume mount")
+    _runtime_exact_directory(volume_base, label="runtime volume base")
+    devices = {
+        source_root.stat().st_dev,
+        source_root.parent.stat().st_dev,
+        volume_base.stat().st_dev,
+        volume_mount.stat().st_dev,
+    }
+    if len(devices) != 1:
+        raise PreflightError("runtime source root is on the wrong device")
+
+    source_commit = handoff.get("source_commit")
+    if (
+        not isinstance(source_commit, str)
+        or len(source_commit) != 40
+        or any(character not in _SHA256 for character in source_commit)
+    ):
+        raise PreflightError("runtime source commit is invalid")
+    inventory_sha256 = _validate_sha256(
+        handoff.get("source_inventory_sha256"),
+        label="runtime source inventory hash",
+    )
+    inventory_raw = _safe_regular_bytes(source_inventory_path)
+    try:
+        expected_inventory_value = json.loads(inventory_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError("runtime source inventory is invalid JSON") from error
+    if (
+        not isinstance(expected_inventory_value, dict)
+        or inventory_raw != canonical_json_bytes(expected_inventory_value) + b"\n"
+        or expected_inventory_value.get("inventory_sha256") != inventory_sha256
+    ):
+        raise PreflightError("runtime source inventory authentication failed")
+    if _runtime_git(source_root, "rev-parse", "HEAD") != source_commit:
+        raise PreflightError("runtime detached source commit diverged")
+    git_top_level = Path(
+        _runtime_git(source_root, "rev-parse", "--show-toplevel")
+    ).resolve(strict=True)
+    if git_top_level != source_root:
+        raise PreflightError("runtime source Git top-level diverged")
+    if _runtime_git(source_root, "status", "--porcelain"):
+        raise PreflightError("runtime source checkout is not clean")
+    actual_inventory = _runtime_source_inventory(source_root, source_commit)
+    if expected_inventory_value != actual_inventory:
+        raise PreflightError("runtime source Git inventory diverged")
+
+    venv_root = _runtime_exact_directory(
+        source_root / ".venv", label="runtime virtual environment"
+    )
+    executable = Path(sys.executable).resolve(strict=True)
+    prefix = Path(sys.prefix).resolve(strict=True)
+    if (
+        not _runtime_path_within(executable, venv_root)
+        or prefix != venv_root
+        or sys.base_prefix == sys.prefix
+        or sys.flags.isolated != 1
+        or sys.flags.no_user_site != 1
+        or os.environ.get("PYTHONNOUSERSITE") != "1"
+    ):
+        raise PreflightError("runtime Python is not the expected isolated venv")
+    try:
+        pyvenv = (venv_root / "pyvenv.cfg").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise PreflightError("runtime venv configuration is unreadable") from error
+    normalized_pyvenv = {
+        key.strip().lower(): value.strip().lower()
+        for line in pyvenv.splitlines()
+        if "=" in line
+        for key, value in (line.split("=", 1),)
+    }
+    if normalized_pyvenv.get("include-system-site-packages") != "false":
+        raise PreflightError("runtime venv exposes system site-packages")
+    import site
+
+    if site.ENABLE_USER_SITE is not False:
+        raise PreflightError("runtime user-site is enabled")
+    cwd = Path.cwd().resolve(strict=True)
+    for raw_path in sys.path:
+        if raw_path in {"", "."}:
+            raise PreflightError("runtime isolated sys.path contains an implicit cwd")
+        candidate = Path(raw_path).resolve(strict=False)
+        if candidate == cwd or (
+            _runtime_path_within(candidate, source_root)
+            and not _runtime_path_within(candidate, venv_root)
+        ):
+            raise PreflightError("runtime source or cwd was present before explicit admission")
+        if (
+            ("site-packages" in candidate.parts or "dist-packages" in candidate.parts)
+            and not _runtime_path_within(candidate, venv_root)
+        ):
+            raise PreflightError("runtime isolated sys.path exposes global site-packages")
+
+    stdlib_roots = tuple(
+        {
+            Path(value).resolve(strict=True)
+            for key in ("stdlib", "platstdlib")
+            if (value := sysconfig.get_path(key))
+        }
+    )
+    before_modules = set(sys.modules)
+    sys.dont_write_bytecode = True
+    sys.path[:0] = [str(source_directory), str(source_root)]
+    importlib.invalidate_caches()
+    imported: dict[str, object] = {}
+    try:
+        for name in (*_RUNTIME_VENV_MODULES, *_RUNTIME_SOURCE_MODULES):
+            imported[name] = importlib.import_module(name)
+    except Exception as error:
+        raise PreflightError(
+            f"runtime required import failed: {type(error).__name__}:{error}"
+        ) from error
+    for module_name, helpers in _RUNTIME_HELPERS.items():
+        module = imported[module_name]
+        if not all(callable(getattr(module, helper, None)) for helper in helpers):
+            raise PreflightError(f"runtime helper contract diverged: {module_name}")
+
+    module_records: dict[str, object] = {}
+    for name, module in imported.items():
+        path = _runtime_module_file(module, name=name)
+        actual_class = _runtime_module_class(
+            path,
+            source_root=source_root,
+            venv_root=venv_root,
+            stdlib_roots=stdlib_roots,
+        )
+        expected_class = "source" if name in _RUNTIME_SOURCE_MODULES else "venv"
+        if actual_class != expected_class:
+            raise PreflightError(f"runtime module origin class diverged: {name}")
+        module_records[name] = {"class": actual_class, "file": str(path)}
+
+    validated_files = 0
+    for name in sorted(set(sys.modules) - before_modules):
+        module = sys.modules.get(name)
+        module_file_value = getattr(module, "__file__", None)
+        if not isinstance(module_file_value, str) or not module_file_value:
+            continue
+        path = _runtime_module_file(module, name=name)
+        _runtime_module_class(
+            path,
+            source_root=source_root,
+            venv_root=venv_root,
+            stdlib_roots=stdlib_roots,
+        )
+        validated_files += 1
+    body: dict[str, object] = {
+        "boundary": BOUNDARY,
+        "inventory_sha256": inventory_sha256,
+        "isolated": True,
+        "loaded_module_files_validated": validated_files,
+        "modules": module_records,
+        "no_user_site": True,
+        "python_executable": str(executable),
+        "schema_version": 1,
+        "source_commit": source_commit,
+        "source_root": str(source_root),
+        "terminal_signal": "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN",
+        "venv_root": str(venv_root),
+    }
+    report = {**body, "admission_sha256": sha256_bytes(canonical_json_bytes(body))}
+    validate_runtime_import_admission(
+        report,
+        source_root=source_root,
+        source_commit=source_commit,
+        inventory_sha256=inventory_sha256,
+    )
+    return report
+
+
+def _runtime_import_subprocess_admission(
+    *,
+    runtime: Path,
+    incoming_root: Path,
+    source_root: Path,
+    source_commit: str,
+    inventory_sha256: str,
+    run: CommandRunner,
+) -> dict[str, object]:
+    completed = run(
+        [
+            str(runtime),
+            "-I",
+            str(incoming_root / "scripts" / "preflight.py"),
+            "runtime-import-admission",
+            "--handoff",
+            str(incoming_root / "handoff.json"),
+            "--source-root",
+            str(source_root),
+            "--source-inventory",
+            str(incoming_root / "source-inventory.json"),
+        ]
+    )
+    if completed.returncode != 0:
+        raise PreflightError(
+            f"isolated runtime import admission failed: {completed.stderr}"
+        )
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise PreflightError("isolated runtime import admission output is invalid") from error
+    if not isinstance(report, dict):
+        raise PreflightError("isolated runtime import admission output is not an object")
+    validate_runtime_import_admission(
+        report,
+        source_root=source_root,
+        source_commit=source_commit,
+        inventory_sha256=inventory_sha256,
+    )
+    return report
 
 
 def validate_install_layout(
@@ -1403,22 +1888,14 @@ def resume_preflight(
             or source_identity.get("status") != "PREDICTION_SOURCE_IDENTITY_GREEN"
         ):
             raise PreflightError("resume source identity result diverged")
-        imported = run(
-            [
-                str(runtime),
-                "-I",
-                "-c",
-                (
-                    "import sys;"
-                    f"sys.path[:0]=[{str(source / 'src')!r},{str(source)!r}];"
-                    "import hyperlab,platform,requests,ssl,websocket;"
-                    "libc,version=platform.libc_ver();"
-                    "assert libc=='glibc' and tuple(map(int,version.split('.')[:2]))>=(2,28)"
-                ),
-            ]
+        runtime_import = _runtime_import_subprocess_admission(
+            runtime=runtime,
+            incoming_root=incoming,
+            source_root=source,
+            source_commit=source_commit,
+            inventory_sha256=source_inventory_sha256,
+            run=run,
         )
-        if imported.returncode != 0:
-            raise PreflightError(f"resume offline imports failed: {imported.stderr}")
         ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
         if ntp.returncode != 0 or ntp.stdout != "yes":
             raise PreflightError("NTP is not synchronized for resume")
@@ -1455,7 +1932,11 @@ def resume_preflight(
                 "required_free_bytes": required,
             },
             "ntp": {"synchronized": True},
-            "offline_imports": {"verified": True},
+            "offline_imports": {
+                "admission_sha256": runtime_import["admission_sha256"],
+                "terminal_signal": runtime_import["terminal_signal"],
+                "verified": True,
+            },
             "roots": {"campaign": str(campaign), "source": str(source)},
             "source_identity": source_identity,
             "transfer_identity": transfer,
@@ -2329,6 +2810,14 @@ def runner_startup_admission(
             or source_identity.get("status") != "PREDICTION_SOURCE_IDENTITY_GREEN"
         ):
             raise PreflightError("runner startup source identity result diverged")
+        runtime_import = _runtime_import_subprocess_admission(
+            runtime=runtime,
+            incoming_root=handoff_path.parent,
+            source_root=source,
+            source_commit=source_commit,
+            inventory_sha256=source_inventory_sha256,
+            run=run,
+        )
         ntp = run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
         if ntp.returncode != 0 or ntp.stdout != "yes":
             raise PreflightError("NTP is not synchronized for runner startup")
@@ -2345,6 +2834,7 @@ def runner_startup_admission(
             "capacity": {"deferred_to_ledger_accounted_runner_gate": True},
             "namespace": namespace,
             "ntp": {"synchronized": True},
+            "runtime_import_admission_sha256": runtime_import["admission_sha256"],
             "roots": {"campaign": str(campaign), "source": str(source)},
             "source_identity": source_identity,
             "transfer_identity": transfer,
@@ -2737,6 +3227,11 @@ def _parser() -> argparse.ArgumentParser:
         "--venue", choices=("polymarket", "kalshi"), required=True
     )
     recovery_network.add_argument("--report", type=Path, required=True)
+    runtime_import = subparsers.add_parser("runtime-import-admission")
+    runtime_import.add_argument("--handoff", type=Path, required=True)
+    runtime_import.add_argument("--source-root", type=Path, required=True)
+    runtime_import.add_argument("--source-inventory", type=Path, required=True)
+    runtime_import.add_argument("--report", type=Path)
     return parser
 
 
@@ -2748,6 +3243,21 @@ def _fail(message: str) -> NoReturn:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        if arguments.command == "runtime-import-admission":
+            report = runtime_import_admission(
+                arguments.handoff,
+                arguments.source_root,
+                arguments.source_inventory,
+            )
+            if arguments.report is not None:
+                expected_report = arguments.handoff.parent / "runtime-import-admission.json"
+                if arguments.report != expected_report:
+                    raise PreflightError(
+                        "runtime import admission report escaped its fixed incoming path"
+                    )
+                _atomic_report(arguments.report, report)
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
         if arguments.command == "recovery-network-admit":
             report = recovery_network_admission(
                 arguments.handoff,

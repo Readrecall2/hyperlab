@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 
@@ -165,6 +166,146 @@ def _create_real_git_bundle(tmp_path: Path, bundle: Path) -> None:
     _run_git("bundle", "create", str(bundle), "HEAD", cwd=source)
 
 
+def test_python_isolated_mode_ignores_pythonpath_for_hyperlab(tmp_path: Path) -> None:
+    fake = tmp_path / "fake-pythonpath"
+    fake.mkdir()
+    (fake / "hyperlab.py").write_text("SHOULD_NOT_IMPORT = True\n", encoding="utf-8")
+    environment = {**os.environ, "PYTHONPATH": str(fake)}
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", "import hyperlab"],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0
+    assert "No module named 'hyperlab'" in completed.stderr
+
+
+def test_runtime_import_admission_isolated_fresh_venv_from_untrusted_cwd(
+    tmp_path: Path,
+) -> None:
+    runtime, handoff_path, source, inventory_path, handoff = (
+        _isolated_runtime_import_fixture(tmp_path)
+    )
+    untrusted_cwd = tmp_path / "old-source-cwd"
+    untrusted_cwd.mkdir()
+    (untrusted_cwd / "hyperlab.py").write_text(
+        "raise RuntimeError('cwd hyperlab must be ignored')\n", encoding="utf-8"
+    )
+    user_base = tmp_path / "fake-user-base"
+    user_site = user_base / "Python" / "site-packages"
+    user_site.mkdir(parents=True)
+    (user_site / "hyperlab.py").write_text(
+        "raise RuntimeError('user-site hyperlab must be ignored')\n", encoding="utf-8"
+    )
+    report_path = handoff_path.parent / "runtime-import-admission.json"
+    completed = subprocess.run(
+        [
+            str(runtime),
+            "-I",
+            str(handoff_path.parent / "scripts" / "preflight.py"),
+            "runtime-import-admission",
+            "--handoff",
+            str(handoff_path),
+            "--source-root",
+            str(source),
+            "--source-inventory",
+            str(inventory_path),
+            "--report",
+            str(report_path),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=untrusted_cwd,
+        env={
+            **os.environ,
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": os.pathsep.join((str(untrusted_cwd), str(user_site))),
+            "PYTHONUSERBASE": str(user_base),
+        },
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report_path.read_bytes() == preflight.canonical_json_bytes(report) + b"\n"
+    assert report["terminal_signal"] == "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN"
+    assert report["isolated"] is True
+    assert report["no_user_site"] is True
+    assert report["modules"]["hyperlab"] == {
+        "class": "source",
+        "file": str(source / "src" / "hyperlab" / "__init__.py"),
+    }
+    for module_name in preflight._RUNTIME_VENV_MODULES:
+        module_record = report["modules"][module_name]
+        assert module_record["class"] == "venv"
+        assert Path(module_record["file"]).is_relative_to(source / ".venv")
+    preflight.validate_runtime_import_admission(
+        report,
+        source_root=source,
+        source_commit=str(handoff["source_commit"]),
+        inventory_sha256=str(handoff["source_inventory_sha256"]),
+    )
+    outside = tmp_path / "outside-venv" / "fastapi.py"
+    outside.parent.mkdir()
+    outside.write_text("SYNTHETIC_FIXTURE = True\n", encoding="utf-8")
+    forged = json.loads(json.dumps(report))
+    forged["modules"]["fastapi"]["file"] = str(outside)
+    forged_body = {
+        key: value for key, value in forged.items() if key != "admission_sha256"
+    }
+    forged["admission_sha256"] = preflight.sha256_bytes(
+        preflight.canonical_json_bytes(forged_body)
+    )
+    with pytest.raises(preflight.PreflightError, match="escaped venv site-packages"):
+        preflight.validate_runtime_import_admission(
+            forged,
+            source_root=source,
+            source_commit=str(handoff["source_commit"]),
+            inventory_sha256=str(handoff["source_inventory_sha256"]),
+        )
+
+
+def test_runtime_import_admission_refuses_symlink_and_external_module_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = tmp_path / "real-source"
+    real.mkdir()
+    linked = tmp_path / "linked-source"
+    try:
+        linked.symlink_to(real, target_is_directory=True)
+    except OSError:
+        linked.mkdir()
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda path: path == linked or original_is_symlink(path),
+        )
+    with pytest.raises(preflight.PreflightError, match="symlinked"):
+        preflight._runtime_exact_directory(linked, label="synthetic source")
+
+    venv_root = tmp_path / "venv"
+    source_root = tmp_path / "source"
+    stdlib_root = tmp_path / "stdlib"
+    for root in (venv_root, source_root, stdlib_root):
+        root.mkdir()
+    outside = tmp_path / "outside" / "hyperlab.py"
+    outside.parent.mkdir()
+    outside.write_text("SYNTHETIC_FIXTURE = True\n", encoding="utf-8")
+    with pytest.raises(preflight.PreflightError, match="escaped"):
+        preflight._runtime_module_class(
+            outside,
+            source_root=source_root,
+            venv_root=venv_root,
+            stdlib_roots=(stdlib_root,),
+        )
+
+
 def _git_bash_path(path: Path) -> str:
     resolved = path.resolve()
     drive = resolved.drive.removesuffix(":").lower()
@@ -246,7 +387,17 @@ def _operator_fake_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     prepared_runtime_wrapper.write_text(
         "#!/usr/bin/bash\n"
         "printf 'venv-python|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n"
-        "if [[ ${1:-} == -I && ${2:-} == -c ]]; then exit \"${HYPERLAB_FAKE_VENV_IMPORT_EXIT:-0}\"; fi\n"
+        "if [[ ${1:-} == -I && ${3:-} == runtime-import-admission ]]; then\n"
+        "  admission_exit=${HYPERLAB_FAKE_VENV_IMPORT_EXIT:-0}\n"
+        "  (( admission_exit == 0 )) || exit \"$admission_exit\"\n"
+        "  report=''\n"
+        "  for ((index=1; index<=$#; index++)); do\n"
+        "    if [[ ${!index} == --report ]]; then next=$((index+1)); report=${!next}; fi\n"
+        "  done\n"
+        "  [[ -z $report ]] || printf '{\"terminal_signal\":\"SYNTHETIC_FIXTURE_SEQUENCE_ONLY\"}\\n' > \"$report\"\n"
+        "  printf '{\"terminal_signal\":\"SYNTHETIC_FIXTURE_SEQUENCE_ONLY\"}\\n'\n"
+        "  exit 0\n"
+        "fi\n"
         "exit \"${HYPERLAB_FAKE_VENV_PYTHON_EXIT:-0}\"\n",
         encoding="utf-8",
     )
@@ -280,6 +431,9 @@ if [[ ${HYPERLAB_FAKE_SUDO_MODE:-green} == cache-expired && ${1:-} == -n ]]; the
         """printf 'git|%s\\n' "$*" >> "$HYPERLAB_FAKE_LOG"
 if [[ ${1:-} == clone && ${2:-} == --no-checkout ]]; then
   mkdir -p -- "$4"
+  if [[ -n ${HYPERLAB_FAKE_CLONE_TEMPLATE:-} ]]; then
+    cp -R -- "$HYPERLAB_FAKE_CLONE_TEMPLATE/." "$4/"
+  fi
 fi
 """,
     )
@@ -316,9 +470,13 @@ case "${HYPERLAB_FAKE_BASH_MODE:-install}" in
     if [[ ${1:-} == */bootstrap-offline.sh ]]; then
       bootstrap_exit=${HYPERLAB_FAKE_BOOTSTRAP_EXIT:-0}
       if (( bootstrap_exit == 0 )); then
-        mkdir -p -- "$2/.venv/bin"
-        cp -- "$HYPERLAB_FAKE_VENV_WRAPPER" "$2/.venv/bin/python"
-        chmod 0700 "$2/.venv/bin/python"
+        if [[ -n ${HYPERLAB_REAL_ADMISSION_BOOTSTRAP:-} ]]; then
+          "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_REAL_ADMISSION_BOOTSTRAP" "$2" "$HYPERLAB_FAKE_LOG"
+        else
+          mkdir -p -- "$2/.venv/bin"
+          cp -- "$HYPERLAB_FAKE_VENV_WRAPPER" "$2/.venv/bin/python"
+          chmod 0700 "$2/.venv/bin/python"
+        fi
         printf 'PREDICTION_OFFLINE_BOOTSTRAP_GREEN:%s\\n' "$2/.venv/bin/python"
       fi
       exit "$bootstrap_exit"
@@ -392,6 +550,7 @@ esac
             "HYPERLAB_FAKE_VENV_WRAPPER": _git_bash_path(prepared_runtime_wrapper),
             "HYPERLAB_FAKE_LOG": _git_bash_path(log),
             "HYPERLAB_REAL_PYTHON": _git_bash_path(Path(sys.executable)),
+            "HYPERLAB_REAL_WINDOWS_PATH": environment["PATH"],
             "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
         }
     )
@@ -455,6 +614,10 @@ if [[ ${1:-} == -I && ${2:-} == - && ${3:-} == */host-preflight-report.json && $
   exit "${PIPESTATUS[0]}"
 fi
 if [[ ${1:-} == -I && ${2:-} == - && $# == 3 ]]; then
+  exit 0
+fi
+if [[ ${1:-} == -I && ${2:-} == */preflight.py && ${3:-} == runtime-import-admission ]]; then
+  printf '{"terminal_signal":"SYNTHETIC_FIXTURE_INSTALL_SEQUENCE_ONLY"}\n'
   exit 0
 fi
 if [[ ${1:-} == -I && ${2:-} == */preflight.py && ${3:-} == authenticate-namespace-probe-completion ]]; then
@@ -1351,6 +1514,13 @@ def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandR
     raise AssertionError(arguments)
 
 
+def _synthetic_runtime_import_result(**_kwargs: object) -> dict[str, object]:
+    return {
+        "admission_sha256": "d" * 64,
+        "terminal_signal": "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN",
+    }
+
+
 def test_plan_freezes_candidate_identities_and_conservative_h1_reservation() -> None:
     plan = launch_pack.validate_plan(_plan())
     assert plan["access_bundle_sha256"] == (
@@ -1676,6 +1846,11 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
     assert "ReadWritePaths=" in kalshi and "/kalshi" in kalshi
     assert "ReadWritePaths=" not in dashboard
     assert "--host 127.0.0.1 --port 18081" in dashboard
+    for service in (polymarket, kalshi, dashboard):
+        assert service.count("ExecStartPre=") == 1
+        assert "runtime-import-admission" in service
+        assert " --source-inventory " in service
+        assert " -I " in service
     for collector in (polymarket, kalshi):
         assert "RestartPreventExitStatus=4" in collector
     for venue, probe in (("polymarket", polymarket_probe), ("kalshi", kalshi_probe)):
@@ -2480,6 +2655,9 @@ def test_rendered_operator_readme_is_attempt_bound_nonexpert_and_h1_safe() -> No
     assert "PUBLIC_SOURCE_INVALID" in readme
     assert "source_usable=false" in readme
     assert "INTEGRITY_FAILED" in readme
+    assert "runtime-import-admission" in readme
+    assert "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN" in readme
+    assert "python -I" in readme
     for name in (
         "A-windows-bundle-verify-transfer.ps1",
         "B-tabby-preflight-install-activate.sh",
@@ -2651,7 +2829,11 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     assert not any("/scripts/install.sh" in line for line in lines)
     host_index = next(index for index, line in enumerate(lines) if "preflight.py host" in line)
     bootstrap_index = next(index for index, line in enumerate(lines) if "bootstrap-offline.sh" in line)
-    import_index = next(index for index, line in enumerate(lines) if line.startswith("venv-python|-I -c "))
+    import_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("venv-python|-I ") and " runtime-import-admission " in line
+    )
     verify_old_index = next(index for index, line in enumerate(lines) if "cutover.sh verify-old" in line)
     disarm_index = next(index for index, line in enumerate(lines) if "cutover.sh disarm-old" in line)
     install_index = lines.index(expected_install)
@@ -2713,9 +2895,114 @@ def test_materialized_tabby_b_import_failure_never_starts_cutover(
     assert completed.returncode == 4
     assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" not in completed.stderr
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert any(line.startswith("venv-python|-I -c ") for line in lines)
+    assert any(
+        line.startswith("venv-python|-I ") and " runtime-import-admission " in line
+        for line in lines
+    )
     assert not any("cutover.sh verify-old" in line for line in lines)
     assert not any("cutover.sh disarm-old" in line for line in lines)
+
+
+def test_materialized_tabby_b_executes_real_isolated_import_admission_before_cutover(
+    tmp_path: Path,
+) -> None:
+    fixture_root = tmp_path / "real-admission-fixture"
+    _runtime, handoff_path, source, _inventory_path, handoff = (
+        _isolated_runtime_import_fixture(fixture_root)
+    )
+    shutil.rmtree(source / ".venv")
+    template = tmp_path / "clone-template"
+    _run_git(
+        "-c",
+        "core.longpaths=true",
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        str(source),
+        str(template),
+    )
+    _run_git("config", "core.longpaths", "true", cwd=template)
+    incoming = handoff_path.parent
+    attempt_mount = (tmp_path / "attempt-volume").resolve()
+    volume_base = attempt_mount / "prediction-markets"
+    volume_base.joinpath("sources").mkdir(parents=True)
+    slug = str(handoff["run_slug"])
+    source = volume_base / "sources" / slug
+    campaign = volume_base / "campaigns" / slug
+    handoff.update(
+        {
+            "bundle_filename": "launch.bundle",
+            "campaign_root": campaign.as_posix(),
+            "incoming_root": incoming.as_posix(),
+            "source_root": source.as_posix(),
+            "volume_base": volume_base.as_posix(),
+            "volume_mount": attempt_mount.as_posix(),
+        }
+    )
+    handoff_raw = preflight.canonical_json_bytes(handoff) + b"\n"
+    handoff_path.write_bytes(handoff_raw)
+    handoff_path.with_name("handoff.sha256").write_text(
+        f"{preflight.sha256_bytes(handoff_raw)}  handoff.json\n", encoding="ascii"
+    )
+
+    builder = tmp_path / "build-fresh-offline-runtime.py"
+    builder.write_text(
+        """from pathlib import Path
+import subprocess,sys,venv
+source=Path(sys.argv[1]); log=Path(sys.argv[2])
+venv.EnvBuilder(with_pip=False,symlinks=False).create(source/'.venv')
+runtime=source/'.venv'/('Scripts/python.exe' if sys.platform=='win32' else 'bin/python')
+query=subprocess.run([str(runtime),'-I','-c',"import site; print(next(p for p in site.getsitepackages() if p.lower().endswith('site-packages')))"],capture_output=True,check=True,text=True)
+site_packages=Path(query.stdout.strip())
+for name in ('fastapi','requests','uvicorn','websocket'):
+ (site_packages/f'{name}.py').write_text('SYNTHETIC_FIXTURE = True\\n',encoding='utf-8')
+wrapper=source/'.venv'/'bin'/'python'; wrapper.parent.mkdir(parents=True,exist_ok=True)
+wrapper_payload=("#!/usr/bin/bash\\n"+"printf 'venv-python|%s\\\\n' \\"$*\\" >> \\"$HYPERLAB_FAKE_LOG\\"\\n"+f'PATH="$HYPERLAB_REAL_WINDOWS_PATH" exec "{runtime.as_posix()}" "$@"\\n')
+wrapper.write_text(wrapper_payload,encoding='utf-8')
+wrapper.chmod(0o700)
+print('PREDICTION_TEST_FRESH_OFFLINE_VENV_GREEN')
+""",
+        encoding="utf-8",
+    )
+    operator_root = tmp_path / "operator-harness"
+    operator_root.mkdir()
+    environment, log = _operator_fake_environment(operator_root)
+    environment.update(
+        {
+            "HYPERLAB_FAKE_BASH_MODE": "install",
+            "HYPERLAB_FAKE_CLONE_TEMPLATE": _git_bash_path(template),
+            "HYPERLAB_REAL_ADMISSION_BOOTSTRAP": _git_bash_path(builder),
+        }
+    )
+    script = tmp_path / "B-real-runtime-import-admission.sh"
+    script.write_text(launch_pack.render_tabby_install(handoff), encoding="utf-8")
+    non_git_cwd = tmp_path / "untrusted-non-git-cwd"
+    non_git_cwd.mkdir()
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN" in completed.stdout
+    assert "PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER" in completed.stdout
+    report = json.loads(
+        (incoming / "runtime-import-admission.json").read_text(encoding="utf-8")
+    )
+    assert report["terminal_signal"] == "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN"
+    lines = log.read_text(encoding="utf-8").splitlines()
+    admission_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("venv-python|-I ") and " runtime-import-admission " in line
+    )
+    verify_old_index = next(
+        index for index, line in enumerate(lines) if "cutover.sh verify-old" in line
+    )
+    disarm_index = next(
+        index for index, line in enumerate(lines) if "cutover.sh disarm-old" in line
+    )
+    assert admission_index < verify_old_index < disarm_index
 
 
 @pytest.mark.parametrize("sudo_mode", ["foreground-refused", "cache-expired"])
@@ -3632,6 +3919,120 @@ def test_materialized_tabby_e_restore_reauthenticates_final_old_state(
     ]
 
 
+def _git_output(*arguments: str, cwd: Path) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        capture_output=True,
+        check=False,
+        cwd=cwd,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+def _isolated_runtime_import_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+    slug = "pm-20260828t170000z-cafefeed"
+    volume_mount = (tmp_path / "volume").resolve()
+    volume_base = volume_mount / "prediction-markets"
+    source = volume_base / "sources" / slug
+    incoming = (tmp_path / "incoming" / slug).resolve()
+    source.joinpath("src", "hyperlab").mkdir(parents=True)
+    source.joinpath("ops", "prediction_markets_launch_v1").mkdir(parents=True)
+    incoming.joinpath("scripts").mkdir(parents=True)
+    (source / ".gitignore").write_text(".venv/\n__pycache__/\n", encoding="utf-8")
+    (source / "src" / "hyperlab" / "__init__.py").write_text(
+        "SYNTHETIC_FIXTURE = True\n", encoding="utf-8"
+    )
+    (source / "ops" / "__init__.py").write_text("", encoding="utf-8")
+    (source / "ops" / "prediction_markets_launch_v1" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    helpers = "\n".join(
+        f"def {name}(*args, **kwargs):\n    return None\n"
+        for name in (
+            "_validate_venue_state",
+            "active_optional_service_is_admissible",
+            "classify_monitored_service",
+            "complete_service_is_admissible",
+            "prepared_state_is_stale",
+            "validate_activation_evidence",
+        )
+    )
+    (source / "ops" / "prediction_markets_launch_v1" / "cockpit.py").write_text(
+        helpers, encoding="utf-8"
+    )
+    runner_helpers = (
+        "def read_ledger(*args, **kwargs):\n    return []\n\n"
+        "def validate_service_ledger_against_manifest(*args, **kwargs):\n    return None\n"
+    )
+    (source / "ops" / "prediction_markets_launch_v1" / "runner.py").write_text(
+        runner_helpers, encoding="utf-8"
+    )
+    (source / "ops" / "prediction_markets_launch_v1" / "preflight.py").write_text(
+        "SYNTHETIC_FIXTURE = True\n", encoding="utf-8"
+    )
+    _run_git("init", "--quiet", str(source))
+    _run_git("config", "core.longpaths", "true", cwd=source)
+    _run_git("config", "user.email", "synthetic-fixture@invalid.example", cwd=source)
+    _run_git("config", "user.name", "Synthetic Fixture", cwd=source)
+    _run_git("add", ".", cwd=source)
+    _run_git("commit", "--quiet", "-m", "isolated runtime fixture", cwd=source)
+    commit = _git_output("rev-parse", "HEAD", cwd=source)
+    inventory = launch_pack.build_source_inventory(source, commit)
+    inventory_path = incoming / "source-inventory.json"
+    inventory_path.write_bytes(preflight.canonical_json_bytes(inventory) + b"\n")
+    shutil.copy2(OPS / "preflight.py", incoming / "scripts" / "preflight.py")
+    shutil.copy2(OPS / "launch_pack.py", incoming / "scripts" / "launch_pack.py")
+
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(source / ".venv")
+    runtime = source / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    site_query = subprocess.run(
+        [
+            str(runtime),
+            "-I",
+            "-c",
+            (
+                "import site; print(next(p for p in site.getsitepackages() "
+                "if p.lower().endswith('site-packages')))"
+            ),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert site_query.returncode == 0, site_query.stderr
+    site_packages = Path(site_query.stdout.strip())
+    for module_name in preflight._RUNTIME_VENV_MODULES:
+        (site_packages / f"{module_name}.py").write_text(
+            "SYNTHETIC_FIXTURE = True\n", encoding="utf-8"
+        )
+
+    handoff = {
+        "boundary": preflight.BOUNDARY,
+        "campaign_root": str(volume_base / "campaigns" / slug),
+        "incoming_root": str(incoming),
+        "run_slug": slug,
+        "schema_version": 1,
+        "source_commit": commit,
+        "source_inventory_sha256": inventory["inventory_sha256"],
+        "source_root": str(source),
+        "volume_base": str(volume_base),
+        "volume_mount": str(volume_mount),
+    }
+    handoff_raw = preflight.canonical_json_bytes(handoff) + b"\n"
+    handoff_path = incoming / "handoff.json"
+    handoff_path.write_bytes(handoff_raw)
+    (incoming / "handoff.sha256").write_text(
+        f"{preflight.sha256_bytes(handoff_raw)}  handoff.json\n", encoding="ascii"
+    )
+    return runtime, handoff_path, source, inventory_path, handoff
+
+
 @pytest.mark.parametrize("sudo_mode", ["foreground-refused", "cache-expired"])
 def test_materialized_tabby_e_sudo_refusal_never_dispatches(
     tmp_path: Path,
@@ -4259,6 +4660,10 @@ exec(compile(source,'materialized-monitor-embedded','exec'),{'__name__':'__main_
         """#!/usr/bin/bash
 set -Eeuo pipefail
 printf 'venv|%s\n' "$*" >> "$HYPERLAB_RUNTIME_LOG"
+if [[ ${1:-} == -I && ${2:-} == */preflight.py && ${3:-} == runtime-import-admission ]]; then
+  printf 'PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN\n'
+  exit 0
+fi
 [[ ${1:-} == -I && ${2:-} == - ]]
 shift 2
 exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_INJECTOR" "$@"
@@ -4409,6 +4814,7 @@ exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_INJECTOR" "$@"
     assert green["services"]["dashboard"]["listener_verified"] is True  # type: ignore[index]
     assert "NameError" not in completed.stderr
     assert "system-python" not in runtime_log.read_text(encoding="utf-8")
+    assert "runtime-import-admission" in runtime_log.read_text(encoding="utf-8")
     assert "venv|-I -" in runtime_log.read_text(encoding="utf-8")
 
     proc_green_completed, proc_green = invoke("proc-green")
@@ -4995,6 +5401,11 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        preflight,
+        "_runtime_import_subprocess_admission",
+        _synthetic_runtime_import_result,
+    )
     slug = "pm-20260827t235959z-feedface"
     home_mount = tmp_path / "home"
     incoming_parent = home_mount / "incoming"
@@ -6111,6 +6522,11 @@ def test_resume_preflight_revalidates_ntp_capacity_roots_and_offline_imports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        preflight,
+        "_runtime_import_subprocess_admission",
+        _synthetic_runtime_import_result,
+    )
     handoff_path = _incoming_handoff(tmp_path)
     handoff = preflight.load_handoff(handoff_path)
     source = Path(str(handoff["source_root"]))
@@ -6124,7 +6540,11 @@ def test_resume_preflight_revalidates_ntp_capacity_roots_and_offline_imports(
     result = preflight.resume_preflight(handoff_path, run=_green_command)
     assert result["resume_admissible"] is True
     assert result["terminal_signal"] == "PREDICTION_RESUME_PREFLIGHT_GREEN"
-    assert result["checks"]["offline_imports"] == {"verified": True}  # type: ignore[index]
+    assert result["checks"]["offline_imports"] == {  # type: ignore[index]
+        "admission_sha256": "d" * 64,
+        "terminal_signal": "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN",
+        "verified": True,
+    }
     assert result["checks"]["source_identity"] == {  # type: ignore[index]
         "commit": "b" * 40,
         "files": 1,

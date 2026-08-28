@@ -74,10 +74,17 @@ SOURCE_ROOT=${VALUES[6]}
 AUTHENTICATED_INCOMING_ROOT=${VALUES[7]}
 RUN_SLUG=${VALUES[8]}
 [[ $INCOMING_ROOT == "$AUTHENTICATED_INCOMING_ROOT" ]] || fail 'incoming root changed after authentication'
+SYSTEMD_HELPER="$INCOMING_ROOT/scripts/systemd_cutover.py"
+[[ -f $SYSTEMD_HELPER && ! -L $SYSTEMD_HELPER ]] || fail 'bounded systemd helper is absent or unsafe'
 
 SYSTEM_ERRORS=0
 system_action() {
-  if ! sudo systemctl "$@"; then
+  local operation=$1 service=$2
+  if [[ $operation == disable ]]; then
+    return 0
+  fi
+  [[ $operation == stop ]] || fail "unsupported recovery system action:$operation"
+  if ! python3.12 -I "$SYSTEMD_HELPER" disarm --service "$service" --allow-absent; then
     printf 'PREDICTION_SYSTEM_ACTION_FAILED=%s\n' "$*" >&2
     SYSTEM_ERRORS=1
   fi
@@ -85,11 +92,13 @@ system_action() {
 
 if [[ $MODE == rollback ]]; then
   for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
-    system_action stop "$SERVICE"
-    system_action disable "$SERVICE"
+    if ! python3.12 -I "$SYSTEMD_HELPER" disarm --service "$SERVICE" --allow-absent; then
+      printf 'PREDICTION_SYSTEM_ACTION_FAILED=disarm %s\n' "$SERVICE" >&2
+      SYSTEM_ERRORS=1
+    fi
   done
   for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
-    if ! ACTIVE=$(timeout 5 sudo systemctl show "$SERVICE" --property=ActiveState --value --no-pager); then
+    if ! ACTIVE=$(timeout --signal=TERM --kill-after=2s 10s systemctl show "$SERVICE" --property=ActiveState --value --no-pager); then
       printf 'PREDICTION_ROLLBACK_POSTCONDITION_UNREADABLE=%s\n' "$SERVICE" >&2
       SYSTEM_ERRORS=1
     else
@@ -102,7 +111,7 @@ if [[ $MODE == rollback ]]; then
       esac
     fi
     set +e
-    ENABLED=$(timeout 5 sudo systemctl is-enabled "$SERVICE" 2>&1)
+    ENABLED=$(timeout --signal=TERM --kill-after=2s 10s systemctl is-enabled "$SERVICE" 2>&1)
     set -e
     if [[ $ENABLED != disabled ]]; then
       printf 'PREDICTION_ROLLBACK_SERVICE_NOT_DISABLED=%s:%s\n' "$SERVICE" "$ENABLED" >&2
@@ -148,10 +157,10 @@ PY
 )
 (( ${#INITIAL_ELIGIBLE[@]} == 2 )) || fail 'initial admission venue rows are incomplete'
 
-if ! sudo systemctl enable --now "$DASHBOARD_SERVICE"; then
+if ! python3.12 -I "$SYSTEMD_HELPER" ensure-active --service "$DASHBOARD_SERVICE"; then
   DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
+  python3.12 -I "$SYSTEMD_HELPER" disarm --service "$DASHBOARD_SERVICE" --allow-absent \
+    || DASHBOARD_CLEANUP_ERRORS=1
   (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'dashboard recovery activation and targeted cleanup both failed'
   fail 'dashboard recovery activation failed before any venue start'
 fi
@@ -251,8 +260,8 @@ PY
 done
 if [[ $DASHBOARD_RECOVERY_READY != yes ]]; then
   DASHBOARD_CLEANUP_ERRORS=0
-  sudo systemctl stop "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
-  sudo systemctl disable "$DASHBOARD_SERVICE" || DASHBOARD_CLEANUP_ERRORS=1
+  python3.12 -I "$SYSTEMD_HELPER" disarm --service "$DASHBOARD_SERVICE" --allow-absent \
+    || DASHBOARD_CLEANUP_ERRORS=1
   (( DASHBOARD_CLEANUP_ERRORS == 0 )) || fail 'dashboard recovery readiness and targeted cleanup both failed'
   fail 'dashboard recovery readiness failed before any venue start'
 fi
@@ -377,7 +386,7 @@ PY
         continue
       fi
     fi
-    if sudo systemctl enable --now "$SERVICE"; then
+    if python3.12 -I "$SYSTEMD_HELPER" ensure-active --service "$SERVICE"; then
       VENUE_STATUS=''
       for _attempt in {1..20}; do
         if VENUE_STATUS=$(recovery_service_status "$VENUE" "$SERVICE"); then

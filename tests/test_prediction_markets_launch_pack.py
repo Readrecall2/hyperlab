@@ -60,6 +60,10 @@ def _incoming_handoff(tmp_path: Path) -> Path:
     scripts.mkdir()
     launch_script = scripts / "launch_pack.py"
     launch_script.write_text("# SYNTHETIC/FIXTURE authenticated source verifier\n", encoding="utf-8")
+    cutover_script = scripts / "cutover.sh"
+    cutover_script.write_bytes(
+        b"#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf 'SYNTHETIC/FIXTURE cutover verifier\\n'\n"
+    )
     source_inventory = incoming / "source-inventory.json"
     source_inventory.write_text('{"fixture":"SYNTHETIC/FIXTURE"}\n', encoding="utf-8")
     bundle = incoming / "launch.bundle"
@@ -80,6 +84,11 @@ def _incoming_handoff(tmp_path: Path) -> Path:
                 "path": "scripts/launch_pack.py",
                 "sha256": preflight.sha256_bytes(launch_script.read_bytes()),
                 "size": launch_script.stat().st_size,
+            },
+            {
+                "path": "scripts/cutover.sh",
+                "sha256": preflight.sha256_bytes(cutover_script.read_bytes()),
+                "size": cutover_script.stat().st_size,
             },
             {
                 "path": "source-inventory.json",
@@ -107,6 +116,7 @@ def _incoming_handoff(tmp_path: Path) -> Path:
         "source_commit": "b" * 40,
         "source_inventory_sha256": "c" * 64,
         "source_root": str(volume_base / "sources" / "source-must-be-new"),
+        "superseded_campaign": launch_pack._superseded_campaign_contract(),
         "transfer_inventory_sha256": preflight.sha256_bytes(transfer_payload),
         "volume_base": str(volume_base),
         "volume_mount": "/mnt/HC_Volume_106716684",
@@ -143,7 +153,14 @@ def _create_real_git_bundle(tmp_path: Path, bundle: Path) -> None:
         "SYNTHETIC/FIXTURE only; no economic evidence.\n",
         encoding="utf-8",
     )
-    _run_git("add", "SYNTHETIC_FIXTURE.txt", cwd=source)
+    scripts = source / "ops" / "prediction_markets_launch_v1"
+    scripts.mkdir(parents=True)
+    for name in launch_pack._SCRIPTS:
+        payload = (OPS / name).read_bytes()
+        if name.endswith(".sh"):
+            payload = launch_pack.validate_posix_shell_payload(payload, label=name)
+        (scripts / name).write_bytes(payload)
+    _run_git("add", ".", cwd=source)
     _run_git("commit", "--quiet", "-m", "synthetic bundle fixture", cwd=source)
     _run_git("bundle", "create", str(bundle), "HEAD", cwd=source)
 
@@ -225,6 +242,15 @@ def _operator_fake_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     log = tmp_path / "operator-fakes.log"
+    prepared_runtime_wrapper = tmp_path / "prepared-runtime-python"
+    prepared_runtime_wrapper.write_text(
+        "#!/usr/bin/bash\n"
+        "printf 'venv-python|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n"
+        "if [[ ${1:-} == -I && ${2:-} == -c ]]; then exit \"${HYPERLAB_FAKE_VENV_IMPORT_EXIT:-0}\"; fi\n"
+        "exit \"${HYPERLAB_FAKE_VENV_PYTHON_EXIT:-0}\"\n",
+        encoding="utf-8",
+    )
+    prepared_runtime_wrapper.chmod(0o700)
     _write_fake_command(
         fake_bin,
         "id",
@@ -243,7 +269,10 @@ exit "${HYPERLAB_FAKE_PYTHON_EXIT:-0}"
     _write_fake_command(
         fake_bin,
         "sudo",
-        "printf 'sudo|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n",
+        """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
+if [[ ${HYPERLAB_FAKE_SUDO_MODE:-green} == foreground-refused && ${1:-} == -v ]]; then exit 1; fi
+if [[ ${HYPERLAB_FAKE_SUDO_MODE:-green} == cache-expired && ${1:-} == -n ]]; then exit 1; fi
+""",
     )
     _write_fake_command(
         fake_bin,
@@ -284,6 +313,27 @@ print(json.dumps(value,separators=(',',':'),sort_keys=True))
         """printf 'bash|%s\\n' "$*" >> "$HYPERLAB_FAKE_LOG"
 case "${HYPERLAB_FAKE_BASH_MODE:-install}" in
   install)
+    if [[ ${1:-} == */bootstrap-offline.sh ]]; then
+      bootstrap_exit=${HYPERLAB_FAKE_BOOTSTRAP_EXIT:-0}
+      if (( bootstrap_exit == 0 )); then
+        mkdir -p -- "$2/.venv/bin"
+        cp -- "$HYPERLAB_FAKE_VENV_WRAPPER" "$2/.venv/bin/python"
+        chmod 0700 "$2/.venv/bin/python"
+        printf 'PREDICTION_OFFLINE_BOOTSTRAP_GREEN:%s\\n' "$2/.venv/bin/python"
+      fi
+      exit "$bootstrap_exit"
+    fi
+    if [[ ${1:-} == */cutover.sh ]]; then
+      case "${2:-}" in
+        verify-old) printf 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED\\n' ;;
+        disarm-old)
+          : > "$(dirname -- "$3")/cutover-old-premutation.json"
+          printf 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED\\n'
+          ;;
+        *) exit 93 ;;
+      esac
+      exit 0
+    fi
     if [[ ${1:-} == */install.sh ]]; then
       install_exit=${HYPERLAB_FAKE_INSTALL_EXIT:-0}
       if (( install_exit == 0 )); then
@@ -317,6 +367,14 @@ case "${HYPERLAB_FAKE_BASH_MODE:-install}" in
     [[ ${1:-} == */rollback.sh && ${2:-} == rollback ]] || exit 95
     printf 'PREDICTION_ROLLBACK_GREEN\\n'
     ;;
+  restore-old)
+    [[ ${1:-} == */cutover.sh ]] || exit 95
+    case ${2:-} in
+      restore-old) printf 'PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY\\n' ;;
+      verify-restored) printf 'PREDICTION_OLD_CAMPAIGN_FINAL_STATE_AUTHENTICATED_NO_NEW_COLLECTOR\\n' ;;
+      *) exit 93 ;;
+    esac
+    ;;
   *) exit 94 ;;
 esac
         """,
@@ -331,6 +389,7 @@ esac
         {
             "BASH_ENV": _git_bash_path(bash_environment),
             "HYPERLAB_FAKE_COUNTER": _git_bash_path(tmp_path / "monitor-counter"),
+            "HYPERLAB_FAKE_VENV_WRAPPER": _git_bash_path(prepared_runtime_wrapper),
             "HYPERLAB_FAKE_LOG": _git_bash_path(log),
             "HYPERLAB_REAL_PYTHON": _git_bash_path(Path(sys.executable)),
             "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
@@ -794,6 +853,11 @@ fi
         fake_bin,
         "sudo",
         """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
+[[ ${1:-} == -n ]] && shift
+if [[ ${1:-} == timeout ]]; then
+  shift
+  while (($#)) && [[ ${1:-} != systemctl && ${1:-} != journalctl ]]; do shift; done
+fi
 if [[ ${1:-} == install ]]; then
   source=${@: -2:1}; target=${@: -1}
   cp -- "$source" "$HYPERLAB_ROOT_UNIT_STATE/$(basename -- "$target")"
@@ -1060,18 +1124,15 @@ def _materialize_windows_transfer_layout(
 ) -> tuple[Path, Path, Path, Path, Path, dict[str, object]]:
     pack = tmp_path / "materialized-pack"
     operator = pack / "operator"
+    scripts = pack / "scripts"
     wheelhouse = pack / "wheelhouse"
     operator.mkdir(parents=True)
+    scripts.mkdir()
     wheelhouse.mkdir()
     bundle = pack / "hyperlab-prediction-markets-prospective-launch-v1.bundle"
     _create_real_git_bundle(tmp_path, bundle)
-    handoff_json = pack / "handoff.json"
-    handoff_json.write_bytes(b'{"fixture":"SYNTHETIC_LAYOUT_ONLY"}\n')
     wheel = wheelhouse / "fixture-1.0-py3-none-any.whl"
     wheel.write_bytes(b"real-wheel-hash-fixture")
-    (pack / "handoff.sha256").write_bytes(
-        f"{launch_pack.sha256_file(handoff_json)}  handoff.json\n".encode("ascii")
-    )
     (pack / "wheelhouse.sha256").write_bytes(
         f"{launch_pack.sha256_file(wheel)}  {wheel.name}\n".encode("ascii")
     )
@@ -1081,10 +1142,64 @@ def _materialize_windows_transfer_layout(
             "bundle_filename": bundle.name,
             "bundle_sha256": launch_pack.sha256_file(bundle),
             "incoming_root": _git_bash_path(pack),
+            "source_commit": "b" * 40,
+            "superseded_campaign": launch_pack._superseded_campaign_contract(),
         }
     )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    for name in launch_pack._SCRIPTS:
+        target = scripts / name
+        if name == "launch_pack.py":
+            target.write_bytes(Path(launch_pack.__file__).read_bytes())
+        elif name.endswith(".sh"):
+            target.write_bytes(
+                launch_pack._git_blob(
+                    ROOT,
+                    commit,
+                    f"ops/prediction_markets_launch_v1/{name}",
+                )
+            )
+        else:
+            target.write_text("# SYNTHETIC/FIXTURE transferred Python payload\n", encoding="utf-8")
+    (pack / "README.md").write_text("SYNTHETIC/FIXTURE transfer layout\n", encoding="utf-8")
+    (pack / "source-inventory.json").write_text(
+        '{"fixture":"SYNTHETIC/FIXTURE"}\n',
+        encoding="utf-8",
+    )
+    blocks = {
+        "A-windows-bundle-verify-transfer.ps1": launch_pack.render_windows_transfer(handoff),
+        "B-tabby-preflight-install-activate.sh": launch_pack.render_tabby_install(handoff),
+        "C-tabby-readonly-monitor.sh": launch_pack.render_tabby_monitor(handoff),
+        "D-windows-dashboard-tunnel.ps1": launch_pack.render_windows_tunnel(handoff),
+        "E-recovery-rollback.sh": launch_pack.render_recovery_rollback(handoff),
+    }
+    for name, content in blocks.items():
+        (operator / name).write_text(content, encoding="utf-8", newline="\n")
+    transfer_paths = [
+        bundle.name,
+        "README.md",
+        "source-inventory.json",
+        "wheelhouse.sha256",
+        *[f"scripts/{name}" for name in launch_pack._SCRIPTS],
+        *[f"operator/{name}" for name in blocks],
+    ]
+    transfer = launch_pack._transfer_inventory(pack, transfer_paths)
+    transfer_raw = launch_pack.canonical_json_bytes(transfer) + b"\n"
+    (pack / "transfer-inventory.json").write_bytes(transfer_raw)
+    handoff["transfer_inventory_sha256"] = launch_pack.sha256_bytes(transfer_raw)
+    handoff_json = pack / "handoff.json"
+    handoff_json.write_bytes(launch_pack.canonical_json_bytes(handoff) + b"\n")
+    (pack / "handoff.sha256").write_bytes(
+        f"{launch_pack.sha256_file(handoff_json)}  handoff.json\n".encode("ascii")
+    )
     block_a = operator / "A-windows-bundle-verify-transfer.ps1"
-    block_a.write_text(launch_pack.render_windows_transfer(handoff), encoding="utf-8")
     ssh_key = tmp_path / "hyperlab_hetzner"
     ssh_key.write_bytes(b"SYNTHETIC_PRIVATE_KEY_PATH_FIXTURE_NOT_A_KEY")
     return pack, block_a, bundle, handoff_json, ssh_key, handoff
@@ -1106,6 +1221,13 @@ def _invoke_windows_transfer_with_strict_fakes(
         git_bash = shutil.which("bash")
     if git_bash is None:
         pytest.skip("Git Bash is unavailable for the remote-command simulation")
+    remote_fake_bin = tmp_path / "remote-fake-bin"
+    remote_fake_bin.mkdir()
+    _write_fake_command(
+        remote_fake_bin,
+        "python3.12",
+        'exec "$HYPERLAB_PM_REAL_PYTHON" "$@"\n',
+    )
     log = tmp_path / log_name
     wrapper = tmp_path / f"invoke-{log_name}.ps1"
     wrapper.write_text(
@@ -1140,6 +1262,8 @@ function global:scp {
             "HYPERLAB_PM_SSH_KEY": str(ssh_key),
             "HYPERLAB_PM_SSH_TARGET": "hyperlab@5.223.60.130",
             "HYPERLAB_PM_TEST_BASH": git_bash,
+            "HYPERLAB_PM_REAL_PYTHON": str(Path(sys.executable)),
+            "PATH": str(remote_fake_bin) + os.pathsep + environment["PATH"],
             "TEMP": str(powershell_temp),
             "TMP": str(powershell_temp),
         }
@@ -1167,6 +1291,14 @@ function global:scp {
 
 
 def _green_command(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
+    if arguments[0] == "bash" and "verify-old" in arguments:
+        return preflight.CommandResult(
+            0,
+            "PREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED\n"
+            "PREDICTION_OLD_CAMPAIGN_FIVE_UNITS_AUTHENTICATED\n"
+            "PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED\n",
+            "",
+        )
     if arguments[0] == "python3.12" or arguments[0].replace("\\", "/").endswith(
         "/.venv/bin/python"
     ):
@@ -1251,6 +1383,95 @@ def test_plan_freezes_candidate_identities_and_conservative_h1_reservation() -> 
     assert "hyperlab-h1" not in json.dumps(plan)
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"\xef\xbb\xbf#!/usr/bin/env bash\ntrue\n", "UTF-8 BOM"),
+        (b"#!/usr/bin/env bash\ntrue\x00\n", "contains NUL"),
+        (b"#!/usr/bin/env bash\r\ntrue\r\n", "contains CR"),
+        (b"#!/bin/sh\ntrue\n", "invalid Bash shebang"),
+        (b"#!/usr/bin/env bash\ntrue", "final LF"),
+    ],
+)
+def test_posix_shell_payload_validation_is_binary_and_fail_closed(
+    payload: bytes,
+    message: str,
+) -> None:
+    with pytest.raises(launch_pack.LaunchPackError, match=message):
+        launch_pack.validate_posix_shell_payload(payload, label="synthetic.sh")
+
+
+def test_commit_blob_materialization_ignores_forced_crlf_worktree_and_is_byte_stable(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "synthetic-crlf-checkout"
+    _run_git("init", "--quiet", str(repo))
+    _run_git("config", "user.email", "synthetic-fixture@invalid.example", cwd=repo)
+    _run_git("config", "user.name", "Synthetic Fixture", cwd=repo)
+    relative = "ops/prediction_markets_launch_v1/bootstrap-offline.sh"
+    tracked = repo.joinpath(*PurePosixPath(relative).parts)
+    tracked.parent.mkdir(parents=True)
+    committed = b"#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf 'BLOB_LF_GREEN\\n'\n"
+    tracked.write_bytes(committed)
+    _run_git("add", relative, cwd=repo)
+    _run_git("commit", "--quiet", "-m", "synthetic LF blob", cwd=repo)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    tracked.write_bytes(committed.replace(b"\n", b"\r\n"))
+    assert b"\r\n" in tracked.read_bytes()
+    first = tmp_path / "pack-one" / "scripts" / "bootstrap-offline.sh"
+    second = tmp_path / "pack-two" / "scripts" / "bootstrap-offline.sh"
+    for target in (first, second):
+        launch_pack._materialize_commit_file(
+            repo_root=repo,
+            commit=commit,
+            relative_path=relative,
+            output_path=target,
+        )
+    assert first.read_bytes() == committed
+    assert second.read_bytes() == committed
+    assert first.read_bytes() == second.read_bytes()
+    assert b"\r" not in first.read_bytes()
+
+
+def test_materialized_bootstrap_executes_real_git_bash_beyond_set_builtin(
+    tmp_path: Path,
+) -> None:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    script = tmp_path / "materialized-bootstrap-offline.sh"
+    launch_pack._materialize_commit_file(
+        repo_root=ROOT,
+        commit=commit,
+        relative_path="ops/prediction_markets_launch_v1/bootstrap-offline.sh",
+        output_path=script,
+    )
+    completed = _run_git_bash_script(
+        script,
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        arguments=(
+            _git_bash_path(tmp_path / "source"),
+            _git_bash_path(tmp_path / "wheelhouse"),
+        ),
+    )
+    assert completed.returncode == 4
+    assert "PREDICTION_OFFLINE_BOOTSTRAP_REFUSED:run as hyperlab" in completed.stderr
+    assert "invalid option name" not in completed.stderr
+
+
 def test_plan_refuses_capacity_arithmetic_or_h1_path_drift() -> None:
     plan = _plan()
     disk = dict(plan["disk"])  # type: ignore[arg-type]
@@ -1329,13 +1550,19 @@ def test_materialized_pack_is_new_slug_bound_authenticated_and_probes_precede_pe
             "source_commit": synthetic_commit,
             "source_inventory_sha256": source_inventory["inventory_sha256"],
             "start_at_override": "HYPERLAB_PM_START_AT_UTC_OPTIONAL",
+            "superseded_campaign": launch_pack._superseded_campaign_contract(),
             "wheelhouse_manifest_sha256": launch_pack.sha256_bytes(wheelhouse_payload),
         }
     )
     scripts_root = pack / "scripts"
     scripts_root.mkdir()
     for name in launch_pack._SCRIPTS:
-        (scripts_root / name).write_bytes((OPS / name).read_bytes())
+        payload = launch_pack._git_blob(
+            synthetic_source,
+            synthetic_commit,
+            f"ops/prediction_markets_launch_v1/{name}",
+        )
+        (scripts_root / name).write_bytes(payload)
     (pack / "README.md").write_text(
         launch_pack.render_operator_readme(handoff), encoding="utf-8"
     )
@@ -1343,7 +1570,7 @@ def test_materialized_pack_is_new_slug_bound_authenticated_and_probes_precede_pe
     for name, content in units.items():
         path = pack / "systemd" / name
         path.parent.mkdir(exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="\n")
     blocks = {
         "A-windows-bundle-verify-transfer.ps1": launch_pack.render_windows_transfer(handoff),
         "B-tabby-preflight-install-activate.sh": launch_pack.render_tabby_install(handoff),
@@ -1353,8 +1580,11 @@ def test_materialized_pack_is_new_slug_bound_authenticated_and_probes_precede_pe
     }
     for name, content in blocks.items():
         path = pack / "operator" / name
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        if name.endswith(".sh"):
+            launch_pack._write_shell_new(path, content.encode("utf-8"))
+        else:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(content, encoding="utf-8")
     transfer_paths = [
         bundle.name,
         "README.md",
@@ -1388,6 +1618,12 @@ def test_materialized_pack_is_new_slug_bound_authenticated_and_probes_precede_pe
     assert launch_pack.sha256_bytes((pack / "handoff.json").read_bytes()) in (
         pack / "handoff.sha256"
     ).read_text(encoding="ascii")
+    transfer_proof = launch_pack.verify_materialized_transfer(
+        pack.resolve(strict=True),
+        (pack / "handoff.json").resolve(strict=True),
+    )
+    assert transfer_proof["terminal_signal"] == "PREDICTION_TRANSFER_SHELLS_LF_AUTHENTICATED"
+    assert transfer_proof["shell_files"] == 8
     text_payload = "\n".join(
         path.read_text(encoding="utf-8")
         for path in pack.rglob("*")
@@ -2187,7 +2423,24 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     ) in install
     assert 'bash "$INCOMING_ROOT/scripts/install.sh"' not in install
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" in install
-    assert install.index('cutover.sh" disarm-old') < install.index('preflight.py" host')
+    assert install.count("sudo -v") == 1
+    assert "sudo -n true" in install
+    assert "sudo -n -v" in install
+    assert recovery.count("sudo -v") == 1
+    assert "sudo -n true" in recovery
+    assert "sudo -n -v" in recovery
+    assert "verify-restored" in recovery
+    assert "PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR" in recovery
+    assert install.index('preflight.py" host') < install.index("bootstrap-offline.sh")
+    assert install.index("PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER") < install.index(
+        'cutover.sh" verify-old'
+    )
+    assert install.index('cutover.sh" verify-old') < install.index(
+        'cutover.sh" disarm-old'
+    )
+    assert install.index('cutover.sh" disarm-old') < install.index(
+        'prediction_markets_launch_v1/install.sh'
+    )
     assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" in install
     expected_monitor = (
         f"bash '{handoff['source_root']}/ops/prediction_markets_launch_v1/monitor.sh' "
@@ -2216,6 +2469,7 @@ def test_rendered_operator_readme_is_attempt_bound_nonexpert_and_h1_safe() -> No
         {
             "run_slug": "pm-20260827t120000z-deadbeef",
             "source_commit": "b" * 40,
+            "superseded_campaign": launch_pack._superseded_campaign_contract(),
         }
     )
     readme = launch_pack.render_operator_readme(handoff)
@@ -2361,6 +2615,7 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     )
     assert failed.returncode == 4
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in failed.stdout
+    assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" in failed.stderr
 
     green_handoff = _operator_handoff_for_git_bash(
         tmp_path, "install-green", materialize_source_runtime=False
@@ -2394,6 +2649,104 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     )
     assert expected_install in lines
     assert not any("/scripts/install.sh" in line for line in lines)
+    host_index = next(index for index, line in enumerate(lines) if "preflight.py host" in line)
+    bootstrap_index = next(index for index, line in enumerate(lines) if "bootstrap-offline.sh" in line)
+    import_index = next(index for index, line in enumerate(lines) if line.startswith("venv-python|-I -c "))
+    verify_old_index = next(index for index, line in enumerate(lines) if "cutover.sh verify-old" in line)
+    disarm_index = next(index for index, line in enumerate(lines) if "cutover.sh disarm-old" in line)
+    install_index = lines.index(expected_install)
+    assert host_index < bootstrap_index < import_index < verify_old_index < disarm_index < install_index
+
+
+def test_materialized_tabby_b_preparation_failure_never_starts_cutover(
+    tmp_path: Path,
+) -> None:
+    environment, log = _operator_fake_environment(tmp_path)
+    non_git_cwd = tmp_path / "non-git-cwd-preparation-failure"
+    non_git_cwd.mkdir()
+    handoff = _operator_handoff_for_git_bash(
+        tmp_path,
+        "bootstrap-failed-before-cutover",
+        materialize_source_runtime=False,
+    )
+    script = tmp_path / "B-bootstrap-failed-before-cutover.sh"
+    script.write_text(launch_pack.render_tabby_install(handoff), encoding="utf-8")
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment={
+            **environment,
+            "HYPERLAB_FAKE_BASH_MODE": "install",
+            "HYPERLAB_FAKE_BOOTSTRAP_EXIT": "4",
+        },
+    )
+    assert completed.returncode == 4
+    assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" not in completed.stderr
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any("bootstrap-offline.sh" in line for line in lines)
+    assert not any("cutover.sh verify-old" in line for line in lines)
+    assert not any("cutover.sh disarm-old" in line for line in lines)
+
+
+def test_materialized_tabby_b_import_failure_never_starts_cutover(
+    tmp_path: Path,
+) -> None:
+    environment, log = _operator_fake_environment(tmp_path)
+    non_git_cwd = tmp_path / "non-git-cwd-import-failure"
+    non_git_cwd.mkdir()
+    handoff = _operator_handoff_for_git_bash(
+        tmp_path,
+        "import-failed-before-cutover",
+        materialize_source_runtime=False,
+    )
+    script = tmp_path / "B-import-failed-before-cutover.sh"
+    script.write_text(launch_pack.render_tabby_install(handoff), encoding="utf-8")
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment={
+            **environment,
+            "HYPERLAB_FAKE_BASH_MODE": "install",
+            "HYPERLAB_FAKE_VENV_IMPORT_EXIT": "4",
+        },
+    )
+    assert completed.returncode == 4
+    assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" not in completed.stderr
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("venv-python|-I -c ") for line in lines)
+    assert not any("cutover.sh verify-old" in line for line in lines)
+    assert not any("cutover.sh disarm-old" in line for line in lines)
+
+
+@pytest.mark.parametrize("sudo_mode", ["foreground-refused", "cache-expired"])
+def test_materialized_tabby_b_sudo_refusal_is_preparation_only(
+    tmp_path: Path,
+    sudo_mode: str,
+) -> None:
+    environment, log = _operator_fake_environment(tmp_path)
+    non_git_cwd = tmp_path / f"non-git-cwd-sudo-{sudo_mode}"
+    non_git_cwd.mkdir()
+    handoff = _operator_handoff_for_git_bash(
+        tmp_path,
+        f"sudo-{sudo_mode}",
+        materialize_source_runtime=False,
+    )
+    script = tmp_path / f"B-sudo-{sudo_mode}.sh"
+    script.write_text(launch_pack.render_tabby_install(handoff), encoding="utf-8")
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment={
+            **environment,
+            "HYPERLAB_FAKE_BASH_MODE": "install",
+            "HYPERLAB_FAKE_SUDO_MODE": sudo_mode,
+        },
+    )
+    assert completed.returncode == 4
+    assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" not in completed.stderr
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "sudo|-v"
+    assert not any("cutover.sh" in line for line in lines)
 
 
 def test_internal_install_runs_real_script_handles_transient_503_and_isolates_failure(
@@ -2501,16 +2854,16 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         green_log = log.read_text(encoding="utf-8")
         services = handoff["services"]
         assert isinstance(services, dict)
-        dashboard_enable = f"sudo|systemctl enable --now {services['dashboard']}"
-        polymarket_enable = f"sudo|systemctl enable --now {services['polymarket']}"
-        kalshi_enable = f"sudo|systemctl enable --now {services['kalshi']}"
+        dashboard_enable = f"systemctl enable --now {services['dashboard']}"
+        polymarket_enable = f"systemctl enable --now {services['polymarket']}"
+        kalshi_enable = f"systemctl enable --now {services['kalshi']}"
         suffix = str(handoff["run_slug"]).removeprefix("pm-")
         polymarket_probe = (
             f"hyperlab-pm-{suffix}-polymarket-namespace-probe.service"
         )
         kalshi_probe = f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service"
-        polymarket_probe_start = f"sudo|systemctl start {polymarket_probe}"
-        kalshi_probe_start = f"sudo|systemctl start {kalshi_probe}"
+        polymarket_probe_start = f"systemctl start {polymarket_probe}"
+        kalshi_probe_start = f"systemctl start {kalshi_probe}"
         assert green_log.index(polymarket_probe_start) < green_log.index(
             kalshi_probe_start
         )
@@ -2566,17 +2919,17 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         )
         refused_log = refused_log_path.read_text(encoding="utf-8")
         assert (
-            f"sudo|systemctl start hyperlab-pm-{refused_suffix}-polymarket-namespace-probe.service"
+            f"systemctl start hyperlab-pm-{refused_suffix}-polymarket-namespace-probe.service"
             in refused_log
         )
-        assert f"sudo|systemctl start {refused_probe}" in refused_log
+        assert f"systemctl start {refused_probe}" in refused_log
         assert (
-            f"sudo|systemctl enable --now {refused_services['dashboard']}"
+            f"systemctl enable --now {refused_services['dashboard']}"
             not in refused_log
         )
         for venue in ("polymarket", "kalshi"):
             assert (
-                f"sudo|systemctl enable --now {refused_services[venue]}"
+                f"systemctl enable --now {refused_services[venue]}"
                 not in refused_log
             )
         refused_cleanup = [
@@ -2586,8 +2939,8 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         ]
         assert len(set(refused_cleanup)) == 5
         for service in refused_cleanup:
-            assert f"sudo|systemctl stop {service}" in refused_log
-            assert f"sudo|systemctl disable {service}" in refused_log
+            assert f"systemctl stop {service}" in refused_log
+            assert f"systemctl disable {service}" in refused_log
 
         cleanup_incoming, cleanup_handoff, _cleanup_campaign, cleanup_pack = (
             _internal_install_fixture(
@@ -2627,7 +2980,7 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         cleanup_log = cleanup_log_path.read_text(encoding="utf-8")
         for venue in ("polymarket", "kalshi"):
             assert (
-                f"sudo|systemctl enable --now {cleanup_services[venue]}"
+                f"systemctl enable --now {cleanup_services[venue]}"
                 not in cleanup_log
             )
 
@@ -2667,9 +3020,9 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
         ]
         for service in expected_cleanup:
-            assert f"sudo|systemctl stop {service}" in failed_log
-            assert f"sudo|systemctl disable {service}" in failed_log
-        assert f"sudo|systemctl enable --now {failed_services['kalshi']}" not in failed_log
+            assert f"systemctl stop {service}" in failed_log
+            assert f"systemctl disable {service}" in failed_log
+        assert f"systemctl enable --now {failed_services['kalshi']}" not in failed_log
     finally:
         if server_started.is_set() and servers:
             servers[0].shutdown()
@@ -2731,10 +3084,10 @@ def test_internal_install_refuses_probe_property_or_payload_divergence_before_ac
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in output
     assert "PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=" in output
     log = log_path.read_text(encoding="utf-8")
-    assert f"sudo|systemctl start {polymarket_probe}" in log
-    assert f"sudo|systemctl enable --now {services['dashboard']}" not in log
+    assert f"systemctl start {polymarket_probe}" in log
+    assert f"systemctl enable --now {services['dashboard']}" not in log
     for venue in ("polymarket", "kalshi"):
-        assert f"sudo|systemctl enable --now {services[venue]}" not in log
+        assert f"systemctl enable --now {services[venue]}" not in log
     cleanup_services = [
         *services.values(),
         polymarket_probe,
@@ -2742,8 +3095,8 @@ def test_internal_install_refuses_probe_property_or_payload_divergence_before_ac
     ]
     assert len(set(cleanup_services)) == 5
     for service in cleanup_services:
-        assert f"sudo|systemctl stop {service}" in log
-        assert f"sudo|systemctl disable {service}" in log
+        assert f"systemctl stop {service}" in log
+        assert f"systemctl disable {service}" in log
 
 
 def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_all(
@@ -2808,11 +3161,11 @@ def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_al
         sentinel = campaign / "polymarket" / "SYNTHETIC_RAW_PRESERVED.bin"
         assert sentinel.read_bytes() == b"SYNTHETIC/FIXTURE raw preservation sentinel\n"
         log = log_path.read_text(encoding="utf-8")
-        collector_enable = f"sudo|systemctl enable --now {services['polymarket']}"
+        collector_enable = f"systemctl enable --now {services['polymarket']}"
         assert collector_enable in log
         after_enable = log.split(collector_enable, 1)[1]
         assert "sleep|0.5" not in after_enable
-        assert f"sudo|systemctl enable --now {services['kalshi']}" not in log
+        assert f"systemctl enable --now {services['kalshi']}" not in log
         suffix = str(handoff["run_slug"]).removeprefix("pm-")
         cleanup_services = [
             *services.values(),
@@ -2820,8 +3173,8 @@ def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_al
             f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
         ]
         for service in cleanup_services:
-            assert f"sudo|systemctl stop {service}" in log
-            assert f"sudo|systemctl disable {service}" in log
+            assert f"systemctl stop {service}" in log
+            assert f"systemctl disable {service}" in log
         service_state = Path(
             environment["HYPERLAB_SERVICE_STATE_DIR"].replace("/c/", "C:/", 1)
         )
@@ -2869,10 +3222,10 @@ def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_al
             f"hyperlab-pm-{diagnostic_suffix}-kalshi-namespace-probe.service",
         ]
         for service in diagnostic_cleanup:
-            assert f"sudo|systemctl stop {service}" in diagnostic_log
-            assert f"sudo|systemctl disable {service}" in diagnostic_log
+            assert f"systemctl stop {service}" in diagnostic_log
+            assert f"systemctl disable {service}" in diagnostic_log
         assert (
-            f"sudo|systemctl enable --now {diagnostic_services['kalshi']}"
+            f"systemctl enable --now {diagnostic_services['kalshi']}"
             not in diagnostic_log
         )
 
@@ -2904,10 +3257,10 @@ def test_internal_install_reports_terminal_exit_four_before_state_and_disarms_al
         assert "PREDICTION_COLLECTOR_TERMINAL_BEFORE_READINESS=polymarket" in clean_output
         assert '"state_present":false' in clean_output
         clean_log = clean_log_path.read_text(encoding="utf-8")
-        clean_enable = f"sudo|systemctl enable --now {clean_services['polymarket']}"
+        clean_enable = f"systemctl enable --now {clean_services['polymarket']}"
         assert clean_enable in clean_log
         assert "sleep|0.5" not in clean_log.split(clean_enable, 1)[1]
-        assert f"sudo|systemctl enable --now {clean_services['kalshi']}" not in clean_log
+        assert f"systemctl enable --now {clean_services['kalshi']}" not in clean_log
     finally:
         server.shutdown()
         server.server_close()
@@ -3010,10 +3363,10 @@ def test_internal_install_refuses_bootstrap_readiness_and_stale_negatives_withou
         assert isinstance(services, dict)
         log = log_path.read_text(encoding="utf-8")
         dashboard = str(services["dashboard"])
-        assert f"sudo|systemctl enable --now {dashboard}" in log
+        assert f"systemctl enable --now {dashboard}" in log
         if failure_mode == "prepared-stale":
-            assert f"sudo|systemctl enable --now {services['polymarket']}" in log
-            assert f"sudo|systemctl enable --now {services['kalshi']}" not in log
+            assert f"systemctl enable --now {services['polymarket']}" in log
+            assert f"systemctl enable --now {services['kalshi']}" not in log
             suffix = str(handoff["run_slug"]).removeprefix("pm-")
             cleanup_services = [
                 *services.values(),
@@ -3021,14 +3374,14 @@ def test_internal_install_refuses_bootstrap_readiness_and_stale_negatives_withou
                 f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
             ]
             for service in cleanup_services:
-                assert f"sudo|systemctl stop {service}" in log
-                assert f"sudo|systemctl disable {service}" in log
+                assert f"systemctl stop {service}" in log
+                assert f"systemctl disable {service}" in log
             assert "collector readiness failed before authenticated state: polymarket" in output
         else:
             for venue in ("polymarket", "kalshi"):
-                assert f"sudo|systemctl enable --now {services[venue]}" not in log
-            assert f"sudo|systemctl stop {dashboard}" in log
-            assert f"sudo|systemctl disable {dashboard}" in log
+                assert f"systemctl enable --now {services[venue]}" not in log
+            assert f"systemctl stop {dashboard}" in log
+            assert f"systemctl disable {dashboard}" in log
     finally:
         server.shutdown()
         server.server_close()
@@ -3101,12 +3454,12 @@ def test_internal_install_binds_empty_or_partial_venue_selection_to_authenticate
         unavailable_services = unavailable_handoff["services"]
         assert isinstance(unavailable_services, dict)
         assert (
-            f"sudo|systemctl enable --now {unavailable_services['dashboard']}"
+            f"systemctl enable --now {unavailable_services['dashboard']}"
             in unavailable_log
         )
         for venue in ("polymarket", "kalshi"):
             assert (
-                f"sudo|systemctl enable --now {unavailable_services[venue]}"
+                f"systemctl enable --now {unavailable_services[venue]}"
                 not in unavailable_log
             )
 
@@ -3122,9 +3475,9 @@ def test_internal_install_binds_empty_or_partial_venue_selection_to_authenticate
         )["eligible_venues"] == ["polymarket", "kalshi"]
         partial_services = partial_handoff["services"]
         assert isinstance(partial_services, dict)
-        assert f"sudo|systemctl enable --now {partial_services['kalshi']}" in partial_log
+        assert f"systemctl enable --now {partial_services['kalshi']}" in partial_log
         assert (
-            f"sudo|systemctl enable --now {partial_services['polymarket']}"
+            f"systemctl enable --now {partial_services['polymarket']}"
             not in partial_log
         )
     finally:
@@ -3249,6 +3602,66 @@ def test_materialized_tabby_e_dispatches_only_the_selected_safe_mode(
     assert "hyperlab-h1" not in dispatches[0]
 
 
+def test_materialized_tabby_e_restore_reauthenticates_final_old_state(
+    tmp_path: Path,
+) -> None:
+    environment, log = _operator_fake_environment(tmp_path)
+    environment["HYPERLAB_FAKE_BASH_MODE"] = "restore-old"
+    handoff = _operator_handoff_for_git_bash(tmp_path, "restore-old")
+    script = tmp_path / "E-restore-old.sh"
+    script.write_text(launch_pack.render_recovery_rollback(handoff), encoding="utf-8")
+    non_git_cwd = tmp_path / "restore-old-non-git-cwd"
+    non_git_cwd.mkdir()
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment=environment,
+        arguments=("restore-old",),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines()[-1] == (
+        "PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR"
+    )
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "sudo|-v"
+    assert lines[1] == "sudo|-n true"
+    dispatches = [line for line in lines if line.startswith("bash|")]
+    assert [line.split("cutover.sh ", 1)[1].split(" ", 1)[0] for line in dispatches] == [
+        "restore-old",
+        "verify-restored",
+    ]
+
+
+@pytest.mark.parametrize("sudo_mode", ["foreground-refused", "cache-expired"])
+def test_materialized_tabby_e_sudo_refusal_never_dispatches(
+    tmp_path: Path,
+    sudo_mode: str,
+) -> None:
+    environment, log = _operator_fake_environment(tmp_path)
+    environment.update(
+        {
+            "HYPERLAB_FAKE_BASH_MODE": "restore-old",
+            "HYPERLAB_FAKE_SUDO_MODE": sudo_mode,
+        }
+    )
+    handoff = _operator_handoff_for_git_bash(tmp_path, f"restore-{sudo_mode}")
+    script = tmp_path / f"E-restore-{sudo_mode}.sh"
+    script.write_text(launch_pack.render_recovery_rollback(handoff), encoding="utf-8")
+    non_git_cwd = tmp_path / f"restore-{sudo_mode}-non-git-cwd"
+    non_git_cwd.mkdir()
+    completed = _run_git_bash_script(
+        script,
+        cwd=non_git_cwd,
+        environment=environment,
+        arguments=("restore-old",),
+    )
+    assert completed.returncode == 4
+    assert "PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR" not in completed.stdout
+    assert not any(
+        line.startswith("bash|") for line in log.read_text(encoding="utf-8").splitlines()
+    )
+
+
 def test_internal_rollback_runs_real_script_and_preserves_campaign_bytes(
     tmp_path: Path,
 ) -> None:
@@ -3291,6 +3704,15 @@ def test_internal_rollback_runs_real_script_and_preserves_campaign_bytes(
     (incoming / "scripts" / "preflight.py").write_text(
         "# SYNTHETIC/FIXTURE path-presence guard\n", encoding="utf-8"
     )
+    (incoming / "scripts" / "systemd_cutover.py").write_text(
+        """# SYNTHETIC/FIXTURE only; bounded helper behavior has dedicated unit tests.
+import os,sys
+with open(os.environ['HYPERLAB_FAKE_LOG'],'a',encoding='utf-8') as handle:
+ handle.write('helper|'+' '.join(sys.argv[1:])+'\\n')
+print('PREDICTION_SYSTEMD_DISARM_GREEN:SYNTHETIC_FIXTURE')
+""",
+        encoding="utf-8",
+    )
     services = {
         name: f"hyperlab-pm-{suffix}-{name}.service"
         for name in ("polymarket", "kalshi", "dashboard")
@@ -3322,11 +3744,28 @@ def test_internal_rollback_runs_real_script_and_preserves_campaign_bytes(
     )
     _write_fake_command(
         fake_bin,
+        "systemctl",
+        """printf 'systemctl|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
+if [[ ${1:-} == show && "$*" == *'--property=ActiveState --value'* ]]; then
+  printf '%s\n' "${HYPERLAB_ROLLBACK_ACTIVE_STATE:-inactive}"
+  exit 0
+fi
+if [[ ${1:-} == show ]]; then
+  active=${HYPERLAB_ROLLBACK_ACTIVE_STATE:-inactive}
+  pid=0; [[ $active == active || $active == deactivating ]] && pid=123
+  printf 'LoadState=loaded\nActiveState=%s\nSubState=dead\nResult=success\nMainPID=%s\nNRestarts=0\n' "$active" "$pid"
+  exit 0
+fi
+if [[ ${1:-} == is-enabled ]]; then printf 'disabled\n'; exit 1; fi
+exit 98
+""",
+    )
+    _write_fake_command(
+        fake_bin,
         "sudo",
         """printf 'sudo|%s\n' "$*" >> "$HYPERLAB_FAKE_LOG"
-[[ ${1:-} == systemctl ]] || exit 98
-if [[ ${2:-} == show ]]; then printf '%s\n' "${HYPERLAB_ROLLBACK_ACTIVE_STATE:-inactive}"; fi
-if [[ ${2:-} == is-enabled ]]; then printf 'disabled\n'; fi
+[[ ${1:-} == -n && ${2:-} == timeout ]] || exit 98
+exit 0
 """,
     )
     bash_environment = tmp_path / "rollback-strict-path.sh"
@@ -3391,15 +3830,13 @@ set -Eeuo pipefail
         f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service",
     ]
     for service in rollback_services:
-        assert f"sudo|systemctl stop {service}" in systemd_log
-        assert f"sudo|systemctl disable {service}" in systemd_log
         assert (
-            f"sudo|systemctl show {service} --property=ActiveState --value --no-pager"
+            f"systemctl|show {service} --property=ActiveState --value --no-pager"
             in systemd_log
         )
-        assert f"sudo|systemctl is-enabled {service}" in systemd_log
+        assert f"systemctl|is-enabled {service}" in systemd_log
     assert "hyperlab-h1" not in systemd_log
-    assert "rm " not in systemd_log
+    assert not any(line.startswith("rm|") for line in systemd_log.splitlines())
 
     environment["HYPERLAB_ROLLBACK_ACTIVE_STATE"] = "deactivating"
     refused = _run_git_bash_script(
@@ -3479,6 +3916,29 @@ def test_internal_recovery_runs_real_control_flow_and_isolates_start_failure(
         )
         (incoming / "scripts" / "preflight.py").write_text(
             "# SYNTHETIC/FIXTURE external-boundary stub target\n",
+            encoding="utf-8",
+        )
+        (incoming / "scripts" / "systemd_cutover.py").write_text(
+            """# SYNTHETIC/FIXTURE only; helper semantics have dedicated unit tests.
+import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+command=args[0]; service=args[args.index('--service')+1]
+state=Path(os.environ['HYPERLAB_SERVICE_STATE_DIR'])
+with open(os.environ['HYPERLAB_FAKE_LOG'],'a',encoding='utf-8') as handle:
+ handle.write('helper|'+' '.join(args)+'\\n')
+if command=='disarm':
+ for suffix in ('','.failed','.probe-success','.probe-failed'):
+  (state/(service+suffix)).unlink(missing_ok=True)
+elif command=='ensure-active':
+ if os.environ.get('HYPERLAB_FAIL_SERVICE')==service: raise SystemExit(4)
+ if os.environ.get('HYPERLAB_TERMINAL_EXIT_SERVICE')==service:
+  (state/(service+'.failed')).touch()
+ elif os.environ.get('HYPERLAB_CLEAN_EXIT_SERVICE')!=service:
+  (state/service).touch()
+else: raise SystemExit(97)
+print('PREDICTION_SYSTEMD_HELPER_GREEN:SYNTHETIC_FIXTURE')
+""",
             encoding="utf-8",
         )
         suffix = slug.removeprefix("pm-")
@@ -3616,7 +4076,7 @@ exit "${PIPESTATUS[0]}"
             "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY"
         )
         for service in green_services.values():
-            assert f"sudo|systemctl enable --now {service}" in green_log
+            assert f"helper|ensure-active --service {service}" in green_log
         assert "prediction-collect" not in green_log
 
         partial, retried, partial_log, partial_services = run_case(
@@ -3629,10 +4089,9 @@ exit "${PIPESTATUS[0]}"
         assert partial.stderr.splitlines()[-1] == (
             "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY"
         )
-        assert f"sudo|systemctl stop {partial_services['polymarket']}" in partial_log
-        assert f"sudo|systemctl disable {partial_services['polymarket']}" in partial_log
-        assert f"sudo|systemctl stop {partial_services['kalshi']}" not in partial_log
-        assert f"sudo|systemctl stop {partial_services['dashboard']}" not in partial_log
+        assert f"helper|disarm --service {partial_services['polymarket']}" in partial_log
+        assert f"helper|disarm --service {partial_services['kalshi']}" not in partial_log
+        assert f"helper|disarm --service {partial_services['dashboard']}" not in partial_log
         assert retried is not None and retried.returncode == 0, (
             None if retried is None else retried.stderr
         )
@@ -3640,7 +4099,7 @@ exit "${PIPESTATUS[0]}"
             "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY"
         )
         assert partial_log.count(
-            f"sudo|systemctl enable --now {partial_services['kalshi']}"
+            f"helper|ensure-active --service {partial_services['kalshi']}"
         ) == 2
 
         for case_name, slug, monitor_mode in (
@@ -3670,11 +4129,10 @@ exit "${PIPESTATUS[0]}"
                 refused.stderr
             )
             dashboard = refused_services["dashboard"]
-            assert f"sudo|systemctl stop {dashboard}" in refused_log
-            assert f"sudo|systemctl disable {dashboard}" in refused_log
+            assert f"helper|disarm --service {dashboard}" in refused_log
             for venue in ("polymarket", "kalshi"):
                 assert (
-                    f"sudo|systemctl enable --now {refused_services[venue]}"
+                    f"helper|ensure-active --service {refused_services[venue]}"
                     not in refused_log
                 )
 
@@ -3689,8 +4147,7 @@ exit "${PIPESTATUS[0]}"
         assert "PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY" not in (
             fragment.stdout + fragment.stderr
         )
-        assert f"sudo|systemctl stop {fragment_services['polymarket']}" in fragment_log
-        assert f"sudo|systemctl disable {fragment_services['polymarket']}" in fragment_log
+        assert f"helper|disarm --service {fragment_services['polymarket']}" in fragment_log
 
         clean_exit, _, clean_exit_log, clean_exit_services = run_case(
             "collector-clean-exit-before-state",
@@ -3703,7 +4160,7 @@ exit "${PIPESTATUS[0]}"
         assert "ActiveState=inactive SubState=dead" in clean_exit.stderr
         assert "ExecMainStatus=0 MainPID=0" in clean_exit.stderr
         assert "PREDICTION_RECOVERY_PARTIAL_OR_ALERT_NO_SLOT_RETRY" in clean_exit.stderr
-        assert f"sudo|systemctl stop {clean_exit_services['polymarket']}" in clean_exit_log
+        assert f"helper|disarm --service {clean_exit_services['polymarket']}" in clean_exit_log
         assert "sleep|0.5" not in clean_exit_log
 
         final_failure, _, final_failure_log, final_failure_services = run_case(
@@ -3721,7 +4178,7 @@ exit "${PIPESTATUS[0]}"
         )
         for venue in ("polymarket", "kalshi"):
             assert (
-                f"sudo|systemctl enable --now {final_failure_services[venue]}"
+                f"helper|ensure-active --service {final_failure_services[venue]}"
                 in final_failure_log
             )
 
@@ -3739,7 +4196,7 @@ exit "${PIPESTATUS[0]}"
             public_invalid.stdout + public_invalid.stderr
         )
         for service in public_invalid_services.values():
-            assert f"sudo|systemctl enable --now {service}" in public_invalid_log
+            assert f"helper|ensure-active --service {service}" in public_invalid_log
     finally:
         server.shutdown()
         server.server_close()
@@ -4356,7 +4813,46 @@ def test_materialized_windows_a_rejects_sha_valid_non_bundle_with_real_git(
     )
     bundle.write_bytes(b"SHA-valid but not a Git bundle")
     handoff["bundle_sha256"] = launch_pack.sha256_file(bundle)
-    block_a.write_text(launch_pack.render_windows_transfer(handoff), encoding="utf-8")
+    block_a.write_text(
+        launch_pack.render_windows_transfer(handoff),
+        encoding="utf-8",
+        newline="\n",
+    )
+    transfer_path = pack / "transfer-inventory.json"
+    transfer = json.loads(transfer_path.read_bytes())
+    bundle_rows = [
+        row
+        for row in transfer["files"]
+        if row["path"] == bundle.name
+    ]
+    assert len(bundle_rows) == 1
+    bundle_rows[0].update(
+        {
+            "sha256": launch_pack.sha256_file(bundle),
+            "size": bundle.stat().st_size,
+        }
+    )
+    block_rows = [
+        row
+        for row in transfer["files"]
+        if row["path"] == "operator/A-windows-bundle-verify-transfer.ps1"
+    ]
+    assert len(block_rows) == 1
+    block_rows[0].update(
+        {
+            "sha256": launch_pack.sha256_file(block_a),
+            "size": block_a.stat().st_size,
+        }
+    )
+    transfer_payload = launch_pack.canonical_json_bytes(transfer) + b"\n"
+    transfer_path.write_bytes(transfer_payload)
+    handoff["transfer_inventory_sha256"] = launch_pack.sha256_bytes(transfer_payload)
+    handoff_payload = launch_pack.canonical_json_bytes(handoff) + b"\n"
+    (pack / "handoff.json").write_bytes(handoff_payload)
+    (pack / "handoff.sha256").write_text(
+        f"{launch_pack.sha256_bytes(handoff_payload)}  handoff.json\n",
+        encoding="ascii",
+    )
     completed, log, powershell_temp = _invoke_windows_transfer_with_strict_fakes(
         tmp_path,
         block_a,
@@ -4597,7 +5093,16 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
                 "options": ["rw", "relatime", "discard"],
                 "source": "/dev/sdb",
                 "stat_device_major_minor": "8:16",
-            }
+            },
+            "loopback_port": {
+                "free": False,
+                "host": "127.0.0.1",
+                "occupied_by_authenticated_superseded_dashboard": True,
+                "owner_service": (
+                    "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service"
+                ),
+                "port": 18081,
+            },
         },
         "eligible_venues": ["polymarket", "kalshi"],
         "errors": [],
@@ -5140,11 +5645,47 @@ def test_host_preflight_synchronously_proves_ntp_capacity_port_services_and_isol
     }
     assert not list(handoff.parent.glob(".git-bundle-verify-*"))
     assert result["checks"]["loopback_port"] == {  # type: ignore[index]
-        "free": True,
+        "free": False,
         "host": "127.0.0.1",
+        "occupied_by_authenticated_superseded_dashboard": True,
+        "owner_service": "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service",
         "port": 18081,
+        "verification_signals": [
+            "PREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED",
+            "PREDICTION_OLD_CAMPAIGN_FIVE_UNITS_AUTHENTICATED",
+            "PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED",
+        ],
     }
     assert len(result["checks"]["services"]) == 5  # type: ignore[index]
+
+
+def test_host_preflight_refuses_unauthenticated_superseded_dashboard_port_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff = _incoming_handoff(tmp_path)
+    monkeypatch.setenv("USER", "hyperlab")
+    monkeypatch.setattr(preflight.Path, "home", classmethod(lambda _cls: Path("/home/hyperlab")))
+    monkeypatch.setattr(preflight, "_required_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:16")
+
+    def wrong_owner(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
+        if arguments[0] == "bash" and "verify-old" in arguments:
+            return preflight.CommandResult(4, "", "old dashboard listener diverged")
+        return _green_command(arguments)
+
+    result = preflight.host_preflight(
+        handoff,
+        run=wrong_owner,
+        connectivity_probe=lambda venue: {
+            "venue": venue,
+            "verdict": "NETWORK_PREFLIGHT_GREEN",
+        },
+    )
+    assert result["installation_admissible"] is False
+    assert "superseded dashboard port owner authentication failed" in " ".join(
+        result["errors"]  # type: ignore[arg-type]
+    )
 
 
 def test_host_preflight_refuses_dangling_attempt_root_symlink(

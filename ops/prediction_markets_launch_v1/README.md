@@ -90,6 +90,70 @@ propage son code d'échec avant tout collecteur. La liste vide reste un état
 honnête `BOTH_UNAVAILABLE` : le dashboard peut rester read-only, les deux unités
 collecteur restent inactives et `PREDICTION_ELIGIBLE_VENUES=NONE` est explicite.
 
+### Correctif runtime pack V2 : LF immuable et préparation transactionnelle
+
+La tentative `pm-20260828t144733z-1e4c8ac6` reste une preuve historique
+intouchable. Son pack a copié les octets CRLF du checkout Windows au lieu des
+blobs LF du commit. Bash a donc lu le caractère `CR` de
+`set -Eeuo pipefail\r` comme une partie du nom d'option et a refusé avec
+`set: p: invalid option name`. `bash -n` ne pouvait pas découvrir ce défaut :
+il parse la grammaire mais n'exécute pas le builtin `set`. Le test causal lance
+désormais réellement le bootstrap matérialisé sous Git Bash, au-delà de cette
+ligne. Son pack, son incoming, son source root partiel et toutes ses preuves
+restent intacts et ne seront jamais réutilisés. L'ancienne campagne désarmée
+reste elle aussi immuable; l'exécution E bloquée n'a fourni aucun signal GREEN,
+donc son état final ne doit pas être supposé sans le diagnostic humain read-only.
+
+Tous les fichiers repo transférés sont désormais lus comme blobs binaires du
+`source_commit` exact. Le résultat ne dépend plus du cwd, de l'OS ni de
+`core.autocrlf`. Chaque `.sh` suivi ou généré est contrôlé avant écriture et
+après matérialisation : UTF-8 sans BOM, aucun NUL, aucun `CR`, shebang exact
+`#!/usr/bin/env bash` et LF final. Le bloc A réapplique le même contrôle sur le
+pack local puis sur l'incoming distant, en plus de chaque taille et SHA-256. La
+règle `.gitattributes` impose aussi `text eol=lf` aux shells du launch pack.
+
+B ne désarme plus l'ancienne campagne pendant la préparation. Il authentifie
+une seule fois sudo au premier plan, puis toute commande interne privilégiée
+est `sudo -n`. Un keepalive `sudo -n -v` maintient ce cache sans prompt pendant
+le travail et est toujours arrêté par le trap de sortie. Pendant que l'ancienne
+campagne reste active, il termine le
+preflight hôte, authentifie que le listener 18081 appartient exactement à
+l'ancien dashboard attendu, vérifie bundle/source/capacité/NTP/ext4, crée un
+clone neuf, exécute le bootstrap offline réel, prouve le venv et les imports.
+Après `PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER`, il réauthentifie immédiatement
+les cinq anciennes unités et leurs preuves. Ce n'est qu'alors qu'il écrit le
+reçu pré-mutation, désarme l'ancien slug, exige zéro collecteur concurrent et le
+port libre, puis active le nouveau. Tout échec antérieur laisse l'ancienne
+campagne active et n'émet pas la demande E; tout échec postérieur émet exactement
+`PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD`.
+
+La restauration historique qui a dépassé trente minutes était bloquée avant
+toute mutation dans une substitution de commande
+`timeout 5 sudo systemctl show ...` : `sudo` et son `timeout` parent étaient tous
+deux stoppés par l'interaction TTY, alors que `systemctl list-jobs` ne montrait
+aucun job. E effectue maintenant une unique authentification sudo synchrone au
+premier plan, puis le même keepalive strictement non interactif. Ensuite, les
+lectures `systemctl show`, `is-enabled` et
+`list-units` n'utilisent jamais sudo; chaque mutation utilise
+`sudo -n timeout ... systemctl`, avec progression BEGIN/GREEN, borne extérieure
+de secours et diagnostic terminal `operation=<...>:service=<...>`. Un timeout
+ne produit jamais de GREEN. Stop/disable/enable/start et les probes oneshot sont
+reprenables : une relance du même mode saute seulement les états déjà terminaux,
+sans supprimer ni réécrire raw, manifest, receipt, ledger ou slot.
+
+Avant de reprendre E après Ctrl+C ou timeout, le diagnostic humain strictement
+read-only est : `systemctl list-jobs --no-pager`, puis `systemctl show` sur les
+cinq unités anciennes et les cinq unités nouvelles avec
+`LoadState,ActiveState,SubState,Result,MainPID,NRestarts,FragmentPath`,
+`systemctl is-enabled` pour chacune, `systemctl list-units --type=service
+--state=active --no-pager 'hyperlab-pm-*'` et `ss -H -ltnp 'sport = :18081'`.
+Ne pas employer de glob mutateur. Conserver la sortie, puis relancer exactement
+`bash operator/E-recovery-rollback.sh restore-old`. Le signal terminal n'est
+valide qu'après la seconde vérification bornée des trois services, des deux
+probes, du listener, PID/commande, `NRestarts=0` et de l'absence de nouveau
+collecteur :
+`PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR`.
+
 ## Capacité et règle de cohabitation H1
 
 Le preflight exige simultanément :
@@ -211,11 +275,13 @@ ou clé n'est inscrite dans le bundle. Chaque
 fichier annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal
 terminal.
 
-Dans B, un Ctrl+C après la première activation peut laisser uniquement les
-services Prediction Markets déjà démarrés actifs ; E `rollback` est alors le
-désarmement ciblé. E annonce un maximum de 12 minutes afin de couvrir les délais
-d'arrêt bornés des cinq unités sans prétendre qu'une interruption les a toutes
-arrêtées. Aucune de ces actions ne supprime les preuves ni ne cible H1.
+Dans B, un Ctrl+C pendant la préparation laisse l'ancienne campagne active. Un
+Ctrl+C après le reçu pré-mutation peut laisser uniquement un sous-ensemble des
+unités Prediction Markets dans un état partiel ; E `restore-old` reprend alors
+la restauration. E annonce 2–8 minutes en moyenne et un maximum borné de
+45 minutes couvrant les bornes d'arrêt des dix unités possibles sans prétendre
+qu'une interruption les a toutes arrêtées. Chaque interruption imprime le mode
+exact à relancer. Aucune de ces actions ne supprime les preuves ni ne cible H1.
 
 Le source, l'incoming et la campagne historiques de
 `pm-20260827t183515z-664bef6e` restent des preuves immuables. Le rollback humain
@@ -260,7 +326,8 @@ service persistant.
 
 ## Preflight cible
 
-Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
+Avant le cutover, pendant que l'ancienne campagne reste active, le bloc B
+vérifie de façon bornée :
 
 - handoff, inventaire de transfert, Git bundle, arbre Git et SHA-256 ;
 - CPython 3.12 x86_64, glibc >= 2.28 et primitives stdlib/venv/SSL ;
@@ -269,8 +336,8 @@ Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
 - parents dédiés `volume_base`, `sources/`, `campaigns/` non-symlinks, chemins
   réels exacts, propriétaire `hyperlab` et mode `0700` réattestés avant clone ;
 - ext4 réel `rw`, capacité avec réservation H1, NTP ;
-- port loopback 18081 et absence des trois services persistants, des deux probes
-  et des racines exactes ;
+- port loopback 18081 occupé exactement par l'ancien dashboard authentifié,
+  absence des cinq nouvelles unités et nouveauté des racines exactes ;
 - DNS officiel via un processus `getent` borné à 3 s par host, puis TLS/HTTPS
   officiels, une seule tentative totale bornée à 40 s par venue ;
 - WebSocket public Polymarket ; Kalshi WSS reste

@@ -33,6 +33,16 @@ _SCRIPTS = (
     "preflight.py",
     "rollback.sh",
     "runner.py",
+    "systemd_cutover.py",
+)
+_SHELL_SHEBANG = b"#!/usr/bin/env bash\n"
+_EXPECTED_TRANSFERRED_SHELLS = frozenset(
+    {
+        *(f"scripts/{name}" for name in _SCRIPTS if name.endswith(".sh")),
+        "operator/B-tabby-preflight-install-activate.sh",
+        "operator/C-tabby-readonly-monitor.sh",
+        "operator/E-recovery-rollback.sh",
+    }
 )
 
 
@@ -182,6 +192,41 @@ def _git(repo_root: Path, *arguments: str) -> str:
     if completed.returncode != 0:
         raise LaunchPackError(completed.stderr.strip() or "Git command failed")
     return completed.stdout.strip()
+
+
+def _git_blob(repo_root: Path, commit: str, relative_path: str) -> bytes:
+    if _COMMIT.fullmatch(commit) is None:
+        raise LaunchPackError("source commit is invalid")
+    pure = PurePosixPath(relative_path)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise LaunchPackError("Git blob path is unsafe")
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "blob", f"{commit}:{pure.as_posix()}"],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        diagnostic = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise LaunchPackError(diagnostic or f"Git blob is absent: {pure.as_posix()}")
+    return completed.stdout
+
+
+def validate_posix_shell_payload(payload: bytes, *, label: str) -> bytes:
+    if payload.startswith(b"\xef\xbb\xbf"):
+        raise LaunchPackError(f"POSIX shell payload has a UTF-8 BOM: {label}")
+    if b"\x00" in payload:
+        raise LaunchPackError(f"POSIX shell payload contains NUL: {label}")
+    if b"\r" in payload:
+        raise LaunchPackError(f"POSIX shell payload contains CR: {label}")
+    try:
+        payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise LaunchPackError(f"POSIX shell payload is not UTF-8: {label}") from error
+    if not payload.startswith(_SHELL_SHEBANG):
+        raise LaunchPackError(f"POSIX shell payload has an invalid Bash shebang: {label}")
+    if not payload.endswith(b"\n"):
+        raise LaunchPackError(f"POSIX shell payload lacks a final LF: {label}")
+    return payload
 
 
 def _git_is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
@@ -414,6 +459,11 @@ def render_operator_readme(handoff: Mapping[str, object]) -> str:
     services = handoff["services"]
     assert isinstance(services, Mapping)
     namespace_probes = _namespace_probe_service_names(str(handoff["run_slug"]))
+    superseded = handoff["superseded_campaign"]
+    assert isinstance(superseded, Mapping)
+    old_services = superseded["services"]
+    old_probes = superseded["namespace_probe_services"]
+    assert isinstance(old_services, Mapping) and isinstance(old_probes, Mapping)
     return f"""# Prediction Markets — exécution humaine unique
 
 Ce pack est strictement `{BOUNDARY}`. Il ne contient aucun ordre, wallet,
@@ -440,7 +490,50 @@ signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
    la nouvelle campagne sans rejouer un slot terminal, désarme ses cinq unités,
    ou restaure explicitement l'ancienne campagne après preuve qu'aucun nouveau
    collecteur ne tourne.
-   Aucun raw, manifest, ledger, run ou rapport n'est supprimé.
+   Aucun raw, manifest, ledger, run ou rapport n'est supprimé. Le signal final
+   de `restore-old` est
+   `PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR`.
+
+A vérifie tous les hashes et tous les shells, localement puis dans le nouvel
+incoming : UTF-8 sans BOM, aucun NUL/CR, shebang Bash exact et LF final. B fait
+une seule authentification sudo foreground, maintient son cache uniquement par
+`sudo -n -v`, prépare complètement clone, venv et imports pendant que l'ancienne
+campagne reste active, puis réauthentifie ses
+cinq unités immédiatement avant le cutover. Un échec de préparation n'appelle
+jamais `disarm-old` et ne demande pas E. Après cette authentification, B et E
+n'emploient que `sudo -n`; chaque mutation systemd est bornée et annonce son
+opération et son service avant/après.
+
+## Diagnostic read-only puis reprise de restore-old
+
+Si E est interrompu ou affiche un timeout, conserver toute sa sortie et lancer
+dans un autre onglet Tabby uniquement ces lectures :
+
+```bash
+systemctl list-jobs --no-pager
+for service in \
+  '{old_services['polymarket']}' \
+  '{old_services['kalshi']}' \
+  '{old_services['dashboard']}' \
+  '{old_probes['polymarket']}' \
+  '{old_probes['kalshi']}' \
+  '{services['polymarket']}' \
+  '{services['kalshi']}' \
+  '{services['dashboard']}' \
+  '{namespace_probes['polymarket']}' \
+  '{namespace_probes['kalshi']}'
+do
+  systemctl show "$service" --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,FragmentPath --no-pager
+  systemctl is-enabled "$service" --no-pager || true
+done
+systemctl list-units --type=service --state=active --no-legend --no-pager 'hyperlab-pm-*'
+ss -H -ltnp 'sport = :18081'
+```
+
+Ces commandes ne modifient rien. Ne pas employer de glob avec stop/disable et
+ne supprimer aucun fichier. Après conservation du diagnostic, reprendre
+exactement `bash operator/E-recovery-rollback.sh restore-old`; les services déjà
+dans leur état terminal seront sautés, les autres reprendront sous timeout.
 
 Les blocs Windows lisent `HYPERLAB_PM_SSH_TARGET` et `HYPERLAB_PM_SSH_KEY` dans
 le shell opérateur. Aucune valeur de connexion n'est enregistrée dans ce pack.
@@ -562,6 +655,63 @@ function Assert-Sha256Manifest {{
     }}
 }}
 
+function Assert-PosixShellPayload {{
+    param([string] $Path)
+    [byte[]] $Bytes = [IO.File]::ReadAllBytes($Path)
+    if ($Bytes.Length -lt 21) {{ throw "POSIX shell payload is too short: $Path" }}
+    if ($Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {{ throw "POSIX shell payload has a UTF-8 BOM: $Path" }}
+    if ([Array]::IndexOf($Bytes, [byte]0) -ge 0) {{ throw "POSIX shell payload contains NUL: $Path" }}
+    if ([Array]::IndexOf($Bytes, [byte]13) -ge 0) {{ throw "POSIX shell payload contains CR: $Path" }}
+    $StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {{ $null = $StrictUtf8.GetString($Bytes) }} catch {{ throw "POSIX shell payload is not strict UTF-8: $Path" }}
+    [byte[]] $ExpectedShebang = [Text.Encoding]::ASCII.GetBytes("#!/usr/bin/env bash`n")
+    for ($Index = 0; $Index -lt $ExpectedShebang.Length; $Index++) {{
+        if ($Bytes[$Index] -ne $ExpectedShebang[$Index]) {{ throw "POSIX shell payload has an invalid Bash shebang: $Path" }}
+    }}
+    if ($Bytes[$Bytes.Length - 1] -ne 10) {{ throw "POSIX shell payload lacks a final LF: $Path" }}
+}}
+
+function Assert-TransferInventory {{
+    param([string] $Root)
+    $ResolvedRoot = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\')
+    $HandoffPath = Join-Path $ResolvedRoot 'handoff.json'
+    $InventoryPath = Join-Path $ResolvedRoot 'transfer-inventory.json'
+    $Handoff = Get-Content -LiteralPath $HandoffPath -Raw | ConvertFrom-Json
+    if ((Get-Sha256Hex -Path $InventoryPath) -cne [string]$Handoff.transfer_inventory_sha256) {{ throw 'Transfer inventory hash diverged from handoff.' }}
+    $Inventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json
+    if ([int]$Inventory.schema_version -ne 1) {{ throw 'Transfer inventory schema diverged.' }}
+    $Seen = @{{}}
+    $Shells = New-Object System.Collections.Generic.List[string]
+    foreach ($Entry in @($Inventory.files)) {{
+        if ($null -eq $Entry.PSObject.Properties['path'] -or $null -eq $Entry.PSObject.Properties['sha256'] -or $null -eq $Entry.PSObject.Properties['size'] -or @($Entry.PSObject.Properties).Count -ne 3) {{ throw 'Transfer inventory entry schema diverged.' }}
+        $Relative = [string]$Entry.path
+        if ($Relative -notmatch '^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$' -or $Seen.ContainsKey($Relative)) {{ throw "Unsafe or duplicate transfer path: $Relative" }}
+        $Seen[$Relative] = $true
+        $Target = [IO.Path]::GetFullPath((Join-Path $ResolvedRoot ($Relative.Replace('/', [IO.Path]::DirectorySeparatorChar))))
+        $RootPrefix = $ResolvedRoot + [IO.Path]::DirectorySeparatorChar
+        if (-not $Target.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {{ throw "Transfer path escaped root: $Relative" }}
+        $Item = Get-Item -LiteralPath $Target -Force
+        if ($Item.PSIsContainer -or (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ throw "Transferred file is unsafe: $Relative" }}
+        if ([long]$Item.Length -ne [long]$Entry.size -or (Get-Sha256Hex -Path $Target) -cne [string]$Entry.sha256) {{ throw "Transferred file identity diverged: $Relative" }}
+        if ($Relative.EndsWith('.sh', [StringComparison]::Ordinal)) {{
+            Assert-PosixShellPayload -Path $Target
+            $Shells.Add($Relative)
+        }}
+    }}
+    $ExpectedShells = @(
+        'operator/B-tabby-preflight-install-activate.sh',
+        'operator/C-tabby-readonly-monitor.sh',
+        'operator/E-recovery-rollback.sh',
+        'scripts/bootstrap-offline.sh',
+        'scripts/cutover.sh',
+        'scripts/install.sh',
+        'scripts/monitor.sh',
+        'scripts/rollback.sh'
+    )
+    if ((@($Shells | Sort-Object) -join "`n") -cne (($ExpectedShells | Sort-Object) -join "`n")) {{ throw 'Transferred POSIX shell set diverged.' }}
+    Write-Output 'PREDICTION_LOCAL_TRANSFER_SHELLS_LF_AUTHENTICATED'
+}}
+
 function Assert-GitBundle {{
     param([string] $Path)
     $VerifyParent = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path.TrimEnd('\')
@@ -588,6 +738,7 @@ if (-not [StringComparer]::OrdinalIgnoreCase.Equals((Split-Path -Parent $BundleP
 if ((Get-Sha256Hex -Path $BundlePath) -ne '{bundle_sha}') {{ throw 'Git bundle SHA-256 diverged.' }}
 Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'handoff.sha256') -ContentRoot $BundleRoot
 Assert-Sha256Manifest -ManifestPath (Join-Path $BundleRoot 'wheelhouse.sha256') -ContentRoot (Join-Path $BundleRoot 'wheelhouse')
+Assert-TransferInventory -Root $BundleRoot
 Assert-GitBundle -Path $BundlePath
 ssh -i $SshKeyPath $SshTarget "test ! -e '$IncomingRoot' && install -d -m 0700 '$IncomingRoot'"
 if ($LASTEXITCODE -ne 0) {{ throw 'Unique incoming root creation failed.' }}
@@ -617,6 +768,8 @@ trap 'exit 130' HUP INT TERM
 cd "$INCOMING_ROOT"
 sha256sum -c handoff.sha256
 (cd wheelhouse && sha256sum -c ../wheelhouse.sha256)
+python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-transfer --incoming-root "$INCOMING_ROOT" --handoff "$INCOMING_ROOT/handoff.json"
+printf 'PREDICTION_REMOTE_TRANSFER_SHELLS_LF_AUTHENTICATED\n'
 VERIFY_REPO=$(mktemp -d "$INCOMING_ROOT/.git-bundle-verify.XXXXXXXX")
 git init --bare --quiet "$VERIFY_REPO"
 git -C "$VERIFY_REPO" bundle verify "$BUNDLE_PATH"
@@ -637,9 +790,10 @@ def render_tabby_install(handoff: Mapping[str, object]) -> str:
     bundle = handoff["bundle_filename"]
     return f"""#!/usr/bin/env bash
 # Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 7-18 min; maximum: 40 min.
-# Prompts: sudo peut demander le mot de passe; aucun pip réseau. Ctrl+C avant la
-# bascule ne change rien. Après le désarmement de l'ancienne campagne, Ctrl+C
-# préserve toutes les preuves mais exige E restore-old avant toute autre activation.
+# Prompts: une authentification sudo foreground au début; aucun autre prompt sudo
+# ni pip réseau. Ctrl+C pendant
+# la préparation laisse l'ancienne campagne active. Après le début du cutover,
+# Ctrl+C préserve les preuves mais exige E restore-old avant toute autre activation.
 # Signal terminal exact: PREDICTION_INSTALL_ACTIVATION_GREEN.
 set -Eeuo pipefail
 umask 077
@@ -648,26 +802,70 @@ SOURCE_ROOT='{source}'
 CAMPAIGN_ROOT='{campaign}'
 VOLUME_BASE='{base}'
 [[ $(id -un) == hyperlab ]] || {{ printf 'PREDICTION_TABBY_REFUSED:user\n' >&2; exit 4; }}
+CUTOVER_STARTED=false
+SUDO_KEEPALIVE_PID=''
+stop_sudo_keepalive() {{
+  if [[ -n $SUDO_KEEPALIVE_PID ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
+}}
 cutover_exit() {{
   status=$?
-  if (( status != 0 )) && [[ -f "$INCOMING_ROOT/cutover-old-premutation.json" ]]; then
+  stop_sudo_keepalive
+  if (( status != 0 )) && [[ $CUTOVER_STARTED == true \
+    && -f "$INCOMING_ROOT/cutover-old-premutation.json" \
+    && ! -L "$INCOMING_ROOT/cutover-old-premutation.json" ]]; then
     printf 'PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD\n' >&2
   fi
   exit "$status"
 }}
 trap cutover_exit EXIT
-bash "$INCOMING_ROOT/scripts/cutover.sh" disarm-old "$INCOMING_ROOT/handoff.json"
+printf 'PREDICTION_SUDO_FOREGROUND_AUTH_BEGIN\n'
+if ! sudo -v; then
+  printf 'PREDICTION_TABBY_REFUSED:sudo_foreground_authentication_failed\n' >&2
+  exit 4
+fi
+sudo -n true || {{ printf 'PREDICTION_TABBY_REFUSED:sudo_noninteractive_cache_unavailable\n' >&2; exit 4; }}
+printf 'PREDICTION_SUDO_FOREGROUND_AUTH_GREEN\n'
+(
+  SUDO_SLEEP_PID=''
+  stop_keepalive_sleep() {{
+    [[ -z $SUDO_SLEEP_PID ]] || kill "$SUDO_SLEEP_PID" 2>/dev/null || true
+    exit 0
+  }}
+  trap stop_keepalive_sleep HUP INT TERM
+  while kill -0 "$$" 2>/dev/null; do
+    sudo -n -v || {{ printf 'PREDICTION_SUDO_KEEPALIVE_FAILED_NO_PROMPT\n' >&2; exit 4; }}
+    /usr/bin/sleep 30 </dev/null >/dev/null 2>&1 &
+    SUDO_SLEEP_PID=$!
+    wait "$SUDO_SLEEP_PID" || exit 0
+    SUDO_SLEEP_PID=''
+  done
+) &
+SUDO_KEEPALIVE_PID=$!
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" host --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/host-preflight-report.json"
-sudo install -d -o hyperlab -g hyperlab -m 0700 "$VOLUME_BASE" "$VOLUME_BASE/sources" "$VOLUME_BASE/campaigns"
+sudo -n install -d -o hyperlab -g hyperlab -m 0700 "$VOLUME_BASE" "$VOLUME_BASE/sources" "$VOLUME_BASE/campaigns"
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" fsync --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/filesystem-fsync-report.json"
 [[ ! -e "$SOURCE_ROOT" && ! -L "$SOURCE_ROOT" && ! -e "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:attempt_roots_must_be_new\n' >&2; exit 4; }}
 git clone --no-checkout "$INCOMING_ROOT/{bundle}" "$SOURCE_ROOT"
 git -C "$SOURCE_ROOT" checkout --detach '{commit}'
 python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
 bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROOT/wheelhouse"
+VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
+[[ -x "$VENV_PYTHON" && ! -L "$VENV_PYTHON" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_runtime_absent_or_unsafe\n' >&2; exit 4; }}
+"$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
+PYTHONPATH="$SOURCE_ROOT/src:$SOURCE_ROOT" "$VENV_PYTHON" -I -c 'import fastapi,hyperlab,requests,uvicorn,websocket; from ops.prediction_markets_launch_v1 import cockpit,preflight,runner; assert cockpit and preflight and runner'
+printf 'PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER\n'
 printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
 printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
+sudo -n -v || {{ printf 'PREDICTION_TABBY_REFUSED:sudo_cache_expired_before_cutover\n' >&2; exit 4; }}
+bash "$INCOMING_ROOT/scripts/cutover.sh" verify-old "$INCOMING_ROOT/handoff.json"
+CUTOVER_STARTED=true
+bash "$INCOMING_ROOT/scripts/cutover.sh" disarm-old "$INCOMING_ROOT/handoff.json"
 bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/install.sh" "$INCOMING_ROOT"
+stop_sudo_keepalive
+SUDO_KEEPALIVE_PID=''
 trap - EXIT
 """
 
@@ -772,16 +970,55 @@ def render_recovery_rollback(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     source = handoff["source_root"]
     return f"""#!/usr/bin/env bash
-# Lieu: Tabby/VPS Bash. Durée attendue: 1-5 min; maximum: 15 min.
-# Prompts: sudo peut demander le mot de passe. Ctrl+C ne supprime aucune preuve,
-# mais peut laisser un sous-ensemble des cinq unités Prediction Markets actif.
+# Lieu: Tabby/VPS Bash. Durée attendue: 2-8 min; maximum borné: 45 min.
+# Prompts: une authentification sudo foreground au début; aucun prompt interne.
+# Ctrl+C ne supprime aucune preuve, imprime un signal de reprise et peut laisser
+# un sous-ensemble des cinq unités Prediction Markets dans un état partiel.
 # recovery reprend seulement la nouvelle campagne; rollback-new désarme ses cinq
 # unités; restore-old désarme d'abord toute unité nouvelle, puis réarme l'ancienne.
 # Signaux: PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY,
 # PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED ou
-# PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY.
+# PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR.
 set -Eeuo pipefail
 MODE=${{1:-}}
+SUDO_KEEPALIVE_PID=''
+stop_sudo_keepalive() {{
+  if [[ -n $SUDO_KEEPALIVE_PID ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
+}}
+interrupted() {{
+  trap - HUP INT TERM
+  printf 'PREDICTION_E_INTERRUPTED_RETRY_SAME_MODE_NO_EVIDENCE_DELETED:mode=%s\n' "$MODE" >&2
+  exit 130
+}}
+trap interrupted HUP INT TERM
+trap stop_sudo_keepalive EXIT
+case "$MODE" in recovery|rollback-new|restore-old) ;; *) printf 'usage: bash E-recovery-rollback.sh recovery|rollback-new|restore-old\n' >&2; exit 4 ;; esac
+printf 'PREDICTION_SUDO_FOREGROUND_AUTH_BEGIN\n'
+if ! sudo -v; then
+  printf 'PREDICTION_E_REFUSED:sudo_foreground_authentication_failed\n' >&2
+  exit 4
+fi
+sudo -n true || {{ printf 'PREDICTION_E_REFUSED:sudo_noninteractive_cache_unavailable\n' >&2; exit 4; }}
+printf 'PREDICTION_SUDO_FOREGROUND_AUTH_GREEN\n'
+(
+  SUDO_SLEEP_PID=''
+  stop_keepalive_sleep() {{
+    [[ -z $SUDO_SLEEP_PID ]] || kill "$SUDO_SLEEP_PID" 2>/dev/null || true
+    exit 0
+  }}
+  trap stop_keepalive_sleep HUP INT TERM
+  while kill -0 "$$" 2>/dev/null; do
+    sudo -n -v || {{ printf 'PREDICTION_SUDO_KEEPALIVE_FAILED_NO_PROMPT\n' >&2; exit 4; }}
+    /usr/bin/sleep 30 </dev/null >/dev/null 2>&1 &
+    SUDO_SLEEP_PID=$!
+    wait "$SUDO_SLEEP_PID" || exit 0
+    SUDO_SLEEP_PID=''
+  done
+) &
+SUDO_KEEPALIVE_PID=$!
 case "$MODE" in
   recovery)
     bash '{source}/ops/prediction_markets_launch_v1/rollback.sh' recovery '{incoming}/handoff.json'
@@ -791,9 +1028,14 @@ case "$MODE" in
     ;;
   restore-old)
     bash '{incoming}/scripts/cutover.sh' restore-old '{incoming}/handoff.json'
+    timeout --signal=TERM --kill-after=5s 240s \
+      bash '{incoming}/scripts/cutover.sh' verify-restored '{incoming}/handoff.json'
+    printf 'PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR\n'
     ;;
-  *) printf 'usage: bash E-recovery-rollback.sh recovery|rollback-new|restore-old\n' >&2; exit 4 ;;
 esac
+stop_sudo_keepalive
+SUDO_KEEPALIVE_PID=''
+trap - EXIT
 """
 
 
@@ -806,6 +1048,108 @@ def _write_new(path: Path, payload: bytes, *, executable: bool = False) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _write_shell_new(path: Path, payload: bytes) -> None:
+    expected = validate_posix_shell_payload(payload, label=path.as_posix())
+    _write_new(path, expected, executable=True)
+    materialized = path.read_bytes()
+    validate_posix_shell_payload(materialized, label=path.as_posix())
+    if materialized != expected:
+        raise LaunchPackError(f"POSIX shell payload changed during materialization: {path}")
+
+
+def _materialize_commit_file(
+    *,
+    repo_root: Path,
+    commit: str,
+    relative_path: str,
+    output_path: Path,
+) -> None:
+    payload = _git_blob(repo_root, commit, relative_path)
+    if output_path.suffix == ".sh":
+        _write_shell_new(output_path, payload)
+    else:
+        _write_new(output_path, payload)
+
+
+def _canonical_object(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LaunchPackError(f"invalid canonical JSON object: {label}") from error
+    if not isinstance(value, dict) or raw != canonical_json_bytes(value) + b"\n":
+        raise LaunchPackError(f"JSON object is not canonical UTF-8/LF: {label}")
+    return value, raw
+
+
+def verify_materialized_transfer(
+    incoming_root: Path,
+    handoff_path: Path,
+) -> dict[str, object]:
+    if (
+        incoming_root.is_symlink()
+        or not incoming_root.is_dir()
+        or incoming_root.resolve(strict=True) != incoming_root
+        or handoff_path != incoming_root / "handoff.json"
+    ):
+        raise LaunchPackError("incoming transfer root or handoff path is unsafe")
+    handoff, handoff_raw = _canonical_object(handoff_path, label="handoff")
+    pin = (incoming_root / "handoff.sha256").read_text(encoding="ascii").strip().split()
+    if len(pin) != 2 or pin[1] != "handoff.json" or pin[0] != sha256_bytes(handoff_raw):
+        raise LaunchPackError("handoff pin diverged")
+    transfer, transfer_raw = _canonical_object(
+        incoming_root / "transfer-inventory.json",
+        label="transfer inventory",
+    )
+    if (
+        transfer.get("schema_version") != 1
+        or sha256_bytes(transfer_raw) != handoff.get("transfer_inventory_sha256")
+    ):
+        raise LaunchPackError("transfer inventory identity diverged")
+    rows = transfer.get("files")
+    if not isinstance(rows, list) or not rows:
+        raise LaunchPackError("transfer inventory entries are absent")
+    seen: set[str] = set()
+    shell_paths: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {"path", "sha256", "size"}:
+            raise LaunchPackError("transfer inventory entry schema diverged")
+        relative = row.get("path")
+        size = row.get("size")
+        digest = row.get("sha256")
+        if not isinstance(relative, str) or "\\" in relative:
+            raise LaunchPackError("transfer inventory path is invalid")
+        pure = PurePosixPath(relative)
+        if (
+            pure.is_absolute()
+            or not pure.parts
+            or any(part in {"", ".", ".."} for part in pure.parts)
+            or relative in seen
+        ):
+            raise LaunchPackError("transfer inventory path is unsafe or duplicated")
+        if type(size) is not int or size < 0 or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+            raise LaunchPackError(f"transfer inventory metadata is invalid: {relative}")
+        seen.add(relative)
+        target = incoming_root.joinpath(*pure.parts)
+        if target.is_symlink() or not target.is_file() or target.resolve(strict=True) != target:
+            raise LaunchPackError(f"transferred file is absent or unsafe: {relative}")
+        payload = target.read_bytes()
+        if len(payload) != size or sha256_bytes(payload) != digest:
+            raise LaunchPackError(f"transferred file identity diverged: {relative}")
+        if target.suffix == ".sh":
+            validate_posix_shell_payload(payload, label=relative)
+            shell_paths.add(relative)
+    if shell_paths != set(_EXPECTED_TRANSFERRED_SHELLS):
+        raise LaunchPackError("transferred POSIX shell set diverged")
+    return {
+        "files": len(rows),
+        "handoff_sha256": sha256_bytes(handoff_raw),
+        "shell_files": len(shell_paths),
+        "terminal_signal": "PREDICTION_TRANSFER_SHELLS_LF_AUTHENTICATED",
+        "transfer_inventory_sha256": sha256_bytes(transfer_raw),
+    }
 
 
 def _wheelhouse_manifest(wheelhouse: Path) -> bytes:
@@ -895,12 +1239,13 @@ def finalize(
     _write_new(output_root / "source-inventory.json", canonical_json_bytes(source_inventory) + b"\n")
     wheelhouse_payload = _wheelhouse_manifest(output_root / "wheelhouse")
     _write_new(output_root / "wheelhouse.sha256", wheelhouse_payload)
-    script_root = repo_root / "ops" / "prediction_markets_launch_v1"
     for name in _SCRIPTS:
-        source_path = script_root / name
-        if not source_path.is_file() or source_path.is_symlink():
-            raise LaunchPackError(f"launch script is absent or unsafe: {name}")
-        _write_new(output_root / "scripts" / name, source_path.read_bytes(), executable=name.endswith(".sh"))
+        _materialize_commit_file(
+            repo_root=repo_root,
+            commit=source_commit,
+            relative_path=f"ops/prediction_markets_launch_v1/{name}",
+            output_path=output_root / "scripts" / name,
+        )
     handoff_base: dict[str, object] = {
         "access_bundle_sha256": plan["access_bundle_sha256"],
         "base_commit": plan["base_commit"],
@@ -944,7 +1289,12 @@ def finalize(
         "E-recovery-rollback.sh": render_recovery_rollback(handoff_base),
     }
     for name, content in operator_blocks.items():
-        _write_new(output_root / "operator" / name, content.encode("utf-8"), executable=name.endswith(".sh"))
+        path = output_root / "operator" / name
+        payload = content.encode("utf-8")
+        if name.endswith(".sh"):
+            _write_shell_new(path, payload)
+        else:
+            _write_new(path, payload)
     transfer_paths = [
         bundle_path.name,
         "README.md",
@@ -954,6 +1304,14 @@ def finalize(
         *[f"systemd/{name}" for name in units],
         *[f"operator/{name}" for name in operator_blocks],
     ]
+    materialized_shells = {relative for relative in transfer_paths if relative.endswith(".sh")}
+    if materialized_shells != set(_EXPECTED_TRANSFERRED_SHELLS):
+        raise LaunchPackError("materialized POSIX shell set diverged")
+    for relative in sorted(materialized_shells):
+        validate_posix_shell_payload(
+            (output_root / relative).read_bytes(),
+            label=relative,
+        )
     transfer = _transfer_inventory(output_root, transfer_paths)
     transfer_payload = canonical_json_bytes(transfer) + b"\n"
     _write_new(output_root / "transfer-inventory.json", transfer_payload)
@@ -981,6 +1339,9 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--source-root", type=Path, required=True)
     verify.add_argument("--inventory", type=Path, required=True)
     verify.add_argument("--expected-commit", required=True)
+    verify_transfer = subparsers.add_parser("verify-transfer")
+    verify_transfer.add_argument("--incoming-root", type=Path, required=True)
+    verify_transfer.add_argument("--handoff", type=Path, required=True)
     return parser
 
 
@@ -1001,11 +1362,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_commit=arguments.source_commit,
                 run_slug=arguments.run_slug,
             )
-        else:
+        elif arguments.command == "verify-source":
             result = verify_source(
                 arguments.source_root.resolve(strict=True),
                 arguments.inventory.resolve(strict=True),
                 arguments.expected_commit,
+            )
+        else:
+            result = verify_materialized_transfer(
+                arguments.incoming_root.resolve(strict=True),
+                arguments.handoff.resolve(strict=True),
             )
         print(canonical_json_bytes(result).decode("utf-8"))
         return 0

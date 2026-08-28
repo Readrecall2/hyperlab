@@ -209,10 +209,10 @@ for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$PO
   UNIT_TARGET="/etc/systemd/system/$SERVICE"
   UNIT_TEMP="/etc/systemd/system/.$SERVICE.$SOURCE_COMMIT.tmp"
   [[ -f "$UNIT_SOURCE" && ! -L "$UNIT_SOURCE" ]] || fail "rendered unit absent: $SERVICE"
-  sudo test ! -e "$UNIT_TARGET"
-  sudo test ! -L "$UNIT_TARGET"
-  sudo test ! -e "$UNIT_TEMP"
-  sudo test ! -L "$UNIT_TEMP"
+  sudo -n test ! -e "$UNIT_TARGET"
+  sudo -n test ! -L "$UNIT_TARGET"
+  sudo -n test ! -e "$UNIT_TEMP"
+  sudo -n test ! -L "$UNIT_TEMP"
   [[ $(sha256sum -- "$UNIT_SOURCE" | awk '{print $1}') == "${EXPECTED_UNIT_SHA256[$UNIT_INDEX]}" ]] \
     || fail "rendered unit hash diverged before privileged copy: $SERVICE"
   systemd-analyze verify "$UNIT_SOURCE"
@@ -224,33 +224,33 @@ for SERVICE in "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$PO
   UNIT_TARGET="/etc/systemd/system/$SERVICE"
   UNIT_TEMP="/etc/systemd/system/.$SERVICE.$SOURCE_COMMIT.tmp"
   EXPECTED_UNIT_SHA=${EXPECTED_UNIT_SHA256[$UNIT_INDEX]}
-  sudo install -o root -g root -m 0644 "$UNIT_SOURCE" "$UNIT_TEMP" \
+  sudo -n install -o root -g root -m 0644 "$UNIT_SOURCE" "$UNIT_TEMP" \
     || fail "privileged unit staging failed: $SERVICE"
-  if [[ $(sudo sha256sum -- "$UNIT_TEMP" | awk '{print $1}') != "$EXPECTED_UNIT_SHA" ]]; then
-    sudo rm -- "$UNIT_TEMP" || true
+  if [[ $(sudo -n sha256sum -- "$UNIT_TEMP" | awk '{print $1}') != "$EXPECTED_UNIT_SHA" ]]; then
+    sudo -n rm -- "$UNIT_TEMP" || true
     fail "privileged staged unit hash diverged: $SERVICE"
   fi
-  if ! sudo ln "$UNIT_TEMP" "$UNIT_TARGET"; then
-    sudo rm -- "$UNIT_TEMP" || true
+  if ! sudo -n ln "$UNIT_TEMP" "$UNIT_TARGET"; then
+    sudo -n rm -- "$UNIT_TEMP" || true
     fail "privileged unit publication failed: $SERVICE"
   fi
-  if [[ $(sudo sha256sum -- "$UNIT_TARGET" | awk '{print $1}') != "$EXPECTED_UNIT_SHA" ]] \
+  if [[ $(sudo -n sha256sum -- "$UNIT_TARGET" | awk '{print $1}') != "$EXPECTED_UNIT_SHA" ]] \
     || ! systemd-analyze verify "$UNIT_TARGET"; then
-    sudo rm -- "$UNIT_TARGET" "$UNIT_TEMP" || true
+    sudo -n rm -- "$UNIT_TARGET" "$UNIT_TEMP" || true
     fail "published unit authentication failed: $SERVICE"
   fi
-  sudo rm -- "$UNIT_TEMP" || fail "privileged unit staging cleanup failed: $SERVICE"
+  sudo -n rm -- "$UNIT_TEMP" || fail "privileged unit staging cleanup failed: $SERVICE"
   UNIT_INDEX=$((UNIT_INDEX + 1))
 done
-sudo systemctl daemon-reload
+sudo -n timeout --signal=TERM --kill-after=5s 30s systemctl daemon-reload
 
 cleanup_prediction_services() {
   local cleanup_errors=0 service active_state enabled_state
   for service in \
     "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" \
     "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE"; do
-    sudo systemctl stop "$service" || cleanup_errors=1
-    sudo systemctl disable "$service" || cleanup_errors=1
+    sudo -n timeout --signal=TERM --kill-after=5s 195s systemctl stop "$service" || cleanup_errors=1
+    sudo -n timeout --signal=TERM --kill-after=5s 30s systemctl disable "$service" || cleanup_errors=1
   done
   for service in \
     "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" \
@@ -276,7 +276,7 @@ namespace_probe_diagnostic() {
     --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
     --no-pager 2>&1) || properties='SYSTEMCTL_SHOW_UNAVAILABLE'
   properties=${properties:0:4096}
-  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
+  journal=$( { sudo -n timeout 5 journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
     || journal='JOURNAL_UNAVAILABLE'
   [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
   VENUE="$venue" SERVICE="$service" PROPERTIES="$properties" JOURNAL="$journal" \
@@ -333,7 +333,7 @@ for VENUE in polymarket kalshi; do
       fail 'namespace probe venue is invalid'
       ;;
   esac
-  if ! sudo systemctl start "$NAMESPACE_PROBE_SERVICE"; then
+  if ! sudo -n timeout --signal=TERM --kill-after=5s 45s systemctl start "$NAMESPACE_PROBE_SERVICE"; then
     namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
     cleanup_prediction_services \
       || fail 'namespace probe refused and Prediction Markets cleanup also failed'
@@ -348,7 +348,7 @@ for VENUE in polymarket kalshi; do
       fail "collector namespace probe properties unavailable: $VENUE"
     }
   NAMESPACE_PROBE_JOURNAL=$( {
-    timeout 5 sudo journalctl --unit "$NAMESPACE_PROBE_SERVICE" \
+    sudo -n timeout 5 journalctl --unit "$NAMESPACE_PROBE_SERVICE" \
       --no-pager -n 20 -o cat 2>&1 || true
   } | head -c 65536 ) || {
       namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
@@ -374,7 +374,7 @@ for VENUE in polymarket kalshi; do
   printf 'PREDICTION_NAMESPACE_PROBE_GREEN=%s\n' "$VENUE"
 done
 
-if ! sudo systemctl enable --now "$DASHBOARD_SERVICE"; then
+if ! sudo -n timeout --signal=TERM --kill-after=5s 75s systemctl enable --now "$DASHBOARD_SERVICE"; then
   cleanup_prediction_services || fail 'dashboard activation failed and Prediction Markets cleanup also failed'
   fail 'dashboard activation failed before any venue start'
 fi
@@ -477,7 +477,7 @@ fi
 STARTED_VENUES=()
 foreign_venue_collector_active() {
   local venue=$1 expected=$2 unit listing
-  if ! listing=$(sudo systemctl list-units --type=service --state=active --no-legend --no-pager \
+  if ! listing=$(systemctl list-units --type=service --state=active --no-legend --no-pager \
     "hyperlab-pm-*-$venue.service"); then
     fail "cannot enumerate active Prediction Markets collectors for venue: $venue"
   fi
@@ -569,7 +569,7 @@ collector_readiness_diagnostic() {
   monitor_json=$( { timeout 10 bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json" 2>&1 || true; } | head -c 4096 ) \
     || monitor_json='MONITOR_UNAVAILABLE'
   [[ -n $monitor_json ]] || monitor_json='MONITOR_UNAVAILABLE'
-  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
+  journal=$( { sudo -n timeout 5 journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
     || journal='JOURNAL_UNAVAILABLE'
   [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
   [[ -f "$CAMPAIGN_ROOT/$venue/state.json" && ! -L "$CAMPAIGN_ROOT/$venue/state.json" ]] \
@@ -606,7 +606,7 @@ for VENUE in "${ELIGIBLE[@]}"; do
       || fail 'foreign collector collision and Prediction Markets cleanup also failed'
     fail "another Prediction Markets collector is active for venue: $VENUE"
   fi
-  if ! sudo systemctl enable --now "$SERVICE"; then
+  if ! sudo -n timeout --signal=TERM --kill-after=5s 75s systemctl enable --now "$SERVICE"; then
     collector_readiness_diagnostic "$VENUE" "$SERVICE"
     cleanup_prediction_services \
       || fail 'collector activation failed and Prediction Markets cleanup also failed'

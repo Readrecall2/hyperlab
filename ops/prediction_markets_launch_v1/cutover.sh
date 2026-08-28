@@ -8,16 +8,25 @@ fail() {
 }
 
 if (($# != 2)); then
-  fail 'usage: cutover.sh verify-old|disarm-old|restore-old NEW_HANDOFF_JSON'
+  fail 'usage: cutover.sh verify-old|verify-restored|disarm-old|restore-old NEW_HANDOFF_JSON'
 fi
 MODE=$1
 NEW_HANDOFF=$2
-[[ $MODE == verify-old || $MODE == disarm-old || $MODE == restore-old ]] \
-  || fail 'mode must be verify-old, disarm-old, or restore-old'
+[[ $MODE == verify-old || $MODE == verify-restored || $MODE == disarm-old || $MODE == restore-old ]] \
+  || fail 'mode must be verify-old, verify-restored, disarm-old, or restore-old'
 [[ $(id -un) == hyperlab ]] || fail 'run as hyperlab'
 [[ -f $NEW_HANDOFF && ! -L $NEW_HANDOFF ]] || fail 'new handoff is absent or unsafe'
 NEW_HANDOFF=$(readlink -f -- "$NEW_HANDOFF")
 NEW_INCOMING=$(dirname -- "$NEW_HANDOFF")
+SYSTEMD_HELPER="$NEW_INCOMING/scripts/systemd_cutover.py"
+[[ -f $SYSTEMD_HELPER && ! -L $SYSTEMD_HELPER ]] || fail 'bounded systemd helper is absent or unsafe'
+
+interrupted() {
+  trap - HUP INT TERM
+  printf 'PREDICTION_CUTOVER_INTERRUPTED_RETRY_SAME_MODE_NO_EVIDENCE_DELETED:mode=%s\n' "$MODE" >&2
+  exit 130
+}
+trap interrupted HUP INT TERM
 
 mapfile -t VALUES < <(python3.12 -I - "$NEW_HANDOFF" <<'PY'
 import hashlib,json,re,stat,sys
@@ -108,7 +117,9 @@ OLD_PYTHON="$OLD_SOURCE/.venv/bin/python"
 [[ -z $(git -C "$OLD_SOURCE" status --porcelain) ]] || fail 'old source checkout is not clean'
 
 authenticate_old_evidence() {
-  PYTHONPATH="$OLD_SOURCE/src:$OLD_SOURCE" PYTHONNOUSERSITE=1 "$OLD_PYTHON" -I - "$OLD_CAMPAIGN" "$OLD_SOURCE" <<'PY'
+  timeout --signal=TERM --kill-after=5s 180s env \
+    PYTHONPATH="$OLD_SOURCE/src:$OLD_SOURCE" PYTHONNOUSERSITE=1 \
+    "$OLD_PYTHON" -I - "$OLD_CAMPAIGN" "$OLD_SOURCE" <<'PY'
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -134,9 +145,10 @@ unit_identity() {
   local service=$1 props fragment line_count load_count fragment_count restart_count
   fragment="/etc/systemd/system/$service"
   [[ -f "$OLD_INCOMING/systemd/$service" && ! -L "$OLD_INCOMING/systemd/$service" ]] || return 1
-  sudo test -f "$fragment" || return 1
-  sudo cmp --silent "$OLD_INCOMING/systemd/$service" "$fragment" || return 1
-  props=$(timeout 5 sudo systemctl show "$service" --property=LoadState,FragmentPath,NRestarts --no-pager) || return 1
+  sudo -n test -f "$fragment" || return 1
+  sudo -n cmp --silent "$OLD_INCOMING/systemd/$service" "$fragment" || return 1
+  props=$(timeout --signal=TERM --kill-after=2s 10s systemctl show "$service" \
+    --property=LoadState,FragmentPath,NRestarts --no-pager) || return 1
   line_count=$(printf '%s\n' "$props" | awk 'NF{count++}END{print count+0}')
   load_count=$(printf '%s\n' "$props" | awk '$0=="LoadState=loaded"{count++}END{print count+0}')
   fragment_count=$(printf '%s\n' "$props" | awk -v expected="FragmentPath=$fragment" '$0==expected{count++}END{print count+0}')
@@ -144,13 +156,32 @@ unit_identity() {
   [[ $line_count == 3 && $load_count == 1 && $fragment_count == 1 && $restart_count == 1 ]]
 }
 
+probe_success_identity() {
+  local service=$1 props line_count active_count sub_count result_count pid_count status_count
+  unit_identity "$service" || return 1
+  props=$(timeout --signal=TERM --kill-after=2s 10s systemctl show "$service" \
+    --property=ActiveState,SubState,Result,MainPID,ExecMainStatus --no-pager) || return 1
+  line_count=$(printf '%s\n' "$props" | awk 'NF{count++}END{print count+0}')
+  active_count=$(printf '%s\n' "$props" | awk '$0=="ActiveState=inactive"{count++}END{print count+0}')
+  sub_count=$(printf '%s\n' "$props" | awk '$0=="SubState=dead"{count++}END{print count+0}')
+  result_count=$(printf '%s\n' "$props" | awk '$0=="Result=success"{count++}END{print count+0}')
+  pid_count=$(printf '%s\n' "$props" | awk '$0=="MainPID=0"{count++}END{print count+0}')
+  status_count=$(printf '%s\n' "$props" | awk '$0=="ExecMainStatus=0"{count++}END{print count+0}')
+  [[ $line_count == 5 && $active_count == 1 && $sub_count == 1 && $result_count == 1 \
+    && $pid_count == 1 && $status_count == 1 ]]
+}
+
 verify_old_active() {
   authenticate_old_evidence || return 1
-  for service in "$OLD_POLY" "$OLD_KALSHI" "$OLD_DASHBOARD" "$OLD_POLY_PROBE" "$OLD_KALSHI_PROBE"; do
+  for service in "$OLD_POLY" "$OLD_KALSHI" "$OLD_DASHBOARD"; do
     unit_identity "$service" || return 1
   done
+  for service in "$OLD_POLY_PROBE" "$OLD_KALSHI_PROBE"; do
+    probe_success_identity "$service" || return 1
+  done
   local monitor
-  monitor=$(bash "$OLD_SOURCE/ops/prediction_markets_launch_v1/monitor.sh" "$OLD_INCOMING/handoff.json") \
+  monitor=$(timeout --signal=TERM --kill-after=5s 90s \
+    bash "$OLD_SOURCE/ops/prediction_markets_launch_v1/monitor.sh" "$OLD_INCOMING/handoff.json") \
     || return 1
   OLD_MONITOR="$monitor" OLD_PYTHON="$OLD_PYTHON" \
     "$OLD_PYTHON" -I - "$OLD_POLY" "$OLD_KALSHI" "$OLD_DASHBOARD" <<'PY'
@@ -170,21 +201,47 @@ PY
 
 require_no_active_prediction_collectors() {
   local active
-  active=$(sudo systemctl list-units --type=service --state=active --no-legend --no-pager \
+  active=$(timeout --signal=TERM --kill-after=2s 10s systemctl list-units \
+    --type=service --state=active --no-legend --no-pager \
     'hyperlab-pm-*-polymarket.service' 'hyperlab-pm-*-kalshi.service' \
     | awk 'NF{print $1}') || fail 'cannot enumerate active Prediction Markets collectors'
   [[ -z $active ]] || fail "Prediction Markets collectors remain active:$active"
 }
 
+require_only_expected_old_collectors() {
+  local active expected
+  active=$(timeout --signal=TERM --kill-after=2s 10s systemctl list-units \
+    --type=service --state=active --no-legend --no-pager \
+    'hyperlab-pm-*-polymarket.service' 'hyperlab-pm-*-kalshi.service' \
+    | awk 'NF{print $1}' | sort) || fail 'cannot enumerate restored Prediction Markets collectors'
+  expected=$(printf '%s\n%s\n' "$OLD_KALSHI" "$OLD_POLY" | sort)
+  [[ $active == "$expected" ]] \
+    || fail "restored collector identity diverged:expected=$expected:actual=$active"
+}
+
+run_systemd_helper() {
+  python3.12 -I "$SYSTEMD_HELPER" "$@" \
+    || fail "bounded systemd operation failed:mode=$MODE:arguments=$*"
+}
+
 disarm_service() {
   local service=$1
-  sudo systemctl stop "$service"
-  sudo systemctl disable "$service"
-  local active enabled
-  active=$(timeout 5 sudo systemctl show "$service" --property=ActiveState --value --no-pager)
-  [[ $active == inactive || $active == failed ]] || fail "service still active:$service:$active"
-  set +e; enabled=$(timeout 5 sudo systemctl is-enabled "$service" 2>&1); set -e
-  [[ $enabled == disabled ]] || fail "service still enabled:$service:$enabled"
+  run_systemd_helper disarm --service "$service"
+}
+
+disarm_service_allow_absent() {
+  local service=$1
+  run_systemd_helper disarm --service "$service" --allow-absent
+}
+
+ensure_active_service() {
+  local service=$1
+  run_systemd_helper ensure-active --service "$service"
+}
+
+ensure_probe_success() {
+  local service=$1
+  run_systemd_helper ensure-probe --service "$service"
 }
 
 write_cutover_receipt() {
@@ -231,16 +288,45 @@ if [[ $MODE == verify-old ]]; then
   exit 0
 fi
 
+if [[ $MODE == verify-restored ]]; then
+  verify_old_active || fail 'restored old campaign identity authentication failed'
+  require_only_expected_old_collectors
+  printf 'PREDICTION_OLD_CAMPAIGN_FINAL_STATE_AUTHENTICATED_NO_NEW_COLLECTOR\n'
+  exit 0
+fi
+
 if [[ $MODE == disarm-old ]]; then
-  verify_old_active || fail 'old campaign pre-mutation authentication failed'
-  write_cutover_receipt "$NEW_INCOMING/cutover-old-premutation.json" 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED'
+  PREMUTATION_RECEIPT="$NEW_INCOMING/cutover-old-premutation.json"
+  DISARMED_RECEIPT="$NEW_INCOMING/cutover-old-disarmed.json"
+  if [[ -e $PREMUTATION_RECEIPT || -L $PREMUTATION_RECEIPT ]]; then
+    [[ -f $PREMUTATION_RECEIPT && ! -L $PREMUTATION_RECEIPT ]] \
+      || fail 'old pre-mutation receipt is unsafe'
+    authenticate_cutover_receipt "$PREMUTATION_RECEIPT" 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED' \
+      || fail 'old pre-mutation receipt diverged'
+    printf 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_RECEIPT_REAUTHENTICATED\n'
+  else
+    verify_old_active || fail 'old campaign pre-mutation authentication failed'
+    write_cutover_receipt "$PREMUTATION_RECEIPT" 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED'
+    printf 'PREDICTION_OLD_CAMPAIGN_PREMUTATION_RECEIPT_WRITTEN\n'
+  fi
+  if [[ -e $DISARMED_RECEIPT || -L $DISARMED_RECEIPT ]]; then
+    [[ -f $DISARMED_RECEIPT && ! -L $DISARMED_RECEIPT ]] || fail 'old-disarm receipt is unsafe'
+    authenticate_cutover_receipt "$DISARMED_RECEIPT" 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED' \
+      || fail 'old-disarm receipt diverged'
+    require_no_active_prediction_collectors
+    if ss -H -ltn 'sport = :18081' | grep -q .; then fail 'dashboard port 18081 remains occupied'; fi
+    authenticate_old_evidence || fail 'old evidence changed after recorded disarm'
+    printf 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED\n'
+    exit 0
+  fi
   for service in "$OLD_POLY" "$OLD_KALSHI" "$OLD_DASHBOARD" "$OLD_POLY_PROBE" "$OLD_KALSHI_PROBE"; do
+    unit_identity "$service" || fail "old unit identity diverged during disarm:$service"
     disarm_service "$service"
   done
   require_no_active_prediction_collectors
   if ss -H -ltn 'sport = :18081' | grep -q .; then fail 'dashboard port 18081 remains occupied'; fi
   authenticate_old_evidence || fail 'old evidence changed during disarm'
-  write_cutover_receipt "$NEW_INCOMING/cutover-old-disarmed.json" 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED'
+  write_cutover_receipt "$DISARMED_RECEIPT" 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED'
   printf 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED\n'
   exit 0
 fi
@@ -255,20 +341,11 @@ if [[ -e $NEW_INCOMING/cutover-old-disarmed.json || -L $NEW_INCOMING/cutover-old
   authenticate_cutover_receipt "$NEW_INCOMING/cutover-old-disarmed.json" 'PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED' \
     || fail 'old-disarm receipt diverged'
 fi
-disarm_new_service() {
-  local service=$1 load active enabled
-  load=$(timeout 5 sudo systemctl show "$service" --property=LoadState --value --no-pager 2>/dev/null || true)
-  if [[ $load == not-found || -z $load ]]; then return 0; fi
-  sudo systemctl stop "$service"
-  sudo systemctl disable "$service"
-  active=$(timeout 5 sudo systemctl show "$service" --property=ActiveState --value --no-pager)
-  [[ $active == inactive || $active == failed ]] || fail "new service still active:$service:$active"
-  set +e; enabled=$(timeout 5 sudo systemctl is-enabled "$service" 2>&1); set -e
-  [[ $enabled == disabled ]] || fail "new service still enabled:$service:$enabled"
-}
-for service in "$NEW_POLY" "$NEW_KALSHI" "$NEW_DASHBOARD"; do disarm_new_service "$service"; done
+for service in "$NEW_POLY" "$NEW_KALSHI" "$NEW_DASHBOARD"; do disarm_service_allow_absent "$service"; done
 NEW_SUFFIX=${NEW_POLY#hyperlab-pm-}; NEW_SUFFIX=${NEW_SUFFIX%-polymarket.service}
-for service in "hyperlab-pm-$NEW_SUFFIX-polymarket-namespace-probe.service" "hyperlab-pm-$NEW_SUFFIX-kalshi-namespace-probe.service"; do disarm_new_service "$service"; done
+for service in "hyperlab-pm-$NEW_SUFFIX-polymarket-namespace-probe.service" "hyperlab-pm-$NEW_SUFFIX-kalshi-namespace-probe.service"; do
+  disarm_service_allow_absent "$service"
+done
 for service in "$OLD_POLY" "$OLD_KALSHI" "$OLD_DASHBOARD" "$OLD_POLY_PROBE" "$OLD_KALSHI_PROBE"; do
   unit_identity "$service" || fail "old unit identity diverged before restore:$service"
   disarm_service "$service"
@@ -277,16 +354,13 @@ require_no_active_prediction_collectors
 if ss -H -ltn 'sport = :18081' | grep -q .; then fail 'dashboard port 18081 is not free before old restore'; fi
 authenticate_old_evidence || fail 'old evidence authentication failed before restore'
 for service in "$OLD_POLY_PROBE" "$OLD_KALSHI_PROBE"; do
-  sudo systemctl enable "$service"
-  sudo systemctl start "$service"
-  [[ $(timeout 5 sudo systemctl show "$service" --property=Result --value --no-pager) == success ]] \
-    || fail "old namespace probe failed:$service"
+  ensure_probe_success "$service"
 done
-sudo systemctl enable --now "$OLD_DASHBOARD"
-sudo systemctl enable --now "$OLD_POLY"
-sudo systemctl enable --now "$OLD_KALSHI"
+ensure_active_service "$OLD_DASHBOARD"
+ensure_active_service "$OLD_POLY"
+ensure_active_service "$OLD_KALSHI"
 for _attempt in {1..20}; do
-  if verify_old_active; then
+  if verify_old_active && require_only_expected_old_collectors; then
     printf 'PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY\n'
     exit 0
   fi

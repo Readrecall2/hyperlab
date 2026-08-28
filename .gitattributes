@@ -1,3 +1,5 @@
+.gitattributes text eol=lf
+
 # These public evidence artifacts are hashed as raw bytes by the Phase 12 audit.
 # Keep their checkout bytes stable when core.autocrlf is enabled on Windows.
 config/paper/hyperliquid-tier0-fees-2026-08-16.json text eol=lf
@@ -16,3 +18,7 @@ config/research/prediction-markets-candidate-v1.json text eol=lf
 docs/evidence/prediction-markets-candidate-v1/**/*.json text eol=lf
 ops/prediction_markets_candidate_v1/**/*.json text eol=lf
 ops/prediction_markets_candidate_v1/**/*.sha256 text eol=lf
+
+# Prediction Markets launch shells execute on Linux after Windows packaging.
+# Keep every tracked POSIX payload byte-stable and LF-only at checkout.
+ops/prediction_markets_launch_v1/*.sh text eol=lf

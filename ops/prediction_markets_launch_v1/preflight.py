@@ -1074,6 +1074,50 @@ def _systemd_collision(service: str, run: CommandRunner) -> dict[str, object]:
     return {"active_state": active, "load_state": load, "service": service}
 
 
+def _authenticate_superseded_dashboard_port(
+    handoff_path: Path,
+    handoff: Mapping[str, object],
+    run: CommandRunner,
+) -> dict[str, object]:
+    superseded = handoff.get("superseded_campaign")
+    if not isinstance(superseded, Mapping):
+        raise PreflightError("superseded campaign contract is absent")
+    services = superseded.get("services")
+    if (
+        superseded.get("run_slug") != "pm-20260828t024827z-bcb5280f"
+        or superseded.get("source_commit")
+        != "bcb5280f87393992e2aa4528188009186cd8bdc3"
+        or superseded.get("dashboard_port") != 18081
+        or not isinstance(services, Mapping)
+    ):
+        raise PreflightError("superseded dashboard identity diverged")
+    dashboard = services.get("dashboard")
+    if dashboard != "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service":
+        raise PreflightError("superseded dashboard service identity diverged")
+    script = handoff_path.parent / "scripts" / "cutover.sh"
+    if script.is_symlink() or not script.is_file() or script.resolve(strict=True) != script:
+        raise PreflightError("authenticated cutover verifier is absent or unsafe")
+    verified = run(["bash", str(script), "verify-old", str(handoff_path)])
+    expected_signals = [
+        "PREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED",
+        "PREDICTION_OLD_CAMPAIGN_FIVE_UNITS_AUTHENTICATED",
+        "PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED",
+    ]
+    if verified.returncode != 0 or verified.stdout.splitlines() != expected_signals:
+        raise PreflightError(
+            "superseded dashboard port owner authentication failed: "
+            + (verified.stderr or verified.stdout or "no diagnostic")[:1024]
+        )
+    return {
+        "free": False,
+        "host": "127.0.0.1",
+        "occupied_by_authenticated_superseded_dashboard": True,
+        "owner_service": dashboard,
+        "port": 18081,
+        "verification_signals": expected_signals,
+    }
+
+
 def host_preflight(
     handoff_path: Path,
     *,
@@ -1109,6 +1153,7 @@ def host_preflight(
             ):
                 raise PreflightError(f"{label} is an unsafe existing path")
         for name in (
+            "bash",
             "df",
             "findmnt",
             "getent",
@@ -1184,10 +1229,11 @@ def host_preflight(
         dashboard_port = handoff.get("dashboard_port")
         if type(dashboard_port) is not int or not 1024 <= dashboard_port <= 65535:
             raise PreflightError("dashboard port is invalid")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-            probe.bind(("127.0.0.1", dashboard_port))
-        checks["loopback_port"] = {"host": "127.0.0.1", "port": dashboard_port, "free": True}
+        checks["loopback_port"] = _authenticate_superseded_dashboard_port(
+            handoff_path,
+            handoff,
+            run,
+        )
         services = handoff.get("services")
         if not isinstance(services, Mapping) or set(services) != {"dashboard", "kalshi", "polymarket"}:
             raise PreflightError("service identity map diverged")
@@ -1507,6 +1553,8 @@ def install_admission_preflight(
         )
         network = host.get("network")
         eligible = host.get("eligible_venues")
+        host_checks = host.get("checks")
+        old_port = host_checks.get("loopback_port") if isinstance(host_checks, Mapping) else None
         if (
             host.get("boundary") != BOUNDARY
             or host.get("schema_version") != 1
@@ -1524,6 +1572,13 @@ def install_admission_preflight(
                 if isinstance(network.get(venue), Mapping)
                 and network[venue].get("verdict") == "NETWORK_PREFLIGHT_GREEN"
             ]
+            or not isinstance(old_port, Mapping)
+            or old_port.get("host") != "127.0.0.1"
+            or old_port.get("port") != 18081
+            or old_port.get("free") is not False
+            or old_port.get("occupied_by_authenticated_superseded_dashboard") is not True
+            or old_port.get("owner_service")
+            != "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service"
         ):
             raise PreflightError("host preflight admission evidence diverged")
         fsync, fsync_raw = _canonical_runtime_report(
@@ -1554,7 +1609,6 @@ def install_admission_preflight(
                 + "; ".join(str(item) for item in resume_errors)
             )
         live = _live_reservation_checks(handoff, run=run, label="install admission")
-        host_checks = host.get("checks")
         host_filesystem = (
             host_checks.get("filesystem") if isinstance(host_checks, Mapping) else None
         )

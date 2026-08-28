@@ -22,7 +22,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -31,6 +31,7 @@ BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _NETWORK_TIMEOUT_SECONDS = 3.0
 _COMMAND_TIMEOUT_SECONDS = 20.0
+_PREPARED_RECEIPT_TTL_SECONDS = 6 * 60 * 60
 _SHA256 = frozenset("0123456789abcdef")
 _RUN_SLUG = re.compile(r"^pm-[0-9]{8}t[0-9]{6}z-[0-9a-f]{8}$")
 _HOME_MOUNT = PurePosixPath("/home")
@@ -2204,9 +2205,26 @@ def _authenticate_superseded_dashboard_port(
     dashboard = services.get("dashboard")
     if dashboard != "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service":
         raise PreflightError("superseded dashboard service identity diverged")
-    script = handoff_path.parent / "scripts" / "cutover.sh"
+    script = (
+        Path(str(handoff.get("source_root") or ""))
+        / "ops"
+        / "prediction_markets_launch_v1"
+        / "cutover.sh"
+    )
     if script.is_symlink() or not script.is_file() or script.resolve(strict=True) != script:
         raise PreflightError("authenticated cutover verifier is absent or unsafe")
+    candidate_tool = (
+        Path(str(handoff.get("source_root") or ""))
+        / _RUNTIME_ADMISSION_SCRIPT_RELATIVE
+    )
+    if (
+        candidate_tool.is_symlink()
+        or not candidate_tool.is_file()
+        or candidate_tool.resolve(strict=True) != candidate_tool
+    ):
+        raise PreflightError(
+            "candidate-owned superseded verifier is unavailable before live authentication"
+        )
     verified = run(["bash", str(script), "verify-old", str(handoff_path)])
     expected_signals = [
         "PREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED",
@@ -2228,7 +2246,7 @@ def _authenticate_superseded_dashboard_port(
     }
 
 
-def host_preflight(
+def base_host_preflight(
     handoff_path: Path,
     *,
     run: CommandRunner = _command,
@@ -2339,11 +2357,9 @@ def host_preflight(
         dashboard_port = handoff.get("dashboard_port")
         if type(dashboard_port) is not int or not 1024 <= dashboard_port <= 65535:
             raise PreflightError("dashboard port is invalid")
-        checks["loopback_port"] = _authenticate_superseded_dashboard_port(
-            handoff_path,
-            handoff,
-            run,
-        )
+        checks["superseded_authentication"] = {
+            "state": "DEFERRED_UNTIL_CANDIDATE_SOURCE_AND_VENV_ARE_AUTHENTICATED"
+        }
         services = handoff.get("services")
         if not isinstance(services, Mapping) or set(services) != {"dashboard", "kalshi", "polymarket"}:
             raise PreflightError("service identity map diverged")
@@ -2382,6 +2398,7 @@ def host_preflight(
     return {
         "boundary": BOUNDARY,
         "checks": checks,
+        "base_admitted": not errors,
         "eligible_venues": eligible,
         "errors": errors,
         "host_admitted": not errors,
@@ -2390,11 +2407,26 @@ def host_preflight(
         "recorded_at_utc": _utc_now_text(),
         "schema_version": 1,
         "terminal_signal": (
-            "PREDICTION_HOST_PREFLIGHT_GREEN"
+            "PREDICTION_BASE_HOST_PREFLIGHT_GREEN"
             if not errors
-            else "PREDICTION_HOST_PREFLIGHT_REFUSED"
+            else "PREDICTION_BASE_HOST_PREFLIGHT_REFUSED"
         ),
     }
+
+
+def host_preflight(
+    handoff_path: Path,
+    *,
+    run: CommandRunner = _command,
+    connectivity_probe: Callable[[str], dict[str, object]] = probe_venue_connectivity,
+) -> dict[str, object]:
+    """Compatibility name for the dependency-free base host preflight."""
+
+    return base_host_preflight(
+        handoff_path,
+        run=run,
+        connectivity_probe=connectivity_probe,
+    )
 
 
 def fsync_probe(handoff_path: Path) -> dict[str, object]:
@@ -2594,6 +2626,713 @@ def _canonical_runtime_report(path: Path, *, label: str) -> tuple[dict[str, Any]
     return value, raw
 
 
+def _parse_utc_timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise PreflightError(f"{label} is not canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise PreflightError(f"{label} is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise PreflightError(f"{label} has no timezone")
+    return parsed.astimezone(UTC)
+
+
+def _validated_base_preflight_evidence(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], bytes, dict[str, Any], bytes]:
+    handoff = load_handoff(handoff_path)
+    expected_host = handoff_path.parent / "host-preflight-report.json"
+    expected_fsync = handoff_path.parent / "filesystem-fsync-report.json"
+    if host_report_path != expected_host or fsync_report_path != expected_fsync:
+        raise PreflightError("base preflight evidence paths diverged")
+    host, host_raw = _canonical_runtime_report(
+        host_report_path, label="base host preflight report"
+    )
+    expected_host_fields = {
+        "base_admitted",
+        "boundary",
+        "checks",
+        "eligible_venues",
+        "errors",
+        "host_admitted",
+        "installation_admissible",
+        "network",
+        "recorded_at_utc",
+        "schema_version",
+        "terminal_signal",
+    }
+    checks = host.get("checks")
+    network = host.get("network")
+    eligible = host.get("eligible_venues")
+    if (
+        set(host) != expected_host_fields
+        or host.get("boundary") != BOUNDARY
+        or host.get("schema_version") != 1
+        or host.get("base_admitted") is not True
+        or host.get("host_admitted") is not True
+        or host.get("installation_admissible") is not True
+        or host.get("errors") != []
+        or host.get("terminal_signal") != "PREDICTION_BASE_HOST_PREFLIGHT_GREEN"
+        or not isinstance(checks, Mapping)
+        or checks.get("superseded_authentication")
+        != {
+            "state": (
+                "DEFERRED_UNTIL_CANDIDATE_SOURCE_AND_VENV_ARE_AUTHENTICATED"
+            )
+        }
+        or not isinstance(checks.get("filesystem"), Mapping)
+        or checks.get("ntp") != {"synchronized": True}
+        or not isinstance(network, Mapping)
+        or set(network) != {"polymarket", "kalshi"}
+        or not isinstance(eligible, list)
+        or eligible
+        != [
+            venue
+            for venue in ("polymarket", "kalshi")
+            if isinstance(network.get(venue), Mapping)
+            and network[venue].get("verdict") == "NETWORK_PREFLIGHT_GREEN"
+        ]
+    ):
+        raise PreflightError("base host preflight evidence diverged")
+    _parse_utc_timestamp(host.get("recorded_at_utc"), label="base host recorded time")
+
+    fsync, fsync_raw = _canonical_runtime_report(
+        fsync_report_path, label="filesystem fsync report"
+    )
+    expected_parents = [
+        str(Path(str(handoff["volume_base"]))),
+        str(Path(str(handoff["volume_base"])) / "sources"),
+        str(Path(str(handoff["volume_base"])) / "campaigns"),
+    ]
+    if (
+        set(fsync)
+        != {
+            "boundary",
+            "filesystem_write_surface",
+            "parent_roots",
+            "probe_removed",
+            "recorded_at_utc",
+            "schema_version",
+            "terminal_signal",
+        }
+        or fsync.get("boundary") != BOUNDARY
+        or fsync.get("schema_version") != 1
+        or fsync.get("terminal_signal") != "PREDICTION_FILESYSTEM_FSYNC_GREEN"
+        or fsync.get("filesystem_write_surface") != str(handoff["volume_base"])
+        or fsync.get("parent_roots") != expected_parents
+        or fsync.get("probe_removed") is not True
+    ):
+        raise PreflightError("filesystem fsync evidence diverged")
+    _parse_utc_timestamp(fsync.get("recorded_at_utc"), label="fsync recorded time")
+    return handoff, host, host_raw, fsync, fsync_raw
+
+
+def validate_base_preflight_evidence(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+) -> dict[str, object]:
+    handoff, _host, host_raw, _fsync, fsync_raw = (
+        _validated_base_preflight_evidence(
+            handoff_path,
+            host_report_path,
+            fsync_report_path,
+        )
+    )
+    return {
+        "boundary": BOUNDARY,
+        "filesystem_fsync_report_sha256": sha256_bytes(fsync_raw),
+        "handoff_sha256": sha256_bytes(_safe_regular_bytes(handoff_path)),
+        "host_preflight_report_sha256": sha256_bytes(host_raw),
+        "run_slug": handoff["run_slug"],
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_BASE_PREFLIGHT_EVIDENCE_AUTHENTICATED",
+    }
+
+
+def _validated_candidate_prepare_evidence(
+    handoff_path: Path,
+    runtime_report_path: Path,
+    *,
+    run: CommandRunner,
+) -> tuple[dict[str, Any], dict[str, object], dict[str, Any], bytes]:
+    handoff = load_handoff(handoff_path)
+    layout = validate_install_layout(handoff, handoff_path=handoff_path)
+    source_root = Path(str(layout["source_root"]))
+    source_commit = str(layout["source_commit"])
+    inventory_sha256 = _validate_sha256(
+        handoff.get("source_inventory_sha256"), label="prepared source inventory hash"
+    )
+    _authenticated_runtime_checkout(
+        source_root=source_root,
+        inventory_path=handoff_path.parent / "source-inventory.json",
+        expected_commit=source_commit,
+        expected_inventory_sha256=inventory_sha256,
+        label="prepared candidate",
+    )
+    runtime = _runtime_reported_file(
+        str(source_root / ".venv" / "bin" / "python"),
+        label="prepared candidate Python",
+    )
+    expected_runtime_report = handoff_path.parent / "runtime-import-admission.json"
+    if runtime_report_path != expected_runtime_report:
+        raise PreflightError("runtime import report path diverged")
+    runtime_report, runtime_raw = _canonical_runtime_report(
+        runtime_report_path, label="runtime import admission report"
+    )
+    validate_runtime_import_admission(
+        runtime_report,
+        source_root=source_root,
+        source_commit=source_commit,
+        inventory_sha256=inventory_sha256,
+    )
+    live_runtime_report = _runtime_import_subprocess_admission(
+        runtime=runtime,
+        incoming_root=handoff_path.parent,
+        source_root=source_root,
+        source_commit=source_commit,
+        inventory_sha256=inventory_sha256,
+        run=run,
+    )
+    if canonical_json_bytes(live_runtime_report) + b"\n" != runtime_raw:
+        raise PreflightError("prepared runtime import evidence changed")
+    return handoff, layout, runtime_report, runtime_raw
+
+
+def _validated_superseded_compatibility_report(
+    handoff_path: Path,
+    report_path: Path,
+) -> tuple[dict[str, Any], bytes]:
+    handoff = load_handoff(handoff_path)
+    expected_path = handoff_path.parent / "superseded-runtime-compatibility.json"
+    if report_path != expected_path:
+        raise PreflightError("superseded compatibility report path diverged")
+    report, raw = _canonical_runtime_report(
+        report_path, label="superseded runtime compatibility report"
+    )
+    expected_fields = {
+        "adapter_id",
+        "boundary",
+        "candidate_commit",
+        "candidate_inventory_sha256",
+        "candidate_source_root",
+        "candidate_tool",
+        "compatibility_sha256",
+        "isolated",
+        "ledgers",
+        "loaded_module_files_validated",
+        "modules",
+        "no_historical_new_cli_invoked",
+        "no_user_site",
+        "schema_version",
+        "target_activation_receipt_sha256",
+        "target_campaign_manifest_sha256",
+        "target_commit",
+        "target_inventory_sha256",
+        "target_python_executable",
+        "target_source_root",
+        "target_venv_root",
+        "terminal_signal",
+    }
+    claimed = _validate_sha256(
+        report.get("compatibility_sha256"), label="superseded compatibility hash"
+    )
+    body = {key: value for key, value in report.items() if key != "compatibility_sha256"}
+    superseded = handoff.get("superseded_campaign")
+    candidate_tool = report.get("candidate_tool")
+    modules = report.get("modules")
+    ledgers = report.get("ledgers")
+    expected_modules = {
+        "__mp_main__",
+        *_SUPERSEDED_RUNTIME_SOURCE_MODULES,
+        *_SUPERSEDED_RUNTIME_VENV_MODULES,
+    }
+    if not isinstance(superseded, Mapping):
+        raise PreflightError("superseded campaign binding is absent")
+    if (
+        set(report) != expected_fields
+        or sha256_bytes(canonical_json_bytes(body)) != claimed
+        or report.get("adapter_id") != _SUPERSEDED_RUNTIME_ADAPTER_ID
+        or report.get("boundary") != BOUNDARY
+        or report.get("schema_version") != 1
+        or report.get("candidate_commit") != handoff.get("source_commit")
+        or report.get("candidate_inventory_sha256")
+        != handoff.get("source_inventory_sha256")
+        or report.get("candidate_source_root") != handoff.get("source_root")
+        or report.get("isolated") is not True
+        or report.get("no_user_site") is not True
+        or report.get("no_historical_new_cli_invoked") is not True
+        or report.get("target_commit") != superseded.get("source_commit")
+        or report.get("target_inventory_sha256")
+        != _SUPERSEDED_RUNTIME_INVENTORY_SHA256
+        or report.get("target_source_root") != superseded.get("source_root")
+        or report.get("target_venv_root")
+        != f"{superseded.get('source_root')}/.venv"
+        or report.get("target_python_executable")
+        != f"{superseded.get('source_root')}/.venv/bin/python"
+        or report.get("terminal_signal")
+        != "PREDICTION_SUPERSEDED_RUNTIME_COMPATIBILITY_RUNTIME_GREEN"
+        or not isinstance(candidate_tool, Mapping)
+        or candidate_tool.get("class") != "candidate_tool"
+        or candidate_tool.get("file")
+        != f"{handoff.get('source_root')}/{_RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix()}"
+        or candidate_tool.get("relative_path")
+        != _RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix()
+        or not isinstance(modules, Mapping)
+        or set(modules) != expected_modules
+        or not isinstance(ledgers, Mapping)
+        or set(ledgers) != {"polymarket", "kalshi"}
+    ):
+        raise PreflightError("superseded runtime compatibility binding diverged")
+    for label in (
+        "target_activation_receipt_sha256",
+        "target_campaign_manifest_sha256",
+    ):
+        _validate_sha256(report.get(label), label=label.replace("_", " "))
+    for venue in ("polymarket", "kalshi"):
+        ledger = ledgers.get(venue)
+        if (
+            not isinstance(ledger, Mapping)
+            or type(ledger.get("entries")) is not int
+            or int(ledger["entries"]) < 1
+        ):
+            raise PreflightError(f"superseded {venue} ledger binding diverged")
+        _validate_sha256(
+            ledger.get("last_entry_sha256"),
+            label=f"superseded {venue} ledger tail hash",
+        )
+    alias = modules.get("__mp_main__")
+    if (
+        not isinstance(alias, Mapping)
+        or alias.get("class") != "candidate_tool"
+        or alias.get("alias_of") != "__main__"
+        or alias.get("file") != candidate_tool.get("file")
+    ):
+        raise PreflightError("superseded candidate tool alias binding diverged")
+    return report, raw
+
+
+def _assert_new_attempt_is_premutation(
+    handoff_path: Path,
+    handoff: Mapping[str, object],
+) -> None:
+    campaign = Path(str(handoff["campaign_root"]))
+    if campaign.exists() or campaign.is_symlink():
+        raise PreflightError("new campaign root is no longer pristine")
+    for name in (
+        "cutover-activation-started.json",
+        "cutover-old-premutation.json",
+        "cutover-old-disarmed.json",
+    ):
+        path = handoff_path.parent / name
+        if path.exists() or path.is_symlink():
+            raise PreflightError("cutover has already started for this run slug")
+
+
+def _prepared_artifact_bindings(
+    handoff_path: Path,
+    *,
+    handoff: Mapping[str, object],
+    host: Mapping[str, object],
+    host_raw: bytes,
+    fsync_raw: bytes,
+    runtime_report: Mapping[str, object],
+    runtime_raw: bytes,
+    compatibility: Mapping[str, object],
+    compatibility_raw: bytes,
+    verification_signals: Sequence[str],
+) -> dict[str, object]:
+    incoming = handoff_path.parent
+    verify_transfer_inventory(incoming, handoff)
+    verify_wheelhouse(incoming, handoff)
+    transfer_raw = _safe_regular_bytes(incoming / "transfer-inventory.json")
+    source_inventory_raw = _safe_regular_bytes(incoming / "source-inventory.json")
+    wheelhouse_raw = _safe_regular_bytes(
+        incoming / "wheelhouse.sha256", maximum_bytes=1024 * 1024
+    )
+    bundle_path = incoming / str(handoff["bundle_filename"])
+    bundle_raw = _safe_regular_bytes(bundle_path, maximum_bytes=512 * 1024 * 1024)
+    checks = host.get("checks")
+    if not isinstance(checks, Mapping):
+        raise PreflightError("prepared host checks are absent")
+    superseded = handoff.get("superseded_campaign")
+    if not isinstance(superseded, Mapping):
+        raise PreflightError("prepared superseded campaign contract is absent")
+    expected_signals = [
+        "PREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED",
+        "PREDICTION_OLD_CAMPAIGN_FIVE_UNITS_AUTHENTICATED",
+        "PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED",
+    ]
+    if list(verification_signals) != expected_signals:
+        raise PreflightError("superseded live verification signals diverged")
+    runtime_admission_sha256 = _validate_sha256(
+        runtime_report.get("admission_sha256"), label="prepared runtime admission hash"
+    )
+    compatibility_sha256 = _validate_sha256(
+        compatibility.get("compatibility_sha256"),
+        label="prepared superseded compatibility hash",
+    )
+    return {
+        "artifacts": {
+            "bundle_sha256": sha256_bytes(bundle_raw),
+            "filesystem_fsync_report_sha256": sha256_bytes(fsync_raw),
+            "handoff_sha256": sha256_bytes(_safe_regular_bytes(handoff_path)),
+            "host_preflight_report_sha256": sha256_bytes(host_raw),
+            "runtime_import_report_sha256": sha256_bytes(runtime_raw),
+            "source_inventory_file_sha256": sha256_bytes(source_inventory_raw),
+            "superseded_compatibility_report_sha256": sha256_bytes(
+                compatibility_raw
+            ),
+            "transfer_inventory_sha256": sha256_bytes(transfer_raw),
+            "wheelhouse_manifest_sha256": sha256_bytes(wheelhouse_raw),
+        },
+        "candidate": {
+            "campaign_root": handoff["campaign_root"],
+            "inventory_sha256": handoff["source_inventory_sha256"],
+            "run_slug": handoff["run_slug"],
+            "runtime_admission_sha256": runtime_admission_sha256,
+            "source_commit": handoff["source_commit"],
+            "source_root": handoff["source_root"],
+            "venv_root": f"{handoff['source_root']}/.venv",
+        },
+        "host": {
+            "filesystem": checks["filesystem"],
+            "network": host["network"],
+            "ntp": checks["ntp"],
+            "recorded_at_utc": host["recorded_at_utc"],
+        },
+        "superseded": {
+            "activation_receipt_sha256": compatibility[
+                "target_activation_receipt_sha256"
+            ],
+            "campaign_manifest_sha256": compatibility[
+                "target_campaign_manifest_sha256"
+            ],
+            "campaign_root": superseded["campaign_root"],
+            "compatibility_sha256": compatibility_sha256,
+            "dashboard_port": superseded["dashboard_port"],
+            "inventory_sha256": compatibility["target_inventory_sha256"],
+            "namespace_probe_services": superseded["namespace_probe_services"],
+            "run_slug": superseded["run_slug"],
+            "services": superseded["services"],
+            "source_commit": superseded["source_commit"],
+            "source_root": superseded["source_root"],
+            "verification_signals": expected_signals,
+        },
+    }
+
+
+def _validate_prepared_receipt(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+    runtime_report_path: Path,
+    compatibility_report_path: Path,
+    receipt_path: Path,
+    *,
+    run: CommandRunner,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    expected_receipt = handoff_path.parent / "prepared-for-cutover.json"
+    if receipt_path != expected_receipt:
+        raise PreflightError("prepared-for-cutover receipt path diverged")
+    receipt, receipt_raw = _canonical_runtime_report(
+        receipt_path, label="prepared-for-cutover receipt"
+    )
+    expected_fields = {
+        "artifacts",
+        "boundary",
+        "candidate",
+        "expires_at_utc",
+        "host",
+        "prepared_sha256",
+        "receipt_kind",
+        "recorded_at_utc",
+        "schema_version",
+        "superseded",
+        "terminal_signal",
+    }
+    claimed = _validate_sha256(
+        receipt.get("prepared_sha256"), label="prepared receipt logical hash"
+    )
+    body = {key: value for key, value in receipt.items() if key != "prepared_sha256"}
+    recorded = _parse_utc_timestamp(
+        receipt.get("recorded_at_utc"), label="prepared receipt recorded time"
+    )
+    expires = _parse_utc_timestamp(
+        receipt.get("expires_at_utc"), label="prepared receipt expiry"
+    )
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if (
+        set(receipt) != expected_fields
+        or receipt.get("boundary") != BOUNDARY
+        or receipt.get("schema_version") != 1
+        or receipt.get("receipt_kind") != "PREPARED_FOR_CUTOVER"
+        or receipt.get("terminal_signal") != "PREDICTION_PREPARED_FOR_CUTOVER"
+        or sha256_bytes(canonical_json_bytes(body)) != claimed
+        or expires - recorded != timedelta(seconds=_PREPARED_RECEIPT_TTL_SECONDS)
+        or recorded > current + timedelta(minutes=5)
+        or current >= expires
+    ):
+        raise PreflightError("prepared-for-cutover receipt is invalid or stale")
+    handoff, host, host_raw, _fsync, fsync_raw = (
+        _validated_base_preflight_evidence(
+            handoff_path,
+            host_report_path,
+            fsync_report_path,
+        )
+    )
+    _runtime_handoff, _layout, runtime_report, runtime_raw = (
+        _validated_candidate_prepare_evidence(
+            handoff_path,
+            runtime_report_path,
+            run=run,
+        )
+    )
+    compatibility, compatibility_raw = _validated_superseded_compatibility_report(
+        handoff_path,
+        compatibility_report_path,
+    )
+    superseded_receipt = receipt.get("superseded")
+    signals = (
+        superseded_receipt.get("verification_signals")
+        if isinstance(superseded_receipt, Mapping)
+        else []
+    )
+    expected_bindings = _prepared_artifact_bindings(
+        handoff_path,
+        handoff=handoff,
+        host=host,
+        host_raw=host_raw,
+        fsync_raw=fsync_raw,
+        runtime_report=runtime_report,
+        runtime_raw=runtime_raw,
+        compatibility=compatibility,
+        compatibility_raw=compatibility_raw,
+        verification_signals=signals if isinstance(signals, Sequence) else [],
+    )
+    for key in ("artifacts", "candidate", "host", "superseded"):
+        if receipt.get(key) != expected_bindings[key]:
+            raise PreflightError(f"prepared-for-cutover {key} binding diverged")
+    return handoff, receipt, receipt_raw
+
+
+def prepare_for_cutover(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+    runtime_report_path: Path,
+    compatibility_report_path: Path,
+    receipt_path: Path,
+    *,
+    run: CommandRunner = _command,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    if (
+        compatibility_report_path
+        != handoff_path.parent / "superseded-runtime-compatibility.json"
+        or receipt_path != handoff_path.parent / "prepared-for-cutover.json"
+    ):
+        raise PreflightError("prepared evidence output paths diverged")
+    handoff, host, host_raw, _fsync, fsync_raw = (
+        _validated_base_preflight_evidence(
+            handoff_path,
+            host_report_path,
+            fsync_report_path,
+        )
+    )
+    _runtime_handoff, _layout, runtime_report, runtime_raw = (
+        _validated_candidate_prepare_evidence(
+            handoff_path,
+            runtime_report_path,
+            run=run,
+        )
+    )
+    _assert_new_attempt_is_premutation(handoff_path, handoff)
+    if receipt_path.exists() or receipt_path.is_symlink():
+        _handoff, receipt, _raw = _validate_prepared_receipt(
+            handoff_path,
+            host_report_path,
+            fsync_report_path,
+            runtime_report_path,
+            compatibility_report_path,
+            receipt_path,
+            run=run,
+            now=now,
+        )
+        live = _authenticate_superseded_dashboard_port(handoff_path, handoff, run)
+        expected_signals = receipt["superseded"]["verification_signals"]
+        if live.get("verification_signals") != expected_signals:
+            raise PreflightError("prepared superseded live state changed")
+        return receipt
+    if compatibility_report_path.exists() or compatibility_report_path.is_symlink():
+        _validated_superseded_compatibility_report(
+            handoff_path,
+            compatibility_report_path,
+        )
+    live = _authenticate_superseded_dashboard_port(handoff_path, handoff, run)
+    compatibility, compatibility_raw = _validated_superseded_compatibility_report(
+        handoff_path,
+        compatibility_report_path,
+    )
+    bindings = _prepared_artifact_bindings(
+        handoff_path,
+        handoff=handoff,
+        host=host,
+        host_raw=host_raw,
+        fsync_raw=fsync_raw,
+        runtime_report=runtime_report,
+        runtime_raw=runtime_raw,
+        compatibility=compatibility,
+        compatibility_raw=compatibility_raw,
+        verification_signals=live["verification_signals"],  # type: ignore[arg-type]
+    )
+    recorded = (now or datetime.now(UTC)).astimezone(UTC)
+    body: dict[str, object] = {
+        **bindings,
+        "boundary": BOUNDARY,
+        "expires_at_utc": (
+            recorded + timedelta(seconds=_PREPARED_RECEIPT_TTL_SECONDS)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "receipt_kind": "PREPARED_FOR_CUTOVER",
+        "recorded_at_utc": recorded.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_PREPARED_FOR_CUTOVER",
+    }
+    receipt = {
+        **body,
+        "prepared_sha256": sha256_bytes(canonical_json_bytes(body)),
+    }
+    _atomic_report(receipt_path, receipt)
+    return receipt
+
+
+def validate_prepared_for_cutover(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+    runtime_report_path: Path,
+    compatibility_report_path: Path,
+    receipt_path: Path,
+    *,
+    run: CommandRunner = _command,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    handoff, receipt, receipt_raw = _validate_prepared_receipt(
+        handoff_path,
+        host_report_path,
+        fsync_report_path,
+        runtime_report_path,
+        compatibility_report_path,
+        receipt_path,
+        run=run,
+        now=now,
+    )
+    _assert_new_attempt_is_premutation(handoff_path, handoff)
+    return {
+        "boundary": BOUNDARY,
+        "prepared_receipt_sha256": sha256_bytes(receipt_raw),
+        "prepared_sha256": receipt["prepared_sha256"],
+        "run_slug": handoff["run_slug"],
+        "schema_version": 1,
+        "terminal_signal": "PREDICTION_PREPARED_RECEIPT_AUTHENTICATED",
+    }
+
+
+def activate_preflight(
+    handoff_path: Path,
+    host_report_path: Path,
+    fsync_report_path: Path,
+    runtime_report_path: Path,
+    compatibility_report_path: Path,
+    receipt_path: Path,
+    activation_started_path: Path,
+    *,
+    run: CommandRunner = _command,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    expected_started = handoff_path.parent / "cutover-activation-started.json"
+    if activation_started_path != expected_started:
+        raise PreflightError("cutover activation-started receipt path diverged")
+    handoff, receipt, receipt_raw = _validate_prepared_receipt(
+        handoff_path,
+        host_report_path,
+        fsync_report_path,
+        runtime_report_path,
+        compatibility_report_path,
+        receipt_path,
+        run=run,
+        now=now,
+    )
+    _assert_new_attempt_is_premutation(handoff_path, handoff)
+    live_reservations = _live_reservation_checks(
+        handoff,
+        run=run,
+        label="staged activation",
+    )
+    services = handoff.get("services")
+    if not isinstance(services, Mapping):
+        raise PreflightError("staged activation service identities are absent")
+    slug = str(handoff["run_slug"])
+    probes = {
+        venue: f"hyperlab-pm-{slug.removeprefix('pm-')}-{venue}-namespace-probe.service"
+        for venue in ("polymarket", "kalshi")
+    }
+    new_service_checks = [
+        _systemd_collision(service, run)
+        for service in (
+            *(str(services[name]) for name in ("polymarket", "kalshi", "dashboard")),
+            *(probes[name] for name in ("polymarket", "kalshi")),
+        )
+    ]
+    live_old = _authenticate_superseded_dashboard_port(handoff_path, handoff, run)
+    prepared_old = receipt.get("superseded")
+    if (
+        not isinstance(prepared_old, Mapping)
+        or live_old.get("verification_signals")
+        != prepared_old.get("verification_signals")
+    ):
+        raise PreflightError("superseded live state changed before activation")
+    _validated_superseded_compatibility_report(
+        handoff_path,
+        compatibility_report_path,
+    )
+    marker_body: dict[str, object] = {
+        "boundary": BOUNDARY,
+        "prepared_receipt_sha256": sha256_bytes(receipt_raw),
+        "prepared_sha256": receipt["prepared_sha256"],
+        "recorded_at_utc": _utc_now_text(),
+        "run_slug": handoff["run_slug"],
+        "schema_version": 1,
+        "superseded_run_slug": prepared_old["run_slug"],
+        "terminal_signal": "PREDICTION_CUTOVER_STARTED",
+    }
+    marker = {
+        **marker_body,
+        "receipt_sha256": sha256_bytes(canonical_json_bytes(marker_body)),
+    }
+    _atomic_report(activation_started_path, marker)
+    return {
+        "activation_started_receipt_sha256": sha256_bytes(
+            _safe_regular_bytes(activation_started_path)
+        ),
+        "boundary": BOUNDARY,
+        "live_reservations": live_reservations,
+        "new_services": new_service_checks,
+        "prepared_receipt_sha256": sha256_bytes(receipt_raw),
+        "prepared_sha256": receipt["prepared_sha256"],
+        "run_slug": handoff["run_slug"],
+        "schema_version": 1,
+        "superseded_live": live_old,
+        "terminal_signal": "PREDICTION_ACTIVATE_PREFLIGHT_GREEN",
+    }
+
+
 def _live_reservation_checks(
     handoff: Mapping[str, object],
     *,
@@ -2641,6 +3380,7 @@ def install_admission_preflight(
     handoff_path: Path,
     host_report_path: Path,
     fsync_report_path: Path,
+    prepared_receipt_path: Path,
     *,
     run: CommandRunner = _command,
 ) -> dict[str, object]:
@@ -2653,18 +3393,32 @@ def install_admission_preflight(
         layout = validate_install_layout(handoff, handoff_path=handoff_path)
         if os.environ.get("USER") != "hyperlab" or Path.home().as_posix() != "/home/hyperlab":
             raise PreflightError("install admission must run as the dedicated hyperlab user")
-        host, host_raw = _canonical_runtime_report(
+        prepared_handoff, prepared_receipt, prepared_raw = _validate_prepared_receipt(
+            handoff_path,
             host_report_path,
-            label="host preflight report",
+            fsync_report_path,
+            handoff_path.parent / "runtime-import-admission.json",
+            handoff_path.parent / "superseded-runtime-compatibility.json",
+            prepared_receipt_path,
+            run=run,
+        )
+        if prepared_handoff != handoff:
+            raise PreflightError("prepared handoff changed before install admission")
+        _base_handoff, host, host_raw, _fsync, fsync_raw = (
+            _validated_base_preflight_evidence(
+                handoff_path,
+                host_report_path,
+                fsync_report_path,
+            )
         )
         network = host.get("network")
         eligible = host.get("eligible_venues")
         host_checks = host.get("checks")
-        old_port = host_checks.get("loopback_port") if isinstance(host_checks, Mapping) else None
         if (
             host.get("boundary") != BOUNDARY
             or host.get("schema_version") != 1
-            or host.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+            or host.get("terminal_signal") != "PREDICTION_BASE_HOST_PREFLIGHT_GREEN"
+            or host.get("base_admitted") is not True
             or host.get("host_admitted") is not True
             or host.get("installation_admissible") is not True
             or host.get("errors") != []
@@ -2678,33 +3432,15 @@ def install_admission_preflight(
                 if isinstance(network.get(venue), Mapping)
                 and network[venue].get("verdict") == "NETWORK_PREFLIGHT_GREEN"
             ]
-            or not isinstance(old_port, Mapping)
-            or old_port.get("host") != "127.0.0.1"
-            or old_port.get("port") != 18081
-            or old_port.get("free") is not False
-            or old_port.get("occupied_by_authenticated_superseded_dashboard") is not True
-            or old_port.get("owner_service")
-            != "hyperlab-pm-20260828t024827z-bcb5280f-dashboard.service"
+            or not isinstance(host_checks, Mapping)
+            or host_checks.get("superseded_authentication")
+            != {
+                "state": (
+                    "DEFERRED_UNTIL_CANDIDATE_SOURCE_AND_VENV_ARE_AUTHENTICATED"
+                )
+            }
         ):
-            raise PreflightError("host preflight admission evidence diverged")
-        fsync, fsync_raw = _canonical_runtime_report(
-            fsync_report_path,
-            label="filesystem fsync report",
-        )
-        expected_parents = [
-            str(_VOLUME_BASE),
-            str(_VOLUME_BASE / "sources"),
-            str(_VOLUME_BASE / "campaigns"),
-        ]
-        if (
-            fsync.get("boundary") != BOUNDARY
-            or fsync.get("schema_version") != 1
-            or fsync.get("terminal_signal") != "PREDICTION_FILESYSTEM_FSYNC_GREEN"
-            or fsync.get("filesystem_write_surface") != str(_VOLUME_BASE)
-            or fsync.get("parent_roots") != expected_parents
-            or fsync.get("probe_removed") is not True
-        ):
-            raise PreflightError("filesystem fsync admission evidence diverged")
+            raise PreflightError("base host preflight admission evidence diverged")
         resumed = resume_preflight(handoff_path, run=run)
         if resumed.get("resume_admissible") is not True:
             resume_errors = resumed.get("errors")
@@ -2778,6 +3514,8 @@ def install_admission_preflight(
             "source_identity": resume_checks.get("source_identity")
             if isinstance(resume_checks, Mapping)
             else None,
+            "prepared_receipt_sha256": sha256_bytes(prepared_raw),
+            "prepared_sha256": prepared_receipt["prepared_sha256"],
             "transfer_inventory_sha256": handoff["transfer_inventory_sha256"],
             "unit_sha256": unit_sha256,
         }
@@ -3598,8 +4336,10 @@ def recovery_initial_admission(handoff_path: Path) -> dict[str, object]:
         or len(set(eligible)) != len(eligible)
         or preflight.get("eligible_venues") != eligible
         or preflight.get("boundary") != BOUNDARY
+        or preflight.get("base_admitted") is not True
         or preflight.get("installation_admissible") is not True
-        or preflight.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+        or preflight.get("terminal_signal")
+        != "PREDICTION_BASE_HOST_PREFLIGHT_GREEN"
     ):
         raise PreflightError("initial preflight admission fields diverged")
     network = preflight.get("network")
@@ -3809,6 +4549,9 @@ def _parser() -> argparse.ArgumentParser:
     host = subparsers.add_parser("host")
     host.add_argument("--handoff", type=Path, required=True)
     host.add_argument("--report", type=Path, required=True)
+    host_base = subparsers.add_parser("host-base")
+    host_base.add_argument("--handoff", type=Path, required=True)
+    host_base.add_argument("--report", type=Path, required=True)
     fsync = subparsers.add_parser("fsync")
     fsync.add_argument("--handoff", type=Path, required=True)
     fsync.add_argument("--report", type=Path, required=True)
@@ -3822,7 +4565,28 @@ def _parser() -> argparse.ArgumentParser:
     install_admission.add_argument("--handoff", type=Path, required=True)
     install_admission.add_argument("--host-report", type=Path, required=True)
     install_admission.add_argument("--fsync-report", type=Path, required=True)
+    install_admission.add_argument("--prepared-receipt", type=Path, required=True)
     install_admission.add_argument("--report", type=Path, required=True)
+    validate_base = subparsers.add_parser("validate-base-evidence")
+    validate_base.add_argument("--handoff", type=Path, required=True)
+    validate_base.add_argument("--host-report", type=Path, required=True)
+    validate_base.add_argument("--fsync-report", type=Path, required=True)
+    for name in (
+        "prepare-for-cutover",
+        "validate-prepared-for-cutover",
+        "activate-preflight",
+    ):
+        staged = subparsers.add_parser(name)
+        staged.add_argument("--handoff", type=Path, required=True)
+        staged.add_argument("--host-report", type=Path, required=True)
+        staged.add_argument("--fsync-report", type=Path, required=True)
+        staged.add_argument("--runtime-report", type=Path, required=True)
+        staged.add_argument("--compatibility-report", type=Path, required=True)
+        staged.add_argument("--prepared-receipt", type=Path, required=True)
+        if name == "activate-preflight":
+            staged.add_argument(
+                "--activation-started-receipt", type=Path, required=True
+            )
     activation_guard = subparsers.add_parser("collector-activation-guard")
     activation_guard.add_argument("--handoff", type=Path, required=True)
     activation_guard.add_argument("--install-admission-report", type=Path, required=True)
@@ -3910,6 +4674,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _atomic_report(arguments.report, report)
             print(canonical_json_bytes(report).decode("utf-8"))
             return 0
+        if arguments.command == "validate-base-evidence":
+            report = validate_base_preflight_evidence(
+                arguments.handoff,
+                arguments.host_report,
+                arguments.fsync_report,
+            )
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
+        if arguments.command in {
+            "prepare-for-cutover",
+            "validate-prepared-for-cutover",
+            "activate-preflight",
+        }:
+            staged_arguments = (
+                arguments.handoff,
+                arguments.host_report,
+                arguments.fsync_report,
+                arguments.runtime_report,
+                arguments.compatibility_report,
+                arguments.prepared_receipt,
+            )
+            if arguments.command == "prepare-for-cutover":
+                report = prepare_for_cutover(*staged_arguments)
+            elif arguments.command == "validate-prepared-for-cutover":
+                report = validate_prepared_for_cutover(*staged_arguments)
+            else:
+                report = activate_preflight(
+                    *staged_arguments,
+                    arguments.activation_started_receipt,
+                )
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
         if arguments.command == "recovery-network-admit":
             report = recovery_network_admission(
                 arguments.handoff,
@@ -3945,14 +4741,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.handoff,
                 arguments.host_report,
                 arguments.fsync_report,
+                arguments.prepared_receipt,
             )
         elif arguments.command == "collector-activation-guard":
             report = collector_activation_guard(
                 arguments.handoff,
                 arguments.install_admission_report,
             )
-        elif arguments.command == "host":
-            report = host_preflight(arguments.handoff)
+        elif arguments.command in {"host", "host-base"}:
+            report = base_host_preflight(arguments.handoff)
         elif arguments.command == "fsync":
             report = fsync_probe(arguments.handoff)
         elif arguments.command == "resume":
@@ -3963,7 +4760,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = probe_venue_connectivity(arguments.venue)
         _atomic_report(arguments.report, report)
         print(canonical_json_bytes(report).decode("utf-8"))
-        if arguments.command == "host" and report["installation_admissible"] is not True:
+        if (
+            arguments.command in {"host", "host-base"}
+            and report["installation_admissible"] is not True
+        ):
             return 4
         if arguments.command == "network" and report["verdict"] != "NETWORK_PREFLIGHT_GREEN":
             return 4

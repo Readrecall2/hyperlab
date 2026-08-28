@@ -118,15 +118,48 @@ OLD_PYTHON="$OLD_SOURCE/.venv/bin/python"
 [[ -x $OLD_PYTHON && ! -L $OLD_PYTHON ]] || fail 'old offline runtime is absent or unsafe'
 [[ $(git -C "$OLD_SOURCE" rev-parse HEAD) == "$OLD_COMMIT" ]] || fail 'old source commit diverged'
 [[ -z $(git -C "$OLD_SOURCE" status --porcelain) ]] || fail 'old source checkout is not clean'
+COMPATIBILITY_REPORT="$NEW_INCOMING/superseded-runtime-compatibility.json"
 
 authenticate_old_evidence() {
-  timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-    "$OLD_PYTHON" -I "$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py" \
-    superseded-runtime-compatibility \
-    --candidate-handoff "$NEW_INCOMING/handoff.json" \
-    --candidate-source-root "$NEW_SOURCE" \
-    --candidate-source-inventory "$NEW_INCOMING/source-inventory.json" \
-    || fail 'candidate-owned superseded runtime compatibility admission failed'
+  local compatibility_output
+  if [[ -e $COMPATIBILITY_REPORT || -L $COMPATIBILITY_REPORT ]]; then
+    [[ -f $COMPATIBILITY_REPORT && ! -L $COMPATIBILITY_REPORT ]] \
+      || fail 'superseded runtime compatibility report is unsafe'
+    compatibility_output=$(timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+      "$OLD_PYTHON" -I "$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py" \
+      superseded-runtime-compatibility \
+      --candidate-handoff "$NEW_INCOMING/handoff.json" \
+      --candidate-source-root "$NEW_SOURCE" \
+      --candidate-source-inventory "$NEW_INCOMING/source-inventory.json") \
+      || fail 'candidate-owned superseded runtime compatibility revalidation failed'
+    EXPECTED_COMPATIBILITY_REPORT="$COMPATIBILITY_REPORT" \
+      ACTUAL_COMPATIBILITY_REPORT="$compatibility_output" \
+      "$OLD_PYTHON" -I - <<'PY' \
+      || fail 'superseded runtime compatibility state changed after preparation'
+from pathlib import Path
+import json,os,stat
+path=Path(os.environ['EXPECTED_COMPATIBILITY_REPORT']); before=path.lstat()
+if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_size>8*1024*1024:
+ raise ValueError('stored compatibility report is unsafe')
+expected=path.read_bytes(); after=path.lstat()
+if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns) or len(expected)!=before.st_size:
+ raise ValueError('stored compatibility report changed during read')
+value=json.loads(expected.decode('utf-8'))
+canonical=lambda item:json.dumps(item,ensure_ascii=False,allow_nan=False,separators=(',',':'),sort_keys=True).encode()
+actual=os.environ['ACTUAL_COMPATIBILITY_REPORT'].encode('utf-8')+b'\n'
+if expected!=canonical(value)+b'\n' or actual!=expected:
+ raise ValueError('live compatibility report diverged from prepared evidence')
+PY
+  else
+    timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+      "$OLD_PYTHON" -I "$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py" \
+      superseded-runtime-compatibility \
+      --candidate-handoff "$NEW_INCOMING/handoff.json" \
+      --candidate-source-root "$NEW_SOURCE" \
+      --candidate-source-inventory "$NEW_INCOMING/source-inventory.json" \
+      --report "$COMPATIBILITY_REPORT" >/dev/null \
+      || fail 'candidate-owned superseded runtime compatibility admission failed'
+  fi
   timeout --signal=TERM --kill-after=5s 180s env \
     PYTHONNOUSERSITE=1 \
     "$OLD_PYTHON" -I - "$OLD_CAMPAIGN" "$OLD_SOURCE" <<'PY'

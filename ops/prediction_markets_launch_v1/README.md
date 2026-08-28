@@ -304,17 +304,21 @@ aux trois racines, aux trois services persistants et aux deux probes exacts. Il 
 
 ## Blocs opérateur générés, dans l'ordre
 
-Le répertoire final contient cinq fichiers distincts, avec chemins, services et
+Le répertoire final contient six fichiers distincts, avec chemins, services et
 hashes exacts :
 
 1. `operator/A-windows-bundle-verify-transfer.ps1` — Windows PowerShell,
    vérification et transfert vers le nouvel incoming root ;
-2. `operator/B-tabby-preflight-install-activate.sh` — Tabby/VPS Bash, preflight
-   synchrone puis installation offline et activation ;
-3. `operator/C-tabby-readonly-monitor.sh` — second onglet Tabby, monitoring
+2. `operator/B0-tabby-prepare.sh` — Tabby/VPS Bash sans sudo, admission de base,
+   clone, venv offline, import candidat, vérification superseded puis reçu
+   `PREPARED_FOR_CUTOVER` atomique ;
+3. `operator/B1-tabby-activate.sh` — Tabby/VPS Bash, authentification du reçu,
+   revalidation TOCTOU, marqueur one-shot fsyncé, puis seulement
+   `CUTOVER_STARTED`, disarm et install ;
+4. `operator/C-tabby-readonly-monitor.sh` — second onglet Tabby, monitoring
    automatique read-only, arrêt à la première transition/alerte ;
-4. `operator/D-windows-dashboard-tunnel.ps1` — tunnel SSH loopback 18081 et URL ;
-5. `operator/E-recovery-rollback.sh` — reprise ou désarmement ciblé, sans
+5. `operator/D-windows-dashboard-tunnel.ps1` — tunnel SSH loopback 18081 et URL ;
+6. `operator/E-recovery-rollback.sh` — reprise ou désarmement ciblé, sans
    supprimer raw, manifests, ledgers, runs ou unités.
 
 Les blocs A et D lisent la cible SSH depuis `HYPERLAB_PM_SSH_TARGET`. Le bloc A
@@ -328,8 +332,9 @@ ou clé n'est inscrite dans le bundle. Chaque
 fichier annonce lieu, durée attendue/maximale, prompts, effet de Ctrl+C et signal
 terminal.
 
-Dans B, un Ctrl+C pendant la préparation laisse l'ancienne campagne active. Un
-Ctrl+C après le reçu pré-mutation peut laisser uniquement un sous-ensemble des
+Dans B0, un Ctrl+C laisse l'ancienne campagne active et ne requiert pas E. B0
+n'exécute aucune mutation sudo/systemd/service/port. Dans B1, un Ctrl+C avant
+`CUTOVER_STARTED` ne modifie rien. Un Ctrl+C après ce signal peut laisser un sous-ensemble des
 unités Prediction Markets dans un état partiel ; E `restore-old` reprend alors
 la restauration. E annonce 2–8 minutes en moyenne et un maximum borné de
 45 minutes couvrant les bornes d'arrêt des dix unités possibles sans prétendre

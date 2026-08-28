@@ -39,7 +39,8 @@ _SHELL_SHEBANG = b"#!/usr/bin/env bash\n"
 _EXPECTED_TRANSFERRED_SHELLS = frozenset(
     {
         *(f"scripts/{name}" for name in _SCRIPTS if name.endswith(".sh")),
-        "operator/B-tabby-preflight-install-activate.sh",
+        "operator/B0-tabby-prepare.sh",
+        "operator/B1-tabby-activate.sh",
         "operator/C-tabby-readonly-monitor.sh",
         "operator/E-recovery-rollback.sh",
     }
@@ -510,17 +511,25 @@ signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
    `operator/A-windows-bundle-verify-transfer.ps1`. Signal attendu :
    `PREDICTION_WINDOWS_TRANSFER_VERIFIED`.
 2. Dans un premier onglet Tabby/VPS, exécuter
-   `operator/B-tabby-preflight-install-activate.sh`. Il refuse avant activation
-   si identité, capacité, NTP, filesystem, port, service ou dépendance diverge.
-   Signal attendu : `PREDICTION_INSTALL_ACTIVATION_GREEN`.
-3. Dans un second onglet Tabby, exécuter
+   `operator/B0-tabby-prepare.sh`. Cette étape sans sudo clone et authentifie le
+   candidat, construit le venv offline, puis seulement après vérifie l'ancienne
+   campagne et écrit le reçu atomique borné `PREPARED_FOR_CUTOVER`. Elle ne
+   désarme, n'installe et ne redémarre aucun service. Signal attendu :
+   `PREDICTION_PREPARED_FOR_CUTOVER`.
+3. Seulement après ce signal humain B0, exécuter dans Tabby
+   `operator/B1-tabby-activate.sh`. B1 refuse un reçu absent, altéré ou expiré,
+   réauthentifie le clone/venv et l'état vivant superseded, puis affiche
+   `PREDICTION_CUTOVER_STARTED` après écriture fsyncée de son marqueur one-shot
+   et avant disarm/install. Tout rerun B1 refuse; seule E reprend. Signal terminal attendu :
+   `PREDICTION_INSTALL_ACTIVATION_GREEN`.
+4. Dans un second onglet Tabby, exécuter
    `operator/C-tabby-readonly-monitor.sh`. Il authentifie séparément dashboard,
    Polymarket, Kalshi, zéro restart, les deux ledgers et l'ordinal 0 de la
    nouvelle campagne. Signal : `PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED`.
-4. Sur Windows PowerShell, exécuter
+5. Sur Windows PowerShell, exécuter
    `operator/D-windows-dashboard-tunnel.ps1`. Ouvrir l'URL seulement après
    `PREDICTION_TUNNEL_READY http://127.0.0.1:18081`.
-5. `operator/E-recovery-rollback.sh recovery|rollback-new|restore-old` reprend
+6. `operator/E-recovery-rollback.sh recovery|rollback-new|restore-old` reprend
    la nouvelle campagne sans rejouer un slot terminal, désarme ses cinq unités,
    ou restaure explicitement l'ancienne campagne après preuve qu'aucun nouveau
    collecteur ne tourne.
@@ -529,17 +538,20 @@ signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
    `PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR`.
 
 A vérifie tous les hashes et tous les shells, localement puis dans le nouvel
-incoming : UTF-8 sans BOM, aucun NUL/CR, shebang Bash exact et LF final. B fait
-une seule authentification sudo foreground, maintient son cache uniquement par
-`sudo -n -v`, prépare complètement clone, venv et imports pendant que l'ancienne
-campagne reste active, puis réauthentifie ses
-cinq unités immédiatement avant le cutover. Un échec de préparation n'appelle
-jamais `disarm-old` et ne demande pas E. Après cette authentification, B et E
+incoming : UTF-8 sans BOM, aucun NUL/CR, shebang Bash exact et LF final. B0 ne
+possède aucun chemin sudo/systemd/cutover et termine après un reçu fsyncé qui lie
+le handoff, commit, inventaire, venv/import, réseau, horloge, filesystem,
+compatibilité historique, cinq unités et propriétaire authentifié du port 18081.
+Un rerun B0 strictement identique ne réécrit rien; toute divergence refuse. B1
+fait une seule authentification sudo foreground, maintient son cache uniquement
+par `sudo -n -v` et ferme le TOCTOU juste avant mutation. Un échec B0 n'appelle
+jamais `disarm-old` et ne demande pas E. Après CUTOVER_STARTED, B1 et E
 n'emploient que `sudo -n`; chaque mutation systemd est bornée et annonce son
 opération et son service avant/après.
 
 L'import runtime n'est jamais confié au cwd ou à `PYTHONPATH` sous `python -I`.
-B exécute avant cutover le contrat isolé `runtime-import-admission` : il lie le
+B0 exécute avant toute vérification superseded le contrat isolé
+`runtime-import-admission` : il lie le
 venv au source root/commit/inventaire exacts, insère explicitement les deux
 racines source et refuse tout module provenant du user-site, du système global,
 d'un ancien source ou d'un chemin symlinké. Son unique signal terminal est
@@ -607,7 +619,7 @@ donnée, mais reste `source_usable=false`, `economic_eligible=false` et n'est
 jamais rejoué. Une divergence de reçu, plan, identité, hash, manifest ou ledger
 reste `INTEGRITY_FAILED` et ne redémarre pas en boucle.
 
-B exécute et authentifie d'abord les deux probes namespace oneshot, avant tout
+B1 exécute et authentifie d'abord les deux probes namespace oneshot, avant tout
 service persistant. Pour chacun, il exige simultanément `Result=success`,
 `ExecMainStatus=0`, `inactive/dead`, `MainPID=0`, zéro restart, le fragment exact
 et l'unique JSON canonique GREEN (`namespace_admissible=true`, `errors=[]`) avec
@@ -628,8 +640,8 @@ La sélection des collecteurs provient de ce même moniteur authentifié et tout
 `operational_failure=false`, tout en admettant une alerte
 `PUBLIC_SOURCE_INVALID` authentique.
 
-La capacité est remesurée après bootstrap puis immédiatement avant les
-collecteurs. Si les 194 347 270 144 octets réservés ne sont plus libres, B refuse
+La capacité est mesurée dans B0 puis immédiatement avant mutation dans B1 et
+avant les collecteurs. Si les 194 347 270 144 octets réservés ne sont plus libres, B1 refuse
 et demande un volume ext4 plus grand ou distinct; il ne réduit jamais le budget
 H1 ni la marge. L'essai `73c6d2d2` a observé environ 296,3 GB disponibles, mais
 cette preuve historique ne vaut jamais admission future et aucun historique ne
@@ -749,7 +761,8 @@ function Assert-TransferInventory {{
         }}
     }}
     $ExpectedShells = @(
-        'operator/B-tabby-preflight-install-activate.sh',
+        'operator/B0-tabby-prepare.sh',
+        'operator/B1-tabby-activate.sh',
         'operator/C-tabby-readonly-monitor.sh',
         'operator/E-recovery-rollback.sh',
         'scripts/bootstrap-offline.sh',
@@ -831,27 +844,141 @@ Write-Output 'PREDICTION_WINDOWS_TRANSFER_VERIFIED'
 """
 
 
-def render_tabby_install(handoff: Mapping[str, object]) -> str:
+def render_tabby_prepare(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     source = handoff["source_root"]
     campaign = handoff["campaign_root"]
-    base = handoff["volume_base"]
     commit = handoff["source_commit"]
     bundle = handoff["bundle_filename"]
     return f"""#!/usr/bin/env bash
-# Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 7-18 min; maximum: 40 min.
-# Prompts: une authentification sudo foreground au début; aucun autre prompt sudo
-# ni pip réseau. Ctrl+C pendant
-# la préparation laisse l'ancienne campagne active. Après le début du cutover,
-# Ctrl+C préserve les preuves mais exige E restore-old avant toute autre activation.
-# Signal terminal exact: PREDICTION_INSTALL_ACTIVATION_GREEN.
+# Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 6-16 min; maximum: 35 min.
+# Prompts: aucun; aucun sudo et aucun pip réseau. Monitoring: ps -u hyperlab -f
+# depuis un second onglet. Ctrl+C n'affecte que cette préparation isolée; la
+# campagne active et ses services restent intacts.
+# Signal terminal exact: PREDICTION_PREPARED_FOR_CUTOVER.
 set -Eeuo pipefail
 umask 077
 INCOMING_ROOT='{incoming}'
 SOURCE_ROOT='{source}'
 CAMPAIGN_ROOT='{campaign}'
-VOLUME_BASE='{base}'
 [[ $(id -un) == hyperlab ]] || {{ printf 'PREDICTION_TABBY_REFUSED:user\n' >&2; exit 4; }}
+[[ $HOME == /home/hyperlab ]] || {{ printf 'PREDICTION_TABBY_REFUSED:home\n' >&2; exit 4; }}
+[[ -d "$INCOMING_ROOT" && ! -L "$INCOMING_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:incoming\n' >&2; exit 4; }}
+[[ $(readlink -f -- "$INCOMING_ROOT") == "$INCOMING_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:incoming_canonicality\n' >&2; exit 4; }}
+[[ ! -e "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:campaign_root_not_pristine\n' >&2; exit 4; }}
+VERIFY_REPO=''
+cleanup_bundle_verify() {{
+  status=$?
+  trap - EXIT
+  if [[ -n $VERIFY_REPO ]]; then
+    case "$VERIFY_REPO" in "$INCOMING_ROOT"/.b0-bundle-verify.*) ;; *) exit 4 ;; esac
+    rm -rf -- "$VERIFY_REPO" || exit 4
+  fi
+  exit "$status"
+}}
+trap cleanup_bundle_verify EXIT
+cd "$INCOMING_ROOT"
+sha256sum -c handoff.sha256
+(cd wheelhouse && sha256sum -c ../wheelhouse.sha256)
+python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-transfer \
+  --incoming-root "$INCOMING_ROOT" --handoff "$INCOMING_ROOT/handoff.json"
+VERIFY_REPO=$(mktemp -d "$INCOMING_ROOT/.b0-bundle-verify.XXXXXXXX")
+git init --bare --quiet "$VERIFY_REPO"
+git -C "$VERIFY_REPO" bundle verify "$INCOMING_ROOT/{bundle}"
+rm -rf -- "$VERIFY_REPO"
+VERIFY_REPO=''
+HOST_REPORT="$INCOMING_ROOT/host-preflight-report.json"
+FSYNC_REPORT="$INCOMING_ROOT/filesystem-fsync-report.json"
+RUNTIME_IMPORT_REPORT="$INCOMING_ROOT/runtime-import-admission.json"
+COMPATIBILITY_REPORT="$INCOMING_ROOT/superseded-runtime-compatibility.json"
+PREPARED_RECEIPT="$INCOMING_ROOT/prepared-for-cutover.json"
+if [[ ! -e $HOST_REPORT && ! -L $HOST_REPORT && ! -e $FSYNC_REPORT && ! -L $FSYNC_REPORT ]]; then
+  python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" host-base \
+    --handoff "$INCOMING_ROOT/handoff.json" --report "$HOST_REPORT" >/dev/null
+  python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" fsync \
+    --handoff "$INCOMING_ROOT/handoff.json" --report "$FSYNC_REPORT" >/dev/null
+elif [[ ! -f $HOST_REPORT || -L $HOST_REPORT || ! -f $FSYNC_REPORT || -L $FSYNC_REPORT ]]; then
+  printf 'PREDICTION_TABBY_REFUSED:partial_or_unsafe_base_evidence\n' >&2
+  exit 4
+fi
+python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" validate-base-evidence \
+  --handoff "$INCOMING_ROOT/handoff.json" \
+  --host-report "$HOST_REPORT" --fsync-report "$FSYNC_REPORT" >/dev/null
+if [[ ! -e $SOURCE_ROOT && ! -L $SOURCE_ROOT ]]; then
+  [[ ! -e $RUNTIME_IMPORT_REPORT && ! -L $RUNTIME_IMPORT_REPORT \
+    && ! -e $COMPATIBILITY_REPORT && ! -L $COMPATIBILITY_REPORT \
+    && ! -e $PREPARED_RECEIPT && ! -L $PREPARED_RECEIPT ]] \
+    || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_artifact_preexists_without_source\n' >&2; exit 4; }}
+  timeout --signal=TERM --kill-after=5s 300s git clone --no-checkout "$INCOMING_ROOT/{bundle}" "$SOURCE_ROOT"
+  git -C "$SOURCE_ROOT" checkout --detach '{commit}'
+  python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source \
+    --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" \
+    --expected-commit '{commit}'
+  timeout --signal=TERM --kill-after=5s 900s bash \
+    "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROOT/wheelhouse"
+elif [[ ! -d $SOURCE_ROOT || -L $SOURCE_ROOT || $(readlink -f -- "$SOURCE_ROOT") != "$SOURCE_ROOT" ]]; then
+  printf 'PREDICTION_TABBY_REFUSED:source_root_unsafe\n' >&2
+  exit 4
+fi
+VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
+[[ -x "$VENV_PYTHON" && ! -L "$VENV_PYTHON" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_runtime_absent_or_unsafe\n' >&2; exit 4; }}
+"$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
+if [[ ! -e $RUNTIME_IMPORT_REPORT && ! -L $RUNTIME_IMPORT_REPORT ]]; then
+  timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
+    "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
+    --handoff "$INCOMING_ROOT/handoff.json" \
+    --source-root "$SOURCE_ROOT" \
+    --source-inventory "$INCOMING_ROOT/source-inventory.json" \
+    --report "$RUNTIME_IMPORT_REPORT" >/dev/null
+fi
+[[ -s "$RUNTIME_IMPORT_REPORT" && ! -L "$RUNTIME_IMPORT_REPORT" ]] \
+  || {{ printf 'PREDICTION_TABBY_REFUSED:runtime_import_admission_report_absent_or_unsafe\n' >&2; exit 4; }}
+timeout --signal=TERM --kill-after=5s 300s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" prepare-for-cutover \
+  --handoff "$INCOMING_ROOT/handoff.json" \
+  --host-report "$HOST_REPORT" --fsync-report "$FSYNC_REPORT" \
+  --runtime-report "$RUNTIME_IMPORT_REPORT" \
+  --compatibility-report "$COMPATIBILITY_REPORT" \
+  --prepared-receipt "$PREPARED_RECEIPT" >/dev/null
+[[ -s "$PREPARED_RECEIPT" && ! -L "$PREPARED_RECEIPT" ]] \
+  || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_receipt_absent_or_unsafe\n' >&2; exit 4; }}
+trap - EXIT
+printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
+printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
+printf 'PREDICTION_PREPARED_FOR_CUTOVER\n'
+"""
+
+
+def render_tabby_activate(handoff: Mapping[str, object]) -> str:
+    incoming = handoff["incoming_root"]
+    source = handoff["source_root"]
+    return f"""#!/usr/bin/env bash
+# Lieu: Tabby/VPS Bash sous hyperlab, seulement après B0 vert. Durée attendue:
+# 4-12 min; maximum: 35 min. Prompt: une authentification sudo foreground.
+# Monitoring: systemctl list-jobs --no-pager depuis un second onglet. Ctrl+C
+# avant CUTOVER_STARTED ne modifie rien; après, exécuter E restore-old.
+# Signal terminal exact: PREDICTION_INSTALL_ACTIVATION_GREEN.
+set -Eeuo pipefail
+umask 077
+INCOMING_ROOT='{incoming}'
+SOURCE_ROOT='{source}'
+[[ $(id -un) == hyperlab && $HOME == /home/hyperlab ]] || {{ printf 'PREDICTION_ACTIVATE_REFUSED:identity\n' >&2; exit 4; }}
+HOST_REPORT="$INCOMING_ROOT/host-preflight-report.json"
+FSYNC_REPORT="$INCOMING_ROOT/filesystem-fsync-report.json"
+RUNTIME_IMPORT_REPORT="$INCOMING_ROOT/runtime-import-admission.json"
+COMPATIBILITY_REPORT="$INCOMING_ROOT/superseded-runtime-compatibility.json"
+PREPARED_RECEIPT="$INCOMING_ROOT/prepared-for-cutover.json"
+ACTIVATION_STARTED_RECEIPT="$INCOMING_ROOT/cutover-activation-started.json"
+VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
+[[ -x "$VENV_PYTHON" && ! -L "$VENV_PYTHON" && -f "$PREPARED_RECEIPT" && ! -L "$PREPARED_RECEIPT" ]] \
+  || {{ printf 'PREDICTION_ACTIVATE_REFUSED:prepared_runtime_or_receipt_absent\n' >&2; exit 4; }}
+timeout --signal=TERM --kill-after=5s 240s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" validate-prepared-for-cutover \
+  --handoff "$INCOMING_ROOT/handoff.json" \
+  --host-report "$HOST_REPORT" --fsync-report "$FSYNC_REPORT" \
+  --runtime-report "$RUNTIME_IMPORT_REPORT" \
+  --compatibility-report "$COMPATIBILITY_REPORT" \
+  --prepared-receipt "$PREPARED_RECEIPT" >/dev/null
 CUTOVER_STARTED=false
 SUDO_KEEPALIVE_PID=''
 stop_sudo_keepalive() {{
@@ -863,28 +990,20 @@ stop_sudo_keepalive() {{
 cutover_exit() {{
   status=$?
   stop_sudo_keepalive
-  if (( status != 0 )) && [[ $CUTOVER_STARTED == true \
-    && -f "$INCOMING_ROOT/cutover-old-premutation.json" \
-    && ! -L "$INCOMING_ROOT/cutover-old-premutation.json" ]]; then
+  if (( status != 0 )) && {{ [[ $CUTOVER_STARTED == true ]] \
+    || [[ -f $ACTIVATION_STARTED_RECEIPT && ! -L $ACTIVATION_STARTED_RECEIPT ]]; }}; then
     printf 'PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD\n' >&2
   fi
   exit "$status"
 }}
 trap cutover_exit EXIT
 printf 'PREDICTION_SUDO_FOREGROUND_AUTH_BEGIN\n'
-if ! sudo -v; then
-  printf 'PREDICTION_TABBY_REFUSED:sudo_foreground_authentication_failed\n' >&2
-  exit 4
-fi
-sudo -n true || {{ printf 'PREDICTION_TABBY_REFUSED:sudo_noninteractive_cache_unavailable\n' >&2; exit 4; }}
+sudo -v || {{ printf 'PREDICTION_ACTIVATE_REFUSED:sudo_foreground_authentication_failed\n' >&2; exit 4; }}
+sudo -n true || {{ printf 'PREDICTION_ACTIVATE_REFUSED:sudo_noninteractive_cache_unavailable\n' >&2; exit 4; }}
 printf 'PREDICTION_SUDO_FOREGROUND_AUTH_GREEN\n'
 (
   SUDO_SLEEP_PID=''
-  stop_keepalive_sleep() {{
-    [[ -z $SUDO_SLEEP_PID ]] || kill "$SUDO_SLEEP_PID" 2>/dev/null || true
-    exit 0
-  }}
-  trap stop_keepalive_sleep HUP INT TERM
+  trap '[[ -z $SUDO_SLEEP_PID ]] || kill "$SUDO_SLEEP_PID" 2>/dev/null || true; exit 0' HUP INT TERM
   while kill -0 "$$" 2>/dev/null; do
     sudo -n -v || {{ printf 'PREDICTION_SUDO_KEEPALIVE_FAILED_NO_PROMPT\n' >&2; exit 4; }}
     /usr/bin/sleep 30 </dev/null >/dev/null 2>&1 &
@@ -894,37 +1013,25 @@ printf 'PREDICTION_SUDO_FOREGROUND_AUTH_GREEN\n'
   done
 ) &
 SUDO_KEEPALIVE_PID=$!
-python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" host --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/host-preflight-report.json"
-sudo -n install -d -o hyperlab -g hyperlab -m 0700 "$VOLUME_BASE" "$VOLUME_BASE/sources" "$VOLUME_BASE/campaigns"
-python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" fsync --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/filesystem-fsync-report.json"
-[[ ! -e "$SOURCE_ROOT" && ! -L "$SOURCE_ROOT" && ! -e "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:attempt_roots_must_be_new\n' >&2; exit 4; }}
-git clone --no-checkout "$INCOMING_ROOT/{bundle}" "$SOURCE_ROOT"
-git -C "$SOURCE_ROOT" checkout --detach '{commit}'
-python3.12 -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
-bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROOT/wheelhouse"
-VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
-[[ -x "$VENV_PYTHON" && ! -L "$VENV_PYTHON" ]] || {{ printf 'PREDICTION_TABBY_REFUSED:prepared_runtime_absent_or_unsafe\n' >&2; exit 4; }}
-"$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
-RUNTIME_IMPORT_REPORT="$INCOMING_ROOT/runtime-import-admission.json"
-timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
+sudo -n -v || {{ printf 'PREDICTION_ACTIVATE_REFUSED:sudo_cache_expired_before_revalidation\n' >&2; exit 4; }}
+timeout --signal=TERM --kill-after=5s 300s env PYTHONNOUSERSITE=1 \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" activate-preflight \
   --handoff "$INCOMING_ROOT/handoff.json" \
-  --source-root "$SOURCE_ROOT" \
-  --source-inventory "$INCOMING_ROOT/source-inventory.json" \
-  --report "$RUNTIME_IMPORT_REPORT"
-[[ -s "$RUNTIME_IMPORT_REPORT" && ! -L "$RUNTIME_IMPORT_REPORT" ]] \
-  || {{ printf 'PREDICTION_TABBY_REFUSED:runtime_import_admission_report_absent_or_unsafe\n' >&2; exit 4; }}
-printf 'PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER\n'
-printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
-printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
-sudo -n -v || {{ printf 'PREDICTION_TABBY_REFUSED:sudo_cache_expired_before_cutover\n' >&2; exit 4; }}
-bash "$INCOMING_ROOT/scripts/cutover.sh" verify-old "$INCOMING_ROOT/handoff.json"
+  --host-report "$HOST_REPORT" --fsync-report "$FSYNC_REPORT" \
+  --runtime-report "$RUNTIME_IMPORT_REPORT" \
+  --compatibility-report "$COMPATIBILITY_REPORT" \
+  --prepared-receipt "$PREPARED_RECEIPT" \
+  --activation-started-receipt "$ACTIVATION_STARTED_RECEIPT" >/dev/null
+[[ -s $ACTIVATION_STARTED_RECEIPT && ! -L $ACTIVATION_STARTED_RECEIPT ]] \
+  || {{ printf 'PREDICTION_ACTIVATE_REFUSED:activation_started_receipt_absent\n' >&2; exit 4; }}
 CUTOVER_STARTED=true
-bash "$INCOMING_ROOT/scripts/cutover.sh" disarm-old "$INCOMING_ROOT/handoff.json"
+printf 'PREDICTION_CUTOVER_STARTED\n'
+bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/cutover.sh" disarm-old "$INCOMING_ROOT/handoff.json"
 bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/install.sh" "$INCOMING_ROOT"
 stop_sudo_keepalive
 SUDO_KEEPALIVE_PID=''
 trap - EXIT
+printf 'PREDICTION_INSTALL_ACTIVATION_GREEN\n'
 """
 
 
@@ -1085,9 +1192,9 @@ case "$MODE" in
     bash '{source}/ops/prediction_markets_launch_v1/rollback.sh' rollback '{incoming}/handoff.json'
     ;;
   restore-old)
-    bash '{incoming}/scripts/cutover.sh' restore-old '{incoming}/handoff.json'
+    bash '{source}/ops/prediction_markets_launch_v1/cutover.sh' restore-old '{incoming}/handoff.json'
     timeout --signal=TERM --kill-after=5s 240s \
-      bash '{incoming}/scripts/cutover.sh' verify-restored '{incoming}/handoff.json'
+      bash '{source}/ops/prediction_markets_launch_v1/cutover.sh' verify-restored '{incoming}/handoff.json'
     printf 'PREDICTION_OLD_CAMPAIGN_RESTORE_VERIFIED_NO_NEW_COLLECTOR\n'
     ;;
 esac
@@ -1345,7 +1452,8 @@ def finalize(
         _write_new(output_root / "systemd" / name, content.encode("utf-8"))
     operator_blocks = {
         "A-windows-bundle-verify-transfer.ps1": render_windows_transfer(handoff_base),
-        "B-tabby-preflight-install-activate.sh": render_tabby_install(handoff_base),
+        "B0-tabby-prepare.sh": render_tabby_prepare(handoff_base),
+        "B1-tabby-activate.sh": render_tabby_activate(handoff_base),
         "C-tabby-readonly-monitor.sh": render_tabby_monitor(handoff_base),
         "D-windows-dashboard-tunnel.ps1": render_windows_tunnel(handoff_base),
         "E-recovery-rollback.sh": render_recovery_rollback(handoff_base),

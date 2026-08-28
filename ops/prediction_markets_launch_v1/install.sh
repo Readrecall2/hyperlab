@@ -18,6 +18,7 @@ INCOMING_ROOT=$1
 [[ $(readlink -f -- "$INCOMING_ROOT") == "$INCOMING_ROOT" ]] || fail 'incoming root real path differs'
 [[ -f "$INCOMING_ROOT/host-preflight-report.json" ]] || fail 'host preflight report is absent'
 [[ -f "$INCOMING_ROOT/filesystem-fsync-report.json" ]] || fail 'filesystem fsync report is absent'
+[[ -f "$INCOMING_ROOT/prepared-for-cutover.json" ]] || fail 'prepared-for-cutover receipt is absent'
 
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}") || fail 'install script path is unavailable'
 [[ ! -L ${BASH_SOURCE[0]} ]] || fail 'install script must not be a symlink'
@@ -112,6 +113,7 @@ run_hyperlab_isolated research-data prediction-prepare \
 install -d -m 0700 "$CAMPAIGN_ROOT/state" "$CAMPAIGN_ROOT/polymarket" "$CAMPAIGN_ROOT/kalshi"
 install -m 0600 "$INCOMING_ROOT/host-preflight-report.json" "$CAMPAIGN_ROOT/state/preflight-report.json"
 install -m 0600 "$INCOMING_ROOT/filesystem-fsync-report.json" "$CAMPAIGN_ROOT/state/filesystem-fsync-report.json"
+install -m 0600 "$INCOMING_ROOT/prepared-for-cutover.json" "$CAMPAIGN_ROOT/state/prepared-for-cutover.json"
 
 "$VENV_PYTHON" - "$INCOMING_ROOT/handoff.json" "$INCOMING_ROOT/host-preflight-report.json" "$CAMPAIGN_ROOT/state/activation-receipt.json" "$CAMPAIGN_ROOT/campaign-manifest.json" <<'PY'
 from datetime import UTC,datetime
@@ -175,8 +177,9 @@ PY
 INSTALL_ADMISSION_REPORT="$CAMPAIGN_ROOT/state/install-admission-report.json"
 "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" install-admission \
   --handoff "$INCOMING_ROOT/handoff.json" \
-  --host-report "$CAMPAIGN_ROOT/state/preflight-report.json" \
-  --fsync-report "$CAMPAIGN_ROOT/state/filesystem-fsync-report.json" \
+  --host-report "$INCOMING_ROOT/host-preflight-report.json" \
+  --fsync-report "$INCOMING_ROOT/filesystem-fsync-report.json" \
+  --prepared-receipt "$INCOMING_ROOT/prepared-for-cutover.json" \
   --report "$INSTALL_ADMISSION_REPORT" \
   || fail 'post-bootstrap install admission refused before any systemd mutation'
 mapfile -t EXPECTED_UNIT_SHA256 < <("$VENV_PYTHON" -I - "$INSTALL_ADMISSION_REPORT" "$POLYMARKET_SERVICE" "$KALSHI_SERVICE" "$DASHBOARD_SERVICE" "$POLYMARKET_NAMESPACE_PROBE_SERVICE" "$KALSHI_NAMESPACE_PROBE_SERVICE" <<'PY'

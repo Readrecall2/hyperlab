@@ -895,7 +895,15 @@ def test_superseded_runtime_environment_refuses_wrong_venv(
 
 def test_cutover_uses_candidate_tool_and_preserves_transaction_order() -> None:
     cutover = (OPS / "cutover.sh").read_text(encoding="utf-8")
-    launch = (OPS / "launch_pack.py").read_text(encoding="utf-8")
+    handoff = {
+        "incoming_root": "/home/hyperlab/incoming/pm-20260828t220000z-c0decafe",
+        "source_root": "/mnt/volume/sources/pm-20260828t220000z-c0decafe",
+        "campaign_root": "/mnt/volume/campaigns/pm-20260828t220000z-c0decafe",
+        "source_commit": "c" * 40,
+        "bundle_filename": "candidate.bundle",
+    }
+    prepare = launch_pack.render_tabby_prepare(handoff)
+    activate = launch_pack.render_tabby_activate(handoff)
     assert (
         '"$OLD_PYTHON" -I "$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py"'
         in cutover
@@ -912,12 +920,19 @@ def test_cutover_uses_candidate_tool_and_preserves_transaction_order() -> None:
     assert cutover.index(helper_guard) < cutover.index(
         "bounded systemd helper is absent or unsafe"
     )
-    assert launch.index('cutover.sh" verify-old') < launch.index(
-        'cutover.sh" disarm-old'
+    assert "sudo" not in "\n".join(
+        line for line in prepare.splitlines() if not line.startswith("#")
     )
-    assert launch.index('cutover.sh" disarm-old') < launch.index(
-        'install.sh" "$INCOMING_ROOT"'
-    )
+    assert "disarm-old" not in prepare and "install.sh" not in prepare
+    assert prepare.index("bootstrap-offline.sh") < prepare.index(
+        "prepare-for-cutover"
+    ) < prepare.index("printf 'PREDICTION_PREPARED_FOR_CUTOVER")
+    assert activate.index("validate-prepared-for-cutover") < activate.index(
+        "activate-preflight"
+    ) < activate.index("printf 'PREDICTION_CUTOVER_STARTED")
+    assert activate.index("printf 'PREDICTION_CUTOVER_STARTED") < activate.index(
+        "disarm-old"
+    ) < activate.index('install.sh" "$INCOMING_ROOT"')
     for token in (
         "props.get('ActiveState')!='active'",
         "int(props.get('MainPID','0') or '0')<=0",

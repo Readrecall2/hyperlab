@@ -418,11 +418,13 @@ def validate_activation_evidence(
         or len(set(eligible)) != len(eligible)
         or eligible != preflight_eligible
         or preflight.get("boundary") != BOUNDARY
+        or preflight.get("base_admitted") is not True
         or preflight.get("host_admitted") is not True
         or preflight.get("installation_admissible") is not True
         or preflight.get("errors") != []
         or preflight.get("schema_version") != 1
-        or preflight.get("terminal_signal") != "PREDICTION_HOST_PREFLIGHT_GREEN"
+        or preflight.get("terminal_signal")
+        != "PREDICTION_BASE_HOST_PREFLIGHT_GREEN"
     ):
         raise CockpitIntegrityError("activation receipt binding diverged")
 

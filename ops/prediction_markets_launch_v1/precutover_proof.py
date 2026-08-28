@@ -6,11 +6,11 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -412,9 +412,11 @@ def _verify_bundle(root: Path, manifest: Mapping[str, object]) -> dict[str, obje
     expected = f"{manifest['source_commit']} {manifest['bundle_ref']}"
     if heads != [expected]:
         raise ProofError("Git bundle ref or commit diverged")
-    verify_root = Path(
-        tempfile.mkdtemp(prefix=".proof-bundle-verify.", dir=root)
-    ).resolve(strict=True)
+    verify_root = root / f".proof-bundle-verify.{secrets.token_hex(8)}"
+    if verify_root.exists() or verify_root.is_symlink():
+        raise ProofError("bundle verifier root must be new")
+    verify_root.mkdir()
+    verify_root = verify_root.resolve(strict=True)
     try:
         _command(["git", "init", "--bare", "--quiet", str(verify_root)])
         _command(["git", "-C", str(verify_root), "bundle", "verify", str(bundle)])

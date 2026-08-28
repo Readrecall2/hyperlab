@@ -1183,7 +1183,7 @@ def finalize(
     slug = runtime_handoff.get("run_slug")
     if not isinstance(slug, str) or _RUN_SLUG.fullmatch(slug) is None:
         raise ProofError("runtime pack run slug is invalid")
-    output_root.mkdir(parents=True, mode=0o700)
+    output_root.mkdir(parents=True)
     for relative in (
         _BUNDLE_NAME,
         "handoff.json",

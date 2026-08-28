@@ -7085,8 +7085,15 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     assert "hyperlab-h1" not in cutover
     assert (
         '"$OLD_PYTHON" -I '
-        '"$OLD_SOURCE/ops/prediction_markets_launch_v1/preflight.py"'
+        '"$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py"'
     ) in cutover
+    assert "superseded-runtime-compatibility" in cutover
+    assert (
+        '"$OLD_SOURCE/ops/prediction_markets_launch_v1/preflight.py" '
+        "runtime-import-admission"
+    ) not in cutover
+    assert "sudo -n test -f" not in cutover
+    assert "sudo -n cmp" not in cutover
     assert "$INCOMING_ROOT" not in cutover
     assert "run_hyperlab_isolated research-data prediction-prepare" in install
     assert '"$VENV_PYTHON" -m hyperlab' not in install

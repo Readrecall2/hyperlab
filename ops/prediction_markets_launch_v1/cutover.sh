@@ -19,7 +19,10 @@ NEW_HANDOFF=$2
 NEW_HANDOFF=$(readlink -f -- "$NEW_HANDOFF")
 NEW_INCOMING=$(dirname -- "$NEW_HANDOFF")
 SYSTEMD_HELPER="$NEW_INCOMING/scripts/systemd_cutover.py"
-[[ -f $SYSTEMD_HELPER && ! -L $SYSTEMD_HELPER ]] || fail 'bounded systemd helper is absent or unsafe'
+if [[ $MODE == disarm-old || $MODE == restore-old ]]; then
+  [[ -f $SYSTEMD_HELPER && ! -L $SYSTEMD_HELPER ]] \
+    || fail 'bounded systemd helper is absent or unsafe'
+fi
 
 interrupted() {
   trap - HUP INT TERM
@@ -118,11 +121,12 @@ OLD_PYTHON="$OLD_SOURCE/.venv/bin/python"
 
 authenticate_old_evidence() {
   timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-    "$OLD_PYTHON" -I "$OLD_SOURCE/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
-    --handoff "$OLD_INCOMING/handoff.json" \
-    --source-root "$OLD_SOURCE" \
-    --source-inventory "$OLD_INCOMING/source-inventory.json" \
-    || fail 'old runtime isolated import admission failed'
+    "$OLD_PYTHON" -I "$NEW_SOURCE/ops/prediction_markets_launch_v1/preflight.py" \
+    superseded-runtime-compatibility \
+    --candidate-handoff "$NEW_INCOMING/handoff.json" \
+    --candidate-source-root "$NEW_SOURCE" \
+    --candidate-source-inventory "$NEW_INCOMING/source-inventory.json" \
+    || fail 'candidate-owned superseded runtime compatibility admission failed'
   timeout --signal=TERM --kill-after=5s 180s env \
     PYTHONNOUSERSITE=1 \
     "$OLD_PYTHON" -I - "$OLD_CAMPAIGN" "$OLD_SOURCE" <<'PY'
@@ -151,8 +155,8 @@ unit_identity() {
   local service=$1 props fragment line_count load_count fragment_count restart_count
   fragment="/etc/systemd/system/$service"
   [[ -f "$OLD_INCOMING/systemd/$service" && ! -L "$OLD_INCOMING/systemd/$service" ]] || return 1
-  sudo -n test -f "$fragment" || return 1
-  sudo -n cmp --silent "$OLD_INCOMING/systemd/$service" "$fragment" || return 1
+  [[ -f "$fragment" && ! -L "$fragment" ]] || return 1
+  cmp --silent "$OLD_INCOMING/systemd/$service" "$fragment" || return 1
   props=$(timeout --signal=TERM --kill-after=2s 10s systemctl show "$service" \
     --property=LoadState,FragmentPath,NRestarts --no-pager) || return 1
   line_count=$(printf '%s\n' "$props" | awk 'NF{count++}END{print count+0}')

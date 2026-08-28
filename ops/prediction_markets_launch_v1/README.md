@@ -156,8 +156,13 @@ canonique `SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py` et sous
 une borne de 180 secondes, avant `verify-old` et
 `disarm-old`. Le même contrat précède l'installation, chaque monitor, le
 démarrage des trois services, le resume/recovery et l'admission runner; la
-réauthentification de l'ancienne campagne l'utilise aussi avant sa preuve de
-ledger. Les unités bornent leur phase de démarrage à 180 secondes. Aucun retrait
+réauthentification de l'ancienne campagne utilise à la place l'adaptateur
+versionné candidat `prediction-markets-bcb5280f-runtime-v1`. Le Python du venv
+historique exécute le fichier `preflight.py` du clone candidat authentifié, qui
+traite la source historique comme une target distincte liée au commit et à
+l'inventaire exacts. Il n'appelle jamais `runtime-import-admission` ni aucune
+autre sous-commande récente dans l'ancien source. Les unités bornent leur phase
+de démarrage à 180 secondes. Aucun retrait
 de `-I`, aucune installation réseau/editable, aucun system-site-packages et
 aucune confiance implicite dans le cwd ou `PYTHONPATH` ne sont admis.
 
@@ -166,6 +171,14 @@ non-symlinké, présent une seule fois dans l'inventaire Git exact et
 byte-identique à son blob. Les contrôles strictement pré-clone restent exécutés
 depuis la copie `incoming`, puisque le clone n'existe pas encore; aucune copie
 `incoming`, externe, ancienne ou non inventoriée n'est admise après clone.
+
+La tentative finale historique `pm-20260828t194738z-68176005` a préparé le
+nouveau runtime puis a refusé dans `verify-old`, avant `disarm-old` et install.
+Son code candidat demandait à tort `runtime-import-admission` au `preflight.py`
+du commit superseded `bcb5280f`, dont le parser ne connaît pas cette commande.
+Cette tentative, son incoming, sa source et ses sorties restent immuables et ne
+doivent jamais être réutilisés. L'ancienne campagne est restée active; aucun
+recovery ou rollback n'était requis pour cet incident.
 
 La restauration historique qui a dépassé trente minutes était bloquée avant
 toute mutation dans une substitution de commande

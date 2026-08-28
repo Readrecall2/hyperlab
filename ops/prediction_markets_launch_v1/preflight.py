@@ -80,6 +80,21 @@ _RUNTIME_HELPERS = {
         "validate_service_ledger_against_manifest",
     ),
 }
+_SUPERSEDED_RUNTIME_ADAPTER_ID = "prediction-markets-bcb5280f-runtime-v1"
+_SUPERSEDED_RUNTIME_COMMIT = "bcb5280f87393992e2aa4528188009186cd8bdc3"
+_SUPERSEDED_RUNTIME_INVENTORY_SHA256 = (
+    "573db1e313459d8b153cc6790fd733bd790898eeacaaade4125f48c28a3edf53"
+)
+_SUPERSEDED_RUNTIME_SLUG = "pm-20260828t024827z-bcb5280f"
+_SUPERSEDED_RUNTIME_SOURCE_MODULES = (
+    "hyperlab",
+    "ops.prediction_markets_launch_v1.cockpit",
+    "ops.prediction_markets_launch_v1.preflight",
+    "ops.prediction_markets_launch_v1.runner",
+)
+_SUPERSEDED_RUNTIME_SOURCE_RELATIVE_FILES = dict(_RUNTIME_SOURCE_RELATIVE_FILES)
+_SUPERSEDED_RUNTIME_VENV_MODULES = _RUNTIME_VENV_MODULES
+_SUPERSEDED_RUNTIME_HELPERS = dict(_RUNTIME_HELPERS)
 
 
 class PreflightError(RuntimeError):
@@ -815,6 +830,455 @@ def _command(arguments: Sequence[str]) -> CommandResult:
         timeout=_COMMAND_TIMEOUT_SECONDS,
     )
     return CommandResult(completed.returncode, completed.stdout.strip(), completed.stderr.strip())
+
+
+def _authenticated_runtime_checkout(
+    *,
+    source_root: Path,
+    inventory_path: Path,
+    expected_commit: str,
+    expected_inventory_sha256: str,
+    label: str,
+) -> dict[str, object]:
+    source_root = _runtime_exact_directory(source_root, label=f"{label} source root")
+    _runtime_exact_directory(source_root / "src", label=f"{label} source package root")
+    if inventory_path != inventory_path.parent / "source-inventory.json":
+        raise PreflightError(f"{label} source inventory path diverged")
+    inventory_raw = _safe_regular_bytes(inventory_path)
+    try:
+        inventory = json.loads(inventory_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"{label} source inventory is invalid JSON") from error
+    if (
+        not isinstance(inventory, dict)
+        or inventory_raw != canonical_json_bytes(inventory) + b"\n"
+        or inventory.get("commit") != expected_commit
+        or inventory.get("inventory_sha256") != expected_inventory_sha256
+    ):
+        raise PreflightError(f"{label} source inventory binding diverged")
+    if _runtime_git(source_root, "rev-parse", "HEAD") != expected_commit:
+        raise PreflightError(f"{label} source commit diverged")
+    top_level = Path(
+        _runtime_git(source_root, "rev-parse", "--show-toplevel")
+    ).resolve(strict=True)
+    if top_level != source_root:
+        raise PreflightError(f"{label} source Git top-level diverged")
+    if _runtime_git(source_root, "status", "--porcelain", "--untracked-files=all"):
+        raise PreflightError(f"{label} source checkout is not clean")
+    actual = _runtime_source_inventory(source_root, expected_commit)
+    if inventory != actual:
+        raise PreflightError(f"{label} source Git inventory diverged")
+    return actual
+
+
+def _inventoried_source_file(
+    path: Path,
+    *,
+    source_root: Path,
+    inventory: Mapping[str, object],
+    relative_path: Path,
+    label: str,
+) -> dict[str, object]:
+    expected = source_root / relative_path
+    authenticated = _runtime_reported_file(str(path), label=label)
+    if authenticated != expected:
+        raise PreflightError(f"{label} escaped its authenticated source root")
+    rows = inventory.get("files")
+    if not isinstance(rows, list):
+        raise PreflightError(f"{label} inventory file list is malformed")
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("path") == relative_path.as_posix()
+    ]
+    if len(matches) != 1:
+        raise PreflightError(f"{label} is not uniquely inventoried")
+    row = matches[0]
+    if set(row) != {"blob_sha1", "mode", "path", "size"}:
+        raise PreflightError(f"{label} inventory row is malformed")
+    blob_sha1 = row.get("blob_sha1")
+    size = row.get("size")
+    if (
+        row.get("mode") not in {"100644", "100755"}
+        or not isinstance(blob_sha1, str)
+        or re.fullmatch(r"[0-9a-f]{40}", blob_sha1) is None
+        or type(size) is not int
+        or size < 1
+    ):
+        raise PreflightError(f"{label} inventory identity is malformed")
+    raw = _safe_regular_bytes(authenticated)
+    actual_blob = hashlib.sha1(
+        f"blob {len(raw)}\0".encode("ascii") + raw
+    ).hexdigest()
+    if len(raw) != size or actual_blob != blob_sha1:
+        raise PreflightError(f"{label} diverged from its Git blob")
+    return {
+        "class": "source",
+        "file": str(authenticated),
+        "git_blob_sha1": actual_blob,
+        "relative_path": relative_path.as_posix(),
+        "sha256": sha256_bytes(raw),
+        "size": len(raw),
+    }
+
+
+def _superseded_contract(candidate_handoff: Mapping[str, object]) -> dict[str, object]:
+    value = candidate_handoff.get("superseded_campaign")
+    if not isinstance(value, dict):
+        raise PreflightError("superseded runtime contract is absent")
+    volume_base = "/mnt/HC_Volume_106716684/hyperlab-prediction-markets"
+    suffix = _SUPERSEDED_RUNTIME_SLUG.removeprefix("pm-")
+    expected: dict[str, object] = {
+        "campaign_root": f"{volume_base}/campaigns/{_SUPERSEDED_RUNTIME_SLUG}",
+        "dashboard_port": 18081,
+        "incoming_root": (
+            "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+            f"{_SUPERSEDED_RUNTIME_SLUG}"
+        ),
+        "namespace_probe_services": {
+            venue: f"hyperlab-pm-{suffix}-{venue}-namespace-probe.service"
+            for venue in ("polymarket", "kalshi")
+        },
+        "run_slug": _SUPERSEDED_RUNTIME_SLUG,
+        "services": {
+            venue: f"hyperlab-pm-{suffix}-{venue}.service"
+            for venue in ("polymarket", "kalshi", "dashboard")
+        },
+        "source_commit": _SUPERSEDED_RUNTIME_COMMIT,
+        "source_root": f"{volume_base}/sources/{_SUPERSEDED_RUNTIME_SLUG}",
+    }
+    if value != expected:
+        raise PreflightError("superseded runtime contract is unknown or divergent")
+    return expected
+
+
+def _superseded_runtime_environment(
+    *,
+    target_source: Path,
+) -> tuple[Path, Path, tuple[Path, ...]]:
+    venv_root = _runtime_exact_directory(
+        target_source / ".venv", label="superseded runtime virtual environment"
+    )
+    expected_python = target_source / ".venv" / "bin" / "python"
+    executable = _runtime_reported_file(
+        str(Path(sys.executable)), label="superseded runtime Python executable"
+    )
+    prefix = Path(sys.prefix).resolve(strict=True)
+    if (
+        sys.platform != "linux"
+        or platform.machine() != "x86_64"
+        or sys.version_info[:2] != (3, 12)
+        or executable != expected_python
+        or prefix != venv_root
+        or sys.base_prefix == sys.prefix
+        or sys.flags.isolated != 1
+        or sys.flags.no_user_site != 1
+        or os.environ.get("PYTHONNOUSERSITE") != "1"
+    ):
+        raise PreflightError("superseded runtime Python isolation diverged")
+    try:
+        pyvenv = _safe_regular_bytes(
+            venv_root / "pyvenv.cfg", maximum_bytes=64 * 1024
+        ).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreflightError("superseded runtime venv configuration is invalid") from error
+    normalized = {
+        key.strip().lower(): value.strip().lower()
+        for line in pyvenv.splitlines()
+        if "=" in line
+        for key, value in (line.split("=", 1),)
+    }
+    if normalized.get("include-system-site-packages") != "false":
+        raise PreflightError("superseded runtime venv exposes system site-packages")
+    import site
+
+    if site.ENABLE_USER_SITE is not False:
+        raise PreflightError("superseded runtime user-site is enabled")
+    stdlib_roots = tuple(
+        {
+            Path(value).resolve(strict=True)
+            for key in ("stdlib", "platstdlib")
+            if (value := sysconfig.get_path(key))
+        }
+    )
+    return venv_root, executable, stdlib_roots
+
+
+def superseded_runtime_compatibility(
+    candidate_handoff_path: Path,
+    candidate_source_root: Path,
+    candidate_inventory_path: Path,
+) -> dict[str, object]:
+    """Verify one versioned historical runtime without calling its newer CLI."""
+
+    candidate_handoff = load_handoff(candidate_handoff_path)
+    candidate_layout = validate_install_layout(
+        candidate_handoff,
+        handoff_path=candidate_handoff_path,
+        trusted_source_root=candidate_source_root,
+    )
+    candidate_commit = str(candidate_layout["source_commit"])
+    if candidate_commit == _SUPERSEDED_RUNTIME_COMMIT:
+        raise PreflightError("candidate and superseded runtime commits must differ")
+    expected_candidate_inventory = _validate_sha256(
+        candidate_handoff.get("source_inventory_sha256"),
+        label="candidate source inventory hash",
+    )
+    if candidate_inventory_path != candidate_handoff_path.parent / "source-inventory.json":
+        raise PreflightError("candidate source inventory path diverged")
+    candidate_inventory = _authenticated_runtime_checkout(
+        source_root=candidate_source_root,
+        inventory_path=candidate_inventory_path,
+        expected_commit=candidate_commit,
+        expected_inventory_sha256=expected_candidate_inventory,
+        label="candidate tool",
+    )
+    candidate_tool = _inventoried_source_file(
+        Path(__file__),
+        source_root=candidate_source_root,
+        inventory=candidate_inventory,
+        relative_path=_RUNTIME_ADMISSION_SCRIPT_RELATIVE,
+        label="candidate compatibility tool",
+    )
+    candidate_tool["class"] = "candidate_tool"
+
+    target_contract = _superseded_contract(candidate_handoff)
+    target_incoming = _runtime_exact_directory(
+        Path(str(target_contract["incoming_root"])),
+        label="superseded incoming root",
+    )
+    target_source = _runtime_exact_directory(
+        Path(str(target_contract["source_root"])),
+        label="superseded source root",
+    )
+    target_campaign = _runtime_exact_directory(
+        Path(str(target_contract["campaign_root"])),
+        label="superseded campaign root",
+    )
+    if target_source == candidate_source_root:
+        raise PreflightError("candidate tool and superseded target source roots collide")
+    target_handoff_path = target_incoming / "handoff.json"
+    target_handoff = load_handoff(target_handoff_path)
+    for field in (
+        "campaign_root",
+        "dashboard_port",
+        "incoming_root",
+        "run_slug",
+        "services",
+        "source_commit",
+        "source_root",
+    ):
+        if target_handoff.get(field) != target_contract.get(field):
+            raise PreflightError(f"superseded target handoff field diverged: {field}")
+    target_inventory_path = target_incoming / "source-inventory.json"
+    if (
+        target_handoff.get("source_inventory_sha256")
+        != _SUPERSEDED_RUNTIME_INVENTORY_SHA256
+    ):
+        raise PreflightError("superseded target inventory adapter is unsupported")
+    target_inventory = _authenticated_runtime_checkout(
+        source_root=target_source,
+        inventory_path=target_inventory_path,
+        expected_commit=_SUPERSEDED_RUNTIME_COMMIT,
+        expected_inventory_sha256=_SUPERSEDED_RUNTIME_INVENTORY_SHA256,
+        label="superseded target",
+    )
+    for name, relative_path in _SUPERSEDED_RUNTIME_SOURCE_RELATIVE_FILES.items():
+        _inventoried_source_file(
+            target_source / relative_path,
+            source_root=target_source,
+            inventory=target_inventory,
+            relative_path=relative_path,
+            label=f"superseded runtime source module: {name}",
+        )
+
+    venv_root, executable, stdlib_roots = _superseded_runtime_environment(
+        target_source=target_source
+    )
+    cwd = Path.cwd().resolve(strict=True)
+    forbidden_roots = (candidate_source_root, target_source, target_incoming)
+    for raw_path in sys.path:
+        if raw_path in {"", "."}:
+            raise PreflightError("superseded isolated sys.path contains an implicit cwd")
+        path = Path(raw_path).resolve(strict=False)
+        if path == cwd or any(
+            _runtime_path_within(path, root)
+            and not _runtime_path_within(path, venv_root)
+            for root in forbidden_roots
+        ):
+            raise PreflightError("superseded source, candidate source, or cwd was preloaded")
+        if (
+            ("site-packages" in path.parts or "dist-packages" in path.parts)
+            and not _runtime_path_within(path, venv_root)
+        ):
+            raise PreflightError("superseded runtime exposes global site-packages")
+    if any(name in sys.modules for name in _SUPERSEDED_RUNTIME_SOURCE_MODULES):
+        raise PreflightError("superseded source modules were imported before admission")
+
+    before_modules = set(sys.modules)
+    sys.dont_write_bytecode = True
+    sys.path[:0] = [str(target_source / "src"), str(target_source)]
+    importlib.invalidate_caches()
+    imported: dict[str, object] = {}
+    try:
+        for name in (
+            *_SUPERSEDED_RUNTIME_VENV_MODULES,
+            *_SUPERSEDED_RUNTIME_SOURCE_MODULES,
+        ):
+            imported[name] = importlib.import_module(name)
+    except Exception as error:
+        raise PreflightError(
+            f"superseded required import failed: {type(error).__name__}:{error}"
+        ) from error
+    for module_name, helpers in _SUPERSEDED_RUNTIME_HELPERS.items():
+        module = imported[module_name]
+        if not all(callable(getattr(module, helper, None)) for helper in helpers):
+            raise PreflightError(
+                f"superseded runtime helper contract diverged: {module_name}"
+            )
+
+    module_records: dict[str, object] = {}
+    for name, module in imported.items():
+        path = _runtime_module_file(module, name=name)
+        actual_class = _runtime_module_class(
+            path,
+            source_root=target_source,
+            venv_root=venv_root,
+            stdlib_roots=stdlib_roots,
+            name=name,
+        )
+        expected_class = (
+            "source" if name in _SUPERSEDED_RUNTIME_SOURCE_MODULES else "venv"
+        )
+        if actual_class != expected_class:
+            raise PreflightError(f"superseded module origin diverged: {name}")
+        if expected_class == "source":
+            expected_path = target_source / _SUPERSEDED_RUNTIME_SOURCE_RELATIVE_FILES[name]
+            if path != expected_path:
+                raise PreflightError(f"superseded source module path diverged: {name}")
+        elif "site-packages" not in path.parts:
+            raise PreflightError(f"superseded dependency escaped site-packages: {name}")
+        module_records[name] = {"class": actual_class, "file": str(path)}
+
+    runner: Any = imported["ops.prediction_markets_launch_v1.runner"]
+    envelope: Any = importlib.import_module("hyperlab.research_data.envelope")
+    venue_type = getattr(envelope, "Venue", None)
+    required_runner_helpers = (
+        "_validate_result",
+        "canonical_json_bytes",
+        "load_campaign_context",
+        "read_ledger",
+        "sha256_bytes",
+        "validate_service_ledger_against_manifest",
+    )
+    if venue_type is None or not all(
+        callable(getattr(runner, name, None)) for name in required_runner_helpers
+    ):
+        raise PreflightError("superseded campaign evidence adapter contract diverged")
+    context = runner.load_campaign_context(target_campaign, target_source)
+    ledgers: dict[str, object] = {}
+    for venue in (venue_type.POLYMARKET, venue_type.KALSHI):
+        rows = runner.read_ledger(target_campaign / venue.value / "ledger.jsonl")
+        if not rows or rows[0].get("ordinal") != 0:
+            raise PreflightError(
+                f"superseded target ledger lacks authenticated ordinal 0: {venue.value}"
+            )
+        runner.validate_service_ledger_against_manifest(
+            rows,
+            campaign_manifest=context.manifest,
+            venue=venue,
+        )
+        for row in rows:
+            terminal_hash = row.get("terminal_result_sha256")
+            if terminal_hash is None:
+                continue
+            scheduled = datetime.fromisoformat(
+                str(row["scheduled_start_utc"]).replace("Z", "+00:00")
+            )
+            run_root = (
+                target_campaign
+                / venue.value
+                / "runs"
+                / f"shard-{row['ordinal']:04d}-{scheduled.strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            result = runner._validate_result(
+                run_root,
+                context,
+                venue,
+                ordinal=row["ordinal"],
+            )
+            if (
+                runner.sha256_bytes(runner.canonical_json_bytes(result))
+                != terminal_hash
+            ):
+                raise PreflightError(
+                    f"superseded terminal result and ledger diverged: {venue.value}"
+                )
+        ledgers[venue.value] = {
+            "entries": len(rows),
+            "last_entry_sha256": rows[-1].get("entry_sha256") if rows else None,
+        }
+
+    validated_files = 0
+    for name in sorted(set(sys.modules) - before_modules):
+        module = sys.modules.get(name)
+        value = getattr(module, "__file__", None)
+        if not isinstance(value, str) or not value:
+            continue
+        path = _runtime_module_file(module, name=name)
+        module_class = _runtime_module_class(
+            path,
+            source_root=target_source,
+            venv_root=venv_root,
+            stdlib_roots=stdlib_roots,
+            name=name,
+        )
+        if module_class == "source":
+            _inventoried_source_file(
+                path,
+                source_root=target_source,
+                inventory=target_inventory,
+                relative_path=path.relative_to(target_source),
+                label=f"superseded loaded source module: {name}",
+            )
+        validated_files += 1
+
+    manifest_path = target_campaign / "campaign-manifest.json"
+    activation_path = target_campaign / "state" / "activation-receipt.json"
+    body: dict[str, object] = {
+        "adapter_id": _SUPERSEDED_RUNTIME_ADAPTER_ID,
+        "boundary": BOUNDARY,
+        "candidate_commit": candidate_commit,
+        "candidate_inventory_sha256": expected_candidate_inventory,
+        "candidate_source_root": str(candidate_source_root),
+        "candidate_tool": candidate_tool,
+        "isolated": True,
+        "ledgers": ledgers,
+        "loaded_module_files_validated": validated_files,
+        "modules": module_records,
+        "no_historical_new_cli_invoked": True,
+        "no_user_site": True,
+        "schema_version": 1,
+        "target_activation_receipt_sha256": sha256_bytes(
+            _safe_regular_bytes(activation_path)
+        ),
+        "target_campaign_manifest_sha256": sha256_bytes(
+            _safe_regular_bytes(manifest_path)
+        ),
+        "target_commit": _SUPERSEDED_RUNTIME_COMMIT,
+        "target_inventory_sha256": _SUPERSEDED_RUNTIME_INVENTORY_SHA256,
+        "target_python_executable": str(executable),
+        "target_source_root": str(target_source),
+        "target_venv_root": str(venv_root),
+        "terminal_signal": (
+            "PREDICTION_SUPERSEDED_RUNTIME_COMPATIBILITY_RUNTIME_GREEN"
+        ),
+    }
+    report = {
+        **body,
+        "compatibility_sha256": sha256_bytes(canonical_json_bytes(body)),
+    }
+    return report
 
 
 def _required_command(name: str) -> str:
@@ -3344,6 +3808,15 @@ def _parser() -> argparse.ArgumentParser:
     runtime_import.add_argument("--source-root", type=Path, required=True)
     runtime_import.add_argument("--source-inventory", type=Path, required=True)
     runtime_import.add_argument("--report", type=Path)
+    superseded_runtime = subparsers.add_parser(
+        "superseded-runtime-compatibility"
+    )
+    superseded_runtime.add_argument("--candidate-handoff", type=Path, required=True)
+    superseded_runtime.add_argument("--candidate-source-root", type=Path, required=True)
+    superseded_runtime.add_argument(
+        "--candidate-source-inventory", type=Path, required=True
+    )
+    superseded_runtime.add_argument("--report", type=Path)
     return parser
 
 
@@ -3355,6 +3828,24 @@ def _fail(message: str) -> NoReturn:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        if arguments.command == "superseded-runtime-compatibility":
+            report = superseded_runtime_compatibility(
+                arguments.candidate_handoff,
+                arguments.candidate_source_root,
+                arguments.candidate_source_inventory,
+            )
+            if arguments.report is not None:
+                expected_report = (
+                    arguments.candidate_handoff.parent
+                    / "superseded-runtime-compatibility.json"
+                )
+                if arguments.report != expected_report:
+                    raise PreflightError(
+                        "superseded compatibility report escaped its fixed incoming path"
+                    )
+                _atomic_report(arguments.report, report)
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
         if arguments.command == "runtime-import-admission":
             report = runtime_import_admission(
                 arguments.handoff,

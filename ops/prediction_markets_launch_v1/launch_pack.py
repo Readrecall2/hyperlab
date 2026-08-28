@@ -547,6 +547,13 @@ d'un ancien source ou d'un chemin symlinké. Son unique signal terminal est
 monitor et chaque démarrage des services; aucun pip editable/réseau ou retrait
 de `-I` n'est admis.
 
+`verify-old` ne demande jamais une sous-commande récente au code historique.
+Le Python du venv superseded exécute l'outil `preflight.py` du clone candidat
+authentifié avec l'adaptateur versionné `prediction-markets-bcb5280f-runtime-v1`.
+L'outil et la target gardent des identités séparées : commit/inventaire/script
+candidats d'un côté, source/commit/inventaire/venv/modules historiques de
+l'autre. La target inconnue, sale, symlinkée, arrêtée ou hors schéma est refusée.
+
 ## Diagnostic read-only puis reprise de restore-old
 
 Si E est interrompu ou affiche un timeout, conserver toute sa sortie et lancer

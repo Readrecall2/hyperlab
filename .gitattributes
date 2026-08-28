@@ -8,3 +8,7 @@ config/paper/hyperliquid-tier0-fee-table-capture-2026-08-16.json text eol=lf
 config/paper/phase08-v9-historical-attestation.json text eol=lf
 reports/phase12-phase05/benchmark.json text eol=lf
 reports/phase12-phase05/technical-evidence.json text eol=lf
+
+# Operator and Linux bootstrap scripts are byte-authenticated before execution.
+ops/h1_dashboard_binding/*.ps1 text eol=lf
+ops/h1_dashboard_binding/*.sh text eol=lf

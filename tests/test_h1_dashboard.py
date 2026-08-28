@@ -36,6 +36,9 @@ def _write_health(
     manifest_sha256: str | None = None,
     raw_root_sha256: str | None = None,
     frames: int | None = None,
+    gaps: int = 0,
+    queue_high_water: int = 3,
+    reconnects: int = 0,
     segments: int | None = None,
     stored_bytes: int | None = None,
 ) -> None:
@@ -47,12 +50,12 @@ def _write_health(
                 "campaign_id": campaign["campaign_id"],
                 "error": None,
                 "frames": (1 if manifest_sha256 else 0) if frames is None else frames,
-                "gaps": 0,
+                "gaps": gaps,
                 "manifest_sha256": manifest_sha256,
                 "monitoring": "state/health.json",
-                "queue_high_water": 3,
+                "queue_high_water": queue_high_water,
                 "raw_root_sha256": raw_root_sha256,
-                "reconnects": 0,
+                "reconnects": reconnects,
                 "segments": (1 if manifest_sha256 else 0) if segments is None else segments,
                 "stored_bytes": (
                     (1 if manifest_sha256 else 0) if stored_bytes is None else stored_bytes
@@ -464,6 +467,53 @@ def test_running_health_preserves_initial_zero_storage_before_raw_manifest(
     assert payload["collection"]["segments"] == 0
     assert payload["collection"]["stored_bytes"] == 0
     assert payload["incidents"] == []
+
+
+def test_interrupted_recoverable_is_honest_readonly_and_keeps_holdout_sealed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_root = _prepared_campaign(
+        tmp_path,
+        monkeypatch,
+        starts=datetime.now(tz=UTC) - timedelta(hours=1),
+    )
+    _write_health(
+        campaign_root,
+        terminal="INTERRUPTED_RECOVERABLE",
+        manifest_sha256=None,
+        raw_root_sha256=None,
+        frames=3_999_005,
+        gaps=0,
+        queue_high_water=9,
+        reconnects=19,
+        segments=358,
+        stored_bytes=1_092_828_859,
+    )
+
+    payload, status = h1_snapshot(
+        campaign_root,
+        policy_path=CONFIG,
+        expected_identity=_expected_identity(campaign_root),
+    )
+
+    assert status == 200
+    assert payload["state"]["code"] == "INTERRUPTED_RECOVERABLE"
+    assert payload["state"]["retryable"] is True
+    assert payload["progress"]["holdout"]["access"] == "SEALED"
+    assert payload["identity"]["raw_manifest_sha256"] is None
+    assert payload["identity"]["raw_root_sha256"] is None
+    assert payload["collection"] == {
+        "connection_generation": 20,
+        "duplicates": None,
+        "duplicates_scope": "NON DISPONIBLE",
+        "frames": 3_999_005,
+        "gaps": 0,
+        "queue_high_water": 9,
+        "reconnects": 19,
+        "segments": 358,
+        "stored_bytes": 1_092_828_859,
+    }
 
 
 def test_every_http_route_is_get_head_only(tmp_path: Path) -> None:

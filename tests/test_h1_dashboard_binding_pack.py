@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,12 +14,13 @@ from ops.h1_dashboard_binding import binding_pack
 
 ROOT = Path(__file__).resolve().parents[1]
 OPS = ROOT / "ops" / "h1_dashboard_binding"
-V8_INPUT = json.loads((OPS / "binding-input-v8.json").read_text(encoding="utf-8"))
+V8_INPUT_PATH = OPS / "binding-input-v8-v2.json"
+V8_INPUT = json.loads(V8_INPUT_PATH.read_text(encoding="utf-8"))
 
 
 def _plan() -> dict[str, object]:
     slug = "h1-synthetic-campaign"
-    name = "h1-synthetic-dashboard-v1"
+    name = "h1-synthetic-dashboard-v2"
     campaign_id = "h1-" + "a" * 24
     return {
         "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
@@ -56,7 +59,7 @@ def _plan() -> dict[str, object]:
             "source_commit": "4" * 40,
         },
         "schema_version": 1,
-        "status": "H1_V8_DASHBOARD_BINDING_V1_GREEN_AWAITING_HUMAN_VPS_EXECUTION",
+        "status": binding_pack.STATUS,
     }
 
 
@@ -68,7 +71,7 @@ def _handoff(source_commit: str = "f" * 40) -> dict[str, object]:
     return {
         "boundary": binding_pack.BOUNDARY,
         "bundle": {
-            "filename": "hyperlab-h1-v8-dashboard-binding-v1.bundle",
+            "filename": binding_pack.BUNDLE_FILENAME,
             "ref": "refs/heads/codex/h1-v7-dashboard-binding-v1",
             "sha256": "1" * 64,
         },
@@ -79,6 +82,71 @@ def _handoff(source_commit: str = "f" * 40) -> dict[str, object]:
         "schema_version": 1,
         "status": binding_pack.STATUS,
     }
+
+
+def _parent_snapshot() -> dict[str, object]:
+    return {
+        "parent_exists": True,
+        "parent_is_directory": True,
+        "parent_is_symlink": False,
+        "parent_is_canonical": True,
+        "parent_same_device": True,
+        "parent_owner": "hyperlab:hyperlab",
+        "parent_mode": "700",
+        "children": [],
+        "v1_is_directory": False,
+        "v1_is_symlink": False,
+        "v1_is_canonical": False,
+        "v1_same_device": False,
+        "v1_owner": "",
+        "v1_mode": "",
+        "v1_empty": False,
+    }
+
+
+def _exact_v1_residue_snapshot() -> dict[str, object]:
+    snapshot = _parent_snapshot()
+    snapshot.update(
+        {
+            "parent_owner": "root:root",
+            "children": [binding_pack.EXPECTED_V1_BINDING_NAME],
+            "v1_is_directory": True,
+            "v1_is_canonical": True,
+            "v1_same_device": True,
+            "v1_owner": "hyperlab:hyperlab",
+            "v1_mode": "700",
+            "v1_empty": True,
+        }
+    )
+    return snapshot
+
+
+def _materialize_pack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict[str, object]]:
+    output = tmp_path / "h1-v8-dashboard-binding-v2"
+    output.mkdir()
+    bundle = output / binding_pack.BUNDLE_FILENAME
+    bundle.write_bytes(b"synthetic-test-bundle\n")
+    monkeypatch.setattr(binding_pack, "_validate_source_causality", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        binding_pack,
+        "portable_git_file_bytes",
+        lambda root, relative: (root / relative).read_bytes().replace(b"\r\n", b"\n"),
+    )
+    monkeypatch.setattr(
+        binding_pack,
+        "build_handoff",
+        lambda **kwargs: _handoff(str(kwargs["plan"]["provenance"]["source_commit"])),
+    )
+    result = binding_pack.finalize_binding_pack(
+        repo_root=ROOT,
+        input_path=V8_INPUT_PATH,
+        bundle_path=bundle,
+        output_root=output,
+        source_commit="f" * 40,
+    )
+    return output, result
 
 
 def test_frozen_v8_input_has_authoritative_non_circular_identity() -> None:
@@ -188,7 +256,7 @@ def test_v8_unit_binds_final_identity_and_port() -> None:
 
 def test_windows_tunnel_is_strict_bounded_and_separate() -> None:
     tunnel = binding_pack.render_windows_tunnel(_plan())
-    assert "LOCATION: Windows PowerShell on the Beelink" in tunnel
+    assert "LOCATION: Windows PowerShell 5.1 on the Beelink" in tunnel
     assert "ssh.exe -N -T" in tunnel
     assert "ClearAllForwardings=yes" in tunnel
     assert "ExitOnForwardFailure=yes" in tunnel
@@ -200,19 +268,19 @@ def test_windows_tunnel_is_strict_bounded_and_separate() -> None:
 
 def test_v8_operator_blocks_are_strictly_separated_and_ordered() -> None:
     handoff = _handoff()
-    inventory_sha256 = "9" * 64
-    transfer = binding_pack.render_windows_transfer(handoff, inventory_sha256)
-    install = binding_pack.render_tabby_install(handoff, inventory_sha256)
+    transfer = binding_pack.render_windows_transfer(handoff)
+    install = binding_pack.render_tabby_install(handoff)
     tunnel = binding_pack.render_windows_tunnel(_v8_plan())
-    assert "STEP 01/03" in transfer and "scp.exe" in transfer
-    assert f"$ExpectedInventorySha256 = '{inventory_sha256}'" in transfer
+    assert "STEP A/3" in transfer and "scp.exe" in transfer
+    assert "[ValidatePattern('^[0-9a-f]{64}$')]" in transfer
+    assert "[string] $ExpectedInventorySha256" in transfer
     assert transfer.index("Get-FileHash -LiteralPath $InventoryPath") < transfer.index(
         "Get-Content -LiteralPath $InventoryPath"
     )
     assert "Unsafe binding-files path" in transfer
     assert "systemctl" not in transfer and "ssh.exe -N -T" not in transfer
-    assert "STEP 02/03" in install and "Tabby - VPS" in install
-    assert f"printf '%s  %s\\n' '{inventory_sha256}' 'binding-files.sha256'" in install
+    assert "STEP B/3" in install and "Tabby - VPS" in install
+    assert "EXPECTED_INVENTORY_SHA256=$1" in install
     assert install.index("'binding-files.sha256' | sha256sum -c -") < install.index(
         "sha256sum -c binding-files.sha256"
     )
@@ -221,11 +289,10 @@ def test_v8_operator_blocks_are_strictly_separated_and_ordered() -> None:
         assert f'systemctl {verb} "$COLLECTOR_SERVICE"' not in install
     assert 'systemctl enable --now "$DASHBOARD_SERVICE"' in install
     assert "render-unit --plan" in install and "systemd-analyze verify" in install
-    assert "sudo chown -R root:root \"$DASHBOARD_SOURCE_ROOT\"" in install
-    assert "sudo chmod -R a-w \"$DASHBOARD_SOURCE_ROOT\"" in install
-    assert "find \"$DASHBOARD_SOURCE_ROOT\" -type l" in install
-    assert install.index("find \"$DASHBOARD_SOURCE_ROOT\" -type l") < install.index(
-        "sudo chown -R root:root \"$DASHBOARD_SOURCE_ROOT\""
+    assert "chown -R" not in install and "chmod -R" not in install
+    assert 'find "$DASHBOARD_SOURCE_ROOT" -xdev -type l' in install
+    assert install.index('find "$DASHBOARD_SOURCE_ROOT" -xdev -type l') < install.index(
+        'find "$DASHBOARD_SOURCE_ROOT" -xdev -exec chown'
     )
     assert "LoadState=loaded" in install and "ActiveState=active" in install
     assert "SubState=running" in install and "NRestarts=0" in install
@@ -235,13 +302,157 @@ def test_v8_operator_blocks_are_strictly_separated_and_ordered() -> None:
     assert 'payload["identity"]["collector_source_commit"]' in install
     assert 'payload["identity"]["dashboard_source_commit"]' in install
     assert "127.0.0.1:18080" in install and "PREPARED_NOT_STARTED" in install
-    assert "RUNNING_HEALTHY" in install and "firewall" not in install.casefold()
-    assert "STEP 03/03" in tunnel and "ssh.exe -N -T" in tunnel
+    assert "RUNNING_HEALTHY" in install and "INTERRUPTED_RECOVERABLE" in install
+    assert "firewall" not in install.casefold()
+    assert "STEP C/3" in tunnel and "ssh.exe -N -T" in tunnel
     assert "-L '127.0.0.1:18080:127.0.0.1:18080'" in tunnel
 
 
+def test_v2_parent_creation_and_exact_v1_residue_repair_are_ordered() -> None:
+    install = binding_pack.render_tabby_install(_handoff())
+    parent_create = '"$DASHBOARD_SOURCE_PARENT"\n  PARENT_CREATED=1'
+    leaf_create = '"$DASHBOARD_SOURCE_ROOT"\nassert_volume_dir "$DASHBOARD_SOURCE_ROOT"'
+    repair = (
+        "sudo chown --no-dereference 'hyperlab:hyperlab' "
+        '"$DASHBOARD_SOURCE_PARENT"'
+    )
+    assert parent_create in install and leaf_create in install and repair in install
+    pre_repair_v1 = "assert_volume_dir \"$V1_SOURCE_ROOT\" 'V1 dashboard source residue before parent repair'"
+    assert pre_repair_v1 in install
+    assert install.index(parent_create) < install.index(pre_repair_v1) < install.index(repair)
+    assert install.index(repair) < install.index(leaf_create)
+    assert "root-owned dashboard parent is not the exact V1 residue" in install
+    assert "dashboard source parent contains foreign content" in install
+    assert "V1 dashboard source residue contains foreign content" in install
+    assert 'rm ' not in install and 'rmdir ' not in install
+    assert 'findmnt -rn -T "$VOLUME_MOUNT" -o SOURCE' in install
+    assert 'stat -c %d "$VOLUME_MOUNT"' in install
+
+
+def test_parent_admission_accepts_absent_and_exact_root_owned_v1_residue() -> None:
+    absent = _parent_snapshot()
+    absent["parent_exists"] = False
+    absent["parent_is_directory"] = False
+    assert binding_pack.admit_dashboard_source_parent(absent) == "CREATE_PARENT_THEN_V2_LEAF"
+
+    residue = _exact_v1_residue_snapshot()
+    assert binding_pack.admit_dashboard_source_parent(residue) == (
+        "REPAIR_PARENT_ONLY_THEN_CREATE_V2_LEAF"
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"parent_is_symlink": True}, "unsafe"),
+        ({"parent_same_device": False}, "unsafe"),
+        ({"parent_owner": "other:other"}, "owner"),
+        ({"parent_mode": "755"}, "mode"),
+        ({"children": ["foreign"]}, "foreign"),
+    ),
+)
+def test_parent_admission_refuses_symlink_device_owner_mode_or_foreign_content(
+    updates: dict[str, object], message: str
+) -> None:
+    snapshot = _parent_snapshot()
+    snapshot.update(updates)
+    with pytest.raises(binding_pack.BindingPackError, match=message):
+        binding_pack.admit_dashboard_source_parent(snapshot)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"v1_is_symlink": True},
+        {"v1_same_device": False},
+        {"v1_owner": "root:root"},
+        {"v1_mode": "755"},
+        {"v1_empty": False},
+    ),
+)
+def test_parent_repair_refuses_any_v1_residue_drift_before_mutation(
+    updates: dict[str, object],
+) -> None:
+    snapshot = _exact_v1_residue_snapshot()
+    snapshot.update(updates)
+    with pytest.raises(binding_pack.BindingPackError, match="V1 dashboard source residue"):
+        binding_pack.admit_dashboard_source_parent(snapshot)
+
+
+def test_materialized_pack_inventories_native_lf_operator_scripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, result = _materialize_pack(tmp_path, monkeypatch)
+    expected = {
+        "operator/A-windows-transfer.ps1",
+        "operator/B-tabby-vps-install.sh",
+        "operator/C-windows-tunnel.ps1",
+    }
+    lines = (output / "binding-files.sha256").read_text(encoding="ascii").splitlines()
+    inventory = {line.split("  ", maxsplit=1)[1]: line.split("  ", maxsplit=1)[0] for line in lines}
+    assert expected <= set(inventory)
+    assert result["inventory_sha256"] == hashlib.sha256(
+        (output / "binding-files.sha256").read_bytes()
+    ).hexdigest()
+    for relative, expected_sha in inventory.items():
+        payload = (output / relative).read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == expected_sha
+        if Path(relative).suffix in {".ps1", ".sh"}:
+            assert payload and b"\r" not in payload and b"\x00" not in payload
+            assert not payload.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"))
+
+
+def test_materialized_bash_reproduces_crlf_refusal_and_lf_selfcheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, _ = _materialize_pack(tmp_path, monkeypatch)
+    candidate = Path("C:/Program Files/Git/bin/bash.exe")
+    bash = str(candidate) if candidate.is_file() else shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is unavailable")
+    script = output / "operator" / "B-tabby-vps-install.sh"
+    lf_run = subprocess.run(
+        [bash, str(script), "--self-check"], check=False, capture_output=True, text=True
+    )
+    assert lf_run.returncode == 0
+    assert "STEP_B_SELFCHECK_GREEN" in lf_run.stdout
+    crlf = tmp_path / "B-tabby-vps-install-crlf.sh"
+    crlf.write_bytes(script.read_bytes().replace(b"\n", b"\r\n"))
+    assert b"set -Eeuo pipefail\r\n" in crlf.read_bytes()
+    with pytest.raises(binding_pack.BindingPackError, match="LF-only shell bytes"):
+        binding_pack.validate_lf_shell_bytes(crlf.read_bytes(), label=crlf.name)
+
+
+def test_materialized_powershell_scripts_execute_from_another_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, _ = _materialize_pack(tmp_path, monkeypatch)
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    unrelated = tmp_path / "unrelated-cwd"
+    unrelated.mkdir()
+    for name, arguments, signal in (
+        (
+            "A-windows-transfer.ps1",
+            ["-ExpectedInventorySha256", "0" * 64, "-SelfCheck"],
+            "STEP_A_SELFCHECK_GREEN",
+        ),
+        ("C-windows-tunnel.ps1", ["-SelfCheck"], "STEP_C_SELFCHECK_GREEN"),
+    ):
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-File", str(output / "operator" / name), *arguments],
+            cwd=unrelated,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert signal in completed.stdout
+
+
 def test_bootstrap_is_hash_locked_and_checks_binding_specific_cli() -> None:
-    bootstrap = (OPS / "bootstrap-linux.sh").read_text(encoding="utf-8")
+    bootstrap = (OPS / "bootstrap-linux-v2.sh").read_text(encoding="utf-8")
     assert "sys.version_info[:3] == (3, 12, 13)" in bootstrap
     assert "--require-hashes" in bootstrap and "--only-binary=:all:" in bootstrap
     assert "timeout --signal=INT --kill-after=60s 30m" in bootstrap
@@ -250,14 +461,14 @@ def test_bootstrap_is_hash_locked_and_checks_binding_specific_cli() -> None:
 
 
 def test_windows_finalizer_is_post_commit_clean_branch_and_bundle_bound() -> None:
-    script = (OPS / "New-H1V8DashboardBindingBundle.ps1").read_text(encoding="utf-8")
+    script = (OPS / "New-H1V8DashboardBindingV2Bundle.ps1").read_text(encoding="utf-8")
     assert "[ValidatePattern('^[0-9a-f]{40}$')]" in script
     assert "$ExpectedBranch = 'codex/h1-v7-dashboard-binding-v1'" in script
     assert "git -C $RepoRoot status --porcelain" in script
-    assert "hyperlab-h1-v8-dashboard-binding-v1.bundle" in script
+    assert binding_pack.BUNDLE_FILENAME in script
     assert "binding_pack.py') finalize" in script
     assert "--source-commit $Commit" in script
-    assert "H1_V8_DASHBOARD_BINDING_WINDOWS_BUNDLE_FINALIZED_NOT_TRANSFERRED" in script
+    assert "H1_V8_DASHBOARD_BINDING_V2_WINDOWS_BUNDLE_FINALIZED_NOT_TRANSFERRED" in script
 
 
 def test_git_helper_is_readonly_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

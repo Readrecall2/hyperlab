@@ -13,12 +13,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Final, NoReturn
 
 BOUNDARY: Final = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-STATUS: Final = "H1_V8_DASHBOARD_BINDING_V1_GREEN_AWAITING_HUMAN_VPS_EXECUTION"
+STATUS: Final = (
+    "H1_V8_DASHBOARD_BINDING_V2_GREEN_CRLF_PARENT_OWNERSHIP_FIXED_"
+    "PUSHED_AWAITING_HUMAN_TRANSFER"
+)
 EXPECTED_BRANCH: Final = "codex/h1-v7-dashboard-binding-v1"
 EXPECTED_BASE_COMMIT: Final = "926c878718c9f7d4095526061893e9f041d40c2b"
 EXPECTED_INTEGRATION_COMMIT: Final = "cda0681b726fadba1a77bd72d2fca9f84dd14566"
 EXPECTED_ORIGINAL_COMMIT: Final = "decb0e08aeabff71859fad052b84bff4af0ed990"
-EXPECTED_BINDING_NAME: Final = "h1-20260827t004500z-5973abde-dashboard-v1"
+EXPECTED_BINDING_NAME: Final = "h1-20260827t004500z-5973abde-dashboard-v2"
+EXPECTED_V1_BINDING_NAME: Final = "h1-20260827t004500z-5973abde-dashboard-v1"
 EXPECTED_CAMPAIGN_ID: Final = "h1-68c6493652abd667420b9a5b"
 EXPECTED_CAMPAIGN_SLUG: Final = "h1-20260827t004500z-5973abde"
 EXPECTED_MANIFEST_SHA256: Final = (
@@ -27,6 +31,11 @@ EXPECTED_MANIFEST_SHA256: Final = (
 EXPECTED_STARTS_AT_UTC: Final = "2026-08-27T00:45:00Z"
 EXPECTED_REMOTE_HOST: Final = "5.223.60.130"
 EXPECTED_PORT: Final = 18080
+EXPECTED_VOLUME_DEVICE: Final = "/dev/sdb"
+EXPECTED_VOLUME_MOUNT: Final = "/mnt/HC_Volume_106716684"
+EXPECTED_VOLUME_FILESYSTEM: Final = "ext4"
+INPUT_FILENAME: Final = "binding-input-v8-v2.json"
+BUNDLE_FILENAME: Final = "hyperlab-h1-v8-dashboard-binding-v2.bundle"
 SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}$")
 CAMPAIGN_ID_RE: Final = re.compile(r"^h1-[0-9a-f]{24}$")
@@ -41,12 +50,13 @@ REMOTE_HOST_RE: Final = re.compile(
 SAFE_RELATIVE_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 UTC_RE: Final = re.compile(r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 PACK_FILES: Final = (
-    "ops/h1_dashboard_binding/New-H1V8DashboardBindingBundle.ps1",
+    ".gitattributes",
+    "ops/h1_dashboard_binding/New-H1V8DashboardBindingV2Bundle.ps1",
     "ops/h1_dashboard_binding/README.md",
     "ops/h1_dashboard_binding/__init__.py",
-    "ops/h1_dashboard_binding/binding-input-v8.json",
+    f"ops/h1_dashboard_binding/{INPUT_FILENAME}",
     "ops/h1_dashboard_binding/binding_pack.py",
-    "ops/h1_dashboard_binding/bootstrap-linux.sh",
+    "ops/h1_dashboard_binding/bootstrap-linux-v2.sh",
 )
 FORBIDDEN_ENVIRONMENT: Final = (
     "API_KEY",
@@ -170,7 +180,7 @@ def _git_output(repo_root: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def portable_git_file_sha256(repo_root: Path, relative_path: str) -> str:
+def portable_git_file_bytes(repo_root: Path, relative_path: str) -> bytes:
     relative = PurePosixPath(relative_path)
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise BindingPackError("Git identity path is unsafe")
@@ -196,7 +206,11 @@ def portable_git_file_sha256(repo_root: Path, relative_path: str) -> str:
     materialized = worktree.read_bytes()
     if materialized != canonical and materialized.replace(b"\r\n", b"\n") != canonical:
         raise BindingPackError(f"worktree bytes differ from HEAD: {relative_path}")
-    return sha256_bytes(canonical)
+    return canonical
+
+
+def portable_git_file_sha256(repo_root: Path, relative_path: str) -> str:
+    return sha256_bytes(portable_git_file_bytes(repo_root, relative_path))
 
 
 def _manifest_checks(value: object) -> dict[str, object]:
@@ -411,8 +425,8 @@ def validate_frozen_v8_input(plan: Mapping[str, object]) -> dict[str, object]:
         ),
         "policy_path": "config/research/hyperliquid-h1-ghost-v1.json",
         "remote_host": EXPECTED_REMOTE_HOST,
-        "runtime_directory": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v1",
-        "service_name": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v1.service",
+        "runtime_directory": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v2",
+        "service_name": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v2.service",
         "source_root": (
             "/mnt/HC_Volume_106716684/hyperlab-h1/dashboard-sources/"
             + EXPECTED_BINDING_NAME
@@ -468,7 +482,7 @@ def validate_handoff(handoff: Mapping[str, object]) -> dict[str, object]:
     bundle = handoff.get("bundle")
     if not isinstance(bundle, dict) or set(bundle) != {"filename", "ref", "sha256"}:
         raise BindingPackError("handoff bundle fields differ")
-    if bundle.get("filename") != "hyperlab-h1-v8-dashboard-binding-v1.bundle":
+    if bundle.get("filename") != BUNDLE_FILENAME:
         raise BindingPackError("handoff bundle filename differs")
     if bundle.get("ref") != f"refs/heads/{provenance['branch']}":
         raise BindingPackError("handoff bundle ref differs")
@@ -656,11 +670,8 @@ WantedBy=multi-user.target
 """
 
 
-def render_windows_transfer(handoff: Mapping[str, object], inventory_sha256: str) -> str:
+def render_windows_transfer(handoff: Mapping[str, object]) -> str:
     checked = validate_handoff(handoff)
-    inventory_sha256 = _required_sha256(
-        inventory_sha256, label="operator inventory SHA-256"
-    )
     plan = checked["plan"]
     bundle = checked["bundle"]
     assert isinstance(plan, dict) and isinstance(bundle, dict)
@@ -669,20 +680,33 @@ def render_windows_transfer(handoff: Mapping[str, object], inventory_sha256: str
     incoming_relative = str(dashboard["incoming_root"]).removeprefix(
         f"/home/{dashboard['user']}/"
     )
-    return rf"""# STEP 01/03 - LOCATION: Windows PowerShell on the Beelink.
+    return rf"""[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{{64}}$')]
+    [string] $ExpectedInventorySha256,
+
+    [switch] $SelfCheck
+)
+
+# STEP A/3 - LOCATION: Windows PowerShell 5.1 on the Beelink.
 # EXPECTED_DURATION: 2-10 minutes; MAXIMUM_DURATION: 30 minutes.
 # PROMPTS: SSH host-key trust or SSH-key passphrase only; HyperLab never prompts.
 # MONITORING: local SHA-256, TCP/22 reachability and exact SFTP/SCP exit codes.
 # CTRL+C: interrupts only this transfer; neither VPS service is changed.
-# TERMINAL_SIGNAL: H1_V8_DASHBOARD_BINDING_STEP_01_TRANSFER_GREEN_NOT_INSTALLED.
+# TERMINAL_SIGNAL: H1_V8_DASHBOARD_BINDING_V2_STEP_A_TRANSFER_GREEN_NOT_INSTALLED.
 $ErrorActionPreference = 'Stop'
 $ArtifactRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $SshKey = "$env:USERPROFILE\.ssh\hyperlab_hetzner"
 $RemoteUser = '{dashboard['user']}'
 $RemoteHost = '{dashboard['remote_host']}'
 $RemoteIncomingRelative = '{incoming_relative}'
-$ExpectedInventorySha256 = '{inventory_sha256}'
 $InventoryPath = Join-Path $ArtifactRoot 'binding-files.sha256'
+
+if ($SelfCheck) {{
+    Write-Output 'H1_V8_DASHBOARD_BINDING_V2_STEP_A_SELFCHECK_GREEN'
+    return
+}}
 
 $ActualInventorySha256 = (Get-FileHash -LiteralPath $InventoryPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($ActualInventorySha256 -ne $ExpectedInventorySha256) {{
@@ -715,7 +739,7 @@ try {{
 $RemoteTarget = "${{RemoteUser}}@${{RemoteHost}}:${{RemoteIncomingRelative}}/"
 & scp.exe -i $SshKey `
     (Join-Path $ArtifactRoot '{bundle['filename']}') `
-    (Join-Path $ArtifactRoot 'binding-input-v8.json') `
+    (Join-Path $ArtifactRoot '{INPUT_FILENAME}') `
     (Join-Path $ArtifactRoot 'binding-plan.json') `
     (Join-Path $ArtifactRoot 'handoff.json') `
     (Join-Path $ArtifactRoot 'binding-files.sha256') `
@@ -728,15 +752,73 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Dashboard binding file transfer failed.' }}
     (Join-Path $ArtifactRoot 'systemd') `
     $RemoteTarget
 if ($LASTEXITCODE -ne 0) {{ throw 'Dashboard binding directory transfer failed.' }}
-Write-Output 'H1_V8_DASHBOARD_BINDING_STEP_01_TRANSFER_GREEN_NOT_INSTALLED'
+Write-Output 'H1_V8_DASHBOARD_BINDING_V2_STEP_A_TRANSFER_GREEN_NOT_INSTALLED'
 """
 
 
-def render_tabby_install(handoff: Mapping[str, object], inventory_sha256: str) -> str:
-    checked = validate_handoff(handoff)
-    inventory_sha256 = _required_sha256(
-        inventory_sha256, label="operator inventory SHA-256"
+def admit_dashboard_source_parent(snapshot: Mapping[str, object]) -> str:
+    """Model the exact fail-closed V2 parent admission used by the Bash installer."""
+    required = {
+        "parent_exists",
+        "parent_is_directory",
+        "parent_is_symlink",
+        "parent_is_canonical",
+        "parent_same_device",
+        "parent_owner",
+        "parent_mode",
+        "children",
+        "v1_is_directory",
+        "v1_is_symlink",
+        "v1_is_canonical",
+        "v1_same_device",
+        "v1_owner",
+        "v1_mode",
+        "v1_empty",
+    }
+    if set(snapshot) != required:
+        raise BindingPackError("dashboard source parent snapshot fields differ")
+    if snapshot["parent_exists"] is False:
+        if snapshot["children"] != []:
+            raise BindingPackError("absent dashboard source parent has children")
+        return "CREATE_PARENT_THEN_V2_LEAF"
+    if snapshot["parent_exists"] is not True:
+        raise BindingPackError("dashboard source parent existence is malformed")
+    if (
+        snapshot["parent_is_directory"] is not True
+        or snapshot["parent_is_symlink"] is not False
+        or snapshot["parent_is_canonical"] is not True
+        or snapshot["parent_same_device"] is not True
+    ):
+        raise BindingPackError("dashboard source parent is unsafe")
+    if snapshot["parent_mode"] != "700":
+        raise BindingPackError("dashboard source parent mode differs")
+    children = snapshot["children"]
+    if not isinstance(children, list) or any(not isinstance(item, str) for item in children):
+        raise BindingPackError("dashboard source parent children are malformed")
+    if children not in ([], [EXPECTED_V1_BINDING_NAME]):
+        raise BindingPackError("dashboard source parent contains foreign content")
+    owner = snapshot["parent_owner"]
+    if owner not in {"hyperlab:hyperlab", "root:root"}:
+        raise BindingPackError("dashboard source parent owner differs")
+    if owner == "root:root" and children != [EXPECTED_V1_BINDING_NAME]:
+        raise BindingPackError("root-owned parent is not the exact V1 residue")
+    if children == [EXPECTED_V1_BINDING_NAME] and (
+        snapshot["v1_is_directory"] is not True
+        or snapshot["v1_is_symlink"] is not False
+        or snapshot["v1_is_canonical"] is not True
+        or snapshot["v1_same_device"] is not True
+        or snapshot["v1_owner"] != "hyperlab:hyperlab"
+        or snapshot["v1_mode"] != "700"
+        or snapshot["v1_empty"] is not True
+    ):
+        raise BindingPackError("V1 dashboard source residue differs")
+    return "REPAIR_PARENT_ONLY_THEN_CREATE_V2_LEAF" if owner == "root:root" else (
+        "CREATE_V2_LEAF"
     )
+
+
+def render_tabby_install(handoff: Mapping[str, object]) -> str:
+    checked = validate_handoff(handoff)
     plan = checked["plan"]
     bundle = checked["bundle"]
     assert isinstance(plan, dict) and isinstance(bundle, dict)
@@ -745,22 +827,36 @@ def render_tabby_install(handoff: Mapping[str, object], inventory_sha256: str) -
     provenance = plan["provenance"]
     assert isinstance(campaign, dict) and isinstance(dashboard, dict) and isinstance(provenance, dict)
     port = dashboard["bind_port"]
-    return rf"""# STEP 02/03 - LOCATION: Tabby - VPS, Bash, logged in as {dashboard['user']}.
-# EXPECTED_DURATION: 10-25 minutes; MAXIMUM_DURATION: 45 minutes.
-# PROMPTS: sudo may request the operator password; pip is non-interactive and bounded.
-# MONITORING: collector show, canonical unit diff, loopback listener and GET/HEAD are printed.
-# CTRL+C: before enable stops installation; after enable the dashboard remains under systemd.
-# TERMINAL_SIGNAL: H1_V8_DASHBOARD_BINDING_STEP_02_INSTALL_GREEN.
+    return rf"""#!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-fail() {{ printf 'H1_V8_DASHBOARD_BINDING_REFUSED:%s\n' "$1" >&2; exit 4; }}
+
+# STEP B/3 - LOCATION: Tabby - VPS, Bash, logged in as {dashboard['user']}.
+# EXPECTED_DURATION: 10-25 minutes; MAXIMUM_DURATION: 45 minutes.
+# PROMPTS: sudo may request the operator password; pip is non-interactive and bounded.
+# MONITORING: collector show, parent admission, canonical unit, loopback and GET/HEAD are printed.
+# CTRL+C: before enable stops installation; after enable the dashboard remains under systemd.
+# TERMINAL_SIGNAL: H1_V8_DASHBOARD_BINDING_V2_STEP_B_INSTALL_GREEN.
+fail() {{ printf 'H1_V8_DASHBOARD_BINDING_V2_REFUSED:%s\n' "$1" >&2; exit 4; }}
+if (($# == 1)) && [[ $1 == --self-check ]]; then
+  printf 'H1_V8_DASHBOARD_BINDING_V2_STEP_B_SELFCHECK_GREEN\n'
+  exit 0
+fi
+(($# == 1)) || fail 'usage: B-tabby-vps-install.sh INVENTORY_SHA256'
+EXPECTED_INVENTORY_SHA256=$1
+[[ $EXPECTED_INVENTORY_SHA256 =~ ^[0-9a-f]{{64}}$ ]] || fail 'inventory SHA-256 format differs'
 
 SOURCE_COMMIT='{provenance['source_commit']}'
 BASE_COMMIT='{provenance['base_launch_commit']}'
 BRANCH='{provenance['branch']}'
+VOLUME_DEVICE='{EXPECTED_VOLUME_DEVICE}'
+VOLUME_MOUNT='{EXPECTED_VOLUME_MOUNT}'
+VOLUME_ROOT='{EXPECTED_VOLUME_MOUNT}/hyperlab-h1'
 INCOMING_ROOT='{dashboard['incoming_root']}'
+DASHBOARD_SOURCE_PARENT='{EXPECTED_VOLUME_MOUNT}/hyperlab-h1/dashboard-sources'
+V1_SOURCE_ROOT="$DASHBOARD_SOURCE_PARENT/{EXPECTED_V1_BINDING_NAME}"
 DASHBOARD_SOURCE_ROOT='{dashboard['source_root']}'
-DASHBOARD_SOURCE_PARENT=$(dirname -- "$DASHBOARD_SOURCE_ROOT")
+HANDOFF_PARENT='/etc/hyperlab-h1-dashboard'
 HANDOFF_ROOT='{dashboard['handoff_root']}'
 CAMPAIGN_ROOT='{campaign['campaign_root']}'
 COLLECTOR_SOURCE_ROOT='{campaign['collector_source_root']}'
@@ -773,46 +869,123 @@ UNIT_TARGET="/etc/systemd/system/$DASHBOARD_SERVICE"
 
 [[ $(id -un) == '{dashboard['user']}' && $HOME == '/home/{dashboard['user']}' ]] \
   || fail 'wrong operator identity'
-[[ $(readlink -f -- "$INCOMING_ROOT") == "$INCOMING_ROOT" ]] || fail 'incoming path differs'
+for command_name in readlink findmnt stat find sort sudo install git sha256sum systemctl curl ss cmp; do
+  command -v "$command_name" >/dev/null 2>&1 || fail "missing command: $command_name"
+done
+for path in "/home/{dashboard['user']}" "/home/{dashboard['user']}/hyperlab-h1" \
+    "/home/{dashboard['user']}/hyperlab-h1/dashboard-bindings" "$INCOMING_ROOT"; do
+  [[ -d "$path" && ! -L "$path" ]] || fail "incoming ancestor is unsafe: $path"
+  [[ $(readlink -f -- "$path") == "$path" ]] || fail "incoming ancestor path differs: $path"
+  [[ $(stat -c '%U:%G:%a' "$path") == '{dashboard['user']}:{dashboard['user']}:700' ]] \
+    || fail "incoming ancestor owner or mode differs: $path"
+done
 cd "$INCOMING_ROOT"
-printf '%s  %s\n' '{inventory_sha256}' 'binding-files.sha256' | sha256sum -c -
+printf '%s  %s\n' "$EXPECTED_INVENTORY_SHA256" 'binding-files.sha256' | sha256sum -c -
 sha256sum -c binding-files.sha256
 [[ -z $(find "$INCOMING_ROOT" -type l -print -quit) ]] || fail 'incoming contains a symlink'
-[[ -d "$CAMPAIGN_ROOT" && ! -L "$CAMPAIGN_ROOT" ]] || fail 'campaign root absent or linked'
-[[ $(readlink -f -- "$CAMPAIGN_ROOT") == "$CAMPAIGN_ROOT" ]] || fail 'campaign path differs'
+
+[[ -b "$VOLUME_DEVICE" ]] || fail 'expected volume device is absent'
+[[ $(readlink -f -- "$VOLUME_DEVICE") == "$VOLUME_DEVICE" ]] || fail 'volume device path differs'
+[[ -d "$VOLUME_MOUNT" && ! -L "$VOLUME_MOUNT" ]] || fail 'volume mount is unsafe'
+[[ $(readlink -f -- "$VOLUME_MOUNT") == "$VOLUME_MOUNT" ]] || fail 'volume mount path differs'
+[[ $(findmnt -rn -T "$VOLUME_MOUNT" -o TARGET) == "$VOLUME_MOUNT" ]] || fail 'mount target differs'
+[[ $(findmnt -rn -T "$VOLUME_MOUNT" -o SOURCE) == "$VOLUME_DEVICE" ]] || fail 'mount device differs'
+[[ $(findmnt -rn -T "$VOLUME_MOUNT" -o FSTYPE) == '{EXPECTED_VOLUME_FILESYSTEM}' ]] \
+  || fail 'mount filesystem differs'
+VOLUME_OPTIONS=$(findmnt -rn -T "$VOLUME_MOUNT" -o OPTIONS)
+case ",$VOLUME_OPTIONS," in *,rw,*) ;; *) fail 'volume is not writable for V2 source creation' ;; esac
+case ",$VOLUME_OPTIONS," in *,ro,*) fail 'volume unexpectedly read-only' ;; esac
+VOLUME_DEV_ID=$(stat -c %d "$VOLUME_MOUNT")
+
+assert_volume_dir() {{
+  local path=$1 label=$2
+  sudo test -d "$path" && ! sudo test -L "$path" || fail "$label is not a real directory"
+  [[ $(sudo readlink -f -- "$path") == "$path" ]] || fail "$label canonical path differs"
+  [[ $(sudo stat -c %d "$path") == "$VOLUME_DEV_ID" ]] || fail "$label device differs"
+}}
+assert_volume_dir "$VOLUME_ROOT" 'volume root'
+[[ $(stat -c '%U:%G:%a' "$VOLUME_ROOT") == 'hyperlab:hyperlab:700' ]] \
+  || fail 'volume root owner or mode differs'
+assert_volume_dir "$CAMPAIGN_ROOT" 'campaign root'
+assert_volume_dir "$COLLECTOR_SOURCE_ROOT" 'collector source root'
 printf '%s  %s\n' "$CAMPAIGN_MANIFEST_SHA256" "$CAMPAIGN_ROOT/campaign-manifest.json" \
   | sha256sum -c -
-[[ -d "$COLLECTOR_SOURCE_ROOT" && ! -L "$COLLECTOR_SOURCE_ROOT" ]] \
-  || fail 'collector source absent or linked'
 [[ $(git -c safe.directory="$COLLECTOR_SOURCE_ROOT" -C "$COLLECTOR_SOURCE_ROOT" rev-parse HEAD) \
     == "$BASE_COMMIT" ]] || fail 'collector source commit differs'
 [[ -z $(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$COLLECTOR_SOURCE_ROOT" \
     -C "$COLLECTOR_SOURCE_ROOT" status --porcelain) ]] || fail 'collector source is not clean'
-[[ ! -e "$DASHBOARD_SOURCE_ROOT" ]] || fail 'dedicated dashboard source already exists'
-[[ ! -e "$HANDOFF_ROOT" ]] || fail 'dedicated handoff root already exists'
-[[ ! -e "$UNIT_TARGET" ]] || fail 'dashboard service already exists'
+[[ ! -e "$DASHBOARD_SOURCE_ROOT" && ! -L "$DASHBOARD_SOURCE_ROOT" ]] \
+  || fail 'V2 dashboard source collision'
+[[ ! -e "$HANDOFF_ROOT" && ! -L "$HANDOFF_ROOT" ]] || fail 'V2 handoff root collision'
+[[ ! -e "$UNIT_TARGET" && ! -L "$UNIT_TARGET" ]] || fail 'V2 dashboard service collision'
+PORT_LISTENERS=$(ss -H -ltn 'sport = :{port}') || fail 'cannot inspect dashboard port 18080'
+[[ -z $PORT_LISTENERS ]] || fail 'dashboard port 18080 is already in use'
 
 # Collector inspection is strictly read-only. No collector lifecycle command exists in this pack.
 mapfile -t COLLECTOR_STATE < <(systemctl show "$COLLECTOR_SERVICE" --no-pager \
   --property=Id --property=LoadState --property=ActiveState --property=SubState \
-  --property=MainPID --property=NRestarts)
+  --property=MainPID --property=NRestarts --property=Result --property=ExecMainStatus)
 printf '%s\n' "${{COLLECTOR_STATE[@]}}"
+[[ " ${{COLLECTOR_STATE[*]}} " == *" Id=$COLLECTOR_SERVICE "* ]] || fail 'collector identity differs'
 [[ " ${{COLLECTOR_STATE[*]}} " == *' LoadState=loaded '* ]] || fail 'collector not loaded'
 [[ " ${{COLLECTOR_STATE[*]}} " == *' ActiveState=active '* ]] || fail 'collector not active'
 [[ " ${{COLLECTOR_STATE[*]}} " == *' SubState=running '* ]] || fail 'collector not running'
 
-if [[ -e "$DASHBOARD_SOURCE_PARENT" ]]; then
-  [[ -d "$DASHBOARD_SOURCE_PARENT" && ! -L "$DASHBOARD_SOURCE_PARENT" ]] \
-    || fail 'dashboard source parent is unsafe'
-  [[ $(readlink -f -- "$DASHBOARD_SOURCE_PARENT") == "$DASHBOARD_SOURCE_PARENT" ]] \
-    || fail 'dashboard source parent path differs'
+# Create/authenticate the dedicated parent first. Only the exact known V1 residue may be repaired.
+PARENT_CREATED=0
+if ! sudo test -e "$DASHBOARD_SOURCE_PARENT" && ! sudo test -L "$DASHBOARD_SOURCE_PARENT"; then
+  sudo install -d -o '{dashboard['user']}' -g '{dashboard['user']}' -m 0700 \
+    "$DASHBOARD_SOURCE_PARENT"
+  PARENT_CREATED=1
 fi
+assert_volume_dir "$DASHBOARD_SOURCE_PARENT" 'dashboard source parent'
+PARENT_META=$(sudo stat -c '%U:%G:%a' "$DASHBOARD_SOURCE_PARENT")
+mapfile -t PARENT_CHILDREN < <(sudo find "$DASHBOARD_SOURCE_PARENT" -mindepth 1 -maxdepth 1 \
+  -printf '%f\n' | LC_ALL=C sort)
+if ((PARENT_CREATED)); then
+  [[ $PARENT_META == '{dashboard['user']}:{dashboard['user']}:700' ]] \
+    || fail 'new dashboard source parent owner or mode differs'
+  ((${{#PARENT_CHILDREN[@]}} == 0)) || fail 'new dashboard source parent is not empty'
+else
+  [[ $PARENT_META == 'root:root:700' || $PARENT_META == '{dashboard['user']}:{dashboard['user']}:700' ]] \
+    || fail 'existing dashboard source parent owner or mode differs'
+  [[ ${{#PARENT_CHILDREN[@]}} -eq 0 || \
+      (${{#PARENT_CHILDREN[@]}} -eq 1 && ${{PARENT_CHILDREN[0]}} == '{EXPECTED_V1_BINDING_NAME}') ]] \
+    || fail 'dashboard source parent contains foreign content'
+  if [[ $PARENT_META == 'root:root:700' ]]; then
+    [[ ${{#PARENT_CHILDREN[@]}} -eq 1 && ${{PARENT_CHILDREN[0]}} == '{EXPECTED_V1_BINDING_NAME}' ]] \
+      || fail 'root-owned dashboard parent is not the exact V1 residue'
+    assert_volume_dir "$V1_SOURCE_ROOT" 'V1 dashboard source residue before parent repair'
+    [[ $(sudo stat -c '%U:%G:%a' "$V1_SOURCE_ROOT") == \
+        '{dashboard['user']}:{dashboard['user']}:700' ]] \
+      || fail 'V1 dashboard source residue owner or mode differs before parent repair'
+    [[ -z $(sudo find "$V1_SOURCE_ROOT" -mindepth 1 -print -quit) ]] \
+      || fail 'V1 dashboard source residue contains foreign content before parent repair'
+    sudo chown --no-dereference '{dashboard['user']}:{dashboard['user']}' "$DASHBOARD_SOURCE_PARENT"
+    sudo chmod 0700 "$DASHBOARD_SOURCE_PARENT"
+  fi
+fi
+[[ $(stat -c '%U:%G:%a' "$DASHBOARD_SOURCE_PARENT") == \
+    '{dashboard['user']}:{dashboard['user']}:700' ]] || fail 'dashboard source parent repair differs'
+
+# Preserve and inspect V1 without following it; V2 never reuses or deletes it.
+if [[ -e "$V1_SOURCE_ROOT" || -L "$V1_SOURCE_ROOT" ]]; then
+  assert_volume_dir "$V1_SOURCE_ROOT" 'V1 dashboard source residue'
+  [[ $(stat -c '%U:%G:%a' "$V1_SOURCE_ROOT") == '{dashboard['user']}:{dashboard['user']}:700' ]] \
+    || fail 'V1 dashboard source residue owner or mode differs'
+  [[ -z $(find "$V1_SOURCE_ROOT" -mindepth 1 -print -quit) ]] \
+    || fail 'V1 dashboard source residue contains foreign content'
+fi
+[[ ! -e "$DASHBOARD_SOURCE_ROOT" && ! -L "$DASHBOARD_SOURCE_ROOT" ]] \
+  || fail 'V2 dashboard source collision after parent admission'
 sudo install -d -o '{dashboard['user']}' -g '{dashboard['user']}' -m 0700 \
   "$DASHBOARD_SOURCE_ROOT"
-[[ -d "$DASHBOARD_SOURCE_ROOT" && ! -L "$DASHBOARD_SOURCE_ROOT" ]] \
-  || fail 'dashboard source creation is unsafe'
-[[ $(readlink -f -- "$DASHBOARD_SOURCE_ROOT") == "$DASHBOARD_SOURCE_ROOT" ]] \
-  || fail 'dashboard source path differs after creation'
+assert_volume_dir "$DASHBOARD_SOURCE_ROOT" 'V2 dashboard source leaf'
+[[ $(stat -c '%U:%G:%a' "$DASHBOARD_SOURCE_ROOT") == '{dashboard['user']}:{dashboard['user']}:700' ]] \
+  || fail 'V2 dashboard source leaf owner or mode differs'
+[[ -z $(find "$DASHBOARD_SOURCE_ROOT" -mindepth 1 -print -quit) ]] \
+  || fail 'V2 dashboard source leaf is not empty'
+
 git clone --branch "$BRANCH" --single-branch "$BUNDLE" "$DASHBOARD_SOURCE_ROOT"
 [[ $(git -C "$DASHBOARD_SOURCE_ROOT" rev-parse HEAD) == "$SOURCE_COMMIT" ]] \
   || fail 'dashboard source HEAD differs'
@@ -820,24 +993,31 @@ git clone --branch "$BRANCH" --single-branch "$BUNDLE" "$DASHBOARD_SOURCE_ROOT"
   || fail 'dashboard source branch differs'
 [[ -z $(GIT_OPTIONAL_LOCKS=0 git -C "$DASHBOARD_SOURCE_ROOT" status --porcelain) ]] \
   || fail 'dashboard source is not clean'
-bash "$DASHBOARD_SOURCE_ROOT/ops/h1_dashboard_binding/bootstrap-linux.sh" \
+bash "$DASHBOARD_SOURCE_ROOT/ops/h1_dashboard_binding/bootstrap-linux-v2.sh" \
   "$DASHBOARD_SOURCE_ROOT" "$SOURCE_COMMIT"
 
 VENV_PYTHON="$DASHBOARD_SOURCE_ROOT/.venv/bin/python"
 "$VENV_PYTHON" -B "$DASHBOARD_SOURCE_ROOT/ops/h1_dashboard_binding/binding_pack.py" \
   inspect-handoff --handoff "$INCOMING_ROOT/handoff.json" >/dev/null
-RENDERED_UNIT="/tmp/h1-v8-dashboard-unit-$PID"
+RENDERED_UNIT="/tmp/h1-v8-dashboard-v2-unit-$PID"
 "$VENV_PYTHON" -B "$DASHBOARD_SOURCE_ROOT/ops/h1_dashboard_binding/binding_pack.py" \
   render-unit --plan "$INCOMING_ROOT/binding-plan.json" >"$RENDERED_UNIT"
 cmp --silent "$RENDERED_UNIT" "$UNIT_SOURCE" || fail 'canonical unit bytes differ'
 unlink "$RENDERED_UNIT"
 systemd-analyze verify "$UNIT_SOURCE"
-[[ -z $(find "$DASHBOARD_SOURCE_ROOT" -type l -print -quit) ]] \
-  || fail 'dashboard source contains a symlink before recursive freeze'
+[[ -z $(find "$DASHBOARD_SOURCE_ROOT" -xdev -type l -print -quit) ]] \
+  || fail 'dashboard source contains a symlink before freeze'
 
-# Freeze only the new dashboard source and its finalized plan. Campaign and collector stay untouched.
-sudo chown -R root:root "$DASHBOARD_SOURCE_ROOT"
-sudo chmod -R a-w "$DASHBOARD_SOURCE_ROOT"
+# Freeze only the V2 dashboard source. V1, campaign and collector stay untouched.
+sudo find "$DASHBOARD_SOURCE_ROOT" -xdev -exec chown --no-dereference root:root {{}} +
+sudo find "$DASHBOARD_SOURCE_ROOT" -xdev -exec chmod a-w {{}} +
+if [[ ! -e "$HANDOFF_PARENT" && ! -L "$HANDOFF_PARENT" ]]; then
+  sudo install -d -o root -g root -m 0755 "$HANDOFF_PARENT"
+fi
+[[ -d "$HANDOFF_PARENT" && ! -L "$HANDOFF_PARENT" ]] || fail 'handoff parent is unsafe'
+[[ $(readlink -f -- "$HANDOFF_PARENT") == "$HANDOFF_PARENT" ]] || fail 'handoff parent path differs'
+[[ $(stat -c '%U:%G:%a' "$HANDOFF_PARENT") == 'root:root:755' ]] \
+  || fail 'handoff parent owner or mode differs'
 sudo install -d -o root -g root -m 0555 "$HANDOFF_ROOT"
 sudo install -o root -g root -m 0444 "$INCOMING_ROOT/binding-plan.json" \
   "$HANDOFF_ROOT/binding-plan.json"
@@ -874,7 +1054,7 @@ for _property in "${{DASHBOARD_STATE[@]}}"; do
 done
 [[ $DASHBOARD_MAIN_PID =~ ^[1-9][0-9]*$ ]] || fail 'dashboard MainPID is not live'
 
-SNAPSHOT="/tmp/h1-v8-dashboard-snapshot-$PID.json"
+SNAPSHOT="/tmp/h1-v8-dashboard-v2-snapshot-$PID.json"
 for _attempt in $(seq 1 30); do
   if curl --fail --silent --show-error --max-time 2 \
       'http://127.0.0.1:{port}/api/h1/snapshot' >"$SNAPSHOT"; then break; fi
@@ -882,7 +1062,7 @@ for _attempt in $(seq 1 30); do
 done
 [[ -s "$SNAPSHOT" ]] || fail 'dashboard GET did not become available'
 python3.12 -I - "$SNAPSHOT" <<'PY'
-import json, pathlib, sys
+import json, pathlib, re, sys
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert payload["mode"] == "readonly"
 assert payload["orders_enabled"] is False
@@ -893,10 +1073,24 @@ assert payload["identity"]["source_commit"] == "{provenance['base_launch_commit'
 assert payload["identity"]["campaign_manifest_sha256"] == "{campaign['manifest_sha256']}"
 assert payload["identity"]["collector_source_commit"] == "{provenance['base_launch_commit']}"
 assert payload["identity"]["dashboard_source_commit"] == "{provenance['source_commit']}"
-assert payload["state"]["code"] in {{"PREPARED_NOT_STARTED", "RUNNING_HEALTHY"}}
+assert payload["state"]["code"] in {{
+    "PREPARED_NOT_STARTED", "RUNNING_HEALTHY", "INTERRUPTED_RECOVERABLE"
+}}
+for field in ("frames", "segments", "stored_bytes", "gaps", "reconnects"):
+    value = payload["collection"][field]
+    assert value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0)
+for field in ("raw_manifest_sha256", "raw_root_sha256"):
+    value = payload["identity"][field]
+    assert value is None or re.fullmatch(r"[0-9a-f]{{64}}", value)
+print(json.dumps({{
+    "collection": payload["collection"],
+    "raw_manifest_sha256": payload["identity"]["raw_manifest_sha256"],
+    "raw_root_sha256": payload["identity"]["raw_root_sha256"],
+    "state": payload["state"],
+}}, sort_keys=True))
 PY
 unlink "$SNAPSHOT"
-HEAD_BODY="/tmp/h1-v8-dashboard-head-$PID"
+HEAD_BODY="/tmp/h1-v8-dashboard-v2-head-$PID"
 HEAD_CODE=$(curl --silent --show-error --max-time 3 --request HEAD \
   --output "$HEAD_BODY" --write-out '%{{http_code}}' \
   'http://127.0.0.1:{port}/api/h1/snapshot')
@@ -908,7 +1102,7 @@ printf '%s\n' "${{LISTEN_LINES[@]}}"
 [[ ${{LISTEN_LINES[0]}} == *'127.0.0.1:{port}'* ]] || fail 'dashboard is not IPv4 loopback-only'
 [[ ${{LISTEN_LINES[0]}} != *'0.0.0.0:{port}'* && ${{LISTEN_LINES[0]}} != *'[::]'* ]] \
   || fail 'dashboard has a non-loopback listener'
-printf 'H1_V8_DASHBOARD_BINDING_STEP_02_INSTALL_GREEN\n'
+printf 'H1_V8_DASHBOARD_BINDING_V2_STEP_B_INSTALL_GREEN\n'
 
 # SECOND TABBY TAB, continuous read-only monitoring; Ctrl+C stops only watch:
 # watch -n 10 -- sh -c "systemctl show '$DASHBOARD_SERVICE' --no-pager \
@@ -922,17 +1116,25 @@ def render_windows_tunnel(plan: Mapping[str, object]) -> str:
     dashboard = checked["dashboard"]
     assert isinstance(dashboard, dict)
     port = dashboard["bind_port"]
-    return rf"""# STEP 03/03 - LOCATION: Windows PowerShell on the Beelink.
-# PREREQUISITE: Tabby printed H1_V8_DASHBOARD_BINDING_STEP_02_INSTALL_GREEN.
+    return rf"""[CmdletBinding()]
+param([switch] $SelfCheck)
+
+# STEP C/3 - LOCATION: Windows PowerShell 5.1 on the Beelink.
+# PREREQUISITE: Tabby printed H1_V8_DASHBOARD_BINDING_V2_STEP_B_INSTALL_GREEN.
 # EXPECTED_DURATION: continuous foreground session; MAXIMUM_DURATION: operator-controlled.
 # PROMPTS: SSH host-key trust or SSH-key passphrase only; HyperLab never prompts.
 # MONITORING: browser http://127.0.0.1:{port}; SSH keepalives detect a dead tunnel.
 # CTRL+C: closes only this tunnel; it never stops or restarts either VPS service.
 # TERMINAL_SIGNAL: ssh remains foreground; a successful browser GET is the signal.
 $ErrorActionPreference = 'Stop'
+if ($SelfCheck) {{
+    Write-Output 'H1_V8_DASHBOARD_BINDING_V2_STEP_C_SELFCHECK_GREEN'
+    return
+}}
 $SshKey = "$env:USERPROFILE\.ssh\hyperlab_hetzner"
-if ((Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort {port} `
-        -State Listen -ErrorAction SilentlyContinue)) {{ throw 'Local endpoint already used.' }}
+if ((Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue)) {{
+    throw 'Local port already used.'
+}}
 & ssh.exe -N -T -i $SshKey `
     -o ClearAllForwardings=yes `
     -o ExitOnForwardFailure=yes `
@@ -947,7 +1149,7 @@ def _write_exclusive(path: Path, payload: bytes, *, executable: bool = False) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
         path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
         0o700 if executable else 0o600,
     )
     try:
@@ -962,6 +1164,18 @@ def _write_exclusive(path: Path, payload: bytes, *, executable: bool = False) ->
         os.close(descriptor)
 
 
+def validate_lf_shell_bytes(payload: bytes, *, label: str) -> bytes:
+    if not payload or b"\x00" in payload or b"\r" in payload:
+        raise BindingPackError(f"{label} must be non-empty LF-only shell bytes")
+    if payload.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+        raise BindingPackError(f"{label} must be UTF-8 without BOM")
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise BindingPackError(f"{label} must be UTF-8") from error
+    return payload
+
+
 def finalize_binding_pack(
     *,
     repo_root: Path,
@@ -970,7 +1184,7 @@ def finalize_binding_pack(
     output_root: Path,
     source_commit: str,
 ) -> dict[str, object]:
-    expected_input = repo_root / "ops" / "h1_dashboard_binding" / "binding-input-v8.json"
+    expected_input = repo_root / "ops" / "h1_dashboard_binding" / INPUT_FILENAME
     if input_path != expected_input or input_path.resolve(strict=True) != input_path:
         raise BindingPackError("binding input path differs from the tracked frozen V8 input")
     binding_input = validate_frozen_v8_input(_load_object(input_path))
@@ -985,31 +1199,59 @@ def finalize_binding_pack(
     handoff = build_handoff(repo_root=repo_root, plan=plan, bundle_path=bundle_path)
     dashboard = plan["dashboard"]
     assert isinstance(dashboard, dict)
-    source_pack = repo_root / "ops" / "h1_dashboard_binding"
-
     _write_exclusive(
-        output_root / "binding-input-v8.json", canonical_json_bytes(binding_input) + b"\n"
+        output_root / INPUT_FILENAME, canonical_json_bytes(binding_input) + b"\n"
     )
     _write_exclusive(output_root / "binding-plan.json", canonical_json_bytes(plan) + b"\n")
     _write_exclusive(output_root / "handoff.json", canonical_json_bytes(handoff) + b"\n")
-    _write_exclusive(output_root / "README.md", (source_pack / "README.md").read_bytes())
     _write_exclusive(
-        output_root / "scripts" / "bootstrap-linux.sh",
-        (source_pack / "bootstrap-linux.sh").read_bytes(),
+        output_root / "README.md",
+        portable_git_file_bytes(repo_root, "ops/h1_dashboard_binding/README.md"),
+    )
+    _write_exclusive(
+        output_root / "scripts" / "bootstrap-linux-v2.sh",
+        validate_lf_shell_bytes(
+            portable_git_file_bytes(
+                repo_root, "ops/h1_dashboard_binding/bootstrap-linux-v2.sh"
+            ),
+            label="bootstrap-linux-v2.sh",
+        ),
         executable=True,
     )
     _write_exclusive(
         output_root / "systemd" / str(dashboard["service_name"]),
         render_systemd_unit(plan).encode("utf-8"),
     )
+    operator_paths = (
+        output_root / "operator" / "A-windows-transfer.ps1",
+        output_root / "operator" / "B-tabby-vps-install.sh",
+        output_root / "operator" / "C-windows-tunnel.ps1",
+    )
+    operator_payloads = (
+        render_windows_transfer(handoff).encode("utf-8"),
+        render_tabby_install(handoff).encode("utf-8"),
+        render_windows_tunnel(plan).encode("utf-8"),
+    )
+    for path, payload in zip(operator_paths, operator_payloads, strict=True):
+        _write_exclusive(
+            path,
+            validate_lf_shell_bytes(payload, label=path.name),
+            executable=path.suffix == ".sh",
+        )
+    for shell_path in (
+        output_root / "scripts" / "bootstrap-linux-v2.sh",
+        *operator_paths,
+    ):
+        validate_lf_shell_bytes(shell_path.read_bytes(), label=f"materialized {shell_path.name}")
     essential_paths = (
         bundle_path,
         output_root / "README.md",
-        output_root / "binding-input-v8.json",
+        output_root / INPUT_FILENAME,
         output_root / "binding-plan.json",
         output_root / "handoff.json",
-        output_root / "scripts" / "bootstrap-linux.sh",
+        output_root / "scripts" / "bootstrap-linux-v2.sh",
         output_root / "systemd" / str(dashboard["service_name"]),
+        *operator_paths,
     )
     inventory = [
         f"{sha256_file(path)}  {path.relative_to(output_root).as_posix()}"
@@ -1021,18 +1263,6 @@ def finalize_binding_pack(
         ("\n".join(inventory) + "\n").encode("ascii"),
     )
     inventory_sha256 = sha256_file(inventory_path)
-    _write_exclusive(
-        output_root / "operator" / "01-windows-transfer.ps1.txt",
-        render_windows_transfer(handoff, inventory_sha256).encode("utf-8"),
-    )
-    _write_exclusive(
-        output_root / "operator" / "02-tabby-vps-install.sh.txt",
-        render_tabby_install(handoff, inventory_sha256).encode("utf-8"),
-    )
-    _write_exclusive(
-        output_root / "operator" / "03-windows-tunnel.ps1.txt",
-        render_windows_tunnel(plan).encode("utf-8"),
-    )
     _validate_source_causality(repo_root, plan=plan, bundle_path=bundle_path)
     return {
         "bundle_sha256": sha256_file(bundle_path),
@@ -1133,7 +1363,10 @@ def run_service_preflight(plan_path: Path) -> dict[str, object]:
         or plan_details.st_mode & 0o222
     ):
         raise BindingPackError("service plan must be a root-owned read-only regular file")
-    if os.getuid() == 0:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise BindingPackError("dashboard service preflight requires Linux")
+    if getuid() == 0:
         raise BindingPackError("dashboard service must be unprivileged")
     for name in FORBIDDEN_ENVIRONMENT:
         if os.getenv(name):
@@ -1167,8 +1400,11 @@ def run_service_preflight(plan_path: Path) -> dict[str, object]:
     for key, expected in campaign["manifest_checks"].items():
         if manifest.get(key) != expected:
             raise BindingPackError(f"campaign manifest {key} differs")
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        raise BindingPackError("dashboard service preflight requires statvfs")
     readonly_flag = getattr(os, "ST_RDONLY", 1)
-    if not os.statvfs(campaign_root).f_flag & readonly_flag:
+    if not statvfs(campaign_root).f_flag & readonly_flag:
         raise BindingPackError("campaign root is not read-only inside the dashboard namespace")
     properties = _systemctl_show_collector(str(campaign["collector_service"]))
     if properties.get("Id") != campaign["collector_service"]:

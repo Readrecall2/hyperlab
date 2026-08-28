@@ -1,0 +1,38 @@
+{
+  "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+  "campaign": {
+    "campaign_id": "h1-68c6493652abd667420b9a5b",
+    "campaign_root": "/mnt/HC_Volume_106716684/hyperlab-h1/campaigns/h1-20260827t004500z-5973abde",
+    "campaign_slug": "h1-20260827t004500z-5973abde",
+    "collector_service": "hyperlab-h1-20260827t004500z-5973abde.service",
+    "collector_source_root": "/mnt/HC_Volume_106716684/hyperlab-h1/sources/h1-20260827t004500z-5973abde",
+    "manifest_checks": {
+      "boundary": "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY",
+      "campaign_id": "h1-68c6493652abd667420b9a5b",
+      "schema_version": 1,
+      "starts_at_utc": "2026-08-27T00:45:00Z"
+    },
+    "manifest_sha256": "3d8aeb91115ca7302266f85e55a2cd89404adbf4285991c35ad5c55b2647c2d5",
+    "starts_at_utc": "2026-08-27T00:45:00Z"
+  },
+  "dashboard": {
+    "bind_host": "127.0.0.1",
+    "bind_port": 18080,
+    "handoff_root": "/etc/hyperlab-h1-dashboard/h1-20260827t004500z-5973abde-dashboard-v2",
+    "incoming_root": "/home/hyperlab/hyperlab-h1/dashboard-bindings/h1-20260827t004500z-5973abde-dashboard-v2",
+    "policy_path": "config/research/hyperliquid-h1-ghost-v1.json",
+    "remote_host": "5.223.60.130",
+    "runtime_directory": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v2",
+    "service_name": "hyperlab-h1-dashboard-20260827t004500z-5973abde-v2.service",
+    "source_root": "/mnt/HC_Volume_106716684/hyperlab-h1/dashboard-sources/h1-20260827t004500z-5973abde-dashboard-v2",
+    "user": "hyperlab"
+  },
+  "provenance": {
+    "base_launch_commit": "926c878718c9f7d4095526061893e9f041d40c2b",
+    "branch": "codex/h1-v7-dashboard-binding-v1",
+    "dashboard_integration_commit": "cda0681b726fadba1a77bd72d2fca9f84dd14566",
+    "dashboard_original_commit": "decb0e08aeabff71859fad052b84bff4af0ed990"
+  },
+  "schema_version": 1,
+  "status": "H1_V8_DASHBOARD_BINDING_V2_GREEN_CRLF_PARENT_OWNERSHIP_FIXED_PUSHED_AWAITING_HUMAN_TRANSFER"
+}

@@ -1,86 +1,97 @@
-# H1 V8 Dashboard Binding V1
+# H1 V8 Dashboard Binding V2 — correction CRLF et parent dédié
 
-Ce pack lie le cockpit H1 read-only à la campagne V8
-`h1-20260827t004500z-5973abde`. Il ne modifie, ne redémarre et ne remplace
-jamais le collecteur existant. Il ne contient aucune route d'ordre, aucun
-wallet, signer, secret, endpoint privé ou accès real-money.
+Ce pack lie le cockpit read-only à la campagne V8
+`h1-20260827t004500z-5973abde` sans modifier son collecteur, ses artefacts ou
+son holdout. Il corrige causalement les deux refus V1 observés : scripts
+matérialisés en CRLF et création implicite de `dashboard-sources` par
+`install -d` sous `umask 077`.
 
-L'input suivi `binding-input-v8.json` fige la base collecteur, le cherry-pick du
-dashboard et son commit original, l'identité campagne/manifest, les chemins VPS,
-le service dashboard séparé et `127.0.0.1:18080`. Il omet volontairement le
-commit source final. Après le commit final, le générateur PowerShell l'injecte
-dans `binding-plan.json` et vérifie :
+La preuve V1 figée comptait 169 CRLF dans le script d'installation : SHA-256
+original `c39229842aaa66c831d32a3cef8a5bad7445489d4f7e16f587cf448ee3308f53`,
+SHA-256 du flux LF authentifié
+`17d7c37f6166c4da6043a5acc0c962b4c2e68b9791193c14bdd743c9a5c1a5ec`.
+Le second refus a établi le parent dédié `root:root:0700` et un leaf V1
+inaccessible, sans clone, handoff, unité ou dashboard installé.
 
-- HEAD, branche historique exacte et worktree propre ;
-- parent direct `base -> integration`, puis ancestry `integration -> source` ;
-- marqueur exact du cherry-pick vers le commit dashboard original ;
-- Git bundle exposant uniquement la ref attendue au commit final ;
-- hashes des fichiers suivis, du bundle et des artefacts essentiels transmis.
+Le pack V1, son incoming et son leaf partiel restent conservés. V2 utilise des
+identités neuves :
 
-`binding-files.sha256` couvre l'ensemble essentiel non circulaire : bundle,
-input, plan, handoff, README, bootstrap et unité. Son propre SHA-256 est injecté
-dans les étapes 01 et 02 ; chacune vérifie ce pin avant de parser la liste ou
-d'appeler `sha256sum -c`. Les blocs opérateur sont produits seulement après ce
-gel, ce qui évite toute auto-référence.
+- incoming : `/home/hyperlab/hyperlab-h1/dashboard-bindings/h1-20260827t004500z-5973abde-dashboard-v2` ;
+- source : `/mnt/HC_Volume_106716684/hyperlab-h1/dashboard-sources/h1-20260827t004500z-5973abde-dashboard-v2` ;
+- handoff : `/etc/hyperlab-h1-dashboard/h1-20260827t004500z-5973abde-dashboard-v2` ;
+- service : `hyperlab-h1-dashboard-20260827t004500z-5973abde-v2.service`.
 
-L'unité générée écoute uniquement sur IPv4 loopback, monte le campaign root par
-self-bind en lecture seule, rend la source et le handoff immuables, utilise
-`ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges`, aucune capacité,
-aucun fichier de secrets et aucune écriture dans la campagne. Son préflight
-vérifie le manifest canonique, les checkouts source, le port et le collecteur via
-la seule commande `systemctl show`.
+Tous les scripts exécutables ont une extension native `.ps1` ou `.sh` et des
+octets UTF-8/LF sans BOM, NUL ou CR. Les trois scripts opérateur sont inclus
+dans `binding-files.sha256`. Pour éviter une identité circulaire, le SHA-256 de
+cet inventaire est un argument obligatoire de A et B ; il est publié par le
+générateur après matérialisation complète.
 
-La preuve runtime opérateur acquise le `2026-08-27T00:45:31Z` est
-`H1_SERVICE_RUNNING_HEALTH_GREEN` : collecteur active/running, PID principal
-`118072`, `NRestarts=0`, `ExecMainStatus=0`, santé terminale `RUNNING`. Après
-21,106 s, la santé publiée comptait 834 frames, 0 gap, 0 reconnect, un
-`queue_high_water` de 9, 0 segment et 0 octet stocké, sans erreur. Ces valeurs
-sont une observation historique, pas un pin de disponibilité : le cockpit
-représente honnêtement les zéros initiaux et admet un manifest raw encore nul
-pendant `RUNNING_HEALTHY` sans ouvrir le holdout ni inventer une erreur.
+## Frontière opérationnelle
 
-## 00 — Finalisation locale après le commit final
+Le dashboard écoute uniquement `127.0.0.1:18080`, répond uniquement à GET/HEAD,
+publie `mode=readonly` et `orders_enabled=false`, et n'est accessible depuis le
+navigateur du Beelink que par le tunnel SSH local C. Aucun firewall n'est
+ouvert. L'unité utilise notamment `ProtectSystem=strict`, `NoNewPrivileges=yes`,
+un jeu de capacités vide, aucun secret et un bind read-only de la campagne.
 
-- lieu : Windows PowerShell, dans le worktree isolé du Beelink ;
-- durée attendue : 1–3 minutes ; maximum : 10 minutes ;
+Le script B ne contient pour le collecteur que `systemctl show` et des lectures
+d'artefacts/checkouts. Il ne lance aucune action start/restart/stop/enable,
+disable ou recovery sur H1. Avant toute création, il refuse si le port 18080,
+le service V2, le handoff V2 ou le leaf V2 existent déjà.
+
+Le parent `dashboard-sources` est créé séparément du leaf. S'il existe en
+`root:root:0700`, B ne corrige que ce parent avec un `chown --no-dereference`
+non récursif, et seulement si son unique contenu est le résidu V1 exact,
+répertoire réel `hyperlab:hyperlab:0700`, vide, canonique et sur le device
+attendu. Les liens, contenus étrangers, modes, propriétaires ou devices
+divergents sont refusés. Le leaf V1 est inspecté sans suivre de lien et n'est
+jamais supprimé, réutilisé ou modifié.
+
+## État H1 acquis, non requalifié
+
+L'observation autoritaire fournie avant V2 est `INTERRUPTED_RECOVERABLE` :
+3 999 005 frames, 358 segments, 1 092 828 859 octets, 0 gap et 19 reconnects.
+Le collecteur est active/running mais totalise 66 redémarrages. Ce n'est pas une
+preuve `RUNNING_HEALTHY` et ce pack n'effectue aucune recovery. Le cockpit admet
+et affiche honnêtement `INTERRUPTED_RECOVERABLE`, les compteurs y compris zéro,
+et un hash raw/final optionnel nul sans fabriquer d'erreur. Le holdout demeure
+scellé.
+
+## Génération locale après le commit final
+
+- lieu : Windows PowerShell 5.1, worktree isolé Beelink ;
+- durée attendue : 1–3 minutes, maximum 10 minutes ;
 - prompts : aucun ;
-- monitoring : validation input, Git bundle, SHA-256 et inventaire final ;
-- Ctrl+C : interrompt uniquement la génération locale, sans action VPS ;
-- signal terminal :
-  `H1_V8_DASHBOARD_BINDING_WINDOWS_BUNDLE_FINALIZED_NOT_TRANSFERRED`.
+- monitoring : bundle Git, SHA-256, inventaire et verdict final ;
+- Ctrl+C : interrompt uniquement la génération locale ;
+- signal : `H1_V8_DASHBOARD_BINDING_V2_WINDOWS_BUNDLE_FINALIZED_NOT_TRANSFERRED`.
 
 ```powershell
-& '.\ops\h1_dashboard_binding\New-H1V8DashboardBindingBundle.ps1' `
+& '.\ops\h1_dashboard_binding\New-H1V8DashboardBindingV2Bundle.ps1' `
   -Commit '<COMMIT_FINAL_40_HEX>' `
-  -OutputRoot 'C:\hyperlab-offline-validation\h1-v8-dashboard-binding-v1'
+  -OutputRoot 'C:\hyperlab-offline-validation\h1-v8-dashboard-binding-v2'
 ```
 
-Le répertoire de sortie doit être nouveau. Le générateur refuse toute branche,
-source, causalité ou propreté divergente.
+Le répertoire de sortie doit être nouveau. Le générateur refuse une branche,
+un HEAD, un ref, une causalité ou une propreté divergents.
 
-## 01–03 — Exécution humaine ordonnée
+## A, B, C — exécution humaine strictement ordonnée
 
-Exécuter ensuite, sans les fusionner :
+1. Dans Windows PowerShell sur le Beelink, exécuter le fichier natif
+   `operator/A-windows-transfer.ps1` depuis n'importe quel cwd avec
+   `-ExpectedInventorySha256 <SHA256_INVENTAIRE>`. Son signal vert signifie
+   seulement transfert terminé ; le dashboard n'est pas installé.
+2. Dans Tabby/Bash sur le VPS, exécuter
+   `bash ./operator/B-tabby-vps-install.sh <SHA256_INVENTAIRE>`. Le signal vert
+   confirme le service V2 séparé, le listener loopback et les contrats GET/HEAD.
+3. Après ce signal uniquement, dans Windows PowerShell sur le Beelink, exécuter
+   `operator/C-windows-tunnel.ps1`. Le processus SSH reste au premier plan ;
+   Ctrl+C ferme uniquement le tunnel.
 
-1. `operator/01-windows-transfer.ps1.txt` dans Windows PowerShell sur le
-   Beelink. Le signal terminal confirme uniquement le transfert, pas
-   l'installation.
-2. `operator/02-tabby-vps-install.sh.txt` dans Tabby/Bash sur le VPS. Ce bloc
-   clone le bundle vers une source dashboard dédiée, crée le venv hash-locké,
-   compare le rendu canonique de l'unité, rend source et plan root-owned/read-only,
-   installe et démarre uniquement le service dashboard, puis vérifie GET, HEAD et
-   l'unique listener `127.0.0.1:18080`.
-3. `operator/03-windows-tunnel.ps1.txt` dans Windows PowerShell uniquement après
-   le signal vert Tabby. Le tunnel foreground est strictement
-   `ssh -N -T -L 127.0.0.1:18080:127.0.0.1:18080` avec
-   `ClearAllForwardings=yes` et `ExitOnForwardFailure=yes`. Ctrl+C ferme seulement
-   ce tunnel.
+Chaque script contient son lieu, sa durée attendue/maximale, ses prompts, son
+monitoring, l'effet de Ctrl+C et son signal terminal. Le monitoring continu
+proposé dans un second onglet Tabby est read-only.
 
-Chaque bloc contient son lieu, ses durées attendue/maximale, ses prompts, son
-monitoring, l'effet de Ctrl+C et son signal terminal. Aucun bloc n'ouvre de
-firewall. Le second onglet Tabby proposé est purement read-only ; le dashboard
-suit `PREPARED_NOT_STARTED -> RUNNING_HEALTHY` sans relance ni mutation de la
-campagne. Le holdout demeure scellé.
-
-Verdict du pack :
-`H1_V8_DASHBOARD_BINDING_V1_GREEN_AWAITING_HUMAN_VPS_EXECUTION`.
+Verdict local attendu :
+`H1_V8_DASHBOARD_BINDING_V2_GREEN_CRLF_PARENT_OWNERSHIP_FIXED_PUSHED_AWAITING_HUMAN_TRANSFER`.

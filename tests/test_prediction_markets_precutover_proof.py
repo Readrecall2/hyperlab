@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -110,6 +113,7 @@ def _synthetic_runtime_pack(tmp_path: Path) -> tuple[Path, Path, str]:
         "bundle_filename": bundle.name,
         "bundle_sha256": launch_pack.sha256_file(bundle),
         "campaign_root": f"{volume}/campaigns/{slug}",
+        "disk": {"required_free_bytes": 194_347_270_144},
         "incoming_root": incoming,
         "run_slug": slug,
         "schema_version": 1,
@@ -157,7 +161,8 @@ def test_proof_pack_finalizes_authenticates_and_verifies_retrieved_output(
         expected_branch=AUDIT_BRANCH,
     )
     assert result["terminal_signal"] == (
-        "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_GREEN_AWAITING_HUMAN_EXECUTION"
+        "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V2_GREEN_"
+        "OS_RELEASE_LAYOUT_FIXED_AWAITING_HUMAN_EXECUTION"
     )
     verified = precutover_proof.verify_input(proof_pack.resolve(strict=True))
     assert verified["source_commit"] == commit
@@ -170,7 +175,9 @@ def test_proof_pack_finalizes_authenticates_and_verifies_retrieved_output(
     ).read_text(encoding="utf-8")
     assert "/usr/bin/env -i HOME=/home/hyperlab PATH=/usr/bin:/bin" in production_b0
     assert "GIT_ALLOW_PROTOCOL=file" in production_b0
-    assert '== "/usr/bin/$command"' in production_b0
+    assert production_b0.index("verify-linux-environment") < production_b0.index(
+        "git clone --no-checkout"
+    )
 
     manifest, manifest_digest = precutover_proof._proof_manifest(proof_pack)
     evidence = tmp_path / "retrieved-evidence"
@@ -245,6 +252,282 @@ def test_proof_pack_finalizes_authenticates_and_verifies_retrieved_output(
         precutover_proof.verify_input(proof_pack)
 
 
+def _os_release_layout(tmp_path: Path) -> tuple[Path, Path, int]:
+    logical = tmp_path / "etc" / "os-release"
+    target = tmp_path / "usr" / "lib" / "os-release"
+    logical.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    target.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8", newline="\n")
+    target.chmod(0o644)
+    return logical, target, target.lstat().st_uid
+
+
+def _safe_test_file_identity(path: Path) -> precutover_proof._FileIdentity:
+    value = precutover_proof._file_identity(path)
+    return replace(value, mode=stat.S_IFREG | 0o644)
+
+
+def _symlink_test_readers(
+    logical: Path,
+    target: Path,
+    link: str,
+    *,
+    target_identity: precutover_proof._FileIdentity | None = None,
+    resolved: Path | None = None,
+) -> tuple[
+    Callable[[Path], precutover_proof._FileIdentity],
+    Callable[[Path], str],
+    Callable[[Path], Path],
+]:
+    selected_identity = target_identity or _safe_test_file_identity(target)
+    logical_identity = replace(
+        selected_identity,
+        inode=selected_identity.inode + 1,
+        mode=stat.S_IFLNK | 0o777,
+        size=len(link.encode()),
+    )
+
+    def identity(path: Path) -> precutover_proof._FileIdentity:
+        return logical_identity if path == logical else selected_identity
+
+    def readlink(path: Path) -> str:
+        assert path == logical
+        return link
+
+    def resolve(path: Path) -> Path:
+        assert path == logical
+        return resolved or target
+
+    return identity, readlink, resolve
+
+
+def test_os_release_accepts_safe_regular_file_and_authenticates_content(
+    tmp_path: Path,
+) -> None:
+    logical, _target, uid = _os_release_layout(tmp_path)
+    logical.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8", newline="\n")
+    logical.chmod(0o644)
+    values, evidence = precutover_proof._read_os_release(
+        logical,
+        tmp_path / "usr" / "lib" / "os-release",
+        required_uid=uid,
+        identity_reader=_safe_test_file_identity,
+    )
+    assert values == {"ID": "ubuntu", "VERSION_ID": "24.04"}
+    assert evidence["layout"] == "regular"
+    assert evidence["logical_path"] == str(logical)
+    assert evidence["resolved_path"] == str(logical)
+    assert evidence["content_sha256"] == precutover_proof.sha256_file(logical)
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_os_release_accepts_only_direct_canonical_ubuntu_symlink(
+    tmp_path: Path,
+    absolute: bool,
+) -> None:
+    logical, target, uid = _os_release_layout(tmp_path)
+    link = str(target) if absolute else os.path.relpath(target, logical.parent)
+    identity, readlink, resolve = _symlink_test_readers(logical, target, link)
+    values, evidence = precutover_proof._read_os_release(
+        logical,
+        target,
+        required_uid=uid,
+        identity_reader=identity,
+        link_reader=readlink,
+        resolve_reader=resolve,
+    )
+    assert values["ID"] == "ubuntu"
+    assert evidence["layout"] == (
+        "canonical_absolute_symlink" if absolute else "canonical_relative_symlink"
+    )
+    assert evidence["symlink_target"] == link
+    assert evidence["resolved_path"] == str(target)
+    assert evidence["target_metadata"]["uid"] == uid  # type: ignore[index]
+
+
+def test_os_release_refuses_wrong_target_and_symlink_chain(tmp_path: Path) -> None:
+    logical, target, uid = _os_release_layout(tmp_path)
+    wrong = tmp_path / "wrong-os-release"
+    wrong.write_text("ID=ubuntu\n", encoding="utf-8", newline="\n")
+    wrong.chmod(0o644)
+    wrong_link = str(wrong)
+    identity, readlink, resolve = _symlink_test_readers(logical, target, wrong_link)
+    with pytest.raises(precutover_proof.ProofError, match="not the canonical Ubuntu target"):
+        precutover_proof._read_os_release(
+            logical,
+            target,
+            required_uid=uid,
+            identity_reader=identity,
+            link_reader=readlink,
+            resolve_reader=resolve,
+        )
+
+    ultimate = tmp_path / "ultimate-os-release"
+    ultimate.write_text("ID=ubuntu\n", encoding="utf-8", newline="\n")
+    ultimate.chmod(0o644)
+    canonical_link = os.path.relpath(target, logical.parent)
+    identity, readlink, resolve = _symlink_test_readers(
+        logical,
+        target,
+        canonical_link,
+        resolved=ultimate,
+    )
+    with pytest.raises(precutover_proof.ProofError, match="ambiguous"):
+        precutover_proof._read_os_release(
+            logical,
+            target,
+            required_uid=uid,
+            identity_reader=identity,
+            link_reader=readlink,
+            resolve_reader=resolve,
+        )
+
+
+def test_os_release_refuses_absent_or_linked_canonical_target(tmp_path: Path) -> None:
+    logical, target, uid = _os_release_layout(tmp_path)
+    link = os.path.relpath(target, logical.parent)
+    safe_target = _safe_test_file_identity(target)
+    identity, readlink, resolve = _symlink_test_readers(logical, target, link)
+
+    def absent_target(path: Path) -> precutover_proof._FileIdentity:
+        if path == target:
+            raise FileNotFoundError(target)
+        return identity(path)
+
+    with pytest.raises(precutover_proof.ProofError, match="absent or unreadable"):
+        precutover_proof._read_os_release(
+            logical,
+            target,
+            required_uid=uid,
+            identity_reader=absent_target,
+            link_reader=readlink,
+            resolve_reader=resolve,
+        )
+
+    linked_target = replace(safe_target, mode=stat.S_IFLNK | 0o777)
+    identity, readlink, resolve = _symlink_test_readers(
+        logical,
+        target,
+        link,
+        target_identity=linked_target,
+    )
+    with pytest.raises(precutover_proof.ProofError, match="not a regular file"):
+        precutover_proof._read_os_release(
+            logical,
+            target,
+            required_uid=uid,
+            identity_reader=identity,
+            link_reader=readlink,
+            resolve_reader=resolve,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("group_writable", "group/world writable"),
+        ("non_regular", "not a regular file"),
+        ("oversized", "oversized"),
+        ("wrong_uid", "not owned by root"),
+    ],
+)
+def test_os_release_refuses_unsafe_target_metadata(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    logical, _target, uid = _os_release_layout(tmp_path)
+    target = tmp_path / "usr" / "lib" / "os-release"
+    target_value = _safe_test_file_identity(target)
+    if mutation == "group_writable":
+        target_value = replace(target_value, mode=target_value.mode | stat.S_IWGRP)
+    elif mutation == "non_regular":
+        target_value = replace(target_value, mode=stat.S_IFDIR | 0o755)
+    elif mutation == "oversized":
+        target_value = replace(
+            target_value,
+            size=precutover_proof._OS_RELEASE_MAXIMUM_BYTES + 1,
+        )
+    else:
+        target_value = replace(target_value, uid=uid + 1)
+    link = os.path.relpath(target, logical.parent)
+    identity, readlink, resolve = _symlink_test_readers(
+        logical,
+        target,
+        link,
+        target_identity=target_value,
+    )
+
+    with pytest.raises(precutover_proof.ProofError, match=message):
+        precutover_proof._read_os_release(
+            logical,
+            target,
+            required_uid=uid,
+            identity_reader=identity,
+            link_reader=readlink,
+            resolve_reader=resolve,
+        )
+
+
+def test_os_release_refuses_toctou_mutation(tmp_path: Path) -> None:
+    logical, _target, uid = _os_release_layout(tmp_path)
+    logical.write_text("ID=ubuntu\n", encoding="utf-8", newline="\n")
+    logical.chmod(0o644)
+
+    def mutating_read(path: Path) -> bytes:
+        raw = path.read_bytes()
+        path.write_bytes(raw + b"MUTATED=1\n")
+        return raw
+
+    with pytest.raises(precutover_proof.ProofError, match="mutated during authentication"):
+        precutover_proof._read_os_release(
+            logical,
+            tmp_path / "usr" / "lib" / "os-release",
+            required_uid=uid,
+            bytes_reader=mutating_read,
+            identity_reader=_safe_test_file_identity,
+        )
+
+
+def test_readonly_preflight_accumulates_all_independent_failures() -> None:
+    def refuse(detail: str) -> dict[str, object]:
+        raise precutover_proof.ProofError(detail)
+
+    checks = {
+        "os_release": ("OS_RELEASE_REFUSED", lambda: refuse("bad os-release")),
+        "capacity": ("CAPACITY_REFUSED", lambda: refuse("low capacity")),
+        "wheelhouse": ("WHEELHOUSE_TAGS_REFUSED", lambda: refuse("wrong tags")),
+        "independent_green": ("UNUSED", lambda: {"value": "green"}),
+    }
+    results, incompatibilities = precutover_proof._collect_readonly_preflight(checks)
+    assert [row["code"] for row in incompatibilities] == [
+        "OS_RELEASE_REFUSED",
+        "CAPACITY_REFUSED",
+        "WHEELHOUSE_TAGS_REFUSED",
+    ]
+    assert results["independent_green"]["status"] == "green"  # type: ignore[index]
+
+
+def test_wheelhouse_names_are_linux_cpython312_compatible_or_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    for name in (
+        "pure-1.0-py3-none-any.whl",
+        "native-1.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+    ):
+        (wheelhouse / name).write_bytes(b"SYNTHETIC/FIXTURE")
+    monkeypatch.setattr(precutover_proof.platform, "libc_ver", lambda: ("glibc", "2.39"))
+    assert precutover_proof._wheelhouse_compatibility(tmp_path)["count"] == 2
+    (wheelhouse / "wrong-1.0-cp312-cp312-win_amd64.whl").write_bytes(
+        b"SYNTHETIC/FIXTURE"
+    )
+    with pytest.raises(precutover_proof.ProofError, match=r"wrong-1\.0.*win_amd64"):
+        precutover_proof._wheelhouse_compatibility(tmp_path)
+
+
 def _b0_fixture(tmp_path: Path, *, fail_linux: bool) -> tuple[Path, dict[str, str], Path, Path]:
     incoming = tmp_path / "incoming" / "pm-20260828t220000z-deadbeef"
     source = tmp_path / "volume" / "sources" / incoming.name
@@ -296,7 +579,11 @@ def _b0_fixture(tmp_path: Path, *, fail_linux: bool) -> tuple[Path, dict[str, st
         fake_bin,
         "python3.12",
         "printf 'python|%s\\n' \"$*\" >> \"$HYPERLAB_FAKE_LOG\"\n"
-        "if [[ $* == *verify-linux-environment* && ${HYPERLAB_FAIL_LINUX:-0} == 1 ]]; then exit 4; fi\n",
+        "if [[ $* == *verify-linux-environment* && ${HYPERLAB_FAIL_LINUX:-0} == 1 ]]; then\n"
+        "  printf '%s\\n' '{\"clone_started\":false,\"compatible\":false,\"incompatibilities\":[{\"code\":\"OS_RELEASE_REFUSED\"},{\"code\":\"CAPACITY_REFUSED\"},{\"code\":\"WHEELHOUSE_TAGS_REFUSED\"}],\"mutation_performed\":false,\"phase\":\"BEFORE_CLONE\"}'\n"
+        "  printf '%s\\n' 'PREDICTION_LINUX_PRECUTOVER_PREFLIGHT_REFUSED:codes=OS_RELEASE_REFUSED,CAPACITY_REFUSED,WHEELHOUSE_TAGS_REFUSED' >&2\n"
+        "  exit 4\n"
+        "fi\n",
     )
     _write_command(
         fake_bin,
@@ -402,12 +689,20 @@ def test_b0_executes_real_bounded_control_flow_and_stops_before_every_cutover(
         "ssh",
         "scp",
         "nc",
+        "ss",
+        "lsof",
+        "fuser",
     ):
         assert re.search(
             rf"(?<![A-Za-z0-9_-]){re.escape(forbidden)}(?![A-Za-z0-9_-])",
             executable,
         ) is None
     assert "timeout --signal=TERM --kill-after=30s 35m" in executable
+    campaign_lines = [line.strip() for line in executable.splitlines() if "CAMPAIGN_ROOT" in line]
+    assert campaign_lines[0].startswith("CAMPAIGN_ROOT=")
+    assert all(
+        line.startswith("[[ ! -e $CAMPAIGN_ROOT") for line in campaign_lines[1:]
+    )
     assert executable.index("write-report") < executable.index(
         f"printf '{precutover_proof.TERMINAL_SIGNAL}"
     )
@@ -429,6 +724,16 @@ def test_b0_linux_refusal_never_clones_or_false_greens(tmp_path: Path) -> None:
     assert any("verify-input" in line for line in lines)
     assert any("verify-linux-environment" in line for line in lines)
     assert not any(line.startswith("git|") for line in lines)
+    for code in (
+        "OS_RELEASE_REFUSED",
+        "CAPACITY_REFUSED",
+        "WHEELHOUSE_TAGS_REFUSED",
+    ):
+        assert code in completed.stdout
+        assert code in completed.stderr
+    assert '"clone_started":false' in completed.stdout
+    assert '"mutation_performed":false' in completed.stdout
+    assert completed.stderr.count(precutover_proof.PREFLIGHT_REFUSED) == 1
     assert precutover_proof.TERMINAL_SIGNAL not in completed.stdout
     assert not campaign.exists()
 

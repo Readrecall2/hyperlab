@@ -11,7 +11,8 @@ import shutil
 import stat
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
@@ -22,7 +23,7 @@ except ImportError:  # pragma: no cover - Windows pack verification path
     pwd = None  # type: ignore[assignment]
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-PROOF_ID = "prediction-markets-linux-precutover-proof-v1"
+PROOF_ID = "prediction-markets-linux-precutover-proof-v2"
 EXPECTED_PROOF_BRANCH = "codex/prediction-markets-v3-independent-audit"
 TERMINAL_SIGNAL = "PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER"
 TRANSFER_SIGNAL = "PREDICTION_LINUX_PRECUTOVER_PROOF_WINDOWS_TRANSFER_VERIFIED"
@@ -40,6 +41,25 @@ OUTPUT_INVENTORY = "linux-precutover-proof-output-inventory.json"
 OUTPUT_INVENTORY_PIN = "linux-precutover-proof-output-inventory.sha256"
 PROGRESS_LOG = "linux-precutover-proof-progress.log"
 NEUTRAL_CWD = "linux-precutover-neutral-cwd"
+PREFLIGHT_GREEN = "PREDICTION_LINUX_PRECUTOVER_ENVIRONMENT_GREEN"
+PREFLIGHT_REFUSED = "PREDICTION_LINUX_PRECUTOVER_PREFLIGHT_REFUSED"
+_REQUIRED_FREE_BYTES = 194_347_270_144
+_OS_RELEASE_MAXIMUM_BYTES = 64 * 1024
+_OS_RELEASE_LOGICAL = Path("/etc/os-release")
+_OS_RELEASE_CANONICAL_TARGET = Path("/usr/lib/os-release")
+_B0_COMMANDS = (
+    "bash",
+    "env",
+    "findmnt",
+    "git",
+    "grep",
+    "id",
+    "mkdir",
+    "python3.12",
+    "readlink",
+    "tee",
+    "timeout",
+)
 _BUNDLE_NAME = "hyperlab-prediction-markets-runtime-data-quality-v1.bundle"
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -270,6 +290,7 @@ def _proof_manifest(root: Path) -> tuple[dict[str, Any], str]:
         "incoming_root",
         "input_inventory_filename",
         "proof_id",
+        "required_free_bytes",
         "run_slug",
         "schema_version",
         "source_commit",
@@ -293,6 +314,7 @@ def _proof_manifest(root: Path) -> tuple[dict[str, Any], str]:
         or manifest.get("terminal_signal") != TERMINAL_SIGNAL
         or manifest.get("bundle_filename") != _BUNDLE_NAME
         or manifest.get("input_inventory_filename") != INPUT_INVENTORY
+        or manifest.get("required_free_bytes") != _REQUIRED_FREE_BYTES
         or not isinstance(slug, str)
         or _RUN_SLUG.fullmatch(slug) is None
         or not isinstance(commit, str)
@@ -523,18 +545,167 @@ def verify_input(root: Path, *, strict_files: bool = True) -> dict[str, object]:
     }
 
 
-def _os_release() -> dict[str, str]:
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    gid: int
+    inode: int
+    mode: int
+    mtime_ns: int
+    ctime_ns: int
+    size: int
+    uid: int
+
+
+def _file_identity(path: Path) -> _FileIdentity:
+    value = path.lstat()
+    return _FileIdentity(
+        device=value.st_dev,
+        gid=value.st_gid,
+        inode=value.st_ino,
+        mode=value.st_mode,
+        mtime_ns=value.st_mtime_ns,
+        ctime_ns=value.st_ctime_ns,
+        size=value.st_size,
+        uid=value.st_uid,
+    )
+
+
+def _identity_evidence(value: _FileIdentity) -> dict[str, object]:
+    return {
+        "device": value.device,
+        "gid": value.gid,
+        "inode": value.inode,
+        "mode": f"{stat.S_IMODE(value.mode):04o}",
+        "mtime_ns": value.mtime_ns,
+        "ctime_ns": value.ctime_ns,
+        "size": value.size,
+        "uid": value.uid,
+    }
+
+
+def _strict_resolve(path: Path) -> Path:
+    return path.resolve(strict=True)
+
+
+def _read_os_release(
+    logical_path: Path = _OS_RELEASE_LOGICAL,
+    canonical_target: Path = _OS_RELEASE_CANONICAL_TARGET,
+    *,
+    required_uid: int = 0,
+    identity_reader: Callable[[Path], _FileIdentity] = _file_identity,
+    bytes_reader: Callable[[Path], bytes] = Path.read_bytes,
+    link_reader: Callable[[Path], str] = os.readlink,
+    resolve_reader: Callable[[Path], Path] = _strict_resolve,
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Read Ubuntu os-release without weakening generic regular-file checks."""
+
+    if not logical_path.is_absolute() or not canonical_target.is_absolute():
+        raise ProofError("os-release paths must be absolute")
+    logical_path = Path(os.path.abspath(logical_path))
+    canonical_target = Path(os.path.abspath(canonical_target))
+    try:
+        logical_before = identity_reader(logical_path)
+    except OSError as error:
+        raise ProofError("os-release logical path is absent or unreadable") from error
+
+    link_target: str | None = None
+    if stat.S_ISREG(logical_before.mode):
+        selected = logical_path
+        layout = "regular"
+        try:
+            if resolve_reader(logical_path) != logical_path:
+                raise ProofError("regular os-release path is not canonical")
+        except OSError as error:
+            raise ProofError("regular os-release path cannot be resolved") from error
+    elif stat.S_ISLNK(logical_before.mode):
+        try:
+            link_target = link_reader(logical_path)
+        except OSError as error:
+            raise ProofError("os-release symlink cannot be read") from error
+        relative_target = os.path.relpath(canonical_target, logical_path.parent)
+        allowed_targets = {relative_target, str(canonical_target)}
+        if link_target not in allowed_targets:
+            raise ProofError("os-release symlink target is not the canonical Ubuntu target")
+        try:
+            resolved = resolve_reader(logical_path)
+        except OSError as error:
+            raise ProofError("os-release canonical target is absent") from error
+        if resolved != canonical_target:
+            raise ProofError("os-release symlink resolution is ambiguous")
+        selected = canonical_target
+        layout = (
+            "canonical_absolute_symlink"
+            if Path(link_target).is_absolute()
+            else "canonical_relative_symlink"
+        )
+    else:
+        raise ProofError("os-release logical path is neither regular nor a symlink")
+
+    try:
+        target_before = identity_reader(selected)
+    except OSError as error:
+        raise ProofError("os-release selected target is absent or unreadable") from error
+    if not stat.S_ISREG(target_before.mode):
+        raise ProofError("os-release selected target is not a regular file")
+    if link_target is None and target_before != logical_before:
+        raise ProofError("regular os-release mutated before content authentication")
+    if target_before.uid != required_uid:
+        raise ProofError("os-release selected target is not owned by root")
+    if target_before.mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ProofError("os-release selected target is group/world writable")
+    if target_before.size > _OS_RELEASE_MAXIMUM_BYTES:
+        raise ProofError("os-release selected target is oversized")
+    if link_target is not None and logical_before.uid != required_uid:
+        raise ProofError("os-release logical symlink is not owned by root")
+
+    try:
+        raw = bytes_reader(selected)
+        target_after = identity_reader(selected)
+        logical_after = identity_reader(logical_path)
+        link_after = link_reader(logical_path) if link_target is not None else None
+    except OSError as error:
+        raise ProofError("os-release changed or became unreadable during authentication") from error
+    if (
+        target_before != target_after
+        or logical_before != logical_after
+        or link_target != link_after
+        or len(raw) != target_before.size
+    ):
+        raise ProofError("os-release mutated during authentication")
+    if raw.startswith(b"\xef\xbb\xbf") or b"\x00" in raw or b"\r" in raw:
+        raise ProofError("os-release content encoding is unsafe")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ProofError("os-release is not strict UTF-8") from error
     values: dict[str, str] = {}
-    for line in _safe_regular_bytes(Path("/etc/os-release"), maximum_bytes=64 * 1024).decode(
-        "utf-8"
-    ).splitlines():
+    for line in text.splitlines():
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
         values[key] = value.strip().strip('"')
     if values.get("ID") != "ubuntu":
         raise ProofError("Linux proof host is not Ubuntu")
-    return values
+    evidence: dict[str, object] = {
+        "content_sha256": sha256_bytes(raw),
+        "layout": layout,
+        "logical_metadata": _identity_evidence(logical_before),
+        "logical_path": str(logical_path),
+        "resolved_path": str(selected),
+        "symlink_target": link_target,
+        "target_metadata": _identity_evidence(target_before),
+    }
+    return values, evidence
+
+
+def _os_release() -> tuple[dict[str, str], dict[str, object]]:
+    return _read_os_release()
+
+
+def _os_release_check() -> dict[str, object]:
+    values, evidence = _os_release()
+    return {"security": evidence, "values": values}
 
 
 def _mount_evidence(path: Path, *, expected_fstype: str | None = None) -> dict[str, object]:
@@ -556,18 +727,391 @@ def _mount_evidence(path: Path, *, expected_fstype: str | None = None) -> dict[s
     if expected_fstype is not None and fstype != expected_fstype:
         raise ProofError(f"filesystem type diverged for {path}: {fstype}")
     stat_device = path.stat().st_dev
+    stat_device_major_minor: str | None = None
+    major = getattr(os, "major", None)
+    minor = getattr(os, "minor", None)
+    if callable(major) and callable(minor):
+        stat_device_major_minor = f"{major(stat_device)}:{minor(stat_device)}"
+        if stat_device_major_minor != device:
+            raise ProofError(f"findmnt/stat device identity diverged for {path}")
     return {
         "device_major_minor": device,
         "filesystem_root": fsroot,
         "fstype": fstype,
         "source": source,
         "stat_device": stat_device,
+        "stat_device_major_minor": stat_device_major_minor,
         "target": target,
         "vfs_options": sorted(set(options.split(","))),
     }
 
 
+def _secure_directory_evidence(
+    path: Path,
+    *,
+    accepted_uids: set[int],
+    exact_mode: int | None = None,
+) -> dict[str, object]:
+    if not path.is_absolute():
+        raise ProofError(f"directory path is not absolute: {path}")
+    try:
+        before = _file_identity(path)
+        resolved = path.resolve(strict=True)
+        after = _file_identity(path)
+    except OSError as error:
+        raise ProofError(f"directory is absent or unreadable: {path}") from error
+    mode = stat.S_IMODE(before.mode)
+    if (
+        before != after
+        or not stat.S_ISDIR(before.mode)
+        or resolved != path
+        or before.uid not in accepted_uids
+        or mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (exact_mode is not None and mode != exact_mode)
+    ):
+        raise ProofError(f"directory security identity diverged: {path}")
+    return {"path": str(path), **_identity_evidence(before)}
+
+
+def _host_kernel_check() -> dict[str, object]:
+    if os.name != "posix" or platform.system() != "Linux":
+        raise ProofError("a real Linux kernel is required")
+    machine = platform.machine()
+    if machine != "x86_64":
+        raise ProofError(f"architecture is not x86_64: {machine}")
+    return {"architecture": machine, "kernel": platform.release(), "system": "Linux"}
+
+
+def _python_check() -> dict[str, object]:
+    expected = Path("/usr/bin/python3.12")
+    selected = shutil.which("python3.12")
+    executable = Path(sys.executable)
+    if selected != str(expected) or executable != expected:
+        raise ProofError(
+            f"Python 3.12 path diverged: selected={selected!r} executable={sys.executable!r}"
+        )
+    exact = _exact_file(expected, label="system Python 3.12")
+    identity = _file_identity(exact)
+    if identity.uid != 0 or identity.mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ProofError("system Python 3.12 ownership or permissions diverged")
+    if platform.python_implementation() != "CPython" or sys.version_info[:2] != (3, 12):
+        raise ProofError("exact CPython 3.12 is required")
+    libc_name, libc_version = platform.libc_ver()
+    try:
+        libc_tuple = tuple(int(part) for part in libc_version.split(".")[:2])
+    except ValueError as error:
+        raise ProofError("glibc version is malformed") from error
+    if libc_name != "glibc" or libc_tuple < (2, 28):
+        raise ProofError("glibc >= 2.28 is required")
+    try:
+        import ssl
+        import venv
+
+        del venv
+    except ImportError as error:
+        raise ProofError("Python ssl/venv standard-library prerequisite is absent") from error
+    if not ssl.OPENSSL_VERSION:
+        raise ProofError("Python SSL runtime identity is absent")
+    return {
+        "executable": str(exact),
+        "glibc": libc_version,
+        "implementation": platform.python_implementation(),
+        "openssl": ssl.OPENSSL_VERSION,
+        "security": _identity_evidence(identity),
+        "version": platform.python_version(),
+    }
+
+
+def _commands_check() -> dict[str, object]:
+    paths: dict[str, str] = {}
+    problems: list[str] = []
+    for name in _B0_COMMANDS:
+        expected = f"/usr/bin/{name}"
+        selected = shutil.which(name)
+        if selected != expected:
+            problems.append(f"{name}={selected!r}, expected={expected}")
+            continue
+        try:
+            resolved = str(Path(selected).resolve(strict=True))
+        except OSError as error:
+            problems.append(f"{name}=unresolvable:{error}")
+            continue
+        paths[name] = resolved
+    if problems:
+        raise ProofError("; ".join(problems))
+    return {"commands": paths, "path": os.environ.get("PATH", "")}
+
+
+def _user_check() -> dict[str, object]:
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    getpwuid = getattr(pwd, "getpwuid", None)
+    if not callable(getuid) or not callable(getgid) or not callable(getpwuid):
+        raise ProofError("Linux pwd database is unavailable")
+    uid = int(getuid())
+    gid = int(getgid())
+    user = getpwuid(uid)
+    if (
+        uid == 0
+        or user.pw_name != "hyperlab"
+        or user.pw_dir != "/home/hyperlab"
+        or os.environ.get("HOME") != "/home/hyperlab"
+    ):
+        raise ProofError(
+            f"service identity diverged: uid={uid} user={user.pw_name!r} "
+            f"pwd_home={user.pw_dir!r} HOME={os.environ.get('HOME')!r}"
+        )
+    return {"gid": gid, "home": user.pw_dir, "uid": uid, "user": user.pw_name}
+
+
+def _incoming_check(root: Path, manifest: Mapping[str, object], uid: int) -> dict[str, object]:
+    expected = Path(str(manifest["incoming_root"]))
+    if root != expected:
+        raise ProofError(f"incoming logical path diverged: {root} != {expected}")
+    rows = [
+        _secure_directory_evidence(root, accepted_uids={uid}, exact_mode=0o700)
+    ]
+    for relative in ("operator", "scripts", "wheelhouse"):
+        rows.append(
+            _secure_directory_evidence(
+                root / relative,
+                accepted_uids={uid},
+            )
+        )
+    return {"directories": rows}
+
+
+def _parents_check(
+    root: Path,
+    manifest: Mapping[str, object],
+    uid: int,
+) -> dict[str, object]:
+    incoming_parent = root.parent
+    application_home = incoming_parent.parent
+    volume_mount = Path(str(manifest["volume_mount"]))
+    volume_base = Path(str(manifest["volume_base"]))
+    specifications = (
+        (Path("/"), {0}, None),
+        (Path("/home"), {0}, None),
+        (Path("/home/hyperlab"), {uid}, None),
+        (application_home, {uid}, None),
+        (incoming_parent, {uid}, None),
+        (Path("/mnt"), {0}, None),
+        (volume_mount, {0, uid}, None),
+        (volume_base, {uid}, 0o700),
+        (volume_base / "sources", {uid}, 0o700),
+        (volume_base / "campaigns", {uid}, 0o700),
+    )
+    rows: list[dict[str, object]] = []
+    problems: list[str] = []
+    seen: set[Path] = set()
+    for path, accepted, exact_mode in specifications:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            rows.append(
+                _secure_directory_evidence(
+                    path,
+                    accepted_uids=accepted,
+                    exact_mode=exact_mode,
+                )
+            )
+        except ProofError as error:
+            problems.append(str(error))
+    if problems:
+        raise ProofError("; ".join(problems))
+    return {"directories": rows}
+
+
+def _new_roots_check(manifest: Mapping[str, object]) -> dict[str, object]:
+    volume_base = Path(str(manifest["volume_base"]))
+    slug = str(manifest["run_slug"])
+    source = Path(str(manifest["source_root"]))
+    campaign = Path(str(manifest["campaign_root"]))
+    if source.parent != volume_base / "sources" or source.name != slug:
+        raise ProofError("source root escaped the authenticated namespace")
+    if campaign.parent != volume_base / "campaigns" or campaign.name != slug:
+        raise ProofError("campaign root escaped the authenticated namespace")
+    existing = [str(path) for path in (source, campaign) if path.exists() or path.is_symlink()]
+    if existing:
+        raise ProofError(f"new source/campaign roots already exist: {existing}")
+    return {"campaign_root": str(campaign), "source_root": str(source), "state": "absent"}
+
+
+def _outputs_absent_check(root: Path) -> dict[str, object]:
+    relative_paths = [*_ALLOWED_OUTPUT_FILES, NEUTRAL_CWD]
+    existing = sorted(
+        relative for relative in relative_paths if (root / relative).exists() or (root / relative).is_symlink()
+    )
+    if existing:
+        raise ProofError(f"proof outputs already exist: {existing}")
+    return {"absent": sorted(relative_paths)}
+
+
+def _write_surfaces_check(root: Path, manifest: Mapping[str, object]) -> dict[str, object]:
+    sources = Path(str(manifest["volume_base"])) / "sources"
+    refused = [str(path) for path in (root, sources) if not os.access(path, os.W_OK | os.X_OK)]
+    if refused:
+        raise ProofError(f"authorized proof/source write surface is not writable: {refused}")
+    return {
+        "authorized_write_surfaces": [str(root), str(sources)],
+        "campaign_mutation_authorized": False,
+    }
+
+
+def _filesystem_check(root: Path, manifest: Mapping[str, object]) -> dict[str, object]:
+    volume_mount = Path(str(manifest["volume_mount"]))
+    volume_base = Path(str(manifest["volume_base"]))
+    sources = volume_base / "sources"
+    campaigns = volume_base / "campaigns"
+    paths = (volume_mount, volume_base, sources, campaigns)
+    devices = {path.stat().st_dev for path in paths}
+    if len(devices) != 1:
+        raise ProofError("Prediction volume parents span devices")
+    volume = _mount_evidence(volume_mount, expected_fstype="ext4")
+    source = _mount_evidence(sources, expected_fstype="ext4")
+    campaign = _mount_evidence(campaigns, expected_fstype="ext4")
+    incoming = _mount_evidence(root)
+    for row in (volume, source, campaign):
+        options = row["vfs_options"]
+        if not isinstance(options, list) or "rw" not in options or "ro" in options:
+            raise ProofError("Prediction volume is not authenticated read-write ext4")
+        if row["device_major_minor"] != volume["device_major_minor"]:
+            raise ProofError("Prediction volume mount devices diverged")
+    if volume["target"] != str(volume_mount) or any(
+        row["target"] != str(volume_mount) for row in (source, campaign)
+    ):
+        raise ProofError("Prediction ext4 mount target diverged")
+    return {
+        "campaign_parent": campaign,
+        "incoming": incoming,
+        "source_parent": source,
+        "volume": volume,
+    }
+
+
+def _capacity_check(manifest: Mapping[str, object]) -> dict[str, object]:
+    required = manifest.get("required_free_bytes")
+    if required != _REQUIRED_FREE_BYTES:
+        raise ProofError("authenticated capacity requirement diverged")
+    volume_mount = Path(str(manifest["volume_mount"]))
+    available = shutil.disk_usage(volume_mount).free
+    if available < _REQUIRED_FREE_BYTES:
+        raise ProofError(
+            f"capacity is insufficient: available={available} required={_REQUIRED_FREE_BYTES}"
+        )
+    return {"available_bytes": available, "required_free_bytes": _REQUIRED_FREE_BYTES}
+
+
+def _wheelhouse_compatibility(root: Path) -> dict[str, object]:
+    names = sorted(path.name for path in (root / "wheelhouse").iterdir())
+    libc_name, libc_version = platform.libc_ver()
+    if libc_name != "glibc":
+        raise ProofError("wheel compatibility requires glibc")
+    try:
+        glibc = tuple(int(part) for part in libc_version.split(".")[:2])
+    except ValueError as error:
+        raise ProofError("wheel compatibility glibc version is malformed") from error
+    incompatible: list[str] = []
+    tags: dict[str, dict[str, str]] = {}
+    for name in names:
+        try:
+            prefix, python_tag, abi_tag, platform_tag = name.removesuffix(".whl").rsplit("-", 3)
+        except ValueError:
+            incompatible.append(name)
+            continue
+        if not prefix or re.fullmatch(r"[A-Za-z0-9_.+!-]+", prefix) is None:
+            incompatible.append(name)
+            continue
+        python_tags = set(python_tag.split("."))
+        abi_tags = set(abi_tag.split("."))
+        platform_tags = set(platform_tag.split("."))
+        python_green = "cp312" in python_tags or "py3" in python_tags
+        abi_green = bool(abi_tags & {"cp312", "abi3", "none"})
+        platform_green = "any" in platform_tags or "linux_x86_64" in platform_tags
+        for candidate in platform_tags:
+            legacy = candidate in {"manylinux1_x86_64", "manylinux2010_x86_64", "manylinux2014_x86_64"}
+            match = re.fullmatch(r"manylinux_([0-9]+)_([0-9]+)_x86_64", candidate)
+            if legacy or (match is not None and (int(match[1]), int(match[2])) <= glibc):
+                platform_green = True
+        if not (python_green and abi_green and platform_green):
+            incompatible.append(name)
+        tags[name] = {"abi": abi_tag, "platform": platform_tag, "python": python_tag}
+    if incompatible:
+        raise ProofError(f"wheel tags are incompatible with Linux CPython 3.12 x86_64: {incompatible}")
+    return {"count": len(names), "target": "CPython-3.12-linux-x86_64", "tags": tags}
+
+
+def _collect_readonly_preflight(
+    checks: Mapping[str, tuple[str, Callable[[], dict[str, object]]]],
+) -> tuple[dict[str, object], list[dict[str, str]]]:
+    results: dict[str, object] = {}
+    incompatibilities: list[dict[str, str]] = []
+    for name, (code, check) in checks.items():
+        try:
+            evidence = check()
+            results[name] = {"evidence": evidence, "status": "green"}
+        except Exception as error:
+            detail = str(error).replace("\r", " ").replace("\n", " ") or type(error).__name__
+            row = {"code": code, "detail": detail}
+            incompatibilities.append(row)
+            results[name] = {**row, "status": "refused"}
+    return results, incompatibilities
+
+
+def linux_preflight(root: Path) -> dict[str, object]:
+    manifest, manifest_digest = _proof_manifest(root)
+    uid = os.getuid() if hasattr(os, "getuid") else -1
+    checks: dict[str, tuple[str, Callable[[], dict[str, object]]]] = {
+        "os_release": ("OS_RELEASE_REFUSED", _os_release_check),
+        "kernel_architecture": ("LINUX_X86_64_REFUSED", _host_kernel_check),
+        "python": ("PYTHON_312_CANONICAL_REFUSED", _python_check),
+        "commands": ("B0_COMMAND_PATHS_REFUSED", _commands_check),
+        "user_home": ("SERVICE_USER_HOME_REFUSED", _user_check),
+        "incoming": ("INCOMING_ROOT_SECURITY_REFUSED", lambda: _incoming_check(root, manifest, uid)),
+        "parents": ("PARENT_PATH_SECURITY_REFUSED", lambda: _parents_check(root, manifest, uid)),
+        "new_roots": ("NEW_ROOTS_NOT_ABSENT", lambda: _new_roots_check(manifest)),
+        "proof_outputs": ("PROOF_OUTPUT_COLLISION", lambda: _outputs_absent_check(root)),
+        "write_surfaces": ("PROOF_WRITE_SURFACE_REFUSED", lambda: _write_surfaces_check(root, manifest)),
+        "filesystem": ("EXT4_MOUNT_DEVICE_REFUSED", lambda: _filesystem_check(root, manifest)),
+        "capacity": ("CAPACITY_REFUSED", lambda: _capacity_check(manifest)),
+        "wheelhouse_tags": ("WHEELHOUSE_TAGS_REFUSED", lambda: _wheelhouse_compatibility(root)),
+    }
+    check_results, incompatibilities = _collect_readonly_preflight(checks)
+    compatible = not incompatibilities
+    return {
+        "boundary": BOUNDARY,
+        "checks": check_results,
+        "clone_started": False,
+        "compatible": compatible,
+        "incompatibilities": incompatibilities,
+        "manifest_sha256": manifest_digest,
+        "mutation_performed": False,
+        "phase": "BEFORE_CLONE",
+        "post_clone_checks": [
+            {"name": "fresh_detached_checkout_and_source_inventory", "status": "deferred_until_clone"},
+            {"name": "fresh_venv_and_offline_hash_locked_install", "status": "deferred_until_clone"},
+            {"name": "isolated_runtime_import_admission", "status": "deferred_until_clone"},
+        ],
+        "proof_id": PROOF_ID,
+        "schema_version": 2,
+        "terminal_signal": PREFLIGHT_GREEN if compatible else PREFLIGHT_REFUSED,
+    }
+
+
 def linux_environment(root: Path, *, source_must_be_absent: bool) -> dict[str, object]:
+    if source_must_be_absent:
+        report = linux_preflight(root)
+        incompatibilities = report.get("incompatibilities")
+        if not isinstance(incompatibilities, list):
+            raise ProofError("preflight incompatibility result is malformed")
+        if incompatibilities:
+            codes = ",".join(
+                str(row.get("code")) for row in incompatibilities if isinstance(row, Mapping)
+            )
+            raise ProofError(f"preflight incompatibilities:{codes}")
+        return report
     root = _exact_directory(root, label="Linux proof incoming root")
     manifest, _digest = _proof_manifest(root)
     if root != Path(str(manifest["incoming_root"])):
@@ -590,7 +1134,7 @@ def linux_environment(root: Path, *, source_must_be_absent: bool) -> dict[str, o
     user = pwd.getpwuid(os.getuid())
     if user.pw_name != "hyperlab" or os.environ.get("HOME") != "/home/hyperlab":
         raise ProofError("Linux proof must run as hyperlab with canonical HOME")
-    release = _os_release()
+    release, os_release_evidence = _os_release()
     volume_mount = _exact_directory(
         Path(str(manifest["volume_mount"])), label="Prediction volume mount"
     )
@@ -641,6 +1185,7 @@ def linux_environment(root: Path, *, source_must_be_absent: bool) -> dict[str, o
         "incoming_mount": _mount_evidence(root),
         "kernel": platform.release(),
         "os_id": release["ID"],
+        "os_release": os_release_evidence,
         "os_version_id": release.get("VERSION_ID", ""),
         "python": platform.python_version(),
         "source_parent_mount": source_parent_evidence,
@@ -777,6 +1322,9 @@ def _scan_b0_forbidden_commands(root: Path) -> dict[str, object]:
         "ssh",
         "scp",
         "nc",
+        "ss",
+        "lsof",
+        "fuser",
     )
     present = [token for token in forbidden if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])", executable)]
     if present:
@@ -968,7 +1516,7 @@ def _git_blob(repo_root: Path, commit: str, relative: str) -> bytes:
 
 
 def render_readme(manifest: Mapping[str, object]) -> str:
-    return f"""# Prediction Markets Linux pre-cutover proof v1
+    return f"""# Prediction Markets Linux pre-cutover proof v2
 
 Boundary: `{BOUNDARY}`. This pack prepares no campaign and changes no service.
 
@@ -981,6 +1529,9 @@ Boundary: `{BOUNDARY}`. This pack prepares no campaign and changes no service.
 
 Run A on Windows, B0 in Tabby as `hyperlab`, then C0 on Windows. B0 stops at
 `{TERMINAL_SIGNAL}`. It is not a cutover, activation, publication, or economic gate.
+Before clone, B0 emits one canonical JSON inventory of every independent Linux
+prerequisite. Any incompatibility produces one `{PREFLIGHT_REFUSED}:codes=...`
+summary and stops without starting the clone.
 """
 
 
@@ -1054,12 +1605,6 @@ if [[ ${{1:-}} != --bounded-child ]]; then
     GIT_ALLOW_PROTOCOL=file /usr/bin/bash "$EXPECTED_SELF" --bounded-child
 fi
 (($# == 1)) || fail 'bounded child arguments diverged'
-[[ $(id -un) == hyperlab ]] || fail 'run as hyperlab'
-[[ $HOME == /home/hyperlab ]] || fail 'HOME must be /home/hyperlab'
-[[ $(readlink -f -- "$INCOMING_ROOT") == "$INCOMING_ROOT" ]] || fail 'incoming root is not canonical'
-for command in python3.12 git bash timeout env findmnt readlink tee id mkdir; do
-  [[ $(command -v "$command") == "/usr/bin/$command" ]] || fail "required command is not canonical:$command"
-done
 python3.12 -I "$INCOMING_ROOT/scripts/precutover_proof.py" verify-input --root "$INCOMING_ROOT"
 python3.12 -I "$INCOMING_ROOT/scripts/precutover_proof.py" verify-linux-environment --root "$INCOMING_ROOT"
 [[ ! -e $SOURCE_ROOT && ! -L $SOURCE_ROOT ]] || fail 'source root must be new'
@@ -1170,6 +1715,12 @@ def finalize(
     )
     if runtime_handoff.get("source_commit") != source_commit:
         raise ProofError("runtime pack source commit diverged")
+    runtime_disk = runtime_handoff.get("disk")
+    if (
+        not isinstance(runtime_disk, Mapping)
+        or runtime_disk.get("required_free_bytes") != _REQUIRED_FREE_BYTES
+    ):
+        raise ProofError("runtime pack capacity contract diverged")
     _command(
         [
             sys.executable,
@@ -1221,6 +1772,7 @@ def finalize(
         "incoming_root": runtime_handoff["incoming_root"],
         "input_inventory_filename": INPUT_INVENTORY,
         "proof_id": PROOF_ID,
+        "required_free_bytes": runtime_disk["required_free_bytes"],
         "run_slug": slug,
         "schema_version": 1,
         "source_commit": source_commit,
@@ -1269,7 +1821,7 @@ def finalize(
     return {
         **verified,
         "output_root": str(output_root.resolve(strict=True)),
-        "terminal_signal": "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_GREEN_AWAITING_HUMAN_EXECUTION",
+        "terminal_signal": "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V2_GREEN_OS_RELEASE_LAYOUT_FIXED_AWAITING_HUMAN_EXECUTION",
     }
 
 
@@ -1316,13 +1868,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "verify-input":
             result = verify_input(arguments.root.resolve(strict=True), strict_files=True)
         elif arguments.command == "verify-linux-environment":
-            result = linux_environment(
-                arguments.root.resolve(strict=True), source_must_be_absent=True
-            )
-            result = {
-                **result,
-                "terminal_signal": "PREDICTION_LINUX_PRECUTOVER_ENVIRONMENT_GREEN",
-            }
+            result = linux_preflight(arguments.root)
+            print(canonical_json_bytes(result).decode("utf-8"))
+            incompatibilities = result["incompatibilities"]
+            if incompatibilities:
+                assert isinstance(incompatibilities, list)
+                codes = ",".join(str(row["code"]) for row in incompatibilities)
+                print(f"{PREFLIGHT_REFUSED}:codes={codes}", file=sys.stderr)
+                return 4
+            return 0
         elif arguments.command == "write-report":
             result = write_report(
                 arguments.root.resolve(strict=True),

@@ -1227,6 +1227,99 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
         assert "18080" not in unit
 
 
+def test_home_mount_evidence_accepts_authenticated_root_and_records_stat_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stat_paths: list[Path] = []
+
+    def stat_device(path: Path) -> str:
+        stat_paths.append(path)
+        return "8:1"
+
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", stat_device)
+    evidence = preflight._mount_evidence(
+        Path("/home"),
+        run=lambda _arguments: preflight.CommandResult(
+            0,
+            "/ /dev/sda1 ext4 ro,nosuid,relatime 8:1 /",
+            "",
+        ),
+        label="runner namespace /home root",
+        target_may_be_ancestor=True,
+        expected_fstype="ext4",
+        required_mode="ro",
+    )
+    assert evidence == {
+        "device_major_minor": "8:1",
+        "filesystem": "ext4",
+        "filesystem_root": "/",
+        "logical_path": "/home",
+        "mount": "/",
+        "options": ["ro", "nosuid", "relatime"],
+        "source": "/dev/sda1",
+        "stat_device_major_minor": "8:1",
+    }
+    assert stat_paths == [Path("/home")]
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "/",
+        "/home",
+        "/home/hyperlab",
+        "/home/hyperlab/hyperlab-prediction-markets",
+        "/home/hyperlab/hyperlab-prediction-markets/incoming",
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef",
+    ),
+)
+def test_incoming_namespace_accepts_authenticated_root_filesystem_ancestors(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    canonical_paths: list[Path] = []
+
+    def canonical(path: Path, *, label: str) -> tuple[int, int, int]:
+        del label
+        canonical_paths.append(path)
+        return 8, 1, 0o40700
+
+    monkeypatch.setattr(preflight, "_canonical_directory", canonical)
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:1")
+    filesystem_root = "/" if target == "/" else target
+    source = "/dev/sda1" if target == "/" else f"/dev/sda1[{target}]"
+    preflight._authenticate_incoming_namespace_target(
+        {
+            "device_major_minor": "8:1",
+            "filesystem": "ext4",
+            "filesystem_root": filesystem_root,
+            "logical_path": incoming.as_posix(),
+            "mount": target,
+            "options": ["ro", "nosuid", "relatime"],
+            "source": source,
+            "stat_device_major_minor": "8:1",
+        },
+        home_evidence={
+            "device_major_minor": "8:1",
+            "filesystem": "ext4",
+            "filesystem_root": "/",
+            "logical_path": "/home",
+            "mount": "/",
+            "options": ["ro", "nosuid", "relatime"],
+            "source": "/dev/sda1",
+            "stat_device_major_minor": "8:1",
+        },
+        incoming=incoming,
+        label="runner namespace incoming root",
+    )
+    assert canonical_paths[0] == Path("/home")
+    assert canonical_paths[-1] == incoming
+
+
 @pytest.mark.parametrize(
     "target",
     (
@@ -1265,6 +1358,7 @@ def test_incoming_namespace_accepts_only_authenticated_readonly_home_ancestors(
         "device_major_minor": "254:0",
         "filesystem": "ext4",
         "filesystem_root": "/home",
+        "logical_path": "/home",
         "mount": "/home",
         "options": ["ro", "relatime"],
         "source": "/dev/root[/home]",
@@ -1307,6 +1401,7 @@ def test_incoming_namespace_accepts_authenticated_ancestor_on_separate_home_moun
             "device_major_minor": "254:0",
             "filesystem": "ext4",
             "filesystem_root": "/",
+            "logical_path": "/home",
             "mount": "/home",
             "options": ["ro", "relatime"],
             "source": "/dev/home[/]",
@@ -1318,9 +1413,232 @@ def test_incoming_namespace_accepts_authenticated_ancestor_on_separate_home_moun
 
 
 @pytest.mark.parametrize(
+    ("home_mutation", "incoming_mutation", "message"),
+    (
+        ({"logical_path": "/srv"}, {}, "logical path"),
+        ({"filesystem_root": "/wrong"}, {}, "root"),
+        ({"source": "/dev/sda2"}, {}, "source"),
+        ({"filesystem": "xfs"}, {}, "filesystem type"),
+        ({"options": ["rw", "relatime"]}, {}, "mounted ro"),
+        ({"stat_device_major_minor": "8:2"}, {}, "device"),
+        ({}, {"filesystem_root": "/home"}, "root/bind"),
+        ({}, {"source": "/dev/sdb"}, "source"),
+        ({}, {"filesystem": "xfs"}, "filesystem type"),
+        ({}, {"device_major_minor": "8:16"}, "device"),
+        ({}, {"options": ["rw", "relatime"]}, "mounted ro"),
+        ({}, {"logical_path": "/home/other"}, "logical path"),
+    ),
+)
+def test_root_backed_incoming_namespace_rejects_identity_or_mode_divergence(
+    home_mutation: dict[str, object],
+    incoming_mutation: dict[str, object],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (8, 1, 0o40700),
+    )
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:1")
+    home_evidence: dict[str, object] = {
+        "device_major_minor": "8:1",
+        "filesystem": "ext4",
+        "filesystem_root": "/",
+        "logical_path": "/home",
+        "mount": "/",
+        "options": ["ro", "nosuid", "relatime"],
+        "source": "/dev/sda1",
+        "stat_device_major_minor": "8:1",
+    }
+    evidence: dict[str, object] = {
+        "device_major_minor": "8:1",
+        "filesystem": "ext4",
+        "filesystem_root": "/",
+        "logical_path": incoming.as_posix(),
+        "mount": "/",
+        "options": ["ro", "nosuid", "relatime"],
+        "source": "/dev/sda1",
+        "stat_device_major_minor": "8:1",
+    }
+    home_evidence.update(home_mutation)
+    evidence.update(incoming_mutation)
+    with pytest.raises(preflight.PreflightError, match=message):
+        preflight._authenticate_incoming_namespace_target(
+            evidence,
+            home_evidence=home_evidence,
+            incoming=incoming,
+            label="runner namespace incoming root",
+        )
+
+
+def test_root_mount_target_remains_refused_for_volume_mapping() -> None:
+    with pytest.raises(preflight.PreflightError, match="not allowlisted"):
+        preflight._authenticate_volume_namespace_mapping(
+            {
+                "filesystem_root": "/",
+                "mount": "/",
+            },
+            admitted_root="/",
+            allowed_targets=(Path("/mnt/HC_Volume_106716684"),),
+            label="runner namespace volume parent",
+            volume_mount=Path("/mnt/HC_Volume_106716684"),
+        )
+
+
+def test_incoming_root_target_requires_home_to_share_the_root_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (8, 1, 0o40700),
+    )
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "8:1")
+    with pytest.raises(preflight.PreflightError, match="home mount target"):
+        preflight._authenticate_incoming_namespace_target(
+            {
+                "device_major_minor": "8:1",
+                "filesystem": "ext4",
+                "filesystem_root": "/",
+                "logical_path": incoming.as_posix(),
+                "mount": "/",
+                "options": ["ro", "relatime"],
+                "source": "/dev/sda1",
+                "stat_device_major_minor": "8:1",
+            },
+            home_evidence={
+                "device_major_minor": "8:1",
+                "filesystem": "ext4",
+                "filesystem_root": "/home",
+                "logical_path": "/home",
+                "mount": "/home",
+                "options": ["ro", "relatime"],
+                "source": "/dev/sda1[/home]",
+                "stat_device_major_minor": "8:1",
+            },
+            incoming=incoming,
+            label="runner namespace incoming root",
+        )
+
+
+@pytest.mark.parametrize("venue", ("polymarket", "kalshi"))
+def test_runner_namespace_admits_root_backed_home_for_both_materialized_probes(
+    venue: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slug = "pm-20260828t020000z-deadbeef"
+    volume_mount = Path("/mnt/HC_Volume_106716684")
+    volume_base = volume_mount / "hyperlab-prediction-markets"
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        f"{slug}"
+    )
+    source = volume_base / "sources" / slug
+    campaign = volume_base / "campaigns" / slug
+    layout = {
+        "campaign_root": campaign.as_posix(),
+        "incoming_root": incoming.as_posix(),
+        "source_root": source.as_posix(),
+        "volume_base": volume_base.as_posix(),
+        "volume_mount": volume_mount.as_posix(),
+    }
+    handoff = {"service_user": "hyperlab"}
+    admitted = {
+        "device_major_minor": "8:16",
+        "filesystem_root": "/",
+    }
+    monkeypatch.setenv("USER", "hyperlab")
+    monkeypatch.setattr(
+        preflight.Path,
+        "home",
+        classmethod(lambda _cls: Path("/home/hyperlab")),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_validated_install_admission",
+        lambda *_args, **_kwargs: (handoff, layout, admitted),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (1, 2, 0o40700),
+    )
+
+    def stat_device(path: Path) -> str:
+        logical = PurePosixPath(path.as_posix())
+        home = PurePosixPath("/home")
+        return "8:1" if logical == home or home in logical.parents else "8:16"
+
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", stat_device)
+
+    def findmnt(arguments: list[str] | tuple[str, ...]) -> preflight.CommandResult:
+        assert arguments[0] == "findmnt"
+        target = Path(str(arguments[arguments.index("-T") + 1]))
+        logical = PurePosixPath(target.as_posix())
+        if logical == PurePosixPath("/home") or PurePosixPath("/home") in logical.parents:
+            return preflight.CommandResult(
+                0,
+                "/ /dev/sda1 ext4 ro,nosuid,relatime 8:1 /",
+                "",
+            )
+        venue_roots = {campaign / "polymarket", campaign / "kalshi"}
+        if target in venue_roots:
+            relative = logical.relative_to(PurePosixPath(volume_mount.as_posix()))
+            filesystem_root = (PurePosixPath("/") / relative).as_posix()
+            return preflight.CommandResult(
+                0,
+                f"{target.as_posix()} /dev/sdb[{filesystem_root}] "
+                f"ext4 rw,relatime 8:16 {filesystem_root}",
+                "",
+            )
+        return preflight.CommandResult(
+            0,
+            f"{volume_mount.as_posix()} /dev/sdb ext4 "
+            "ro,nosuid,relatime 8:16 /",
+            "",
+        )
+
+    report = preflight.runner_namespace_admission(
+        Path("/fixture/handoff.json"),
+        Path("/fixture/install-admission-report.json"),
+        venue=venue,
+        run=findmnt,
+        write_probe=lambda root: {
+            "probe_removed": True,
+            "surface": root.as_posix(),
+        },
+    )
+    assert report["namespace_admissible"] is True, report
+    assert report["terminal_signal"] == "PREDICTION_RUNNER_NAMESPACE_GREEN"
+    assert report["venue"] == venue
+    observed = report["observed_mounts"]
+    assert isinstance(observed, dict)
+    for key in ("home", "incoming"):
+        evidence = observed[key]
+        assert isinstance(evidence, dict)
+        assert evidence["mount"] == "/"
+        assert evidence["device_major_minor"] == "8:1"
+        assert evidence["stat_device_major_minor"] == "8:1"
+        assert evidence["filesystem_root"] == "/"
+        assert evidence["options"] == ["ro", "nosuid", "relatime"]
+
+
+@pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ({"mount": "/", "filesystem_root": "/", "source": "/dev/root"}, "ancestor"),
+        (
+            {"mount": "/", "filesystem_root": "/", "source": "/dev/root"},
+            "home mount target",
+        ),
         (
             {
                 "mount": "/home/other",
@@ -1383,6 +1701,7 @@ def test_incoming_namespace_rejects_escape_or_identity_relaxation(
         "device_major_minor": "254:0",
         "filesystem": "ext4",
         "filesystem_root": "/home",
+        "logical_path": "/home",
         "mount": "/home",
         "options": ["ro", "relatime"],
         "source": "/dev/root[/home]",
@@ -1429,6 +1748,7 @@ def test_incoming_namespace_rejects_a_symlinked_authenticated_chain_member(
                 "device_major_minor": "254:0",
                 "filesystem": "ext4",
                 "filesystem_root": "/home",
+                "logical_path": "/home",
                 "mount": "/home",
                 "options": ["ro", "relatime"],
                 "source": "/dev/root[/home]",

@@ -1,7 +1,7 @@
 # Prediction Markets Prospective Launch V1
 
 Verdict technique visé :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_SYSTEMD_WRITE_SURFACE_FIXED_AWAITING_CAPACITY_AND_SINGLE_HUMAN_EXECUTION`.
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_ROOT_MOUNT_HOME_NAMESPACE_FIXED_COMMITTED_LOCALLY_AWAITING_PUSH`.
 
 Statut économique permanent avant preuve prospective réelle :
 `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
@@ -135,8 +135,15 @@ exact read-only. systemd peut coalescer les `ReadOnlyPaths` imbriqués devenus
 redondants : `volume_base`, source et campagne doivent alors résoudre seulement
 vers le mount volume, le `volume_base` ou leur target exact suivant une allowlist
 fixe. Pour l'incoming, le target observé doit être exactement l'incoming ou un
-membre canonique de sa chaîne d'ancêtres entre `/home` et cet incoming. `/`, un
-autre home, un cousin, un descendant arbitraire et tout symlink sont refusés.
+membre canonique de sa chaîne d'ancêtres entre `/home` et cet incoming. Lorsque
+`/home` appartient au filesystem racine, systemd peut aussi exposer `TARGET=/`
+pour les vues RO de `/home` et de l'incoming. Ce cas n'est admis que si le chemin
+logique `/home`, chaque membre canonique jusqu'à l'incoming, `SOURCE`, `FSROOT`,
+le fstype ext4 et le couple `MAJ:MIN`/`stat(2)` authentifient tous le même
+filesystem racine, avec `ro` présent et `rw` absent. Le target `/` reste refusé
+pour le volume `/dev/sdb`, pour toute vue RW ou si `/home` est un montage
+distinct. Un autre home, un cousin, un descendant arbitraire et tout symlink
+sont refusés.
 L'identité est liée au même superblock ext4 par `MAJ:MIN` concordant avec
 `stat(2)`, ainsi qu'à la relation `SOURCE`/`FSROOT` dérivée du target effectif.
 `ReadOnlyPaths` ne modifie pas H1. Seul `campaign_root/<venue>` doit être un bind
@@ -225,6 +232,17 @@ La tentative `pm-20260827t234404z-73c6d2d2` et toutes ses racines restent
 mais le premier probe Kalshi a refusé un ancêtre intermédiaire authentique de
 l'incoming à cause de l'ancienne allowlist littérale. Aucun collecteur n'a
 démarré et la cleanup ciblée a désarmé les cinq unités sans supprimer de preuve.
+
+La tentative `pm-20260828t010120z-9e2987aa` et toutes ses racines restent elles
+aussi immuables. Les admissions hôte et volume étaient vertes, puis le premier
+probe Polymarket a observé la représentation Linux authentique
+`TARGET=/`, `SOURCE=/dev/sda1`, `FSTYPE=ext4`, `MAJ:MIN=8:1`, `FSROOT=/` et
+`VFS_OPTIONS=ro,nosuid,relatime` pour le chemin logique `/home`. L'ancien appel
+exigeait prématurément `TARGET=/home` et refusait avant la preuve `stat(2)`.
+Aucun service persistant n'a été activé et la cleanup ciblée a préservé toutes
+les preuves. Le correctif ne rend aucune nouvelle surface writable : les vues
+`/home`/incoming restent strictement RO et la seule surface RW reste le
+sous-répertoire exact de la venue sur `/dev/sdb`.
 
 ## Preflight cible
 

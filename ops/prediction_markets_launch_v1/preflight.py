@@ -327,6 +327,7 @@ def _mount_evidence(
         "device_major_minor": device,
         "filesystem": fstype,
         "filesystem_root": fsroot,
+        "logical_path": path.as_posix(),
         "mount": target.as_posix(),
         "options": options,
         "source": source,
@@ -388,6 +389,7 @@ def _authenticate_incoming_namespace_target(
     incoming: Path,
     label: str,
 ) -> None:
+    logical_path = evidence.get("logical_path")
     target_text = evidence.get("mount")
     filesystem_root = evidence.get("filesystem_root")
     filesystem = evidence.get("filesystem")
@@ -402,9 +404,11 @@ def _authenticate_incoming_namespace_target(
     home_stat_device = home_evidence.get("stat_device_major_minor")
     home_source = home_evidence.get("source")
     home_options = home_evidence.get("options")
+    home_logical_path = home_evidence.get("logical_path")
     if not all(
         isinstance(value, str)
         for value in (
+            logical_path,
             target_text,
             filesystem_root,
             filesystem,
@@ -417,6 +421,7 @@ def _authenticate_incoming_namespace_target(
             home_device,
             home_stat_device,
             home_source,
+            home_logical_path,
         )
     ) or not all(
         isinstance(value, list) and all(isinstance(item, str) for item in value)
@@ -424,6 +429,7 @@ def _authenticate_incoming_namespace_target(
     ):
         raise PreflightError(f"{label} mount mapping evidence is invalid")
     assert isinstance(target_text, str)
+    assert isinstance(logical_path, str)
     assert isinstance(filesystem_root, str)
     assert isinstance(filesystem, str)
     assert isinstance(device, str)
@@ -437,23 +443,44 @@ def _authenticate_incoming_namespace_target(
     assert isinstance(home_stat_device, str)
     assert isinstance(home_source, str)
     assert isinstance(home_options, list)
+    assert isinstance(home_logical_path, str)
     target = PurePosixPath(target_text)
+    home_target = PurePosixPath(home_target_text)
     incoming_path = PurePosixPath(incoming.as_posix())
-    if target == PurePosixPath("/") or home_target_text != _HOME_MOUNT.as_posix():
-        raise PreflightError(f"{label} target is not an authenticated /home ancestor")
+    filesystem_root_path = PurePosixPath(filesystem_root)
+    home_root = PurePosixPath(home_root_text)
+    root = PurePosixPath("/")
+    if logical_path != incoming_path.as_posix():
+        raise PreflightError(f"{label} logical path diverged")
+    if home_logical_path != _HOME_MOUNT.as_posix():
+        raise PreflightError(f"{label} /home logical path diverged")
+    root_backed_home = PurePosixPath("/home") == _HOME_MOUNT and home_target == root
+    if home_target != _HOME_MOUNT and not root_backed_home:
+        raise PreflightError(f"{label} home mount target is not authenticated")
     try:
         relative_incoming = incoming_path.relative_to(_HOME_MOUNT)
     except ValueError as error:
         raise PreflightError(f"{label} logical path leaves /home") from error
     if not relative_incoming.parts or ".." in relative_incoming.parts:
         raise PreflightError(f"{label} logical path is not a canonical /home descendant")
+    if (
+        incoming_path.parent != _INCOMING_PARENT
+        or _RUN_SLUG.fullmatch(incoming_path.name) is None
+    ):
+        raise PreflightError(f"{label} logical path is outside the dedicated incoming root")
     allowed: set[PurePosixPath] = {incoming_path}
     cursor = incoming_path
     while cursor != _HOME_MOUNT:
         cursor = cursor.parent
-        if cursor == PurePosixPath("/"):
+        if cursor == root:
             raise PreflightError(f"{label} ancestor chain reached filesystem root")
         allowed.add(cursor)
+    if root_backed_home:
+        allowed.add(root)
+    if target == root and not root_backed_home:
+        raise PreflightError(
+            f"{label} root target requires the authenticated home mount target"
+        )
     if target not in allowed:
         raise PreflightError(f"{label} mount target is not an authenticated /home ancestor")
     if (
@@ -466,10 +493,21 @@ def _authenticate_incoming_namespace_target(
         raise PreflightError(f"{label} filesystem type or device identity diverged")
     if "ro" not in options or "rw" in options or "ro" not in home_options or "rw" in home_options:
         raise PreflightError(f"{label} is not mounted ro")
-    home_root = PurePosixPath(home_root_text)
-    if not home_root.is_absolute() or ".." in home_root.parts:
+    if (
+        not home_root.is_absolute()
+        or ".." in home_root.parts
+        or not filesystem_root_path.is_absolute()
+        or ".." in filesystem_root_path.parts
+    ):
         raise PreflightError(f"{label} /home filesystem root is invalid")
-    target_relative = target.relative_to(_HOME_MOUNT)
+    if root_backed_home and home_root != root:
+        raise PreflightError(f"{label} /home filesystem root mapping diverged")
+    try:
+        target_relative = target.relative_to(home_target)
+    except ValueError as error:
+        raise PreflightError(
+            f"{label} target precedes the authenticated home mount target"
+        ) from error
     expected_root = (home_root / target_relative).as_posix()
     if filesystem_root != expected_root:
         raise PreflightError(f"{label} filesystem root/bind identity diverged")
@@ -484,17 +522,20 @@ def _authenticate_incoming_namespace_target(
     source_base, source_root = source_parts(source)
     if home_source_root is not None and home_source_root != home_root_text:
         raise PreflightError(f"{label} /home source/root identity diverged")
+    if home_source_root is None and home_root != root:
+        raise PreflightError(f"{label} /home source/root identity is absent")
     if source_base != home_source_base or (
         source_root is not None and source_root != filesystem_root
     ):
         raise PreflightError(f"{label} source/root identity diverged")
-    if source_root is None and (
-        target != _HOME_MOUNT or filesystem_root != home_root_text
-    ):
+    if source_root is None and filesystem_root_path != root:
         raise PreflightError(f"{label} ancestor bind source/root identity is absent")
-    target_index = incoming_path.parents.index(target) if target != incoming_path else -1
-    chain = [incoming_path] if target_index == -1 else [incoming_path, *incoming_path.parents[: target_index + 1]]
-    for member in reversed(chain):
+    chain: list[PurePosixPath] = [_HOME_MOUNT]
+    cursor = _HOME_MOUNT
+    for part in relative_incoming.parts:
+        cursor /= part
+        chain.append(cursor)
+    for member in chain:
         member_path = Path(member.as_posix())
         _canonical_directory(member_path, label=f"{label} authenticated chain member")
         if _stat_device_major_minor(member_path) != device:
@@ -1791,7 +1832,7 @@ def _runner_namespace_checks(
         Path(_HOME_MOUNT.as_posix()),
         run=run,
         label="runner namespace /home root",
-        expected_target=Path(_HOME_MOUNT.as_posix()),
+        target_may_be_ancestor=True,
         expected_fstype="ext4",
         required_mode="ro",
     )

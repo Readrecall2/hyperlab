@@ -445,7 +445,12 @@ jamais rejoué. Une divergence de reçu, plan, identité, hash, manifest ou ledg
 reste `INTEGRITY_FAILED` et ne redémarre pas en boucle.
 
 B exécute et authentifie d'abord les deux probes namespace oneshot, avant tout
-service persistant. Le moniteur utilise exclusivement le Python du venv offline
+service persistant. Pour chacun, il exige simultanément `Result=success`,
+`ExecMainStatus=0`, `inactive/dead`, `MainPID=0`, zéro restart, le fragment exact
+et l'unique JSON canonique GREEN (`namespace_admissible=true`, `errors=[]`) avec
+son graphe mount/write authentifié. `ExecMainCode` est borné aux deux formes 0
+ou 1 compatibles avec une fin oneshot normale réussie et ne constitue jamais à
+lui seul un oracle. Le moniteur utilise exclusivement le Python du venv offline
 lié au source root authentifié. Avant tout collecteur, B exige ensuite le HTTP loopback
 readonly, `orders_enabled=false`, le PID/commande et l'unité systemd exacts, et
 la preuve que ce PID possède `127.0.0.1:18081`. Une course de premier bind ou un
@@ -471,8 +476,11 @@ Sous le namespace durci, le target volume admis reste exact read-only. systemd
 peut coalescer les `ReadOnlyPaths` imbriqués : `volume_base`, source et campagne
 ne peuvent résoudre que vers leurs targets RO allowlistés. L'incoming accepte
 uniquement son target exact ou un ancêtre canonique de sa chaîne entre `/home`
-et lui-même; `/`, autre home, cousin, descendant arbitraire et symlink restent
-refusés. Leur device ext4, `MAJ:MIN` et relation `SOURCE`/`FSROOT` sont
+et lui-même. Si `/home` appartient au filesystem racine, `TARGET=/` est admis
+uniquement pour les vues RO `/home`/incoming lorsque la chaîne canonique, ext4,
+`MAJ:MIN`/`stat(2)`, `SOURCE` et `FSROOT=/` concordent; il reste refusé pour le
+volume `/dev/sdb` et toute vue RW. Autre home, cousin, descendant arbitraire et
+symlink restent refusés. Leur device ext4, `MAJ:MIN` et relation `SOURCE`/`FSROOT` sont
 réauthentifiés depuis le target effectif ; seule la venue doit rester un bind
 exact read-write. Le runner répète create/fsync/unlink/fsync avant chaque slot.
 Un refus produit un diagnostic borné avec `TARGET`, `SOURCE`, `FSTYPE`,

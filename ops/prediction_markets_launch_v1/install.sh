@@ -347,29 +347,29 @@ for VENUE in polymarket kalshi; do
         || fail 'namespace probe properties unavailable and Prediction Markets cleanup also failed'
       fail "collector namespace probe properties unavailable: $VENUE"
     }
-  if ! NAMESPACE_PROBE_PROPERTIES="$NAMESPACE_PROBE_PROPERTIES" NAMESPACE_PROBE_SERVICE="$NAMESPACE_PROBE_SERVICE" "$VENV_PYTHON" -I - <<'PY'
-import os
-properties={}
-for line in os.environ['NAMESPACE_PROBE_PROPERTIES'].splitlines():
- if '=' not in line: raise SystemExit('namespace-probe:malformed-property')
- key,value=line.split('=',1); properties[key]=value
-def require(condition,label):
- if not condition: raise SystemExit('namespace-probe:'+label)
-require(properties.get('LoadState')=='loaded','load-state')
-require(properties.get('ActiveState')=='inactive','active-state')
-require(properties.get('SubState')=='dead','sub-state')
-require(properties.get('Result')=='success','result')
-require(properties.get('MainPID')=='0','main-pid')
-require(properties.get('NRestarts')=='0','restart-count')
-require(properties.get('ExecMainCode')=='1','exit-code-kind')
-require(properties.get('ExecMainStatus')=='0','exit-status')
-require(properties.get('FragmentPath')=='/etc/systemd/system/'+os.environ['NAMESPACE_PROBE_SERVICE'],'fragment')
-PY
+  NAMESPACE_PROBE_JOURNAL=$( {
+    timeout 5 sudo journalctl --unit "$NAMESPACE_PROBE_SERVICE" \
+      --no-pager -n 20 -o cat 2>&1 || true
+  } | head -c 65536 ) || {
+      namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+      cleanup_prediction_services \
+        || fail 'namespace probe journal unavailable and Prediction Markets cleanup also failed'
+      fail "collector namespace probe journal unavailable: $VENUE"
+    }
+  if ! HYPERLAB_NAMESPACE_PROBE_PROPERTIES="$NAMESPACE_PROBE_PROPERTIES" \
+    HYPERLAB_NAMESPACE_PROBE_JOURNAL="$NAMESPACE_PROBE_JOURNAL" \
+    "$VENV_PYTHON" -I \
+      "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" \
+      authenticate-namespace-probe-completion \
+      --service "$NAMESPACE_PROBE_SERVICE" \
+      --venue "$VENUE" \
+      --campaign-root "$CAMPAIGN_ROOT" \
+      --incoming-root "$INCOMING_ROOT"
   then
     namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
     cleanup_prediction_services \
-      || fail 'namespace probe result diverged and Prediction Markets cleanup also failed'
-    fail "collector namespace probe result diverged before any persistent service activation: $VENUE"
+      || fail 'namespace probe completion diverged and Prediction Markets cleanup also failed'
+    fail "collector namespace probe completion authentication diverged before any persistent service activation: $VENUE"
   fi
   printf 'PREDICTION_NAMESPACE_PROBE_GREEN=%s\n' "$VENUE"
 done

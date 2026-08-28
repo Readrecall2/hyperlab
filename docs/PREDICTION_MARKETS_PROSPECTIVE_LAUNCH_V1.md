@@ -171,9 +171,13 @@ L'admission hôte continue d'exiger la vue interactive du volume ext4 `rw`. Sous
 peut coalescer les `ReadOnlyPaths` imbriqués : les targets effectifs de
 `volume_base`/source/campagne sont donc strictement allowlistés entre le volume,
 le `volume_base` et le chemin exact concerné. Pour l'incoming, seul le chemin
-exact ou un ancêtre canonique de sa chaîne entre `/home` et l'incoming est admis;
-`/`, autre home, cousin, descendant arbitraire et symlink restent refusés. Seul
-le bind venue reste target exact `rw`. `ReadOnlyPaths` applique cette vue sans
+exact ou un ancêtre canonique de sa chaîne entre `/home` et l'incoming est admis.
+Lorsque `/home` réside sur le filesystem racine, `TARGET=/` est également admis
+uniquement pour les vues `/home`/incoming si `/dev/sda1`, ext4, `FSROOT=/`, le
+couple `MAJ:MIN`/`stat(2)` et l'option RO concordent sur toute la chaîne
+canonique. Un autre home, cousin, descendant arbitraire et symlink restent
+refusés; `TARGET=/` reste interdit pour le volume `/dev/sdb` et toute vue RW.
+Seul le bind venue reste target exact `rw`. `ReadOnlyPaths` applique cette vue sans
 modifier H1. L'admission compare `MAJ:MIN` à `stat(2)`, le fstype et la relation
 `SOURCE`/`FSROOT` dérivée du target effectif. Le probe venue fait une création exclusive,
 fsync fichier/répertoire, suppression et second fsync, puis le runner répète la
@@ -187,6 +191,15 @@ reconnaissait correctement un ancêtre de l'incoming coalescé par systemd, mais
 `_authenticate_incoming_namespace_target` n'acceptait littéralement que `/home`
 ou l'incoming exact. La cleanup a désarmé les unités et aucun collecteur n'a
 démarré. Cette racine et toutes ses preuves restent immuables.
+
+La tentative `pm-20260828t013545z-c15607ae` a ensuite authentifié le namespace
+Polymarket complet, y compris la vue root-backed RO de `/home`, le volume
+`/dev/sdb` RO, la venue seule RW et le write probe durable. B l'a refusée à tort
+parce qu'il exigeait `ExecMainCode=1` alors que ce systemd a publié 0 pour un
+oneshot pourtant `Result=success`, `ExecMainStatus=0`, `inactive/dead`, sans PID
+ni restart. La cleanup a laissé tous les services persistants inactifs et cette
+racine reste immuable. L'admission lie désormais ces propriétés au JSON GREEN
+canonique du probe au lieu d'utiliser `ExecMainCode` seul.
 
 Une venue DNS/HTTPS/WSS indisponible reçoit son propre verdict; l'autre venue et
 le cockpit restent installables. Kalshi WSS n'est jamais sondé car le contrat
@@ -235,7 +248,11 @@ démarrage. `eligible_venues=[]` reste admis comme `BOTH_UNAVAILABLE` explicite,
 dashboard-only, sans faux collecteur ni faux métrique.
 
 Avant d'activer le dashboard ou un collecteur, B exécute les deux unités oneshot
-namespace et exige pour chacune `Result=success`, exit 0 et zéro restart. Un
+namespace et exige pour chacune `Result=success`, `ExecMainStatus=0`,
+`inactive/dead`, `MainPID=0`, zéro restart, le fragment exact et l'unique JSON
+canonique GREEN avec `namespace_admissible=true` et `errors=[]`. Le champ
+`ExecMainCode` n'est admis que sous les formes 0 et 1 compatibles avec une fin
+oneshot normale réussie; il n'est jamais utilisé seul comme oracle de succès. Un
 refus expose de façon bornée `TARGET`, `SOURCE`, `FSTYPE`, `VFS_OPTIONS`,
 `MAJ:MIN`, `FSROOT` et le chemin logique. Si un probe ou un collecteur échoue
 avant un state authentifié, B capture immédiatement Result, exit, présence

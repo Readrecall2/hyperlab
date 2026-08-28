@@ -1981,6 +1981,226 @@ def runner_namespace_admission(
     }
 
 
+def authenticate_namespace_probe_completion(
+    *,
+    properties_text: str,
+    journal_text: str,
+    service: str,
+    venue: str,
+    campaign_root: Path,
+    incoming_root: Path,
+) -> dict[str, object]:
+    """Bind successful oneshot properties to its exact fail-closed JSON receipt."""
+
+    if venue not in {"polymarket", "kalshi"}:
+        raise PreflightError("namespace probe venue is invalid")
+    campaign = PurePosixPath(campaign_root.as_posix())
+    incoming = PurePosixPath(incoming_root.as_posix())
+    if (
+        not campaign.is_absolute()
+        or not incoming.is_absolute()
+        or ".." in campaign.parts
+        or ".." in incoming.parts
+        or campaign.name != incoming.name
+        or _RUN_SLUG.fullmatch(campaign.name) is None
+    ):
+        raise PreflightError("namespace probe attempt roots are invalid or divergent")
+    expected_service = (
+        f"hyperlab-pm-{campaign.name.removeprefix('pm-')}-"
+        f"{venue}-namespace-probe.service"
+    )
+    if service != expected_service:
+        raise PreflightError("namespace probe service identity diverged")
+    if len(properties_text.encode("utf-8")) > 4096:
+        raise PreflightError("namespace probe properties are oversized")
+    expected_properties = {
+        "ActiveState",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "FragmentPath",
+        "LoadState",
+        "MainPID",
+        "NRestarts",
+        "Result",
+        "SubState",
+    }
+    properties: dict[str, str] = {}
+    for line in properties_text.splitlines():
+        if "=" not in line:
+            raise PreflightError("namespace probe properties are malformed")
+        key, value = line.split("=", 1)
+        if key in properties:
+            raise PreflightError("namespace probe property is duplicated")
+        properties[key] = value
+    if set(properties) != expected_properties:
+        raise PreflightError("namespace probe property set diverged")
+
+    def require_property(key: str, expected: str, label: str) -> None:
+        if properties.get(key) != expected:
+            raise PreflightError(f"namespace probe {label} diverged")
+
+    require_property("LoadState", "loaded", "load-state")
+    require_property("ActiveState", "inactive", "active-state")
+    require_property("SubState", "dead", "sub-state")
+    require_property("Result", "success", "result")
+    require_property("MainPID", "0", "main-pid")
+    require_property("NRestarts", "0", "restart-count")
+    if properties["ExecMainCode"] not in {"0", "1"}:
+        raise PreflightError("namespace probe exit-code-kind diverged")
+    require_property("ExecMainStatus", "0", "exit-status")
+    require_property(
+        "FragmentPath",
+        f"/etc/systemd/system/{service}",
+        "fragment",
+    )
+
+    journal_raw = journal_text.encode("utf-8")
+    if not journal_raw:
+        raise PreflightError("namespace probe payload is absent")
+    if len(journal_raw) > 65_536:
+        raise PreflightError("namespace probe journal payload is oversized")
+    candidates: list[tuple[str, dict[str, object]]] = []
+    for line in journal_text.splitlines():
+        try:
+            candidate = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("terminal_signal")
+            in {
+                "PREDICTION_RUNNER_NAMESPACE_GREEN",
+                "PREDICTION_RUNNER_NAMESPACE_REFUSED",
+            }
+        ):
+            candidates.append((line, candidate))
+    if not candidates:
+        raise PreflightError("namespace probe payload is absent or malformed")
+    if len(candidates) != 1:
+        raise PreflightError("namespace probe payload is ambiguous")
+    payload_line, payload = candidates[0]
+    if payload_line != canonical_json_bytes(payload).decode("utf-8"):
+        raise PreflightError("namespace probe payload is not canonical JSON")
+    expected_payload_fields = {
+        "boundary",
+        "checks",
+        "errors",
+        "namespace_admissible",
+        "observed_mounts",
+        "recorded_at_utc",
+        "schema_version",
+        "terminal_signal",
+        "venue",
+    }
+    if set(payload) != expected_payload_fields:
+        raise PreflightError("namespace probe payload field set diverged")
+    if (
+        payload.get("boundary") != BOUNDARY
+        or payload.get("schema_version") != 1
+        or payload.get("venue") != venue
+    ):
+        raise PreflightError("namespace probe payload identity diverged")
+    recorded_at = payload.get("recorded_at_utc")
+    if not isinstance(recorded_at, str):
+        raise PreflightError("namespace probe payload timestamp is invalid")
+    try:
+        parsed_at = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise PreflightError("namespace probe payload timestamp is invalid") from error
+    if parsed_at.tzinfo is None or parsed_at.utcoffset() != UTC.utcoffset(parsed_at):
+        raise PreflightError("namespace probe payload timestamp is not UTC")
+    if (
+        payload.get("terminal_signal") != "PREDICTION_RUNNER_NAMESPACE_GREEN"
+        or payload.get("namespace_admissible") is not True
+        or payload.get("errors") != []
+    ):
+        raise PreflightError("namespace probe payload refused admission")
+    checks = payload.get("checks")
+    observed = payload.get("observed_mounts")
+    if not isinstance(checks, dict) or not isinstance(observed, dict):
+        raise PreflightError("namespace probe payload proofs are invalid")
+    required_mounts = {
+        "campaign",
+        "home",
+        "incoming",
+        "source",
+        "venue",
+        "volume_base",
+        "volume_parent",
+    }
+    if set(observed) != required_mounts:
+        raise PreflightError("namespace probe observed mount set diverged")
+    mount_fields = {
+        "device_major_minor",
+        "filesystem",
+        "filesystem_root",
+        "logical_path",
+        "mount",
+        "options",
+        "source",
+        "stat_device_major_minor",
+    }
+    for name in sorted(required_mounts):
+        row = observed[name]
+        if not isinstance(row, dict) or set(row) != mount_fields:
+            raise PreflightError(f"namespace probe {name} mount proof is invalid")
+        device = row.get("device_major_minor")
+        options = row.get("options")
+        if (
+            row.get("filesystem") != "ext4"
+            or not isinstance(device, str)
+            or re.fullmatch(r"[0-9]+:[0-9]+", device) is None
+            or row.get("stat_device_major_minor") != device
+            or not isinstance(options, list)
+            or not all(isinstance(item, str) for item in options)
+        ):
+            raise PreflightError(f"namespace probe {name} mount identity diverged")
+        expected_mode = "rw" if name == "venue" else "ro"
+        opposite = "ro" if expected_mode == "rw" else "rw"
+        if expected_mode not in options or opposite in options:
+            raise PreflightError(f"namespace probe {name} mount mode diverged")
+    venue_root = (campaign / venue).as_posix()
+    if observed["incoming"].get("logical_path") != incoming.as_posix():
+        raise PreflightError("namespace probe incoming logical path diverged")
+    if observed["venue"].get("logical_path") != venue_root:
+        raise PreflightError("namespace probe venue logical path diverged")
+    readonly = checks.get("readonly_roots")
+    write_surface = checks.get("write_surface")
+    if (
+        checks.get("admitted_device_major_minor")
+        != observed["venue"].get("device_major_minor")
+        or checks.get("incoming_readonly") != observed["incoming"]
+        or checks.get("parent_mount") != observed["volume_parent"]
+        or checks.get("venue") != venue
+        or checks.get("venue_mount") != observed["venue"]
+        or checks.get("volume_base_readonly") != observed["volume_base"]
+        or readonly
+        != {
+            "campaign": observed["campaign"],
+            "source": observed["source"],
+        }
+        or not isinstance(write_surface, dict)
+        or write_surface
+        != {
+            "directory_fsync": True,
+            "exclusive_create": True,
+            "file_fsync": True,
+            "probe_removed": True,
+            "root": venue_root,
+        }
+    ):
+        raise PreflightError("namespace probe authenticated proof graph diverged")
+    return {
+        "authenticated": True,
+        "boundary": BOUNDARY,
+        "exec_main_code": properties["ExecMainCode"],
+        "payload_sha256": sha256_bytes(canonical_json_bytes(payload)),
+        "service": service,
+        "terminal_signal": "PREDICTION_NAMESPACE_PROBE_COMPLETION_GREEN",
+        "venue": venue,
+    }
+
+
 def runner_startup_admission(
     handoff_path: Path,
     install_admission_path: Path,
@@ -2444,6 +2664,15 @@ def _parser() -> argparse.ArgumentParser:
     namespace_guard.add_argument(
         "--venue", choices=("polymarket", "kalshi"), required=True
     )
+    namespace_completion = subparsers.add_parser(
+        "authenticate-namespace-probe-completion"
+    )
+    namespace_completion.add_argument("--service", required=True)
+    namespace_completion.add_argument(
+        "--venue", choices=("polymarket", "kalshi"), required=True
+    )
+    namespace_completion.add_argument("--campaign-root", type=Path, required=True)
+    namespace_completion.add_argument("--incoming-root", type=Path, required=True)
     recovery_admission = subparsers.add_parser("recovery-admission")
     recovery_admission.add_argument("--handoff", type=Path, required=True)
     recovery_admission.add_argument("--report", type=Path, required=True)
@@ -2482,6 +2711,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(canonical_json_bytes(report).decode("utf-8"))
             return 0 if report["namespace_admissible"] is True else 4
+        if arguments.command == "authenticate-namespace-probe-completion":
+            report = authenticate_namespace_probe_completion(
+                properties_text=os.environ.get(
+                    "HYPERLAB_NAMESPACE_PROBE_PROPERTIES", ""
+                ),
+                journal_text=os.environ.get("HYPERLAB_NAMESPACE_PROBE_JOURNAL", ""),
+                service=arguments.service,
+                venue=arguments.venue,
+                campaign_root=arguments.campaign_root,
+                incoming_root=arguments.incoming_root,
+            )
+            print(canonical_json_bytes(report).decode("utf-8"))
+            return 0
         if arguments.command == "install-admission":
             report = install_admission_preflight(
                 arguments.handoff,

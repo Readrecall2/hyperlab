@@ -244,6 +244,20 @@ les preuves. Le correctif ne rend aucune nouvelle surface writable : les vues
 `/home`/incoming restent strictement RO et la seule surface RW reste le
 sous-répertoire exact de la venue sur `/dev/sdb`.
 
+La tentative `pm-20260828t013545z-c15607ae` et toutes ses racines restent
+également immuables. Son probe Polymarket a authentifié le namespace complet,
+dont la vue root-backed RO de `/home`, le volume `/dev/sdb` RO et la seule venue
+RW avec le write probe durable. Le wrapper B l'a pourtant refusé après la fin
+réussie du `Type=oneshot` parce qu'il exigeait littéralement
+`ExecMainCode=1`; ce systemd a exposé `ExecMainCode=0`, tout en attestant
+`Result=success`, `ExecMainStatus=0`, `inactive/dead`, `MainPID=0`, zéro restart
+et le fragment exact. B accepte désormais uniquement les deux représentations
+`ExecMainCode` 0 ou 1 compatibles avec une fin normale réussie lorsque tous ces
+invariants concordent. Il authentifie en plus l'unique JSON canonique GREEN du
+probe, son identité venue/service, ses sept preuves mount et son write probe;
+un payload absent, ambigu, malformé ou refusé désarme les cinq unités avant tout
+service persistant.
+
 ## Preflight cible
 
 Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :

@@ -184,6 +184,51 @@ def test_python_isolated_mode_ignores_pythonpath_for_hyperlab(tmp_path: Path) ->
     assert "No module named 'hyperlab'" in completed.stderr
 
 
+def test_install_hyperlab_entrypoint_uses_explicit_isolated_source_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "authenticated-source"
+    package = source / "src" / "hyperlab"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        """import json,sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({'argv':sys.argv[1:],'file':__file__}),encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    untrusted = tmp_path / "untrusted-cwd"
+    (untrusted / "hyperlab").mkdir(parents=True)
+    (untrusted / "hyperlab" / "__init__.py").write_text("", encoding="utf-8")
+    (untrusted / "hyperlab" / "__main__.py").write_text(
+        "raise SystemExit('UNTRUSTED_HYPERLAB_IMPORTED')\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "entrypoint.json"
+    bridge = (
+        'import runpy,sys; source=sys.argv.pop(1); '
+        'sys.path[:0]=[source+"/src",source]; '
+        'runpy.run_module("hyperlab",run_name="__main__")'
+    )
+    install = (OPS / "install.sh").read_text(encoding="utf-8")
+    assert f"'{bridge}'" in install
+    environment = {**os.environ, "PYTHONPATH": str(untrusted)}
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", bridge, str(source), str(output), "sentinel"],
+        capture_output=True,
+        check=False,
+        cwd=untrusted,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["argv"] == [str(output), "sentinel"]
+    assert Path(record["file"]).resolve() == (package / "__main__.py").resolve()
+
+
 def test_runtime_import_admission_isolated_fresh_venv_from_untrusted_cwd(
     tmp_path: Path,
 ) -> None:
@@ -628,7 +673,7 @@ fi
 if [[ ${1:-} == -I && ${2:-} == */preflight.py ]]; then
   exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_INSTALL_PREFLIGHT_HELPER" "${@:3}"
 fi
-if [[ ${1:-} == -m && ${4:-} == prediction-prepare ]]; then
+if [[ ${1:-} == -I && ${2:-} == -c && ${3:-} == *'runpy.run_module("hyperlab"'* && ${5:-} == research-data && ${6:-} == prediction-prepare ]]; then
   output=''
   while (($#)); do
     if [[ $1 == --output-root ]]; then output=$2; break; fi
@@ -6821,6 +6866,10 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     assert "PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED" in cutover
     assert "PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY" in cutover
     assert "hyperlab-h1" not in cutover
+    assert '"$OLD_PYTHON" -I "$NEW_INCOMING/scripts/preflight.py"' in cutover
+    assert "$INCOMING_ROOT" not in cutover
+    assert "run_hyperlab_isolated research-data prediction-prepare" in install
+    assert '"$VENV_PYTHON" -m hyperlab' not in install
     assert "rm -rf" not in cutover and "unlink" not in cutover
     assert "rm -rf" not in rollback + install
     assert "unlink" not in rollback + install

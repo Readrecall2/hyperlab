@@ -72,6 +72,12 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export TZ=UTC
 
+run_hyperlab_isolated() {
+  "$VENV_PYTHON" -I -c \
+    'import runpy,sys; source=sys.argv.pop(1); sys.path[:0]=[source+"/src",source]; runpy.run_module("hyperlab",run_name="__main__")' \
+    "$SOURCE_ROOT" "$@"
+}
+
 START_AT_UTC=${HYPERLAB_PM_START_AT_UTC:-}
 if [[ -z $START_AT_UTC ]]; then
   START_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -96,7 +102,7 @@ PY
   fi
 fi
 CAMPAIGN_ID=$(basename -- "$CAMPAIGN_ROOT")
-"$VENV_PYTHON" -m hyperlab research-data prediction-prepare \
+run_hyperlab_isolated research-data prediction-prepare \
   --output-root "$CAMPAIGN_ROOT" \
   --campaign-id "$CAMPAIGN_ID" \
   --starts-at-utc "$START_AT_UTC" \

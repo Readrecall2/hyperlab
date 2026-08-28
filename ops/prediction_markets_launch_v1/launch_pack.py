@@ -12,8 +12,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-EXPECTED_BRANCH = "codex/prediction-markets-prospective-launch-v1"
-PACK_ID = "prediction-markets-prospective-launch-v1"
+EXPECTED_BRANCH = "codex/prediction-markets-runtime-data-quality-v1"
+PACK_ID = "prediction-markets-runtime-data-quality-v1"
+SUPERSEDED_RUN_SLUG = "pm-20260828t024827z-bcb5280f"
+SUPERSEDED_SOURCE_COMMIT = "bcb5280f87393992e2aa4528188009186cd8bdc3"
 _RUN_SLUG = re.compile(r"^pm-[0-9]{8}t[0-9]{6}z-[0-9a-f]{8}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -24,6 +26,7 @@ _PROBE_SERVICE = re.compile(
 _SCRIPTS = (
     "bootstrap-offline.sh",
     "cockpit.py",
+    "cutover.sh",
     "install.sh",
     "launch_pack.py",
     "monitor.sh",
@@ -31,6 +34,21 @@ _SCRIPTS = (
     "rollback.sh",
     "runner.py",
 )
+
+
+def _superseded_campaign_contract() -> dict[str, object]:
+    slug = SUPERSEDED_RUN_SLUG
+    volume_base = "/mnt/HC_Volume_106716684/hyperlab-prediction-markets"
+    return {
+        "campaign_root": f"{volume_base}/campaigns/{slug}",
+        "dashboard_port": 18081,
+        "incoming_root": f"/home/hyperlab/hyperlab-prediction-markets/incoming/{slug}",
+        "namespace_probe_services": _namespace_probe_service_names(slug),
+        "run_slug": slug,
+        "services": _service_names(slug),
+        "source_commit": SUPERSEDED_SOURCE_COMMIT,
+        "source_root": f"{volume_base}/sources/{slug}",
+    }
 
 
 class LaunchPackError(RuntimeError):
@@ -412,14 +430,16 @@ signer, secret ou accès privé. Il ne touche pas la campagne H1. Son statut
    si identité, capacité, NTP, filesystem, port, service ou dépendance diverge.
    Signal attendu : `PREDICTION_INSTALL_ACTIVATION_GREEN`.
 3. Dans un second onglet Tabby, exécuter
-   `operator/C-tabby-readonly-monitor.sh`. Il s'arrête à la première transition
-   ou alerte avec `PREDICTION_MONITOR_TRANSITION_OR_ALERT`.
+   `operator/C-tabby-readonly-monitor.sh`. Il authentifie séparément dashboard,
+   Polymarket, Kalshi, zéro restart, les deux ledgers et l'ordinal 0 de la
+   nouvelle campagne. Signal : `PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED`.
 4. Sur Windows PowerShell, exécuter
    `operator/D-windows-dashboard-tunnel.ps1`. Ouvrir l'URL seulement après
    `PREDICTION_TUNNEL_READY http://127.0.0.1:18081`.
-5. `operator/E-recovery-rollback.sh recovery|rollback` reprend sans rejouer un
-   slot terminal, ou arrête/désactive uniquement les trois services et deux
-   probes ci-dessous.
+5. `operator/E-recovery-rollback.sh recovery|rollback-new|restore-old` reprend
+   la nouvelle campagne sans rejouer un slot terminal, désarme ses cinq unités,
+   ou restaure explicitement l'ancienne campagne après preuve qu'aucun nouveau
+   collecteur ne tourne.
    Aucun raw, manifest, ledger, run ou rapport n'est supprimé.
 
 Les blocs Windows lisent `HYPERLAB_PM_SSH_TARGET` et `HYPERLAB_PM_SSH_KEY` dans
@@ -616,10 +636,10 @@ def render_tabby_install(handoff: Mapping[str, object]) -> str:
     commit = handoff["source_commit"]
     bundle = handoff["bundle_filename"]
     return f"""#!/usr/bin/env bash
-# Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 5-15 min; maximum: 35 min.
+# Lieu: Tabby/VPS Bash sous hyperlab. Durée attendue: 7-18 min; maximum: 40 min.
 # Prompts: sudo peut demander le mot de passe; aucun pip réseau. Ctrl+C avant la
-# première activation laisse seulement de nouvelles racines isolées. Après activation,
-# les services déjà démarrés peuvent rester actifs: utiliser E rollback pour les arrêter.
+# bascule ne change rien. Après le désarmement de l'ancienne campagne, Ctrl+C
+# préserve toutes les preuves mais exige E restore-old avant toute autre activation.
 # Signal terminal exact: PREDICTION_INSTALL_ACTIVATION_GREEN.
 set -Eeuo pipefail
 umask 077
@@ -628,6 +648,15 @@ SOURCE_ROOT='{source}'
 CAMPAIGN_ROOT='{campaign}'
 VOLUME_BASE='{base}'
 [[ $(id -un) == hyperlab ]] || {{ printf 'PREDICTION_TABBY_REFUSED:user\n' >&2; exit 4; }}
+cutover_exit() {{
+  status=$?
+  if (( status != 0 )) && [[ -f "$INCOMING_ROOT/cutover-old-premutation.json" ]]; then
+    printf 'PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD\n' >&2
+  fi
+  exit "$status"
+}}
+trap cutover_exit EXIT
+bash "$INCOMING_ROOT/scripts/cutover.sh" disarm-old "$INCOMING_ROOT/handoff.json"
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" host --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/host-preflight-report.json"
 sudo install -d -o hyperlab -g hyperlab -m 0700 "$VOLUME_BASE" "$VOLUME_BASE/sources" "$VOLUME_BASE/campaigns"
 python3.12 -I "$INCOMING_ROOT/scripts/preflight.py" fsync --handoff "$INCOMING_ROOT/handoff.json" --report "$INCOMING_ROOT/filesystem-fsync-report.json"
@@ -639,36 +668,84 @@ bash "$INCOMING_ROOT/scripts/bootstrap-offline.sh" "$SOURCE_ROOT" "$INCOMING_ROO
 printf 'PREDICTION_SOURCE_ROOT=%s\n' "$SOURCE_ROOT"
 printf 'PREDICTION_CAMPAIGN_ROOT=%s\n' "$CAMPAIGN_ROOT"
 bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/install.sh" "$INCOMING_ROOT"
+trap - EXIT
 """
 
 
 def render_tabby_monitor(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     source = handoff["source_root"]
+    campaign = handoff["campaign_root"]
     return f"""#!/usr/bin/env bash
-# Lieu: second onglet Tabby. Durée: jusqu'à la première transition/alerte.
-# Prompts: aucun. Ctrl+C arrête seulement ce moniteur read-only.
-# Signal terminal: PREDICTION_MONITOR_TRANSITION_OR_ALERT.
+# Lieu: second onglet Tabby. Durée attendue: 2-5 min; maximum opérateur: 12 min.
+# Prompts: aucun. Ctrl+C arrête seulement ce moniteur read-only et ne change
+# aucun service, ledger, receipt, raw ou manifest.
+# Signal terminal exact: PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED.
 set -Eeuo pipefail
-PREVIOUS=''
 while :; do
   if ! CURRENT=$(bash '{source}/ops/prediction_markets_launch_v1/monitor.sh' '{incoming}/handoff.json'); then
     printf 'PREDICTION_MONITOR_EXECUTION_FAILED\n' >&2
-    printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
+    printf 'PREDICTION_MONITOR_OPERATIONAL_FAILURE\n'
     exit 4
   fi
   printf '%s\n' "$CURRENT"
-  if ! PARSED=$(printf '%s' "$CURRENT" | python3.12 -I -c 'import json,re,sys; d=json.load(sys.stdin); f=d.get("semantic_fingerprint_sha256"); assert isinstance(f,str) and re.fullmatch(r"[0-9a-f]{{64}}",f); assert isinstance(d.get("alert"),bool); print(f,"yes" if d["alert"] else "no")'); then
+  if ! printf '%s' "$CURRENT" | '{source}/.venv/bin/python' -I -c 'import json,re,sys; d=json.load(sys.stdin); f=d.get("semantic_fingerprint_sha256"); assert isinstance(f,str) and re.fullmatch(r"[0-9a-f]{{64}}",f); assert isinstance(d.get("alert"),bool)'; then
     printf 'PREDICTION_MONITOR_JSON_INVALID\n' >&2
-    printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
+    printf 'PREDICTION_MONITOR_OPERATIONAL_FAILURE\n'
     exit 4
   fi
-  read -r FINGERPRINT ALERT <<< "$PARSED"
-  if [[ $ALERT == yes || ( -n $PREVIOUS && $FINGERPRINT != "$PREVIOUS" ) ]]; then
-    printf 'PREDICTION_MONITOR_TRANSITION_OR_ALERT\n'
-    break
+  set +e
+  PROOF=$(CURRENT="$CURRENT" PYTHONPATH='{source}/src:{source}' '{source}/.venv/bin/python' -I - '{campaign}' '{source}' <<'PY'
+from datetime import datetime
+from pathlib import Path
+import json,os,sys
+source=Path(sys.argv[2]); sys.path[:0]=[str(source/'src'),str(source)]
+from hyperlab.research_data.envelope import Venue
+from ops.prediction_markets_launch_v1.runner import _validate_result,canonical_json_bytes,load_campaign_context,read_ledger,sha256_bytes,validate_service_ledger_against_manifest
+value=json.loads(os.environ['CURRENT'])
+if value.get('preflight_error') is not None or value.get('operational_failure') is not False or value.get('activation_admissible') is not True:
+ raise SystemExit(4)
+services=value.get('services')
+if not isinstance(services,dict) or set(services)!=set(('polymarket','kalshi','dashboard')): raise SystemExit(4)
+for name in ('polymarket','kalshi','dashboard'):
+ service=services[name]; props=service.get('properties')
+ if (not isinstance(props,dict) or props.get('NRestarts')!='0' or service.get('restarts_verified') is not True
+     or service.get('fragment_verified') is not True): raise SystemExit(4)
+if (services['dashboard'].get('command_verified') is not True or services['dashboard'].get('listener_verified') is not True
+    or services['dashboard']['properties'].get('ActiveState')!='active'): raise SystemExit(4)
+root=Path(sys.argv[1]); context=load_campaign_context(root,source); result={{}}
+for venue in (Venue.POLYMARKET,Venue.KALSHI):
+ rows=read_ledger(root/venue.value/'ledger.jsonl')
+ validate_service_ledger_against_manifest(rows,campaign_manifest=context.manifest,venue=venue)
+ if not rows or rows[0].get('ordinal')!=0: raise SystemExit(20)
+ first=rows[0]
+ scheduled=datetime.fromisoformat(str(first['scheduled_start_utc']).replace('Z','+00:00'))
+ run=root/venue.value/'runs'/f"shard-0000-{{scheduled.strftime('%Y%m%dT%H%M%SZ')}}"
+ receipt=_validate_result(run,context,venue,ordinal=0)
+ if sha256_bytes(canonical_json_bytes(receipt))!=first.get('terminal_result_sha256'): raise SystemExit(4)
+ result[venue.value]={{key:first.get(key) for key in ('economic_eligible','manifest_sha256','receipt_classification','root_sha256','source_usable','terminal_health','terminal_result_sha256')}}
+ service=services[venue.value]
+ state=service.get('state')
+ if (service.get('ledger_error') is not None or service.get('command_verified') is not True
+     or not isinstance(state,dict) or state.get('recorded_slots',0)<1 or state.get('last_terminal')!=first.get('terminal_health')): raise SystemExit(4)
+print(json.dumps({{'dashboard':{{'listener_verified':True,'nrestarts':0}},'first_slots':result}},ensure_ascii=False,separators=(',',':'),sort_keys=True))
+PY
+  )
+  PROOF_STATUS=$?
+  set -e
+  if (( PROOF_STATUS == 0 )); then
+    printf '%s\n' "$PROOF"
+    printf 'PREDICTION_MONITOR_DASHBOARD_AUTHENTICATED\n'
+    printf 'PREDICTION_MONITOR_NRESTARTS_ZERO_AUTHENTICATED\n'
+    printf 'PREDICTION_MONITOR_POLYMARKET_LEDGER_FIRST_SLOT_AUTHENTICATED\n'
+    printf 'PREDICTION_MONITOR_KALSHI_LEDGER_FIRST_SLOT_AUTHENTICATED\n'
+    printf 'PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED\n'
+    exit 0
   fi
-  PREVIOUS=$FINGERPRINT
+  if (( PROOF_STATUS != 20 )); then
+    printf 'PREDICTION_MONITOR_OPERATIONAL_FAILURE\n' >&2
+    exit 4
+  fi
   sleep 10
 done
 """
@@ -695,21 +772,27 @@ def render_recovery_rollback(handoff: Mapping[str, object]) -> str:
     incoming = handoff["incoming_root"]
     source = handoff["source_root"]
     return f"""#!/usr/bin/env bash
-# Lieu: Tabby/VPS Bash. Durée attendue: 1-4 min; maximum: 12 min.
+# Lieu: Tabby/VPS Bash. Durée attendue: 1-5 min; maximum: 15 min.
 # Prompts: sudo peut demander le mot de passe. Ctrl+C ne supprime aucune preuve,
 # mais peut laisser un sous-ensemble des cinq unités Prediction Markets actif.
-# RECOVERY redémarre seulement les services Prediction Markets admissibles.
-# ROLLBACK arrête/désactive seulement ces trois services et deux probes, et préserve tous les raw/manifests/runs.
+# recovery reprend seulement la nouvelle campagne; rollback-new désarme ses cinq
+# unités; restore-old désarme d'abord toute unité nouvelle, puis réarme l'ancienne.
+# Signaux: PREDICTION_RECOVERY_RESUME_REQUESTED_NO_SLOT_RETRY,
+# PREDICTION_ROLLBACK_DISARMED_RAW_PRESERVED ou
+# PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY.
 set -Eeuo pipefail
 MODE=${{1:-}}
 case "$MODE" in
   recovery)
     bash '{source}/ops/prediction_markets_launch_v1/rollback.sh' recovery '{incoming}/handoff.json'
     ;;
-  rollback)
+  rollback-new)
     bash '{source}/ops/prediction_markets_launch_v1/rollback.sh' rollback '{incoming}/handoff.json'
     ;;
-  *) printf 'usage: bash E-recovery-rollback.sh recovery|rollback\n' >&2; exit 4 ;;
+  restore-old)
+    bash '{incoming}/scripts/cutover.sh' restore-old '{incoming}/handoff.json'
+    ;;
+  *) printf 'usage: bash E-recovery-rollback.sh recovery|rollback-new|restore-old\n' >&2; exit 4 ;;
 esac
 """
 
@@ -841,6 +924,7 @@ def finalize(
         "source_inventory_sha256": source_inventory["inventory_sha256"],
         "source_root": source,
         "start_at_override": "HYPERLAB_PM_START_AT_UTC_OPTIONAL",
+        "superseded_campaign": _superseded_campaign_contract(),
         "volume_base": volume_base,
         "volume_mount": remote["volume_mount"],
         "wheelhouse_manifest_sha256": sha256_bytes(wheelhouse_payload),

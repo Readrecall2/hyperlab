@@ -205,14 +205,16 @@ def test_kalshi_ghost_nonterminal_timestamp_cannot_omit_valid_raw_time() -> None
 
 def test_kalshi_trade_ids_require_nonempty_strings() -> None:
     assert _kalshi_trade_ids(
-        [{"ticker": "KXTEST", "trade_id": "trade-1"}],
+        [{"is_block_trade": False, "ticker": "KXTEST", "trade_id": "trade-1"}],
         expected_ticker="KXTEST",
+        expected_block_trade=False,
     ) == ("trade-1",)
     for invalid in (None, 7, ""):
         with pytest.raises(ValueError, match="identity or ticker"):
             _kalshi_trade_ids(
-                [{"ticker": "KXTEST", "trade_id": invalid}],
+                [{"is_block_trade": False, "ticker": "KXTEST", "trade_id": invalid}],
                 expected_ticker="KXTEST",
+                expected_block_trade=False,
             )
 
 

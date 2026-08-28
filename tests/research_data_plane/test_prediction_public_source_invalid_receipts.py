@@ -44,6 +44,8 @@ EXPECTED = {
 
 def _forensic_bytes(path: Path) -> bytes:
     raw = path.read_bytes()
+    if raw.endswith(b"\r\n"):
+        return raw[:-2]
     return raw[:-1] if raw.endswith(b"\n") else raw
 
 

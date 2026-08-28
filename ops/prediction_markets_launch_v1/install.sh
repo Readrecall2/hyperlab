@@ -475,6 +475,17 @@ if [[ -n $ELIGIBLE_RAW ]]; then
 fi
 
 STARTED_VENUES=()
+foreign_venue_collector_active() {
+  local venue=$1 expected=$2 unit listing
+  if ! listing=$(sudo systemctl list-units --type=service --state=active --no-legend --no-pager \
+    "hyperlab-pm-*-$venue.service"); then
+    fail "cannot enumerate active Prediction Markets collectors for venue: $venue"
+  fi
+  while read -r unit _rest; do
+    [[ -z $unit || $unit == "$expected" ]] || return 0
+  done <<< "$listing"
+  return 1
+}
 collector_ready() {
   local venue=$1 monitor_json
   monitor_json=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json") || return 1
@@ -590,6 +601,11 @@ for VENUE in "${ELIGIBLE[@]}"; do
     kalshi) SERVICE=$KALSHI_SERVICE ;;
     *) fail 'preflight eligible venue is invalid' ;;
   esac
+  if foreign_venue_collector_active "$VENUE" "$SERVICE"; then
+    cleanup_prediction_services \
+      || fail 'foreign collector collision and Prediction Markets cleanup also failed'
+    fail "another Prediction Markets collector is active for venue: $VENUE"
+  fi
   if ! sudo systemctl enable --now "$SERVICE"; then
     collector_readiness_diagnostic "$VENUE" "$SERVICE"
     cleanup_prediction_services \

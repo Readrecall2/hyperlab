@@ -183,13 +183,29 @@ def _write_fake_command(fake_bin: Path, name: str, body: str) -> None:
     path.chmod(0o700)
 
 
-def _operator_handoff_for_git_bash(tmp_path: Path, suffix: str) -> dict[str, object]:
+def _operator_handoff_for_git_bash(
+    tmp_path: Path,
+    suffix: str,
+    *,
+    materialize_source_runtime: bool = True,
+) -> dict[str, object]:
     run_slug = str(_handoff()["run_slug"])
     incoming = tmp_path / f"incoming-{suffix}" / run_slug
     source = tmp_path / f"source-{suffix}" / run_slug
     campaign = tmp_path / f"campaign-{suffix}" / run_slug
     volume = tmp_path / f"volume-{suffix}"
     incoming.mkdir(parents=True)
+    if materialize_source_runtime:
+        runtime = source / ".venv" / "bin" / "python"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text(
+            """#!/usr/bin/bash
+if [[ ${1:-} == -I && ${2:-} == -c ]]; then exec \"$HYPERLAB_REAL_PYTHON\" \"$@\"; fi
+printf '{\"dashboard\":{\"listener_verified\":true,\"nrestarts\":0},\"first_slots\":{\"kalshi\":{\"terminal_health\":\"COMPLETE\"},\"polymarket\":{\"terminal_health\":\"COMPLETE\"}}}\n'
+""",
+            encoding="utf-8",
+        )
+        runtime.chmod(0o700)
     handoff = _handoff()
     handoff.update(
         {
@@ -297,7 +313,7 @@ case "${HYPERLAB_FAKE_BASH_MODE:-install}" in
     [[ ${1:-} == */rollback.sh && ${2:-} == recovery ]] || exit 96
     printf 'PREDICTION_RECOVERY_GREEN\\n'
     ;;
-  rollback)
+  rollback-new)
     [[ ${1:-} == */rollback.sh && ${2:-} == rollback ]] || exit 95
     printf 'PREDICTION_ROLLBACK_GREEN\\n'
     ;;
@@ -355,7 +371,9 @@ def _internal_install_fixture(
     eligible_venues: tuple[str, ...] = ("polymarket", "kalshi"),
 ) -> tuple[Path, dict[str, object], Path, Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    handoff = _operator_handoff_for_git_bash(tmp_path, suffix)
+    handoff = _operator_handoff_for_git_bash(
+        tmp_path, suffix, materialize_source_runtime=False
+    )
     incoming = Path(str(handoff["incoming_root"]).replace("/c/", "C:/", 1))
     source = Path(str(handoff["source_root"]).replace("/c/", "C:/", 1))
     campaign = Path(str(handoff["campaign_root"]).replace("/c/", "C:/", 1))
@@ -1206,7 +1224,7 @@ def test_plan_freezes_candidate_identities_and_conservative_h1_reservation() -> 
     assert plan["access_bundle_sha256"] == (
         "965a42f2169c16201323477c0eb1ba7a8b540b24109c1d9252d5d9fcce55bbe5"
     )
-    assert plan["base_commit"] == "3f188b9c28c9fec406b904a9e3307b43f54243e8"
+    assert plan["base_commit"] == "bcb5280f87393992e2aa4528188009186cd8bdc3"
     assert plan["candidate_config_sha256"] == (
         "aa60c0ff0ef95813d79f56b6ea93a31952061b562905dc9729162f7b16e41964"
     )
@@ -2169,13 +2187,16 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     ) in install
     assert 'bash "$INCOMING_ROOT/scripts/install.sh"' not in install
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" in install
+    assert install.index('cutover.sh" disarm-old') < install.index('preflight.py" host')
+    assert "PREDICTION_NEW_ACTIVATION_FAILED_RUN_E_RESTORE_OLD" in install
     expected_monitor = (
         f"bash '{handoff['source_root']}/ops/prediction_markets_launch_v1/monitor.sh' "
         f"'{handoff['incoming_root']}/handoff.json'"
     )
     assert expected_monitor in monitor
     assert f"{handoff['incoming_root']}/scripts/monitor.sh" not in monitor
-    assert "PREDICTION_MONITOR_TRANSITION_OR_ALERT" in monitor
+    assert "PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED" in monitor
+    assert "first_slots" in monitor and "NRestarts" in monitor
     assert "$SshKeyRaw = $env:HYPERLAB_PM_SSH_KEY" in tunnel
     assert "Resolve-Path -LiteralPath $SshKeyRaw" in tunnel
     assert "ssh -i $SshKeyPath -N -o ExitOnForwardFailure=yes" in tunnel
@@ -2185,6 +2206,7 @@ def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
     assert "df -P --output" not in rendered
     assert "systemctl" not in windows
     assert "hyperlab-h1" not in rendered
+    assert "rollback-new|restore-old" in recovery
     assert "18080" not in rendered
 
 
@@ -2320,7 +2342,9 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     non_git_cwd = tmp_path / "non-git-cwd"
     non_git_cwd.mkdir()
 
-    failed_handoff = _operator_handoff_for_git_bash(tmp_path, "install-failed")
+    failed_handoff = _operator_handoff_for_git_bash(
+        tmp_path, "install-failed", materialize_source_runtime=False
+    )
     failed_script = tmp_path / "B-install-failed.sh"
     failed_script.write_text(
         launch_pack.render_tabby_install(failed_handoff), encoding="utf-8"
@@ -2338,7 +2362,9 @@ def test_materialized_tabby_b_runs_under_git_bash_and_never_false_greens(
     assert failed.returncode == 4
     assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in failed.stdout
 
-    green_handoff = _operator_handoff_for_git_bash(tmp_path, "install-green")
+    green_handoff = _operator_handoff_for_git_bash(
+        tmp_path, "install-green", materialize_source_runtime=False
+    )
     green_script = tmp_path / "B-install-green.sh"
     green_script.write_text(
         launch_pack.render_tabby_install(green_handoff), encoding="utf-8"
@@ -3128,22 +3154,21 @@ def test_materialized_tabby_c_stops_on_semantic_transition_with_real_json_parser
         environment=environment,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.count("PREDICTION_MONITOR_TRANSITION_OR_ALERT") == 1
-    assert completed.stdout.count('"alert":false') == 2
+    assert completed.stdout.count("PREDICTION_MONITOR_FIRST_SLOTS_AUTHENTICATED") == 1
+    assert completed.stdout.count('"alert":false') == 1
     lines = log.read_text(encoding="utf-8").splitlines()
     expected_monitor = (
         "bash|"
         f"{handoff['source_root']}/ops/prediction_markets_launch_v1/monitor.sh "
         f"{handoff['incoming_root']}/handoff.json"
     )
-    assert lines.count(expected_monitor) == 2
+    assert lines.count(expected_monitor) == 1
     assert not any(
         line.startswith("bash|")
         and f"{handoff['incoming_root']}/scripts/monitor.sh" in line
         for line in lines
     )
-    assert sum(line.startswith("python|-I -c ") for line in lines) == 2
-    assert sum(line.startswith("sleep|10") for line in lines) == 1
+    assert sum(line.startswith("sleep|10") for line in lines) == 0
 
 
 @pytest.mark.parametrize(
@@ -3177,14 +3202,14 @@ def test_materialized_tabby_c_always_signals_on_monitor_or_json_failure(
     )
     assert completed.returncode == 4
     assert diagnostic in completed.stderr
-    assert completed.stdout.count("PREDICTION_MONITOR_TRANSITION_OR_ALERT") == 1
+    assert completed.stdout.count("PREDICTION_MONITOR_OPERATIONAL_FAILURE") == 1
 
 
 @pytest.mark.parametrize(
     ("mode", "signal"),
     [
         ("recovery", "PREDICTION_RECOVERY_GREEN"),
-        ("rollback", "PREDICTION_ROLLBACK_GREEN"),
+        ("rollback-new", "PREDICTION_ROLLBACK_GREEN"),
     ],
 )
 def test_materialized_tabby_e_dispatches_only_the_selected_safe_mode(
@@ -3219,7 +3244,8 @@ def test_materialized_tabby_e_dispatches_only_the_selected_safe_mode(
     lines = log.read_text(encoding="utf-8").splitlines()
     dispatches = [line for line in lines if line.startswith("bash|")]
     assert len(dispatches) == 1
-    assert f"rollback.sh {mode} " in dispatches[0]
+    expected_mode = "rollback" if mode == "rollback-new" else mode
+    assert f"rollback.sh {expected_mode} " in dispatches[0]
     assert "hyperlab-h1" not in dispatches[0]
 
 
@@ -3742,8 +3768,9 @@ class _SyntheticSystemctlResult:
   if _synthetic_mode=='pid-diverged' and name=='dashboard': pid='0'
   fragment=f'/etc/systemd/system/{services[name]}'
   if _synthetic_mode=='fragment-diverged' and name=='dashboard': fragment='/etc/systemd/system/foreign.service'
+  restarts='1' if _synthetic_mode=='restart-diverged' and name=='dashboard' else '0'
   self.returncode=0; self.stderr=''
-  self.stdout=f'LoadState=loaded\nActiveState={"active" if active else "inactive"}\nSubState={"running" if active else "dead"}\nMainPID={pid}\nNRestarts=0\nExecMainStatus=0\nFragmentPath={fragment}\n'
+  self.stdout=f'LoadState=loaded\nActiveState={"active" if active else "inactive"}\nSubState={"running" if active else "dead"}\nMainPID={pid}\nNRestarts={restarts}\nExecMainStatus=0\nFragmentPath={fragment}\n'
 def _synthetic_systemctl(arguments,**_kwargs):
  name=next(key for key,value in services.items() if value==arguments[2])
  return _SyntheticSystemctlResult(name)
@@ -3941,6 +3968,7 @@ exec "$HYPERLAB_REAL_PYTHON" "$HYPERLAB_MONITOR_INJECTOR" "$@"
         ("fragment-diverged", "fragment_verified"),
         ("listener-diverged", "listener_verified"),
         ("proc-foreign", "listener_verified"),
+        ("restart-diverged", "restarts_verified"),
     ):
         refused_completed, refused = invoke(mode)
         assert refused_completed.returncode == 0
@@ -5800,6 +5828,7 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     rollback = (OPS / "rollback.sh").read_text(encoding="utf-8")
     install = (OPS / "install.sh").read_text(encoding="utf-8")
     monitor = (OPS / "monitor.sh").read_text(encoding="utf-8")
+    cutover = (OPS / "cutover.sh").read_text(encoding="utf-8")
     bundle = (OPS / "New-PredictionMarketsLaunchBundle.ps1").read_text(encoding="utf-8")
     assert "PIP_NO_INDEX=1" in bootstrap
     assert "--no-index" in bootstrap
@@ -5824,5 +5853,13 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     assert "admission_required" in monitor and "eligible_venues" in monitor
     assert "CAPACITY_REFUSED" in monitor and "INTERRUPTED_RECOVERABLE" in monitor
     assert "hyperlab-h1" not in rollback + install + monitor
+    assert "pm-20260828t024827z-bcb5280f" in cutover
+    assert "bcb5280f87393992e2aa4528188009186cd8bdc3" in cutover
+    assert "_validate_result" in cutover and "read_ledger" in cutover
+    assert "PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED" in cutover
+    assert "PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED" in cutover
+    assert "PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY" in cutover
+    assert "hyperlab-h1" not in cutover
+    assert "rm -rf" not in cutover and "unlink" not in cutover
     assert "rm -rf" not in rollback + install
     assert "unlink" not in rollback + install

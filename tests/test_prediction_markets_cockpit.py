@@ -109,6 +109,7 @@ def _ledger_entry(venue: str, ordinal: int, *, frames: int, terminal: str = "COM
         "venue": venue_name,
     }
     identity_sha256 = runner.sha256_bytes(runner.canonical_json_bytes(identity))
+    source_usable = terminal != "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED"
     return {
         "boundary": cockpit.BOUNDARY,
         "bytes": frames * 100,
@@ -117,7 +118,7 @@ def _ledger_entry(venue: str, ordinal: int, *, frames: int, terminal: str = "COM
         "collection_id": (
             f"{plan['collection_id']}-shard-{ordinal:04d}-{identity_sha256[:16]}"
         ),
-        "economic_eligible": True,
+        "economic_eligible": source_usable,
         "duplicates": 1,
         "error": (
             "synthetic recovered public source interruption"
@@ -130,13 +131,17 @@ def _ledger_entry(venue: str, ordinal: int, *, frames: int, terminal: str = "COM
         "official_contract_sha256": CAMPAIGN_MANIFEST["contracts"][venue_name],
         "ordinal": ordinal,
         "probe_binding_sha256": str(ordinal + 2) * 64,
-        "receipt_classification": "AUTHENTICATED_COLLECTION_ADMISSIBLE_FOR_DERIVATION",
+        "receipt_classification": (
+            "AUTHENTICATED_COLLECTION_ADMISSIBLE_FOR_DERIVATION"
+            if source_usable
+            else "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+        ),
         "reconnects": 3,
         "recorded_at_utc": "2026-09-01T00:03:00.000000Z",
         "root_sha256": str(ordinal + 3) * 64,
         "scheduled_start_utc": scheduled_text,
         "segments": 4,
-        "source_usable": True,
+        "source_usable": source_usable,
         "terminal_health": terminal,
         "terminal_result_sha256": str(ordinal + 5) * 64,
         "venue": venue_name,

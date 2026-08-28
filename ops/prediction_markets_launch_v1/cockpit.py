@@ -822,7 +822,8 @@ def _venue_snapshot(
         "last_terminal_health": None if latest is None else latest.get("terminal_health"),
         "recovery": (
             "INTERRUPTED_RECOVERABLE"
-            if latest is not None and "INTERRUPTED" in str(latest.get("terminal_health"))
+            if latest is not None
+            and latest.get("terminal_health") == "INTERRUPTED_RECOVERABLE"
             else "NO_RECOVERY_PENDING"
         ),
         "service_state": "PREPARED_STALE" if prepared_stale else lifecycle,
@@ -852,10 +853,7 @@ def _state_code(
         return "PREPARED"
     if lifecycles == {"COMPLETE_WINDOW"}:
         return "COMPLETE_WINDOW"
-    if any(
-        value is not None and "INTERRUPTED" in str(value)
-        for value in (*lifecycles, *terminals)
-    ):
+    if "INTERRUPTED_RECOVERABLE" in lifecycles or "INTERRUPTED_RECOVERABLE" in terminals:
         return "INTERRUPTED_RECOVERABLE"
     unavailable: set[str] = set()
     invalid: set[str] = set()

@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import urlsplit
 
-from .adapters import KALSHI_METADATA_VERSION, POLYMARKET_METADATA_VERSION
+from .adapters import (
+    KALSHI_SUPPORTED_METADATA_VERSIONS,
+    POLYMARKET_METADATA_VERSION,
+)
 from .canonical import canonical_json_bytes
 from .envelope import PublicDataEnvelope, Venue
 from .segments import ResearchSegmentReader
@@ -29,9 +32,9 @@ class _EndpointContract(Protocol):
     def url(self) -> str: ...
 
 
-_EXPECTED_METADATA_VERSION = {
-    Venue.POLYMARKET: POLYMARKET_METADATA_VERSION,
-    Venue.KALSHI: KALSHI_METADATA_VERSION,
+_EXPECTED_METADATA_VERSIONS = {
+    Venue.POLYMARKET: frozenset({POLYMARKET_METADATA_VERSION}),
+    Venue.KALSHI: KALSHI_SUPPORTED_METADATA_VERSIONS,
 }
 
 _FEED_ENDPOINTS: dict[Venue, dict[str, frozenset[str]]] = {
@@ -102,8 +105,8 @@ def _validate_official_provenance(
 ) -> None:
     if contract.venue is not envelope.venue:
         raise ValueError("prediction raw contract venue diverged")
-    expected_version = _EXPECTED_METADATA_VERSION[envelope.venue]
-    if envelope.source_metadata_version != expected_version:
+    expected_versions = _EXPECTED_METADATA_VERSIONS[envelope.venue]
+    if envelope.source_metadata_version not in expected_versions:
         raise ValueError("prediction raw source metadata version is not the frozen adapter contract")
     if envelope.provenance.transport == "FIXTURE":
         if (
@@ -198,12 +201,12 @@ def prediction_raw_records(envelope: PublicDataEnvelope) -> tuple[Mapping[str, A
             return (cast(Mapping[str, Any], record),)
     sequence_keys = {
         "block_trades": ("trades",),
-        "event_fee_changes": ("fee_changes", "event_fee_changes"),
+        "event_fee_changes": ("event_fee_changes",),
         "events": ("events",),
-        "fee_changes": ("fee_changes",),
+        "fee_changes": ("series_fee_change_arr",),
         "historical_markets": ("markets",),
         "historical_trades": ("trades",),
-        "incentives": ("incentive_programs", "incentives"),
+        "incentives": ("incentive_programs",),
         "markets": ("markets",),
         "metadata": ("markets", "events"),
         "public_trades": ("trades",),
@@ -257,7 +260,7 @@ class PredictionRawEvidenceIndex:
             if contract is None:
                 if envelope.provenance.transport != "FIXTURE":
                     raise ValueError("public prediction raw evidence requires an official contract")
-                if envelope.source_metadata_version != _EXPECTED_METADATA_VERSION[envelope.venue]:
+                if envelope.source_metadata_version not in _EXPECTED_METADATA_VERSIONS[envelope.venue]:
                     raise ValueError("prediction fixture metadata version diverged")
                 continue
             _validate_official_provenance(envelope, contract)

@@ -87,7 +87,6 @@ _ADMISSIBLE_RAW_TERMINALS = {
     "MAX_FRAMES_REACHED",
     "MAX_NETWORK_CALLS_REACHED",
     "MAX_SEGMENTS_REACHED",
-    "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
 }
 _EXCLUDED_SLOT_TERMINALS = {
     "BACKPRESSURE_LIMIT_REACHED",
@@ -97,6 +96,7 @@ _EXCLUDED_SLOT_TERMINALS = {
     "INTERRUPTED_RECOVERED",
     "PUBLIC_SOURCE_INVALID",
     "PUBLIC_SOURCE_UNAVAILABLE",
+    "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
     "RECOVERED_AFTER_PROCESS_ERROR",
 }
 _ZERO = Decimal("0")
@@ -329,6 +329,8 @@ class PredictionUnavailableSource:
                 terminal_result_raw=result_raw,
             )
             if result.get("terminal_health") == "PUBLIC_SOURCE_INVALID"
+            and type(result.get("frames")) is int
+            and cast(int, result.get("frames")) > 0
             else None
         )
         expected_config_fields = {

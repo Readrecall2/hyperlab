@@ -16,7 +16,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-$ExpectedBranch = 'codex/prediction-markets-prospective-launch-v1'
+$ExpectedBranch = 'codex/prediction-markets-runtime-data-quality-v1'
 $ExpectedRef = "refs/heads/$ExpectedBranch"
 
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
@@ -40,7 +40,7 @@ Write-Output 'Durée attendue: 3-12 min; maximum: 35 min.'
 Write-Output 'Prompts: aucun pour Git/Python; téléchargement strictement limité au lock hashé.'
 Write-Output 'Ctrl+C laisse une sortie incomplète non transférable; recommencer avec un nouvel OutputRoot/RunSlug.'
 New-Item -ItemType Directory -Path $OutputRoot | Out-Null
-$BundlePath = Join-Path $OutputRoot 'hyperlab-prediction-markets-prospective-launch-v1.bundle'
+$BundlePath = Join-Path $OutputRoot 'hyperlab-prediction-markets-runtime-data-quality-v1.bundle'
 git -C $RepoRoot bundle create $BundlePath $ExpectedRef
 if ($LASTEXITCODE -ne 0) { throw 'git bundle create failed.' }
 git -C $RepoRoot bundle verify $BundlePath

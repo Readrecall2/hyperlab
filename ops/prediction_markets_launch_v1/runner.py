@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -44,7 +45,17 @@ _ADMISSIBLE_COLLECTION_TERMINALS = {
     "MAX_FRAMES_REACHED",
     "MAX_NETWORK_CALLS_REACHED",
     "MAX_SEGMENTS_REACHED",
+}
+_EXCLUDED_COLLECTION_TERMINALS = {
+    "BACKPRESSURE_LIMIT_REACHED",
+    "CONTINUITY_BROKEN_FROZEN",
+    "CONTINUITY_UNKNOWN_AFTER_RECONNECT_FROZEN",
+    "INTERRUPTED_RECOVERABLE",
+    "INTERRUPTED_RECOVERED",
+    "PUBLIC_SOURCE_INVALID",
+    "PUBLIC_SOURCE_UNAVAILABLE",
     "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+    "RECOVERED_AFTER_PROCESS_ERROR",
 }
 _ADMISSIBLE_RECEIPT = "AUTHENTICATED_COLLECTION_ADMISSIBLE_FOR_DERIVATION"
 _NO_RECEIPT_CLASSIFICATION = (
@@ -240,7 +251,7 @@ def _ledger_body(entry: Mapping[str, object]) -> dict[str, object]:
 
 
 def read_ledger(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
+    if not os.path.lexists(path):
         return []
     raw = _regular_file_bytes(path, maximum_bytes=_MAX_LEDGER_BYTES)
     if raw and (not raw.endswith(b"\n") or b"\r" in raw):
@@ -297,7 +308,16 @@ def append_ledger(
     if context is not None and venue is not None:
         _validate_service_ledger([*rows, entry], context=context, venue=venue)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("ab", buffering=0) as handle:
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise RunnerError("ledger cannot be opened without following links") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RunnerError("ledger target is not a regular file")
+    with os.fdopen(descriptor, "ab", buffering=0) as handle:
         handle.write(canonical_json_bytes(entry) + b"\n")
         os.fsync(handle.fileno())
     _fsync_directory(path.parent)
@@ -572,27 +592,6 @@ def validate_service_ledger_against_manifest(
                 "terminal_result_sha256",
             )
         )
-        if terminal == "PUBLIC_SOURCE_INVALID":
-            if (
-                source_usable is not False
-                or economic_eligible is not False
-                or classification != CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
-                or type(error) is not str
-                or not error.strip()
-                or len(error.encode("utf-8")) > 2_048
-                or any(type(value) is not int or value < 0 for value in counters)
-                or any(
-                    type(value) is not int or value <= 0
-                    for value in (
-                        row.get("bytes"),
-                        row.get("frames"),
-                        row.get("segments"),
-                    )
-                )
-                or any(not _is_sha256(value) for value in receipt_hashes)
-            ):
-                raise RunnerError(f"invalid-source ledger receipt diverged at line {index}")
-            continue
         if terminal == "PUBLIC_SOURCE_UNAVAILABLE":
             common_invalid = (
                 source_usable is not False
@@ -631,10 +630,7 @@ def validate_service_ledger_against_manifest(
                 raise RunnerError(f"unavailable-source ledger receipt diverged at line {index}")
             continue
         if terminal in _ADMISSIBLE_COLLECTION_TERMINALS:
-            error_required = terminal in {
-                "MAX_BYTES_REACHED",
-                "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
-            }
+            error_required = terminal == "MAX_BYTES_REACHED"
             if (
                 source_usable is not True
                 or economic_eligible is not True
@@ -652,6 +648,46 @@ def validate_service_ledger_against_manifest(
                 or (not error_required and error is not None)
             ):
                 raise RunnerError(f"usable ledger receipt diverged at line {index}")
+            continue
+        if terminal in _EXCLUDED_COLLECTION_TERMINALS:
+            has_raw = row.get("frames") != 0
+            error_required = terminal in {
+                "BACKPRESSURE_LIMIT_REACHED",
+                "INTERRUPTED_RECOVERED",
+                "PUBLIC_SOURCE_INVALID",
+                "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
+                "RECOVERED_AFTER_PROCESS_ERROR",
+            }
+            expected_classification = (
+                CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+                if terminal == "PUBLIC_SOURCE_UNAVAILABLE" and not has_raw
+                else CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+            )
+            raw_invalid = (
+                any(type(row.get(field)) is not int or row.get(field) <= 0 for field in ("bytes", "frames", "segments"))
+                or any(not _is_sha256(value) for value in receipt_hashes)
+            ) if has_raw else (
+                any(row.get(field) != 0 for field in ("bytes", "frames", "segments"))
+                or any(row.get(field) is not None for field in ("manifest_sha256", "probe_binding_sha256", "root_sha256"))
+                or not _is_sha256(row.get("terminal_result_sha256"))
+            )
+            if (
+                source_usable is not False
+                or economic_eligible is not False
+                or classification != expected_classification
+                or any(type(value) is not int or value < 0 for value in counters)
+                or raw_invalid
+                or (
+                    error_required
+                    and (
+                        type(error) is not str
+                        or not error.strip()
+                        or len(error.encode("utf-8")) > 2_048
+                    )
+                )
+                or (not error_required and error is not None)
+            ):
+                raise RunnerError(f"excluded-slot ledger receipt diverged at line {index}")
             continue
         if terminal in {"MISSING_SLOT_NO_BACKFILL", "PROCESS_ERROR_NO_TERMINAL_RECEIPT"}:
             if (
@@ -944,16 +980,16 @@ def _validate_result(
         expected_cutoff = _datetime_utc_ns(scheduled_start) + context.cadence_seconds * 1_000_000_000
         terminal_health = result.get("terminal_health")
         binding: PredictionCollectionBinding | None = None
-        if terminal_health in {"PUBLIC_SOURCE_INVALID", "PUBLIC_SOURCE_UNAVAILABLE"}:
+        if terminal_health in _EXCLUDED_COLLECTION_TERMINALS:
             excluded = PredictionUnavailableSource.from_probe_output(output_root)
             verify_prediction_collection_plan_payload(excluded.probe_payload, plan)
             expected_classification = (
-                CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
-                if terminal_health == "PUBLIC_SOURCE_INVALID"
-                or excluded.frame_count > 0
-                else CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+                CAMPAIGN_BOUND_UNAVAILABILITY_RECEIPT
+                if terminal_health == "PUBLIC_SOURCE_UNAVAILABLE"
+                and excluded.frame_count == 0
+                else CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
             )
-            expected_raw = expected_classification == CAMPAIGN_BOUND_EXCLUDED_SLOT_RECEIPT
+            expected_raw = excluded.frame_count > 0
             if (
                 excluded.classification != expected_classification
                 or excluded.venue is not venue

@@ -237,6 +237,12 @@ for name in ('polymarket','kalshi','dashboard'):
   shown=None; system_error=f'{type(error).__name__}:{error}'; result['alert']=True
  try: pid=int(props.get('MainPID','0') or '0')
  except ValueError: pid=0; result['alert']=True
+ try:
+  restarts=int(props.get('NRestarts',''))
+  restarts_verified=restarts==0 and str(restarts)==props.get('NRestarts')
+ except (TypeError,ValueError):
+  restarts=None; restarts_verified=False
+ if not restarts_verified: result['alert']=True
  command=None
  if pid>0:
   try:
@@ -302,13 +308,17 @@ for name in ('polymarket','kalshi','dashboard'):
     result['alert']=True; result['operational_failure']=True
    if name!='dashboard' and not isinstance(state,dict):
     result['alert']=True; result['operational_failure']=True
+  if not restarts_verified:
+   result['alert']=True; result['operational_failure']=True
  if venue_status in {'INTEGRITY_FAILED','CAPACITY_REFUSED','INTERRUPTED_RECOVERABLE','PREPARED_STALE','SERVICE_UNAVAILABLE','COMPLETE_WINDOW_SERVICE_FAILED'} and required:
   result['operational_failure']=True
  if preflight_error is None and not required and (props.get('ActiveState')=='active' or pid>0):
   active_optional_ok=active_optional_service_is_admissible(recovery_dashboard=recovery_dashboard,name=name,eligible=name in eligible,show_returncode=None if shown is None else shown.returncode,load_state=props.get('LoadState'),active_state=props.get('ActiveState'),pid=pid,command_verified=command_verified,state_present=isinstance(state,dict),venue_status=venue_status)
   if not active_optional_ok or not fragment_verified:
    result['alert']=True; result['operational_failure']=True
- result['services'][name]={'admission_required':required,'command':command,'command_verified':command_verified,'data_quality_alert':invalid_history,'fragment_verified':fragment_verified,'ledger_error':ledger_error,'listener_verified':listener_verified,'network_verdict':network_verdict,'properties':props,'state':state,'state_error':state_error,'system_error':system_error,'terminal_condition':terminal_condition,'venue_status':venue_status}
+  if not restarts_verified:
+   result['alert']=True; result['operational_failure']=True
+ result['services'][name]={'admission_required':required,'command':command,'command_verified':command_verified,'data_quality_alert':invalid_history,'fragment_verified':fragment_verified,'ledger_error':ledger_error,'listener_verified':listener_verified,'network_verdict':network_verdict,'properties':props,'restarts_verified':restarts_verified,'state':state,'state_error':state_error,'system_error':system_error,'terminal_condition':terminal_condition,'venue_status':venue_status}
 result['activation_admissible']=preflight_error is None and result['operational_failure'] is False
 semantic={'activation_admissible':result['activation_admissible'],'eligible_venues':result['eligible_venues'],'operational_failure':result['operational_failure'],'services':{}}
 for name,service in result['services'].items():

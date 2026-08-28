@@ -908,7 +908,6 @@ class PredictionCollectionBinding:
         )
         error_required = terminal_health in {
             "MAX_BYTES_REACHED",
-            "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
         }
         accepted_terminal = {
             "COMPLETE",
@@ -917,7 +916,6 @@ class PredictionCollectionBinding:
             "MAX_FRAMES_REACHED",
             "MAX_NETWORK_CALLS_REACHED",
             "MAX_SEGMENTS_REACHED",
-            "PUBLIC_SOURCE_UNAVAILABLE_RECOVERED",
         }
         if (
             type(frame_count) is not int
@@ -3461,8 +3459,6 @@ def build_prediction_trade_dataset(
                 )
                 if yes_price is None and no_price is None:
                     raise ValueError("Kalshi trade lacks both binary outcome prices")
-                if yes_price is not None and no_price is not None and yes_price + no_price != 1:
-                    raise ValueError("Kalshi YES/NO trade prices are not complementary")
                 if taker_outcome_side == "YES":
                     price = yes_price if yes_price is not None else _ONE - cast(Decimal, no_price)
                 else:
@@ -3476,7 +3472,10 @@ def build_prediction_trade_dataset(
                     label="Kalshi trade created time",
                 )
                 source_time_classification = EvidenceClassification.DOCUMENTED
-                block_trade = bool(record.get("is_block_trade"))
+                block_trade_value = record.get("is_block_trade")
+                if type(block_trade_value) is not bool:
+                    raise ValueError("Kalshi trade is_block_trade must be an exact boolean")
+                block_trade = block_trade_value
                 if (envelope.feed_type == "block_trades" and not block_trade) or (
                     envelope.feed_type == "trades" and block_trade
                 ):

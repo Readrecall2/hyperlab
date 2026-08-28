@@ -1,5 +1,9 @@
 # Prediction Markets Prospective Launch V1
 
+Runtime Kalshi normalization, terminal-receipt handling, and the authenticated
+campaign cutover are specified in
+[`PREDICTION_MARKETS_KALSHI_RUNTIME_DATA_QUALITY_V1.md`](PREDICTION_MARKETS_KALSHI_RUNTIME_DATA_QUALITY_V1.md).
+
 Verdict terminal logiciel après admission des reçus forensics réels, fermeture
 du bootstrap moniteur et correction du namespace incoming systemd :
 `PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_SYSTEMD_INCOMING_NAMESPACE_FIXED_COMMITTED_LOCALLY_AWAITING_PUSH`.

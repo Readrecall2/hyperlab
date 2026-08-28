@@ -603,7 +603,13 @@ def _next_cursor(payload: bytes, *, key: str) -> str | None:
     if not isinstance(decoded, Mapping):
         raise ValueError("cursor page must be an object")
     value = decoded.get(key)
-    return None if value in {None, ""} else str(value)
+    if value is None or value == "":
+        return None
+    if type(value) is not str:
+        raise ValueError("cursor value must be absent, null, or exact text")
+    if len(value) > 4_096 or any(ord(character) < 32 for character in value):
+        raise ValueError("cursor value must be bounded opaque text")
+    return value
 
 
 def _polymarket_event_id(market: Mapping[str, object]) -> str | None:
@@ -638,17 +644,19 @@ def _kalshi_markets(census_payload: bytes, *, limit: int) -> tuple[tuple[str, st
         markets = [cast(Mapping[str, object], decoded["market"])]
     elif isinstance(decoded.get("markets"), list):
         raw_markets = decoded["markets"]
-        if not raw_markets or any(not isinstance(item, Mapping) for item in raw_markets):
-            raise LookupError("Kalshi market census returned no active market")
+        if any(not isinstance(item, Mapping) for item in raw_markets):
+            raise ValueError("Kalshi market census records must be objects")
         markets = [cast(Mapping[str, object], item) for item in raw_markets]
     else:
         raise ValueError("Kalshi market census is invalid")
     identities: list[tuple[str, str | None, str | None]] = []
     for market in markets[:limit]:
-        ticker = str(market.get("ticker") or "")
-        if not ticker:
+        ticker = market.get("ticker")
+        if type(ticker) is not str or not ticker:
             raise ValueError("Kalshi market census omitted ticker")
-        event = None if market.get("event_ticker") is None else str(market["event_ticker"])
+        event = market.get("event_ticker")
+        if event is not None and (type(event) is not str or not event):
+            raise ValueError("Kalshi market census event ticker must be exact text")
         identities.append((ticker, event, None))
     return tuple(identities)
 
@@ -658,14 +666,13 @@ def _kalshi_series(event_payload: bytes, *, expected_event_ticker: str | None = 
     if not isinstance(decoded, Mapping) or not isinstance(decoded.get("event"), Mapping):
         raise ValueError("Kalshi event metadata is invalid")
     event = cast(Mapping[str, object], decoded["event"])
-    if expected_event_ticker is not None and str(event.get("event_ticker") or "") != (
-        expected_event_ticker
-    ):
+    observed_event_ticker = event.get("event_ticker")
+    if expected_event_ticker is not None and observed_event_ticker != expected_event_ticker:
         raise ValueError("Kalshi event payload returned another event ticker")
     series = event.get("series_ticker")
-    if not series:
+    if type(series) is not str or not series:
         raise ValueError("Kalshi event metadata omitted series_ticker")
-    return str(series)
+    return series
 
 
 def _kalshi_event_metadata_record(
@@ -695,9 +702,8 @@ def _kalshi_series_record(
     if not isinstance(decoded, Mapping) or not isinstance(decoded.get("series"), Mapping):
         raise ValueError("Kalshi series payload is invalid")
     series = cast(Mapping[str, object], decoded["series"])
-    if str(series.get("ticker") or series.get("series_ticker") or "") != (
-        expected_series_ticker
-    ):
+    observed = series.get("ticker") or series.get("series_ticker")
+    if type(observed) is not str or observed != expected_series_ticker:
         raise ValueError("Kalshi series payload returned another series ticker")
     return series
 
@@ -712,16 +718,19 @@ def _kalshi_market_record(
     if not isinstance(decoded, Mapping) or not isinstance(decoded.get("market"), Mapping):
         raise ValueError("Kalshi market payload is invalid")
     market = cast(Mapping[str, object], decoded["market"])
-    if str(market.get("ticker") or "") != expected_ticker:
+    if type(market.get("ticker")) is not str or market.get("ticker") != expected_ticker:
         raise ValueError("Kalshi market payload returned another ticker")
-    if expected_event_ticker is not None and str(market.get("event_ticker") or "") != (
-        expected_event_ticker
-    ):
+    if expected_event_ticker is not None and market.get("event_ticker") != expected_event_ticker:
         raise ValueError("Kalshi market payload returned another event ticker")
     return market
 
 
-def _kalshi_trade_ids(records: object, *, expected_ticker: str) -> tuple[str, ...]:
+def _kalshi_trade_ids(
+    records: object,
+    *,
+    expected_ticker: str,
+    expected_block_trade: bool | None,
+) -> tuple[str, ...]:
     if not isinstance(records, list):
         raise ValueError("Kalshi trade records must be an array")
     identities: list[str] = []
@@ -737,8 +746,27 @@ def _kalshi_trade_ids(records: object, *, expected_ticker: str) -> tuple[str, ..
             or ticker != expected_ticker
         ):
             raise ValueError("Kalshi trade identity or ticker is missing")
+        block_trade = raw_record.get("is_block_trade")
+        if type(block_trade) is not bool:
+            raise ValueError("Kalshi block-trade classification must be an exact boolean")
+        if expected_block_trade is not None and block_trade is not expected_block_trade:
+            raise ValueError("Kalshi block-trade feed classification diverged")
         identities.append(trade_id)
     return tuple(identities)
+
+
+def _admitted_kalshi_scopes(
+    page_scopes: Sequence[tuple[str, str | None, str | None]],
+    admitted_ids: Sequence[str],
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    remaining = set(admitted_ids)
+    selected: list[tuple[str, str | None, str | None]] = []
+    for scope in page_scopes:
+        if scope[0] not in remaining:
+            continue
+        selected.append(scope)
+        remaining.remove(scope[0])
+    return tuple(selected)
 
 
 def _polymarket_token_parameter_plan(
@@ -1795,9 +1823,11 @@ def _kalshi_probe(
             decoded_fee = json.loads(fee_raw.decode("utf-8"))
             if not isinstance(decoded_fee, Mapping):
                 raise ValueError("Kalshi event fee-change page must be an object")
-            fee_items = decoded_fee.get("fee_changes", [])
+            fee_items = decoded_fee.get("event_fee_changes")
             if not isinstance(fee_items, list):
                 raise ValueError("Kalshi event fee-change records must be an array")
+            if any(not isinstance(item, Mapping) for item in fee_items):
+                raise ValueError("Kalshi event fee-change records must be objects")
             next_fee_cursor = _next_cursor(fee_raw, key="cursor")
             if next_fee_cursor is None:
                 next_fee_cursor = _next_cursor(fee_raw, key="next_cursor")
@@ -1807,7 +1837,6 @@ def _kalshi_probe(
                 item_ids=[
                     hashlib.sha256(_raw_json(item)).hexdigest()
                     for item in fee_items
-                    if isinstance(item, Mapping)
                 ],
             )
             if next_fee_cursor is None:
@@ -1838,15 +1867,19 @@ def _kalshi_probe(
             if not isinstance(decoded_incentives, Mapping):
                 raise ValueError("Kalshi incentives page must be an object")
             programs = decoded_incentives.get("incentive_programs")
-            if programs is None:
-                programs = decoded_incentives.get("incentives", [])
             if not isinstance(programs, list):
                 raise ValueError("Kalshi incentives page omitted its records")
-            item_ids = [
-                str(item.get("id") or item.get("incentive_id") or hashlib.sha256(_raw_json(item)).hexdigest())
-                for item in programs
-                if isinstance(item, Mapping)
-            ]
+            if any(not isinstance(item, Mapping) for item in programs):
+                raise ValueError("Kalshi incentive records must be objects")
+            item_ids: list[str] = []
+            for item in programs:
+                assert isinstance(item, Mapping)
+                identity = item.get("id") or item.get("incentive_id")
+                if identity is None:
+                    identity = hashlib.sha256(_raw_json(item)).hexdigest()
+                if type(identity) is not str or not identity:
+                    raise ValueError("Kalshi incentive identity must be exact text")
+                item_ids.append(identity)
             next_incentive_cursor = _next_cursor(incentive_raw, key="next_cursor")
             incentive_pager.admit(
                 requested_cursor=incentive_cursor,
@@ -1908,14 +1941,12 @@ def _kalshi_probe(
             next_market_cursor = _next_cursor(census, key="cursor")
             if next_market_cursor is None:
                 next_market_cursor = _next_cursor(census, key="next_cursor")
-            admitted = set(
-                market_pager.admit(
-                    requested_cursor=market_cursor,
-                    next_cursor=next_market_cursor,
-                    item_ids=[item[0] for item in page_scopes],
-                )
+            admitted = market_pager.admit(
+                requested_cursor=market_cursor,
+                next_cursor=next_market_cursor,
+                item_ids=[item[0] for item in page_scopes],
             )
-            scopes.extend(item for item in page_scopes if item[0] in admitted)
+            scopes.extend(_admitted_kalshi_scopes(page_scopes, admitted))
             if next_market_cursor is None or market_pager.items >= config.census_limit:
                 break
             market_cursor = next_market_cursor
@@ -1947,14 +1978,12 @@ def _kalshi_probe(
                 next_historical_cursor = _next_cursor(historical_raw, key="cursor")
                 if next_historical_cursor is None:
                     next_historical_cursor = _next_cursor(historical_raw, key="next_cursor")
-                admitted = set(
-                    historical_pager.admit(
-                        requested_cursor=historical_cursor,
-                        next_cursor=next_historical_cursor,
-                        item_ids=[item[0] for item in page_scopes],
-                    )
+                admitted = historical_pager.admit(
+                    requested_cursor=historical_cursor,
+                    next_cursor=next_historical_cursor,
+                    item_ids=[item[0] for item in page_scopes],
                 )
-                historical_scopes.extend(item for item in page_scopes if item[0] in admitted)
+                historical_scopes.extend(_admitted_kalshi_scopes(page_scopes, admitted))
                 if next_historical_cursor is None or historical_pager.items >= max(1, config.census_limit):
                     break
                 historical_cursor = next_historical_cursor
@@ -2112,7 +2141,11 @@ def _kalshi_probe(
             historical_trade_pager.admit(
                 requested_cursor=historical_trade_cursor,
                 next_cursor=next_historical_trade_cursor,
-                item_ids=_kalshi_trade_ids(historical_trades, expected_ticker=ticker),
+                item_ids=_kalshi_trade_ids(
+                    historical_trades,
+                    expected_ticker=ticker,
+                    expected_block_trade=None,
+                ),
             )
             if next_historical_trade_cursor is None:
                 break
@@ -2231,7 +2264,11 @@ def _kalshi_probe(
                     trade_pager.admit(
                         requested_cursor=trade_cursor,
                         next_cursor=next_trade_cursor,
-                        item_ids=_kalshi_trade_ids(trade_items, expected_ticker=ticker),
+                        item_ids=_kalshi_trade_ids(
+                            trade_items,
+                            expected_ticker=ticker,
+                            expected_block_trade=is_block_trade,
+                        ),
                     )
                     if next_trade_cursor is None:
                         break

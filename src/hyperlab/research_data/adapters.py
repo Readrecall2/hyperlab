@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Final, cast
 from urllib.parse import unquote, urlsplit
 
@@ -22,7 +23,11 @@ KALSHI_PUBLIC_HTTP_URL: Final = "https://external-api.kalshi.com/trade-api/v2"
 
 HYPERLIQUID_METADATA_VERSION: Final = "hyperliquid-official-public-api-2026-08-26"
 POLYMARKET_METADATA_VERSION: Final = "polymarket-official-public-api-2026-08-27"
-KALSHI_METADATA_VERSION: Final = "kalshi-official-public-rest-2026-08-27"
+KALSHI_METADATA_VERSION_V1: Final = "kalshi-official-public-rest-2026-08-27"
+KALSHI_METADATA_VERSION: Final = "kalshi-official-public-rest-2026-08-28"
+KALSHI_SUPPORTED_METADATA_VERSIONS: Final = frozenset(
+    {KALSHI_METADATA_VERSION_V1, KALSHI_METADATA_VERSION}
+)
 
 _PRIVATE_PATH_SEGMENTS = {
     "account",
@@ -61,6 +66,33 @@ _LIGHTER_PUBLIC_WEBSOCKET_PATH = "/stream"
 _LIGHTER_PUBLIC_WEBSOCKET_QUERIES = {"", "readonly=true"}
 _LIGHTER_PUBLIC_CHANNEL = re.compile(r"^(?:order_book|ticker|market_stats|trade)/[0-9]+$")
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}$")
+_KALSHI_PRICE_DOLLARS = re.compile(r"^(?:0(?:\.\d{1,4})?|1(?:\.0{1,4})?)$")
+_KALSHI_COUNT_FP = re.compile(r"^(?:0|[1-9]\d*)\.\d{2}$")
+
+# Kalshi REST V2 documents date-time response fields as RFC3339 text.  Numeric
+# epochs currently appear only in request filters, not in any activated response
+# field.  Keeping this allowlist empty prevents a JSON number from being guessed
+# as seconds, milliseconds, microseconds, or nanoseconds.
+_KALSHI_NUMERIC_EPOCH_RESPONSE_FIELDS: Final[dict[tuple[str, str], str]] = {}
+_KALSHI_SOURCE_TIMESTAMP_FIELDS: Final = {
+    "series": "last_updated_ts",
+    "events": "last_updated_ts",
+    "markets": "updated_time",
+    "trades": "created_time",
+    "block_trades": "created_time",
+    "historical_markets": "updated_time",
+    "historical_trades": "created_time",
+}
+_KALSHI_CURSOR_FIELDS: Final = {
+    "events": "cursor",
+    "markets": "cursor",
+    "trades": "cursor",
+    "block_trades": "cursor",
+    "incentives": "next_cursor",
+    "event_fee_changes": "cursor",
+    "historical_markets": "cursor",
+    "historical_trades": "cursor",
+}
 
 
 def _documented_public_get_route(host: str, path: str) -> bool:
@@ -152,6 +184,193 @@ def _iso_to_ns(value: object | None) -> int | None:
     if value is None or value == "":
         return None
     return prediction_rfc3339_to_ns(value, label="source timestamp")
+
+
+def _kalshi_rfc3339_to_ns(value: object, *, feed_type: str, field: str) -> int:
+    timestamp_ns = prediction_rfc3339_to_ns(
+        value,
+        label=f"Kalshi {feed_type}.{field}",
+    )
+    if timestamp_ns < 0:
+        raise ValueError(
+            f"Kalshi {feed_type}.{field} must normalize to a non-negative UTC epoch"
+        )
+    return timestamp_ns
+
+
+def _kalshi_optional_timestamp(
+    record: Mapping[str, Any],
+    *,
+    feed_type: str,
+) -> int | None:
+    field = _KALSHI_SOURCE_TIMESTAMP_FIELDS[feed_type]
+    if field not in record or record[field] is None:
+        return None
+    numeric_unit = _KALSHI_NUMERIC_EPOCH_RESPONSE_FIELDS.get((feed_type, field))
+    if numeric_unit is not None:
+        value = record[field]
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"Kalshi {feed_type}.{field} must be a non-negative {numeric_unit} epoch integer"
+            )
+        multiplier = {
+            "seconds": 1_000_000_000,
+            "milliseconds": 1_000_000,
+            "microseconds": 1_000,
+            "nanoseconds": 1,
+        }[numeric_unit]
+        return value * multiplier
+    return _kalshi_rfc3339_to_ns(record[field], feed_type=feed_type, field=field)
+
+
+def _kalshi_cursor(decoded: Mapping[str, Any], *, feed_type: str) -> str | None:
+    field = _KALSHI_CURSOR_FIELDS.get(feed_type)
+    if field is None or field not in decoded:
+        return None
+    value = decoded[field]
+    if value is None or value == "":
+        return None
+    if type(value) is not str:
+        raise ValueError(f"Kalshi {feed_type} cursor must be absent, null, or exact text")
+    return _opaque_query_value(value, label=f"Kalshi {feed_type} cursor")
+
+
+def _kalshi_text(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be exact text")
+    return _path_component(value, label=label)
+
+
+def _kalshi_price(value: object, *, label: str) -> Decimal:
+    if type(value) is not str or _KALSHI_PRICE_DOLLARS.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a fixed-point dollar string with one to four decimals")
+    try:
+        price = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError(f"{label} is not a finite fixed-point decimal") from error
+    if not price.is_finite() or price < 0 or price > 1:
+        raise ValueError(f"{label} is outside binary price bounds")
+    return price
+
+
+def _kalshi_count(value: object, *, label: str, allow_zero: bool = False) -> Decimal:
+    if type(value) is not str or _KALSHI_COUNT_FP.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a fixed-point count string with two decimals")
+    try:
+        count = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError(f"{label} is not a finite fixed-point decimal") from error
+    if not count.is_finite() or count < 0 or (not allow_zero and count == 0):
+        raise ValueError(f"{label} must be a positive finite quantity")
+    return count
+
+
+def _kalshi_mapping_records(
+    decoded: Mapping[str, Any],
+    *,
+    feed_type: str,
+    singular_key: str,
+    plural_key: str,
+) -> tuple[Mapping[str, Any], ...]:
+    if singular_key == plural_key and singular_key in decoded:
+        wrapped = decoded[singular_key]
+        if isinstance(wrapped, Mapping):
+            return (_mapping(wrapped, label=f"Kalshi {feed_type} record"),)
+        return tuple(
+            _mapping(item, label=f"Kalshi {feed_type} record")
+            for item in _sequence(wrapped, label=f"Kalshi {feed_type} records")
+        )
+    singular_present = singular_key in decoded
+    plural_present = plural_key in decoded
+    if singular_present and plural_present:
+        raise ValueError(f"Kalshi {feed_type} payload has ambiguous wrappers")
+    if singular_present:
+        return (_mapping(decoded[singular_key], label=f"Kalshi {feed_type} record"),)
+    if plural_present:
+        return tuple(
+            _mapping(item, label=f"Kalshi {feed_type} record")
+            for item in _sequence(decoded[plural_key], label=f"Kalshi {feed_type} records")
+        )
+    raise ValueError(f"Kalshi {feed_type} payload omitted its documented wrapper")
+
+
+def _kalshi_validate_market_record(record: Mapping[str, Any], *, feed_type: str) -> str:
+    ticker = _kalshi_text(record.get("ticker"), label="Kalshi market ticker")
+    event_ticker = record.get("event_ticker")
+    if event_ticker is not None:
+        _kalshi_text(event_ticker, label="Kalshi event ticker")
+    for field in (
+        "yes_bid_dollars",
+        "yes_ask_dollars",
+        "no_bid_dollars",
+        "no_ask_dollars",
+        "last_price_dollars",
+        "previous_yes_bid_dollars",
+        "previous_yes_ask_dollars",
+        "previous_price_dollars",
+        "settlement_value_dollars",
+    ):
+        if field in record and record[field] is not None:
+            _kalshi_price(record[field], label=f"Kalshi market {field}")
+    for field in (
+        "yes_bid_size_fp",
+        "yes_ask_size_fp",
+        "open_interest_fp",
+        "volume_fp",
+        "volume_24h_fp",
+    ):
+        if field in record and record[field] is not None:
+            _kalshi_count(
+                record[field],
+                label=f"Kalshi market {field}",
+                allow_zero=True,
+            )
+    return ticker
+
+
+def _kalshi_validate_orderbook(decoded: Mapping[str, Any]) -> None:
+    orderbook = _mapping(decoded.get("orderbook_fp"), label="Kalshi orderbook_fp")
+    for side in ("yes_dollars", "no_dollars"):
+        levels = _sequence(orderbook.get(side), label=f"Kalshi orderbook {side}")
+        previous: Decimal | None = None
+        for raw_level in levels:
+            level = _sequence(raw_level, label=f"Kalshi orderbook {side} level")
+            if len(level) != 2:
+                raise ValueError("Kalshi orderbook level must contain price and quantity")
+            price = _kalshi_price(level[0], label="Kalshi orderbook price")
+            _kalshi_count(level[1], label="Kalshi orderbook quantity")
+            if previous is not None and price <= previous:
+                raise ValueError("Kalshi orderbook prices must be strictly increasing")
+            previous = price
+
+
+def _kalshi_validate_trade_record(
+    record: Mapping[str, Any],
+    *,
+    expected_block_trade: bool | None,
+) -> tuple[str, str]:
+    trade_id = _kalshi_text(record.get("trade_id"), label="Kalshi trade id")
+    ticker = _kalshi_text(record.get("ticker"), label="Kalshi trade ticker")
+    block_trade = record.get("is_block_trade")
+    if type(block_trade) is not bool:
+        raise ValueError("Kalshi trade is_block_trade must be a boolean")
+    if expected_block_trade is not None and block_trade is not expected_block_trade:
+        raise ValueError("Kalshi block-trade feed classification diverged")
+    count = _kalshi_count(record.get("count_fp"), label="Kalshi trade count_fp")
+    if count <= 0:
+        raise ValueError("Kalshi trade count must be positive")
+    _kalshi_price(record.get("yes_price_dollars"), label="Kalshi YES trade price")
+    _kalshi_price(record.get("no_price_dollars"), label="Kalshi NO trade price")
+    if record.get("taker_outcome_side") not in {"yes", "no"}:
+        raise ValueError("Kalshi taker outcome side is invalid")
+    if record.get("taker_book_side") not in {"bid", "ask"}:
+        raise ValueError("Kalshi taker book side is invalid")
+    _kalshi_rfc3339_to_ns(
+        record.get("created_time"),
+        feed_type="trades",
+        field="created_time",
+    )
+    return trade_id, ticker
 
 
 @dataclass(frozen=True, slots=True)
@@ -1019,47 +1238,142 @@ class KalshiPublicAdapter:
     ) -> PublicDataEnvelope:
         if feed_type not in self.supported_feeds:
             raise ValueError("unsupported Kalshi public feed")
-        decoded = _json(raw_payload)
-        source_cursor: str | None = None
+        decoded = _mapping(_json(raw_payload), label=f"Kalshi {feed_type} payload")
+        source_cursor = _kalshi_cursor(decoded, feed_type=feed_type)
         source_timestamp_ns: int | None = None
         source_event_id: str | None = None
         detected_ticker = ticker
-        if isinstance(decoded, Mapping):
-            for cursor_key in ("cursor", "next_cursor"):
-                if decoded.get(cursor_key):
-                    source_cursor = str(decoded[cursor_key])
-                    break
-            record: Mapping[str, Any] | None = None
-            singular_keys = {
-                "series": "series",
-                "events": "event",
-                "markets": "market",
-                "order_book": "orderbook_fp",
-            }
-            singular_key = singular_keys.get(feed_type)
-            if singular_key and isinstance(decoded.get(singular_key), Mapping):
-                record = cast(Mapping[str, Any], decoded[singular_key])
-            if record is not None:
-                for key in ("ticker", "market_ticker"):
-                    if record.get(key):
-                        detected_ticker = str(record[key])
-                for key in (
-                    "updated_time",
-                    "last_updated_ts",
-                    "created_time",
-                    "settlement_ts",
-                ):
-                    if record.get(key):
-                        source_timestamp_ns = _iso_to_ns(record[key])
-                        break
-            if feed_type in {"trades", "block_trades", "historical_trades"}:
-                trades = decoded.get("trades")
-                if isinstance(trades, list) and len(trades) == 1 and isinstance(trades[0], Mapping):
-                    trade = trades[0]
-                    detected_ticker = str(trade.get("ticker") or detected_ticker or "GLOBAL")
-                    source_timestamp_ns = _iso_to_ns(trade.get("created_time"))
-                    if trade.get("trade_id"):
-                        source_event_id = str(trade["trade_id"])
+        if feed_type == "series":
+            records = _kalshi_mapping_records(
+                decoded,
+                feed_type=feed_type,
+                singular_key="series",
+                plural_key="series",
+            )
+            for record in records:
+                _kalshi_text(record.get("ticker"), label="Kalshi series ticker")
+            if isinstance(decoded.get("series"), Mapping):
+                detected_ticker = _kalshi_text(
+                    records[0].get("ticker"), label="Kalshi series ticker"
+                )
+                source_timestamp_ns = _kalshi_optional_timestamp(records[0], feed_type=feed_type)
+        elif feed_type == "events":
+            records = _kalshi_mapping_records(
+                decoded,
+                feed_type=feed_type,
+                singular_key="event",
+                plural_key="events",
+            )
+            for record in records:
+                _kalshi_text(record.get("event_ticker"), label="Kalshi event ticker")
+                if record.get("series_ticker") is not None:
+                    _kalshi_text(record["series_ticker"], label="Kalshi series ticker")
+            if "event" in decoded:
+                detected_ticker = _kalshi_text(
+                    records[0].get("event_ticker"), label="Kalshi event ticker"
+                )
+                source_timestamp_ns = _kalshi_optional_timestamp(records[0], feed_type=feed_type)
+        elif feed_type in {"markets", "historical_markets"}:
+            records = _kalshi_mapping_records(
+                decoded,
+                feed_type=feed_type,
+                singular_key="market",
+                plural_key="markets",
+            )
+            tickers = tuple(
+                _kalshi_validate_market_record(record, feed_type=feed_type)
+                for record in records
+            )
+            if "market" in decoded:
+                detected_ticker = tickers[0]
+                source_timestamp_ns = _kalshi_optional_timestamp(records[0], feed_type=feed_type)
+        elif feed_type == "order_book":
+            _kalshi_validate_orderbook(decoded)
+        elif feed_type in {"trades", "block_trades", "historical_trades"}:
+            records = tuple(
+                _mapping(item, label=f"Kalshi {feed_type} trade")
+                for item in _sequence(decoded.get("trades"), label=f"Kalshi {feed_type} trades")
+            )
+            expected_block_trade = {"trades": False, "block_trades": True}.get(feed_type)
+            identities = tuple(
+                _kalshi_validate_trade_record(
+                    record,
+                    expected_block_trade=expected_block_trade,
+                )
+                for record in records
+            )
+            if len(records) == 1:
+                source_event_id, detected_ticker = identities[0]
+                source_timestamp_ns = _kalshi_optional_timestamp(records[0], feed_type=feed_type)
+        elif feed_type == "incentives":
+            records = tuple(
+                _mapping(item, label="Kalshi incentive record")
+                for item in _sequence(
+                    decoded.get("incentive_programs"),
+                    label="Kalshi incentive_programs",
+                )
+            )
+            for record in records:
+                if record.get("id") is not None:
+                    _kalshi_text(record["id"], label="Kalshi incentive id")
+                if record.get("market_ticker") is not None:
+                    _kalshi_text(record["market_ticker"], label="Kalshi incentive market ticker")
+                for field in ("start_date", "end_date"):
+                    if record.get(field) is not None:
+                        _kalshi_rfc3339_to_ns(record[field], feed_type=feed_type, field=field)
+        elif feed_type == "fee_changes":
+            records = tuple(
+                _mapping(item, label="Kalshi series fee-change record")
+                for item in _sequence(
+                    decoded.get("series_fee_change_arr"),
+                    label="Kalshi series_fee_change_arr",
+                )
+            )
+            for record in records:
+                if record.get("id") is not None:
+                    _kalshi_text(record["id"], label="Kalshi series fee-change id")
+                _kalshi_text(record.get("series_ticker"), label="Kalshi series ticker")
+                _kalshi_rfc3339_to_ns(
+                    record.get("scheduled_ts"), feed_type=feed_type, field="scheduled_ts"
+                )
+        elif feed_type == "event_fee_changes":
+            records = tuple(
+                _mapping(item, label="Kalshi event fee-change record")
+                for item in _sequence(
+                    decoded.get("event_fee_changes"),
+                    label="Kalshi event_fee_changes",
+                )
+            )
+            for record in records:
+                if record.get("id") is not None:
+                    _kalshi_text(record["id"], label="Kalshi event fee-change id")
+                _kalshi_text(record.get("event_ticker"), label="Kalshi event ticker")
+                multiplier = record.get("fee_multiplier_override")
+                fee_type_override = record.get("fee_type_override")
+                if (multiplier is None) != (fee_type_override is None):
+                    raise ValueError("Kalshi event fee overrides must both be null or both be present")
+                _kalshi_rfc3339_to_ns(
+                    record.get("scheduled_ts"), feed_type=feed_type, field="scheduled_ts"
+                )
+        elif feed_type == "event_metadata":
+            for field in ("market_details", "settlement_sources"):
+                metadata_records = _sequence(
+                    decoded.get(field), label=f"Kalshi event metadata {field}"
+                )
+                if any(not isinstance(item, Mapping) for item in metadata_records):
+                    raise ValueError(f"Kalshi event metadata {field} records must be objects")
+        elif feed_type == "exchange_status":
+            for field in ("exchange_active", "trading_active"):
+                if type(decoded.get(field)) is not bool:
+                    raise ValueError(f"Kalshi exchange status {field} must be a boolean")
+            resume = decoded.get("exchange_estimated_resume_time")
+            if resume is not None:
+                _kalshi_rfc3339_to_ns(resume, feed_type=feed_type, field="resume_time")
+        elif feed_type == "exchange_schedule":
+            _mapping(decoded.get("schedule"), label="Kalshi exchange schedule")
+        elif feed_type == "historical_cutoff":
+            for field in ("market_settled_ts", "orders_updated_ts", "trades_created_ts"):
+                _kalshi_rfc3339_to_ns(decoded.get(field), feed_type=feed_type, field=field)
         canonical_ticker = detected_ticker or "GLOBAL"
         if feed_type in {"events", "event_metadata", "event_fee_changes"}:
             canonical_id = canonical_kalshi_event(canonical_ticker)
@@ -1135,7 +1449,9 @@ __all__ = [
     "HYPERLIQUID_PUBLIC_HTTP_URL",
     "HYPERLIQUID_PUBLIC_WEBSOCKET_URL",
     "KALSHI_METADATA_VERSION",
+    "KALSHI_METADATA_VERSION_V1",
     "KALSHI_PUBLIC_HTTP_URL",
+    "KALSHI_SUPPORTED_METADATA_VERSIONS",
     "POLYMARKET_CLOB_PUBLIC_URL",
     "POLYMARKET_DATA_PUBLIC_URL",
     "POLYMARKET_GAMMA_PUBLIC_URL",

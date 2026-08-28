@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -237,6 +238,10 @@ def _synthetic_public_source_invalid_transport(config, **kwargs):
     raise ValueError("Polymarket CLOB market-info identity graph diverged")
 
 
+def _synthetic_zero_frame_kalshi_invalid_transport(_config, **_kwargs):
+    raise ValueError("source timestamp must be absent or a non-negative UTC epoch value")
+
+
 def _synthetic_late_public_source_unavailable_transport(config, **kwargs):
     factory = kwargs["factory"]
     writer = kwargs["writer"]
@@ -346,6 +351,74 @@ def test_terminal_ledger_is_append_only_hash_chained_and_rejects_tamper(tmp_path
     ledger.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
     with pytest.raises(runner.RunnerError, match="chain diverged"):
         runner.read_ledger(ledger)
+
+
+def test_broken_ledger_symlink_is_corruption_not_an_absent_ledger(tmp_path: Path) -> None:
+    ledger = tmp_path / "kalshi" / "ledger.jsonl"
+    ledger.parent.mkdir()
+    try:
+        os.symlink(tmp_path / "missing-ledger-target", ledger)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+    with pytest.raises(runner.RunnerError, match="unsafe"):
+        runner.read_ledger(ledger)
+    assert ledger.is_symlink()
+
+
+def test_all_authenticated_recovery_terminals_are_excluded_and_never_retried(
+    tmp_path: Path,
+) -> None:
+    context = _campaign(tmp_path)
+    terminals = (
+        ("BACKPRESSURE_LIMIT_REACHED", "bounded queue reached"),
+        ("CONTINUITY_BROKEN_FROZEN", None),
+        ("CONTINUITY_UNKNOWN_AFTER_RECONNECT_FROZEN", None),
+        ("INTERRUPTED_RECOVERABLE", None),
+        ("INTERRUPTED_RECOVERED", "recovered after interruption"),
+        ("PUBLIC_SOURCE_UNAVAILABLE_RECOVERED", "network counters unavailable after recovery"),
+        ("RECOVERED_AFTER_PROCESS_ERROR", "recovered after child process error"),
+    )
+    rows = []
+    for ordinal, (terminal, error) in enumerate(terminals):
+        result = {
+            "bytes": 100,
+            "duplicates": 0,
+            "error": error,
+            "frames": 1,
+            "gaps": 1 if terminal.startswith("CONTINUITY_") else 0,
+            "manifest_sha256": "1" * 64,
+            "probe_binding_sha256": "2" * 64,
+            "reconnects": 1 if "RECONNECT" in terminal else 0,
+            "root_sha256": "3" * 64,
+            "segments": 1,
+            "terminal_health": terminal,
+        }
+        body = runner._result_entry(
+            context,
+            Venue.KALSHI,
+            ordinal,
+            result,
+            now=context.start + timedelta(seconds=ordinal),
+        )
+        row = runner.append_ledger(
+            tmp_path / "excluded" / "ledger.jsonl",
+            body,
+            context=context,
+            venue=Venue.KALSHI,
+        )
+        assert row["source_usable"] is False
+        assert row["economic_eligible"] is False
+        assert row["receipt_classification"] == (
+            "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+        )
+        rows.append(row)
+    decision = runner.schedule_decision(
+        context,
+        rows,
+        now=context.start + timedelta(hours=len(rows) - 1, seconds=10),
+    )
+    assert decision.action == "WAIT_NEXT_SLOT"
+    assert decision.ordinal is None
 
 
 def test_service_ledger_rejects_cross_venue_and_rechained_semantic_tamper(
@@ -854,6 +927,92 @@ def test_two_real_error_shapes_are_terminally_ledgered_without_replay(
             assert resumed.run() == 130
         assert previous._ledger()[0]["ordinal"] == 0
     assert len(invocations) == 2
+
+
+def test_zero_frame_kalshi_invalid_receipt_is_authenticated_and_never_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _current_synthetic_campaign(tmp_path)
+
+    class Usage:
+        total = 400 * 1024**3
+        used = 100 * 1024**3
+        free = 300 * 1024**3
+
+    actual_run_public_probe = probe_module.run_public_probe
+
+    def fixture_run_public_probe(config, **_kwargs):
+        return actual_run_public_probe(config)
+
+    monkeypatch.setattr(
+        probe_module,
+        "_kalshi_probe",
+        _synthetic_zero_frame_kalshi_invalid_transport,
+    )
+    monkeypatch.setattr(research_cli, "run_public_probe", fixture_run_public_probe)
+    monkeypatch.setattr(runner.shutil, "disk_usage", lambda _path: Usage())
+    invocations: list[tuple[str, ...]] = []
+
+    class CliProcess:
+        def __init__(self, command, *, cwd, env):
+            assert Path(cwd) == ROOT
+            assert env["PYTHONNOUSERSITE"] == "1"
+            arguments = tuple(str(item) for item in command)
+            invocations.append(arguments)
+            completed = CliRunner().invoke(app, list(arguments[3:]))
+            self.returncode = completed.exit_code
+
+        def wait(self) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def send_signal(self, _signal: int) -> None:  # pragma: no cover
+            raise AssertionError("completed invalid-source fixture received a signal")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", CliProcess)
+    service = runner.VenueRunner(
+        context=context,
+        source_root=ROOT,
+        python=Path("/synthetic-fixture/.venv/bin/python"),
+        venue=Venue.KALSHI,
+        h1_reserved_bytes=144 * 1024**3,
+        prediction_maximum_raw_bytes=21 * 1024**3,
+        safety_margin_bytes=16 * 1024**3,
+    )
+    service._run_slot(0)
+    rows = service._ledger()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["terminal_health"] == "PUBLIC_SOURCE_INVALID"
+    assert row["receipt_classification"] == (
+        "CAMPAIGN_BOUND_EXPLICIT_GAP_EXCLUDED_FROM_ECONOMICS"
+    )
+    assert row["source_usable"] is False
+    assert row["economic_eligible"] is False
+    assert row["frames"] == row["bytes"] == row["segments"] == 0
+    assert row["manifest_sha256"] is None
+    assert row["probe_binding_sha256"] is None
+    assert row["root_sha256"] is None
+    assert len(str(row["terminal_result_sha256"])) == 64
+    output_root = next(service.runs_root.iterdir())
+    authenticated = runner._validate_result(
+        output_root,
+        context,
+        Venue.KALSHI,
+        ordinal=0,
+    )
+    assert authenticated["terminal_health"] == "PUBLIC_SOURCE_INVALID"
+    decision = runner.schedule_decision(
+        context,
+        rows,
+        now=context.start + timedelta(seconds=10),
+    )
+    assert decision.action == "WAIT_NEXT_SLOT"
+    assert decision.ordinal is None
+    assert len(invocations) == 1
 
 
 def test_late_public_source_unavailability_is_terminally_excluded_without_replay(

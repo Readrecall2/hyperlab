@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
+import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +46,374 @@ def _blob_row(path: Path, relative: Path) -> dict[str, object]:
         "path": relative.as_posix(),
         "size": len(raw),
     }
+
+
+def _write_pinned_object(path: Path, value: object) -> None:
+    raw = preflight.canonical_json_bytes(value) + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    path.with_name("handoff.sha256").write_text(
+        f"{preflight.sha256_bytes(raw)}  handoff.json\n",
+        encoding="ascii",
+    )
+
+
+def _commit_fixture(root: Path, message: str) -> str:
+    assert _git("init", "--quiet", cwd=root).returncode == 0
+    for key, value in (
+        ("user.email", "superseded-alias-fixture@invalid.example"),
+        ("user.name", "Superseded Alias Fixture"),
+        ("core.autocrlf", "false"),
+        ("core.longpaths", "true"),
+    ):
+        assert _git("config", key, value, cwd=root).returncode == 0
+    assert _git("add", ".", cwd=root).returncode == 0
+    committed = _git("commit", "--quiet", "-m", message, cwd=root)
+    assert committed.returncode == 0, committed.stderr
+    return _git("rev-parse", "HEAD", cwd=root).stdout.strip()
+
+
+def _instrument_alias_candidate(
+    source: str,
+    *,
+    target_commit: str,
+    target_inventory_sha256: str,
+    preload_alias: bool = False,
+) -> str:
+    marker = '\nif __name__ == "__main__":\n'
+    assert source.count(marker) == 1
+    preload = "import multiprocessing as _fixture_multiprocessing\n" if preload_alias else ""
+    injection = f'''
+
+# SYNTHETIC/FIXTURE: portable subprocess harness; production paths stay unchanged.
+_SUPERSEDED_RUNTIME_COMMIT = {target_commit!r}
+_SUPERSEDED_RUNTIME_INVENTORY_SHA256 = {target_inventory_sha256!r}
+
+def _alias_fixture_install_layout(handoff, *, handoff_path, trusted_source_root=None):
+    source_commit = handoff.get("source_commit")
+    if not isinstance(source_commit, str):
+        raise PreflightError("fixture candidate commit is absent")
+    return {{"source_commit": source_commit}}
+
+def _alias_fixture_contract(handoff):
+    value = handoff.get("superseded_campaign")
+    if not isinstance(value, dict):
+        raise PreflightError("fixture superseded contract is absent")
+    return dict(value)
+
+def _alias_fixture_environment(*, target_source):
+    venv_root = _runtime_exact_directory(
+        target_source / ".venv", label="fixture superseded runtime virtual environment"
+    )
+    executable = _runtime_reported_file(
+        str(Path(sys.executable)), label="fixture superseded runtime Python executable"
+    )
+    if (
+        not _runtime_path_within(executable, venv_root)
+        or Path(sys.prefix).resolve(strict=True) != venv_root
+        or sys.base_prefix == sys.prefix
+        or sys.flags.isolated != 1
+        or sys.flags.no_user_site != 1
+        or os.environ.get("PYTHONNOUSERSITE") != "1"
+    ):
+        raise PreflightError("fixture superseded runtime Python isolation diverged")
+    return venv_root, executable, (Path(sys.base_prefix).resolve(strict=True),)
+
+validate_install_layout = _alias_fixture_install_layout
+_superseded_contract = _alias_fixture_contract
+_superseded_runtime_environment = _alias_fixture_environment
+{preload}'''
+    return source.replace(marker, injection + marker, 1)
+
+
+def _create_alias_target(tmp_path: Path) -> dict[str, object]:
+    target_source = tmp_path / "target-historical-source"
+    target_ops = target_source / "ops" / "prediction_markets_launch_v1"
+    target_hyperlab = target_source / "src" / "hyperlab"
+    target_research = target_hyperlab / "research_data"
+    target_ops.mkdir(parents=True)
+    target_research.mkdir(parents=True)
+    (target_source / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (target_hyperlab / "__init__.py").write_text(
+        "# SYNTHETIC/FIXTURE historical hyperlab\n", encoding="utf-8"
+    )
+    (target_research / "__init__.py").write_text(
+        "# SYNTHETIC/FIXTURE research package\n", encoding="utf-8"
+    )
+    (target_research / "envelope.py").write_text(
+        textwrap.dedent(
+            """
+            from enum import Enum
+            class Venue(Enum):
+                POLYMARKET = "polymarket"
+                KALSHI = "kalshi"
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    (target_ops / "preflight.py").write_text(
+        "# SYNTHETIC/FIXTURE historical preflight without new CLI\n",
+        encoding="utf-8",
+    )
+    (target_ops / "cockpit.py").write_text(
+        "\n".join(
+            f"def {name}(*args, **kwargs): return None"
+            for name in preflight._SUPERSEDED_RUNTIME_HELPERS[
+                "ops.prediction_markets_launch_v1.cockpit"
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runner_helpers = "\n".join(
+        f"def {name}(*args, **kwargs): return None"
+        for name in preflight._SUPERSEDED_RUNTIME_HELPERS[
+            "ops.prediction_markets_launch_v1.runner"
+        ]
+        if name not in {"read_ledger", "validate_service_ledger_against_manifest"}
+    )
+    (target_ops / "runner.py").write_text(
+        textwrap.dedent(
+            f"""
+            import hashlib
+            import json
+            from types import SimpleNamespace
+
+            def canonical_json_bytes(value):
+                return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+            def sha256_bytes(value):
+                return hashlib.sha256(value).hexdigest()
+
+            def load_campaign_context(*args, **kwargs):
+                return SimpleNamespace(manifest={{"fixture": "SYNTHETIC/FIXTURE"}})
+
+            def read_ledger(*args, **kwargs):
+                return [{{"entry_sha256": "{'e' * 64}", "ordinal": 0, "terminal_result_sha256": None}}]
+
+            def validate_service_ledger_against_manifest(*args, **kwargs):
+                return None
+
+            def _validate_result(*args, **kwargs):
+                return {{}}
+
+            {runner_helpers}
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    target_commit = _commit_fixture(target_source, "historical target fixture")
+    target_inventory = launch_pack.build_source_inventory(target_source, target_commit)
+
+    target_venv = target_source / ".venv"
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", "--copies", str(target_venv)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=120,
+    )
+    assert created.returncode == 0, created.stderr
+    target_python = (
+        target_venv / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else target_venv / "bin" / "python"
+    )
+    purelib_result = subprocess.run(
+        [str(target_python), "-I", "-c", "import sysconfig;print(sysconfig.get_path('purelib'))"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert purelib_result.returncode == 0, purelib_result.stderr
+    purelib = Path(purelib_result.stdout.strip())
+    for name in ("fastapi", "requests", "websocket"):
+        (purelib / f"{name}.py").write_text(
+            f"# SYNTHETIC/FIXTURE {name}\n", encoding="utf-8"
+        )
+    for package_name in ("uvicorn", "click"):
+        specification = importlib.util.find_spec(package_name)
+        assert specification is not None and specification.submodule_search_locations
+        package_source = Path(next(iter(specification.submodule_search_locations)))
+        shutil.copytree(package_source, purelib / package_name)
+
+    target_incoming = tmp_path / "target-historical-incoming"
+    target_campaign = tmp_path / "target-historical-campaign"
+    target_incoming.mkdir()
+    target_campaign.joinpath("state").mkdir(parents=True)
+    for venue in ("polymarket", "kalshi"):
+        target_campaign.joinpath(venue).mkdir()
+        target_campaign.joinpath(venue, "ledger.jsonl").write_text(
+            '{"fixture":"SYNTHETIC/FIXTURE"}\n', encoding="utf-8"
+        )
+    target_campaign.joinpath("campaign-manifest.json").write_text(
+        '{"fixture":"SYNTHETIC/FIXTURE"}\n', encoding="utf-8"
+    )
+    target_campaign.joinpath("state", "activation-receipt.json").write_text(
+        '{"fixture":"SYNTHETIC/FIXTURE"}\n', encoding="utf-8"
+    )
+    target_contract = {
+        "campaign_root": str(target_campaign.resolve()),
+        "dashboard_port": 18081,
+        "incoming_root": str(target_incoming.resolve()),
+        "namespace_probe_services": {
+            "kalshi": "fixture-kalshi-probe.service",
+            "polymarket": "fixture-polymarket-probe.service",
+        },
+        "run_slug": "pm-20260828t000000z-11111111",
+        "services": {
+            "dashboard": "fixture-dashboard.service",
+            "kalshi": "fixture-kalshi.service",
+            "polymarket": "fixture-polymarket.service",
+        },
+        "source_commit": target_commit,
+        "source_root": str(target_source.resolve()),
+    }
+    target_handoff = {
+        **target_contract,
+        "boundary": preflight.BOUNDARY,
+        "schema_version": 1,
+        "source_inventory_sha256": target_inventory["inventory_sha256"],
+    }
+    _write_pinned_object(target_incoming / "handoff.json", target_handoff)
+    (target_incoming / "source-inventory.json").write_bytes(
+        preflight.canonical_json_bytes(target_inventory) + b"\n"
+    )
+    return {
+        "contract": target_contract,
+        "inventory": target_inventory,
+        "purelib": purelib,
+        "python": target_python,
+        "source": target_source,
+    }
+
+
+def _create_alias_candidate(
+    root: Path,
+    source: str,
+    *,
+    target: dict[str, object],
+    preload_alias: bool = False,
+) -> dict[str, Path | str]:
+    candidate_tool = root / "ops" / "prediction_markets_launch_v1" / "preflight.py"
+    candidate_tool.parent.mkdir(parents=True)
+    candidate_src = root / "src"
+    candidate_src.mkdir()
+    (candidate_src / ".gitkeep").write_text("", encoding="utf-8")
+    target_inventory = target["inventory"]
+    assert isinstance(target_inventory, dict)
+    candidate_tool.write_text(
+        _instrument_alias_candidate(
+            source,
+            target_commit=str(target["contract"]["source_commit"]),  # type: ignore[index]
+            target_inventory_sha256=str(target_inventory["inventory_sha256"]),
+            preload_alias=preload_alias,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    candidate_other = candidate_tool.with_name("candidate-other.py")
+    candidate_other.write_text(
+        "# SYNTHETIC/FIXTURE alternate candidate file\n", encoding="utf-8"
+    )
+    candidate_commit = _commit_fixture(root, "candidate compatibility fixture")
+    candidate_inventory = launch_pack.build_source_inventory(root, candidate_commit)
+    incoming = root.parent / f"{root.name}-incoming"
+    incoming.mkdir()
+    handoff = {
+        "boundary": preflight.BOUNDARY,
+        "schema_version": 1,
+        "source_commit": candidate_commit,
+        "source_inventory_sha256": candidate_inventory["inventory_sha256"],
+        "superseded_campaign": target["contract"],
+    }
+    handoff_path = incoming / "handoff.json"
+    _write_pinned_object(handoff_path, handoff)
+    inventory_path = incoming / "source-inventory.json"
+    inventory_path.write_bytes(preflight.canonical_json_bytes(candidate_inventory) + b"\n")
+    return {
+        "commit": candidate_commit,
+        "handoff": handoff_path,
+        "inventory": inventory_path,
+        "other": candidate_other,
+        "source": root,
+        "tool": candidate_tool,
+    }
+
+
+def _set_alias_uvicorn(
+    purelib: Path,
+    mode: str,
+    *,
+    candidate: dict[str, Path | str],
+) -> None:
+    tool = Path(candidate["tool"])
+    other = Path(candidate["other"])
+    real_package = purelib / "uvicorn"
+    saved_package = purelib / "_fixture_real_uvicorn"
+    stub = purelib / "uvicorn.py"
+    if mode == "green":
+        if saved_package.exists():
+            saved_package.rename(real_package)
+        if stub.exists():
+            stub.unlink()
+        return
+    if real_package.exists():
+        real_package.rename(saved_package)
+    variants = {
+        "absent": "# alias intentionally absent\n",
+        "different": (
+            "import multiprocessing,sys,types\n"
+            "value=types.ModuleType('__mp_main__')\n"
+            "value.__file__=__file__\n"
+            "sys.modules['__mp_main__']=value\n"
+        ),
+        "other_file": (
+            "import multiprocessing,sys\n"
+            f"sys.modules['__main__'].__file__={str(other)!r}\n"
+        ),
+        "other_candidate_module": (
+            "import multiprocessing,sys\n"
+            "sys.modules['candidate_extra']=sys.modules['__main__']\n"
+        ),
+        "modified": (
+            "import multiprocessing,sys\n"
+            "from pathlib import Path\n"
+            f"Path({str(tool)!r}).write_text('# mutated candidate tool\\n',encoding='utf-8')\n"
+        ),
+    }
+    stub.write_text(variants[mode], encoding="utf-8")
+
+
+def _run_alias_candidate(
+    candidate: dict[str, Path | str],
+    target: dict[str, object],
+    *,
+    cwd: Path,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["PYTHONNOUSERSITE"] = "1"
+    return subprocess.run(
+        [
+            str(target["python"]),
+            "-I",
+            str(candidate["tool"]),
+            "superseded-runtime-compatibility",
+            "--candidate-handoff",
+            str(candidate["handoff"]),
+            "--candidate-source-root",
+            str(candidate["source"]),
+            "--candidate-source-inventory",
+            str(candidate["inventory"]),
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=90,
+    )
 
 
 def test_real_historical_preflight_reproduces_argparse_incompatibility(
@@ -154,6 +526,94 @@ def test_real_historical_checkout_inventory_is_exact_and_dirty_state_is_refused(
             expected_inventory_sha256=preflight._SUPERSEDED_RUNTIME_INVENTORY_SHA256,
             label="superseded target",
         )
+
+
+def test_distinct_git_roots_exact_subprocess_admits_only_candidate_tool_alias(
+    tmp_path: Path,
+) -> None:
+    target = _create_alias_target(tmp_path)
+    baseline = _git(
+        "show",
+        "98566fab0ce8405bf591041f7a789f94acf6757e:"
+        "ops/prediction_markets_launch_v1/preflight.py",
+    )
+    assert baseline.returncode == 0, baseline.stderr
+    before_patch = _create_alias_candidate(
+        tmp_path / "candidate-before-patch",
+        baseline.stdout,
+        target=target,
+    )
+    fixed = _create_alias_candidate(
+        tmp_path / "candidate-fixed",
+        (OPS / "preflight.py").read_text(encoding="utf-8"),
+        target=target,
+    )
+    neutral = tmp_path / "neutral-cwd"
+    neutral.mkdir()
+    assert Path(before_patch["source"]) != Path(target["source"])
+    assert Path(fixed["source"]) != Path(target["source"])
+    assert before_patch["commit"] != target["contract"]["source_commit"]  # type: ignore[index]
+    assert fixed["commit"] != target["contract"]["source_commit"]  # type: ignore[index]
+
+    purelib = Path(target["purelib"])
+    _set_alias_uvicorn(purelib, "green", candidate=before_patch)
+    reproduced = _run_alias_candidate(before_patch, target, cwd=neutral)
+    assert reproduced.returncode == 4
+    assert (
+        "runtime module escaped source, venv, and stdlib roots: "
+        f"__mp_main__:{before_patch['tool']}"
+    ) in reproduced.stderr
+
+    _set_alias_uvicorn(purelib, "green", candidate=fixed)
+    admitted = _run_alias_candidate(fixed, target, cwd=neutral)
+    assert admitted.returncode == 0, admitted.stderr
+    report = json.loads(admitted.stdout)
+    alias = report["modules"]["__mp_main__"]
+    assert alias["class"] == "candidate_tool"
+    assert alias["alias_of"] == "__main__"
+    assert alias["file"] == str(fixed["tool"])
+    assert report["loaded_module_files_validated"] >= 1
+
+    refusals = {
+        "absent": "candidate tool alias was not created",
+        "different": "candidate tool alias does not reference __main__",
+        "other_file": "candidate tool alias file diverged",
+        "other_candidate_module": "candidate_extra:",
+        "modified": "candidate compatibility tool alias diverged from its Git blob",
+    }
+    original_tool = Path(fixed["tool"]).read_bytes()
+    for mode, expected_error in refusals.items():
+        _set_alias_uvicorn(purelib, mode, candidate=fixed)
+        refused = _run_alias_candidate(fixed, target, cwd=neutral)
+        assert refused.returncode == 4, (mode, refused.stdout, refused.stderr)
+        assert expected_error in refused.stderr
+        if mode == "modified":
+            Path(fixed["tool"]).write_bytes(original_tool)
+            assert not _git(
+                "status", "--porcelain", "--untracked-files=all", cwd=Path(fixed["source"])
+            ).stdout.strip()
+
+    preloaded = _create_alias_candidate(
+        tmp_path / "candidate-preloaded-alias",
+        (OPS / "preflight.py").read_text(encoding="utf-8"),
+        target=target,
+        preload_alias=True,
+    )
+    _set_alias_uvicorn(purelib, "green", candidate=preloaded)
+    preloaded_result = _run_alias_candidate(preloaded, target, cwd=neutral)
+    assert preloaded_result.returncode == 4
+    assert "candidate tool alias was preloaded" in preloaded_result.stderr
+
+    fixed_handoff_path = Path(fixed["handoff"])
+    fixed_handoff = json.loads(fixed_handoff_path.read_text(encoding="utf-8"))
+    conflated = json.loads(json.dumps(fixed_handoff))
+    conflated["superseded_campaign"]["source_root"] = str(fixed["source"])
+    _write_pinned_object(fixed_handoff_path, conflated)
+    _set_alias_uvicorn(purelib, "green", candidate=fixed)
+    conflated_result = _run_alias_candidate(fixed, target, cwd=neutral)
+    assert conflated_result.returncode == 4
+    assert "candidate tool and superseded target source roots collide" in conflated_result.stderr
+    _write_pinned_object(fixed_handoff_path, fixed_handoff)
 
 
 def test_candidate_owned_adapter_authenticates_distinct_historical_target(
@@ -311,6 +771,8 @@ def test_candidate_owned_adapter_authenticates_distinct_historical_target(
     def fake_import(name: str) -> object:
         if name == "hyperlab.research_data.envelope":
             return SimpleNamespace(Venue=Venue)
+        if name == "uvicorn":
+            sys.modules["__mp_main__"] = sys.modules["__main__"]
         return modules[name]
 
     monkeypatch.setattr(preflight, "load_handoff", fake_load_handoff)
@@ -335,6 +797,9 @@ def test_candidate_owned_adapter_authenticates_distinct_historical_target(
         for name in preflight._SUPERSEDED_RUNTIME_SOURCE_MODULES
         if name in sys.modules
     }
+    previous_main = sys.modules.get("__main__")
+    previous_alias = sys.modules.pop("__mp_main__", None)
+    sys.modules["__main__"] = SimpleNamespace(__file__=str(candidate_tool_path))
     try:
         report = preflight.superseded_runtime_compatibility(
             candidate_handoff_path,
@@ -342,6 +807,13 @@ def test_candidate_owned_adapter_authenticates_distinct_historical_target(
             candidate_inventory_path,
         )
     finally:
+        sys.modules.pop("__mp_main__", None)
+        if previous_alias is not None:
+            sys.modules["__mp_main__"] = previous_alias
+        if previous_main is None:
+            sys.modules.pop("__main__", None)
+        else:
+            sys.modules["__main__"] = previous_main
         sys.modules.update(removed)
 
     assert report["adapter_id"] == preflight._SUPERSEDED_RUNTIME_ADAPTER_ID
@@ -351,7 +823,9 @@ def test_candidate_owned_adapter_authenticates_distinct_historical_target(
     assert report["terminal_signal"] == (
         "PREDICTION_SUPERSEDED_RUNTIME_COMPATIBILITY_RUNTIME_GREEN"
     )
-    assert set(report["modules"]) == set(modules)
+    assert set(report["modules"]) == {*modules, "__mp_main__"}
+    assert report["modules"]["__mp_main__"]["class"] == "candidate_tool"  # type: ignore[index]
+    assert report["modules"]["__mp_main__"]["alias_of"] == "__main__"  # type: ignore[index]
 
 
 def test_unknown_adapter_and_external_module_are_refused(tmp_path: Path) -> None:
@@ -527,10 +1001,23 @@ def test_superseded_compatibility_proof_pack_round_trip_is_read_only(
     ):
         assert forbidden not in b1
 
+    candidate_tool = {
+        "class": "candidate_tool",
+        "file": f"{handoff['source_root']}/ops/prediction_markets_launch_v1/preflight.py",
+        "git_blob_sha1": "a" * 40,
+        "relative_path": "ops/prediction_markets_launch_v1/preflight.py",
+        "sha256": "b" * 64,
+        "size": 123,
+    }
     runtime_body = {
         "adapter_id": superseded_compat_proof.ADAPTER_ID,
         "candidate_commit": commit,
         "candidate_inventory_sha256": handoff["source_inventory_sha256"],
+        "candidate_tool": candidate_tool,
+        "loaded_module_files_validated": 1,
+        "modules": {
+            "__mp_main__": {**candidate_tool, "alias_of": "__main__"},
+        },
         "no_historical_new_cli_invoked": True,
         "target_commit": superseded_compat_proof.TARGET_COMMIT,
         "target_inventory_sha256": superseded_compat_proof.TARGET_INVENTORY_SHA256,
@@ -545,6 +1032,24 @@ def test_superseded_compatibility_proof_pack_round_trip_is_read_only(
         ),
     }
     output = pack / "superseded-runtime-compatibility-verify-old.stdout"
+    invalid_body = {**runtime_body, "modules": {}}
+    invalid_runtime = {
+        **invalid_body,
+        "compatibility_sha256": superseded_compat_proof.sha256_bytes(
+            superseded_compat_proof.canonical_json_bytes(invalid_body)
+        ),
+    }
+    output.write_bytes(
+        superseded_compat_proof.canonical_json_bytes(invalid_runtime)
+        + b"\nPREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED\n"
+        + b"PREDICTION_OLD_CAMPAIGN_FIVE_UNITS_AUTHENTICATED\n"
+        + b"PREDICTION_OLD_CAMPAIGN_PREMUTATION_AUTHENTICATED\n"
+    )
+    with pytest.raises(
+        superseded_compat_proof.CompatibilityProofError,
+        match="candidate tool alias report binding diverged",
+    ):
+        superseded_compat_proof.finalize_output(pack, output)
     output.write_bytes(
         superseded_compat_proof.canonical_json_bytes(runtime)
         + b"\nPREDICTION_OLD_RAW_RECEIPTS_LEDGER_AUTHENTICATED\n"

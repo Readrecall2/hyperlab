@@ -1004,6 +1004,40 @@ def _superseded_runtime_environment(
     return venv_root, executable, stdlib_roots
 
 
+def _superseded_candidate_tool_alias_record(
+    *,
+    name: str,
+    module: object,
+    candidate_source_root: Path,
+    candidate_inventory: Mapping[str, object],
+    candidate_tool: Mapping[str, object],
+) -> dict[str, object] | None:
+    if name != "__mp_main__":
+        return None
+    main_module = sys.modules.get("__main__")
+    if module is not main_module:
+        raise PreflightError(
+            "superseded candidate tool alias does not reference __main__"
+        )
+    path = _runtime_module_file(module, name=name)
+    expected = _runtime_reported_file(
+        candidate_tool.get("file"), label="authenticated candidate compatibility tool"
+    )
+    if path != expected:
+        raise PreflightError("superseded candidate tool alias file diverged")
+    refreshed = _inventoried_source_file(
+        path,
+        source_root=candidate_source_root,
+        inventory=candidate_inventory,
+        relative_path=_RUNTIME_ADMISSION_SCRIPT_RELATIVE,
+        label="superseded candidate compatibility tool alias",
+    )
+    refreshed["class"] = "candidate_tool"
+    if refreshed != candidate_tool:
+        raise PreflightError("superseded candidate tool changed after authentication")
+    return {**refreshed, "alias_of": "__main__"}
+
+
 def superseded_runtime_compatibility(
     candidate_handoff_path: Path,
     candidate_source_root: Path,
@@ -1116,6 +1150,8 @@ def superseded_runtime_compatibility(
         raise PreflightError("superseded source modules were imported before admission")
 
     before_modules = set(sys.modules)
+    if "__mp_main__" in before_modules:
+        raise PreflightError("superseded candidate tool alias was preloaded")
     sys.dont_write_bytecode = True
     sys.path[:0] = [str(target_source / "src"), str(target_source)]
     importlib.invalidate_caches()
@@ -1136,6 +1172,8 @@ def superseded_runtime_compatibility(
             raise PreflightError(
                 f"superseded runtime helper contract diverged: {module_name}"
             )
+    if "__mp_main__" not in set(sys.modules) - before_modules:
+        raise PreflightError("superseded candidate tool alias was not created")
 
     module_records: dict[str, object] = {}
     for name, module in imported.items():
@@ -1226,6 +1264,17 @@ def superseded_runtime_compatibility(
         if not isinstance(value, str) or not value:
             continue
         path = _runtime_module_file(module, name=name)
+        alias_record = _superseded_candidate_tool_alias_record(
+            name=name,
+            module=module,
+            candidate_source_root=candidate_source_root,
+            candidate_inventory=candidate_inventory,
+            candidate_tool=candidate_tool,
+        )
+        if alias_record is not None:
+            module_records[name] = alias_record
+            validated_files += 1
+            continue
         module_class = _runtime_module_class(
             path,
             source_root=target_source,

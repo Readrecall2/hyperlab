@@ -234,6 +234,10 @@ rapports utilisent uniquement les nouvelles racines de preuve ci-dessous.
 - source historique target : `{_target_contract()['source_root']}`
 - adaptateur : `{ADAPTER_ID}`
 
+L'alias multiprocessing `__mp_main__` n'est admis que s'il désigne exactement
+`__main__`, c'est-à-dire ce vérificateur candidat réauthentifié contre son blob
+Git; le rapport et C1 lient explicitement cette classe `candidate_tool`.
+
 Ordre humain : A1 Windows, B1 Tabby/VPS, C1 Windows. Le signal terminal B1 est
 `PREDICTION_SUPERSEDED_RUNTIME_COMPATIBILITY_GREEN_NO_CUTOVER`. Ctrl+C pendant
 B1 n'affecte que le clone/rapport de preuve et laisse la campagne historique
@@ -576,6 +580,20 @@ def finalize_output(root: Path, cutover_output: Path) -> dict[str, object]:
         raise CompatibilityProofError("compatibility runtime report is not an object")
     claimed = runtime.get("compatibility_sha256")
     runtime_body = {key: value for key, value in runtime.items() if key != "compatibility_sha256"}
+    candidate_tool = runtime.get("candidate_tool")
+    modules = runtime.get("modules")
+    alias = modules.get("__mp_main__") if isinstance(modules, dict) else None
+    if (
+        not isinstance(candidate_tool, dict)
+        or not isinstance(alias, dict)
+        or alias.get("alias_of") != "__main__"
+        or alias.get("class") != "candidate_tool"
+        or {key: value for key, value in alias.items() if key != "alias_of"}
+        != candidate_tool
+        or type(runtime.get("loaded_module_files_validated")) is not int
+        or runtime["loaded_module_files_validated"] < 1
+    ):
+        raise CompatibilityProofError("candidate tool alias report binding diverged")
     if (
         claimed != sha256_bytes(canonical_json_bytes(runtime_body))
         or runtime.get("adapter_id") != ADAPTER_ID

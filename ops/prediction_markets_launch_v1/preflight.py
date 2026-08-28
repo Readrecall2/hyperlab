@@ -48,6 +48,15 @@ class PreflightError(RuntimeError):
     """Fail-closed target preflight error."""
 
 
+class _MountEvidenceError(PreflightError):
+    """A mount refusal carrying only bounded, non-secret kernel evidence."""
+
+    def __init__(self, message: str, evidence: Mapping[str, object]) -> None:
+        self.evidence = dict(evidence)
+        diagnostic = canonical_json_bytes(self.evidence).decode("utf-8")
+        super().__init__(f"{message}; observed_mount={diagnostic}")
+
+
 def canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -264,35 +273,56 @@ def _mount_evidence(
     if mounted.returncode != 0 or len(fields) != 6:
         raise PreflightError(f"{label} mount evidence is unavailable or malformed")
     target_text, source, fstype, options_text, device, fsroot = fields
+    if any(len(field) > 1024 for field in fields):
+        raise PreflightError(f"{label} mount evidence field is oversized")
     target = PurePosixPath(target_text)
     candidate = PurePosixPath(path.as_posix())
+    observed: dict[str, object] = {
+        "device_major_minor": device,
+        "filesystem": fstype,
+        "filesystem_root": fsroot,
+        "logical_path": path.as_posix(),
+        "mount": target.as_posix(),
+        "options": options_text.split(","),
+        "source": source,
+        "stat_device_major_minor": None,
+    }
+
+    def refuse(reason: str) -> NoReturn:
+        raise _MountEvidenceError(f"{label} {reason}", observed)
+
     target_is_absolute = target.is_absolute() or (
         os.name == "nt" and re.fullmatch(r"[A-Za-z]:/.*", target_text) is not None
     )
     if not target_is_absolute or (target != candidate and not target_may_be_ancestor):
-        raise PreflightError(f"{label} mount target diverged")
+        refuse("mount target diverged")
     if target_may_be_ancestor and target != candidate and target not in candidate.parents:
-        raise PreflightError(f"{label} mount target is not an authenticated ancestor")
+        refuse("mount target is not an authenticated ancestor")
     if expected_target is not None and target != PurePosixPath(expected_target.as_posix()):
-        raise PreflightError(f"{label} mount target diverged")
+        refuse("mount target diverged")
     if re.fullmatch(r"[0-9]+:[0-9]+", device) is None:
-        raise PreflightError(f"{label} findmnt device identity is invalid")
-    stat_device = _stat_device_major_minor(path)
+        refuse("findmnt device identity is invalid")
+    try:
+        stat_device = _stat_device_major_minor(path)
+    except PreflightError as error:
+        refuse(f"stat device authentication failed: {error}")
+    observed["stat_device_major_minor"] = stat_device
     if stat_device != device:
-        raise PreflightError(f"{label} findmnt and stat device identities diverged")
+        refuse("findmnt and stat device identities diverged")
     if expected_device is not None and device != expected_device:
-        raise PreflightError(f"{label} filesystem device diverged")
+        refuse("filesystem device diverged")
     if expected_fstype is not None and fstype != expected_fstype:
-        raise PreflightError(f"{label} filesystem type diverged")
+        refuse("filesystem type diverged")
     if not fsroot.startswith("/") or ".." in PurePosixPath(fsroot).parts:
-        raise PreflightError(f"{label} filesystem root is invalid")
+        refuse("filesystem root is invalid")
     if expected_fsroot is not None and fsroot != expected_fsroot:
-        raise PreflightError(f"{label} filesystem root/bind identity diverged")
-    options = options_text.split(",")
+        refuse("filesystem root/bind identity diverged")
+    options = observed["options"]
+    assert isinstance(options, list)
     if required_mode is not None:
         opposite = "ro" if required_mode == "rw" else "rw"
         if required_mode not in options or opposite in options:
-            raise PreflightError(f"{label} is not mounted {required_mode}")
+            refuse(f"is not mounted {required_mode}")
     return {
         "device_major_minor": device,
         "filesystem": fstype,
@@ -354,16 +384,121 @@ def _authenticate_volume_namespace_mapping(
 def _authenticate_incoming_namespace_target(
     evidence: Mapping[str, object],
     *,
+    home_evidence: Mapping[str, object],
     incoming: Path,
     label: str,
 ) -> None:
     target_text = evidence.get("mount")
-    if not isinstance(target_text, str):
+    filesystem_root = evidence.get("filesystem_root")
+    filesystem = evidence.get("filesystem")
+    device = evidence.get("device_major_minor")
+    stat_device = evidence.get("stat_device_major_minor")
+    source = evidence.get("source")
+    options = evidence.get("options")
+    home_target_text = home_evidence.get("mount")
+    home_root_text = home_evidence.get("filesystem_root")
+    home_filesystem = home_evidence.get("filesystem")
+    home_device = home_evidence.get("device_major_minor")
+    home_stat_device = home_evidence.get("stat_device_major_minor")
+    home_source = home_evidence.get("source")
+    home_options = home_evidence.get("options")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            target_text,
+            filesystem_root,
+            filesystem,
+            device,
+            stat_device,
+            source,
+            home_target_text,
+            home_root_text,
+            home_filesystem,
+            home_device,
+            home_stat_device,
+            home_source,
+        )
+    ) or not all(
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+        for value in (options, home_options)
+    ):
         raise PreflightError(f"{label} mount mapping evidence is invalid")
+    assert isinstance(target_text, str)
+    assert isinstance(filesystem_root, str)
+    assert isinstance(filesystem, str)
+    assert isinstance(device, str)
+    assert isinstance(stat_device, str)
+    assert isinstance(source, str)
+    assert isinstance(options, list)
+    assert isinstance(home_target_text, str)
+    assert isinstance(home_root_text, str)
+    assert isinstance(home_filesystem, str)
+    assert isinstance(home_device, str)
+    assert isinstance(home_stat_device, str)
+    assert isinstance(home_source, str)
+    assert isinstance(home_options, list)
     target = PurePosixPath(target_text)
-    allowed = {_HOME_MOUNT, PurePosixPath(incoming.as_posix())}
+    incoming_path = PurePosixPath(incoming.as_posix())
+    if target == PurePosixPath("/") or home_target_text != _HOME_MOUNT.as_posix():
+        raise PreflightError(f"{label} target is not an authenticated /home ancestor")
+    try:
+        relative_incoming = incoming_path.relative_to(_HOME_MOUNT)
+    except ValueError as error:
+        raise PreflightError(f"{label} logical path leaves /home") from error
+    if not relative_incoming.parts or ".." in relative_incoming.parts:
+        raise PreflightError(f"{label} logical path is not a canonical /home descendant")
+    allowed: set[PurePosixPath] = {incoming_path}
+    cursor = incoming_path
+    while cursor != _HOME_MOUNT:
+        cursor = cursor.parent
+        if cursor == PurePosixPath("/"):
+            raise PreflightError(f"{label} ancestor chain reached filesystem root")
+        allowed.add(cursor)
     if target not in allowed:
-        raise PreflightError(f"{label} mount target is not allowlisted")
+        raise PreflightError(f"{label} mount target is not an authenticated /home ancestor")
+    if (
+        filesystem != "ext4"
+        or home_filesystem != "ext4"
+        or device != stat_device
+        or home_device != home_stat_device
+        or device != home_device
+    ):
+        raise PreflightError(f"{label} filesystem type or device identity diverged")
+    if "ro" not in options or "rw" in options or "ro" not in home_options or "rw" in home_options:
+        raise PreflightError(f"{label} is not mounted ro")
+    home_root = PurePosixPath(home_root_text)
+    if not home_root.is_absolute() or ".." in home_root.parts:
+        raise PreflightError(f"{label} /home filesystem root is invalid")
+    target_relative = target.relative_to(_HOME_MOUNT)
+    expected_root = (home_root / target_relative).as_posix()
+    if filesystem_root != expected_root:
+        raise PreflightError(f"{label} filesystem root/bind identity diverged")
+
+    def source_parts(value: str) -> tuple[str, str | None]:
+        matched = re.fullmatch(r"([^\[\]]+?)(?:\[(/[^\[\]]*)\])?", value)
+        if matched is None:
+            raise PreflightError(f"{label} mount source identity is invalid")
+        return matched.group(1), matched.group(2)
+
+    home_source_base, home_source_root = source_parts(home_source)
+    source_base, source_root = source_parts(source)
+    if home_source_root is not None and home_source_root != home_root_text:
+        raise PreflightError(f"{label} /home source/root identity diverged")
+    if source_base != home_source_base or (
+        source_root is not None and source_root != filesystem_root
+    ):
+        raise PreflightError(f"{label} source/root identity diverged")
+    if source_root is None and (
+        target != _HOME_MOUNT or filesystem_root != home_root_text
+    ):
+        raise PreflightError(f"{label} ancestor bind source/root identity is absent")
+    target_index = incoming_path.parents.index(target) if target != incoming_path else -1
+    chain = [incoming_path] if target_index == -1 else [incoming_path, *incoming_path.parents[: target_index + 1]]
+    for member in reversed(chain):
+        member_path = Path(member.as_posix())
+        _canonical_directory(member_path, label=f"{label} authenticated chain member")
+        if _stat_device_major_minor(member_path) != device:
+            raise PreflightError(f"{label} authenticated chain member device diverged")
 
 
 def _durable_write_surface_probe(root: Path) -> dict[str, object]:
@@ -1590,6 +1725,7 @@ def _runner_namespace_checks(
     venue: str,
     run: CommandRunner,
     write_probe: WriteSurfaceProbe,
+    observed_mounts: dict[str, object],
 ) -> dict[str, object]:
     if venue not in {"polymarket", "kalshi"}:
         raise PreflightError("runner namespace venue is invalid")
@@ -1627,6 +1763,10 @@ def _runner_namespace_checks(
         expected_fsroot=admitted_root,
         required_mode="ro",
     )
+    observed_mounts["volume_parent"] = {
+        **parent_mount,
+        "logical_path": volume_mount.as_posix(),
+    }
     volume_base_mount = _mount_evidence(
         volume_base,
         run=run,
@@ -1636,6 +1776,10 @@ def _runner_namespace_checks(
         expected_fstype="ext4",
         required_mode="ro",
     )
+    observed_mounts["volume_base"] = {
+        **volume_base_mount,
+        "logical_path": volume_base.as_posix(),
+    }
     _authenticate_volume_namespace_mapping(
         volume_base_mount,
         admitted_root=admitted_root,
@@ -1643,6 +1787,18 @@ def _runner_namespace_checks(
         label="runner Prediction Markets volume base",
         volume_mount=volume_mount,
     )
+    home_mount = _mount_evidence(
+        Path(_HOME_MOUNT.as_posix()),
+        run=run,
+        label="runner namespace /home root",
+        expected_target=Path(_HOME_MOUNT.as_posix()),
+        expected_fstype="ext4",
+        required_mode="ro",
+    )
+    observed_mounts["home"] = {
+        **home_mount,
+        "logical_path": _HOME_MOUNT.as_posix(),
+    }
     incoming_mount = _mount_evidence(
         incoming,
         run=run,
@@ -1650,8 +1806,13 @@ def _runner_namespace_checks(
         target_may_be_ancestor=True,
         required_mode="ro",
     )
+    observed_mounts["incoming"] = {
+        **incoming_mount,
+        "logical_path": incoming.as_posix(),
+    }
     _authenticate_incoming_namespace_target(
         incoming_mount,
+        home_evidence=home_mount,
         incoming=incoming,
         label="runner namespace incoming root",
     )
@@ -1666,6 +1827,10 @@ def _runner_namespace_checks(
             expected_fstype="ext4",
             required_mode="ro",
         )
+        observed_mounts[label] = {
+            **readonly_mounts[label],
+            "logical_path": path.as_posix(),
+        }
         _authenticate_volume_namespace_mapping(
             readonly_mounts[label],
             admitted_root=admitted_root,
@@ -1688,6 +1853,10 @@ def _runner_namespace_checks(
         expected_fsroot=venue_expected_root,
         required_mode="rw",
     )
+    observed_mounts["venue"] = {
+        **venue_mount,
+        "logical_path": venue_root.as_posix(),
+    }
     write_surface = write_probe(venue_root)
     venue_mount_after = _mount_evidence(
         venue_root,
@@ -1734,6 +1903,7 @@ def runner_namespace_admission(
 
     errors: list[str] = []
     checks: dict[str, object] = {}
+    observed_mounts: dict[str, object] = {}
     try:
         handoff, layout, admitted_filesystem = _validated_install_admission(
             handoff_path,
@@ -1747,14 +1917,18 @@ def runner_namespace_admission(
             venue=venue,
             run=run,
             write_probe=write_probe,
+            observed_mounts=observed_mounts,
         )
     except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        if isinstance(error, _MountEvidenceError):
+            observed_mounts["rejected"] = error.evidence
         errors.append(str(error))
     return {
         "boundary": BOUNDARY,
         "checks": checks,
         "errors": errors,
         "namespace_admissible": not errors,
+        "observed_mounts": observed_mounts,
         "recorded_at_utc": _utc_now_text(),
         "schema_version": 1,
         "terminal_signal": (
@@ -1778,6 +1952,7 @@ def runner_startup_admission(
 
     errors: list[str] = []
     checks: dict[str, object] = {}
+    observed_mounts: dict[str, object] = {}
     try:
         handoff, layout, admitted_filesystem = _validated_install_admission(
             handoff_path,
@@ -1849,6 +2024,7 @@ def runner_startup_admission(
             venue=venue,
             run=run,
             write_probe=write_probe,
+            observed_mounts=observed_mounts,
         )
         checks = {
             "capacity": {"deferred_to_ledger_accounted_runner_gate": True},
@@ -1859,11 +2035,14 @@ def runner_startup_admission(
             "transfer_identity": transfer,
         }
     except (OSError, PreflightError, subprocess.SubprocessError, ValueError) as error:
+        if isinstance(error, _MountEvidenceError):
+            observed_mounts["rejected"] = error.evidence
         errors.append(str(error))
     return {
         "boundary": BOUNDARY,
         "checks": checks,
         "errors": errors,
+        "observed_mounts": observed_mounts,
         "recorded_at_utc": _utc_now_text(),
         "schema_version": 1,
         "startup_admissible": not errors,

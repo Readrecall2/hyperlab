@@ -618,7 +618,17 @@ if [[ ${1:-} == rm ]]; then
 fi
 if [[ ${1:-} == journalctl ]]; then
   [[ $* == *'--no-pager -n 20 -o cat'* ]] || exit 92
-  printf 'PREDICTION_RUNNER_REFUSED:runner startup admission refused before slot selection: SYNTHETIC/FIXTURE namespace contract diverged\n'
+  journal_service=''
+  previous=''
+  for argument in "$@"; do
+    if [[ $previous == --unit ]]; then journal_service=$argument; break; fi
+    previous=$argument
+  done
+  if [[ $journal_service == *-namespace-probe.service ]]; then
+    printf '%s\n' '{"boundary":"PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY","checks":{},"errors":["SYNTHETIC/FIXTURE namespace contract diverged"],"namespace_admissible":false,"observed_mounts":{"incoming":{"device_major_minor":"254:0","filesystem":"ext4","filesystem_root":"/home/hyperlab/hyperlab-prediction-markets/incoming","logical_path":"/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef","mount":"/home/hyperlab/hyperlab-prediction-markets/incoming","options":["ro","relatime"],"source":"/dev/root[/home/hyperlab/hyperlab-prediction-markets/incoming]","stat_device_major_minor":"254:0"}},"recorded_at_utc":"2026-08-27T23:59:59.000000Z","schema_version":1,"terminal_signal":"PREDICTION_RUNNER_NAMESPACE_REFUSED","venue":"polymarket"}'
+  else
+    printf '%s\n' 'PREDICTION_RUNNER_REFUSED:runner startup admission refused before slot selection: SYNTHETIC/FIXTURE terminal exit 4'
+  fi
   exit 0
 fi
 if [[ ${1:-} != systemctl ]]; then exit 0; fi
@@ -1014,6 +1024,131 @@ def test_new_slugs_produce_unique_incoming_source_campaign_and_service_identitie
     )
 
 
+def test_materialized_pack_is_new_slug_bound_authenticated_and_probes_precede_persistent_services(
+    tmp_path: Path,
+) -> None:
+    old_slug = "pm-20260827t234404z-73c6d2d2"
+    new_slug = "pm-20260828t010203z-cafefeed"
+    pack = tmp_path / new_slug
+    pack.mkdir()
+    (pack / "wheelhouse").mkdir()
+    bundle = pack / "hyperlab-prediction-markets-prospective-launch-v1.bundle"
+    _create_real_git_bundle(tmp_path, bundle)
+    wheel = pack / "wheelhouse" / "fixture-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"SYNTHETIC/FIXTURE offline wheel")
+    wheelhouse_payload = (
+        f"{launch_pack.sha256_file(wheel)}  {wheel.name}\n".encode("ascii")
+    )
+    (pack / "wheelhouse.sha256").write_bytes(wheelhouse_payload)
+    synthetic_source = tmp_path / "synthetic-bundle-source"
+    synthetic_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        check=True,
+        cwd=synthetic_source,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+    source_inventory = launch_pack.build_source_inventory(
+        synthetic_source, synthetic_commit
+    )
+    (pack / "source-inventory.json").write_bytes(
+        launch_pack.canonical_json_bytes(source_inventory) + b"\n"
+    )
+    handoff = json.loads(json.dumps(_handoff()).replace("pm-20260827t120000z-deadbeef", new_slug))
+    plan = _plan()
+    handoff.update(
+        {
+            "access_bundle_sha256": plan["access_bundle_sha256"],
+            "base_commit": plan["base_commit"],
+            "bundle_filename": bundle.name,
+            "bundle_sha256": launch_pack.sha256_file(bundle),
+            "candidate_config_sha256": plan["candidate_config_sha256"],
+            "candidate_pack_manifest_sha256": plan["campaign_manifest_sha256"],
+            "disk": plan["disk"],
+            "economic_evidence_status": "ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE",
+            "pack_id": launch_pack.PACK_ID,
+            "quick_start_default": "IMMEDIATE_AFTER_SUCCESSFUL_INSTALL",
+            "schema_version": 1,
+            "source_commit": synthetic_commit,
+            "source_inventory_sha256": source_inventory["inventory_sha256"],
+            "start_at_override": "HYPERLAB_PM_START_AT_UTC_OPTIONAL",
+            "wheelhouse_manifest_sha256": launch_pack.sha256_bytes(wheelhouse_payload),
+        }
+    )
+    scripts_root = pack / "scripts"
+    scripts_root.mkdir()
+    for name in launch_pack._SCRIPTS:
+        (scripts_root / name).write_bytes((OPS / name).read_bytes())
+    (pack / "README.md").write_text(
+        launch_pack.render_operator_readme(handoff), encoding="utf-8"
+    )
+    units = launch_pack.render_units(handoff)
+    for name, content in units.items():
+        path = pack / "systemd" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    blocks = {
+        "A-windows-bundle-verify-transfer.ps1": launch_pack.render_windows_transfer(handoff),
+        "B-tabby-preflight-install-activate.sh": launch_pack.render_tabby_install(handoff),
+        "C-tabby-readonly-monitor.sh": launch_pack.render_tabby_monitor(handoff),
+        "D-windows-dashboard-tunnel.ps1": launch_pack.render_windows_tunnel(handoff),
+        "E-recovery-rollback.sh": launch_pack.render_recovery_rollback(handoff),
+    }
+    for name, content in blocks.items():
+        path = pack / "operator" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    transfer_paths = [
+        bundle.name,
+        "README.md",
+        "source-inventory.json",
+        "wheelhouse.sha256",
+        *[f"scripts/{name}" for name in launch_pack._SCRIPTS],
+        *[f"systemd/{name}" for name in units],
+        *[f"operator/{name}" for name in blocks],
+    ]
+    transfer = launch_pack._transfer_inventory(pack, transfer_paths)
+    transfer_payload = launch_pack.canonical_json_bytes(transfer) + b"\n"
+    (pack / "transfer-inventory.json").write_bytes(transfer_payload)
+    handoff["transfer_inventory_sha256"] = launch_pack.sha256_bytes(transfer_payload)
+    handoff_payload = launch_pack.canonical_json_bytes(handoff) + b"\n"
+    (pack / "handoff.json").write_bytes(handoff_payload)
+    (pack / "handoff.sha256").write_text(
+        f"{launch_pack.sha256_bytes(handoff_payload)}  handoff.json\n",
+        encoding="ascii",
+    )
+
+    assert pack.name == new_slug and old_slug not in pack.as_posix()
+    assert len(units) == 5 and len(blocks) == 5
+    verify_repo = tmp_path / "materialized-pack-bundle-verifier.git"
+    _run_git("init", "--quiet", "--bare", str(verify_repo))
+    _run_git("bundle", "verify", str(bundle), cwd=verify_repo)
+    for row in transfer["files"]:  # type: ignore[index]
+        assert isinstance(row, dict)
+        target = pack.joinpath(*PurePosixPath(str(row["path"])).parts)
+        assert target.stat().st_size == row["size"]
+        assert launch_pack.sha256_file(target) == row["sha256"]
+    assert launch_pack.sha256_bytes((pack / "handoff.json").read_bytes()) in (
+        pack / "handoff.sha256"
+    ).read_text(encoding="ascii")
+    text_payload = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in pack.rglob("*")
+        if path.is_file() and path.suffix not in {".bundle", ".whl"}
+    )
+    assert old_slug not in text_payload
+    assert new_slug in blocks["B-tabby-preflight-install-activate.sh"]
+    install_script = (scripts_root / "install.sh").read_text(encoding="utf-8")
+    first_probe = install_script.index("for VENUE in polymarket kalshi")
+    dashboard = install_script.index('systemctl enable --now "$DASHBOARD_SERVICE"')
+    collector = install_script.index('systemctl enable --now "$SERVICE"')
+    assert first_probe < dashboard < collector
+    assert "PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=" in install_script
+    for field in ("TARGET", "SOURCE", "FSTYPE", "VFS_OPTIONS", "MAJ:MIN", "FSROOT", "LOGICAL_PATH"):
+        assert f'"{field}"' in install_script
+
+
 def test_authoritative_base_remains_valid_for_causal_fix_descendants() -> None:
     base = "3f188b9c28c9fec406b904a9e3307b43f54243e8"
     head = subprocess.run(
@@ -1055,6 +1190,24 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
         assert "runner-namespace-guard" in probe
         assert f"--venue {venue}" in probe
         assert f"ReadWritePaths={_handoff()['campaign_root']}/{venue}" in probe
+        collector = polymarket if venue == "polymarket" else kalshi
+        filesystem_directives = (
+            "PrivateTmp=",
+            "PrivateDevices=",
+            "ProtectSystem=",
+            "ProtectHome=",
+            "ReadOnlyPaths=",
+            "ReadWritePaths=",
+        )
+        assert {
+            line
+            for line in probe.splitlines()
+            if line.startswith(filesystem_directives)
+        } == {
+            line
+            for line in collector.splitlines()
+            if line.startswith(filesystem_directives)
+        }
     assert "RestartPreventExitStatus=4" not in dashboard
     for unit in units.values():
         assert "User=hyperlab" in unit
@@ -1072,6 +1225,218 @@ def test_rendered_units_are_independent_hardened_and_path_isolated() -> None:
         assert unit.count("ReadWritePaths=") <= 1
         assert "hyperlab-h1" not in unit
         assert "18080" not in unit
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "/home",
+        "/home/hyperlab",
+        "/home/hyperlab/hyperlab-prediction-markets",
+        "/home/hyperlab/hyperlab-prediction-markets/incoming",
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef",
+    ),
+)
+def test_incoming_namespace_accepts_only_authenticated_readonly_home_ancestors(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (254, 1, 0o40700),
+    )
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "254:0")
+    evidence = {
+        "device_major_minor": "254:0",
+        "filesystem": "ext4",
+        "filesystem_root": target,
+        "logical_path": incoming.as_posix(),
+        "mount": target,
+        "options": ["ro", "relatime"],
+        "source": f"/dev/root[{target}]",
+        "stat_device_major_minor": "254:0",
+    }
+    home_evidence = {
+        "device_major_minor": "254:0",
+        "filesystem": "ext4",
+        "filesystem_root": "/home",
+        "mount": "/home",
+        "options": ["ro", "relatime"],
+        "source": "/dev/root[/home]",
+        "stat_device_major_minor": "254:0",
+    }
+    preflight._authenticate_incoming_namespace_target(
+        evidence,
+        home_evidence=home_evidence,
+        incoming=incoming,
+        label="runner namespace incoming root",
+    )
+
+
+def test_incoming_namespace_accepts_authenticated_ancestor_on_separate_home_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    target = "/home/hyperlab"
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (254, 1, 0o40700),
+    )
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "254:0")
+    preflight._authenticate_incoming_namespace_target(
+        {
+            "device_major_minor": "254:0",
+            "filesystem": "ext4",
+            "filesystem_root": "/hyperlab",
+            "logical_path": incoming.as_posix(),
+            "mount": target,
+            "options": ["ro", "relatime"],
+            "source": "/dev/home[/hyperlab]",
+            "stat_device_major_minor": "254:0",
+        },
+        home_evidence={
+            "device_major_minor": "254:0",
+            "filesystem": "ext4",
+            "filesystem_root": "/",
+            "mount": "/home",
+            "options": ["ro", "relatime"],
+            "source": "/dev/home[/]",
+            "stat_device_major_minor": "254:0",
+        },
+        incoming=incoming,
+        label="runner namespace incoming root",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ({"mount": "/", "filesystem_root": "/", "source": "/dev/root"}, "ancestor"),
+        (
+            {
+                "mount": "/home/other",
+                "filesystem_root": "/home/other",
+                "source": "/dev/root[/home/other]",
+            },
+            "ancestor",
+        ),
+        (
+            {
+                "mount": "/home/hyperlab/cousin",
+                "filesystem_root": "/home/hyperlab/cousin",
+                "source": "/dev/root[/home/hyperlab/cousin]",
+            },
+            "ancestor",
+        ),
+        (
+            {
+                "mount": "/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef/child",
+                "filesystem_root": "/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef/child",
+                "source": "/dev/root[/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef/child]",
+            },
+            "ancestor",
+        ),
+        ({"filesystem_root": "/wrong"}, "root/bind"),
+        ({"device_major_minor": "8:16"}, "device"),
+        ({"filesystem": "xfs"}, "filesystem type"),
+        ({"options": ["rw", "relatime"]}, "mounted ro"),
+        ({"source": "/dev/root[/wrong]"}, "source/root"),
+    ),
+)
+def test_incoming_namespace_rejects_escape_or_identity_relaxation(
+    mutation: dict[str, object],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    target = "/home/hyperlab/hyperlab-prediction-markets/incoming"
+    monkeypatch.setattr(
+        preflight,
+        "_canonical_directory",
+        lambda _path, *, label: (254, 1, 0o40700),
+    )
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "254:0")
+    evidence: dict[str, object] = {
+        "device_major_minor": "254:0",
+        "filesystem": "ext4",
+        "filesystem_root": target,
+        "logical_path": incoming.as_posix(),
+        "mount": target,
+        "options": ["ro", "relatime"],
+        "source": f"/dev/root[{target}]",
+        "stat_device_major_minor": "254:0",
+    }
+    evidence.update(mutation)
+    home_evidence = {
+        "device_major_minor": "254:0",
+        "filesystem": "ext4",
+        "filesystem_root": "/home",
+        "mount": "/home",
+        "options": ["ro", "relatime"],
+        "source": "/dev/root[/home]",
+        "stat_device_major_minor": "254:0",
+    }
+    with pytest.raises(preflight.PreflightError, match=message):
+        preflight._authenticate_incoming_namespace_target(
+            evidence,
+            home_evidence=home_evidence,
+            incoming=incoming,
+            label="runner namespace incoming root",
+        )
+
+
+def test_incoming_namespace_rejects_a_symlinked_authenticated_chain_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming = Path(
+        "/home/hyperlab/hyperlab-prediction-markets/incoming/"
+        "pm-20260827t120000z-deadbeef"
+    )
+    target = "/home/hyperlab"
+
+    def canonical(path: Path, *, label: str) -> tuple[int, int, int]:
+        if path == Path("/home/hyperlab/hyperlab-prediction-markets"):
+            raise preflight.PreflightError(f"{label} is symlinked")
+        return 254, 1, 0o40700
+
+    monkeypatch.setattr(preflight, "_canonical_directory", canonical)
+    monkeypatch.setattr(preflight, "_stat_device_major_minor", lambda _path: "254:0")
+    with pytest.raises(preflight.PreflightError, match="symlinked"):
+        preflight._authenticate_incoming_namespace_target(
+            {
+                "device_major_minor": "254:0",
+                "filesystem": "ext4",
+                "filesystem_root": target,
+                "logical_path": incoming.as_posix(),
+                "mount": target,
+                "options": ["ro", "relatime"],
+                "source": f"/dev/root[{target}]",
+                "stat_device_major_minor": "254:0",
+            },
+            home_evidence={
+                "device_major_minor": "254:0",
+                "filesystem": "ext4",
+                "filesystem_root": "/home",
+                "mount": "/home",
+                "options": ["ro", "relatime"],
+                "source": "/dev/root[/home]",
+                "stat_device_major_minor": "254:0",
+            },
+            incoming=incoming,
+            label="runner namespace incoming root",
+        )
 
 
 def test_operator_blocks_are_shell_separated_bounded_and_h1_safe() -> None:
@@ -1401,15 +1766,8 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
             f"{log.read_text(encoding='utf-8')}\n{green.stderr}"
         )
         assert server_started.is_set(), server_error
-        assert any(
-            signature in green.stderr
-            for signature in (
-                "ConnectionRefusedError",
-                "WinError 10061",
-                "Errno 111",
-                "urlopen error timed out",
-            )
-        ), green.stderr
+        assert "PREDICTION_DASHBOARD_READINESS_WAIT=URLError" in green.stderr
+        assert "Traceback (most recent call last)" not in green.stderr
         assert green.stdout.splitlines()[-1] == "PREDICTION_INSTALL_ACTIVATION_GREEN"
         assert HealthHandler.ready_requests == 3
         manifest = json.loads((pack / "campaign-manifest.json").read_bytes())
@@ -1431,13 +1789,11 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         kalshi_probe = f"hyperlab-pm-{suffix}-kalshi-namespace-probe.service"
         polymarket_probe_start = f"sudo|systemctl start {polymarket_probe}"
         kalshi_probe_start = f"sudo|systemctl start {kalshi_probe}"
-        assert green_log.index(dashboard_enable) < green_log.index(polymarket_enable)
-        assert green_log.index(dashboard_enable) < green_log.index(
-            polymarket_probe_start
-        )
         assert green_log.index(polymarket_probe_start) < green_log.index(
             kalshi_probe_start
         )
+        assert green_log.index(kalshi_probe_start) < green_log.index(dashboard_enable)
+        assert green_log.index(dashboard_enable) < green_log.index(polymarket_enable)
         assert green_log.index(kalshi_probe_start) < green_log.index(
             polymarket_enable
         )
@@ -1453,7 +1809,7 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         assert isinstance(refused_services, dict)
         refused_suffix = str(refused_handoff["run_slug"]).removeprefix("pm-")
         refused_probe = (
-            f"hyperlab-pm-{refused_suffix}-polymarket-namespace-probe.service"
+            f"hyperlab-pm-{refused_suffix}-kalshi-namespace-probe.service"
         )
         refused_environment, refused_log_path = _internal_install_environment(
             tmp_path / "namespace-refused",
@@ -1473,10 +1829,25 @@ def test_internal_install_runs_real_script_handles_transient_503_and_isolates_fa
         refused_output = namespace_refused.stdout + namespace_refused.stderr
         assert namespace_refused.returncode == 4, refused_output
         assert "PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=" in refused_output
-        assert "collector namespace probe refused before runner activation: polymarket" in refused_output
+        assert "collector namespace probe refused before any persistent service activation: kalshi" in refused_output
         assert "PREDICTION_INSTALL_ACTIVATION_GREEN" not in refused_output
+        assert '"TARGET":"/home/hyperlab/hyperlab-prediction-markets/incoming"' in refused_output
+        assert '"SOURCE":"/dev/root[/home/hyperlab/hyperlab-prediction-markets/incoming]"' in refused_output
+        assert '"FSTYPE":"ext4"' in refused_output
+        assert '"VFS_OPTIONS":["ro","relatime"]' in refused_output
+        assert '"MAJ:MIN":"254:0"' in refused_output
+        assert '"FSROOT":"/home/hyperlab/hyperlab-prediction-markets/incoming"' in refused_output
+        assert '"LOGICAL_PATH":"/home/hyperlab/hyperlab-prediction-markets/incoming/pm-20260827t120000z-deadbeef"' in refused_output
         refused_log = refused_log_path.read_text(encoding="utf-8")
+        assert (
+            f"sudo|systemctl start hyperlab-pm-{refused_suffix}-polymarket-namespace-probe.service"
+            in refused_log
+        )
         assert f"sudo|systemctl start {refused_probe}" in refused_log
+        assert (
+            f"sudo|systemctl enable --now {refused_services['dashboard']}"
+            not in refused_log
+        )
         for venue in ("polymarket", "kalshi"):
             assert (
                 f"sudo|systemctl enable --now {refused_services[venue]}"
@@ -3485,7 +3856,11 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
     monkeypatch.setattr(
         preflight,
         "_stat_device_major_minor",
-        lambda path: incoming_device if path == incoming else "8:16",
+        lambda path: (
+            incoming_device
+            if path == home_mount or home_mount in path.parents
+            else "8:16"
+        ),
     )
     available = 195_484_491_776
     ntp = "yes"
@@ -3529,13 +3904,18 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
                     f"{target.as_posix()} {filesystem_source} ext4 {volume_mode},relatime,discard {filesystem_device} /",
                     "",
                 )
+            if target == home_mount:
+                return preflight.CommandResult(
+                    0,
+                    f"{home_mount.as_posix()} /dev/root[/home] ext4 ro,relatime {incoming_device} /home",
+                    "",
+                )
             if target == incoming:
                 incoming_target = incoming_mount_target_override or home_mount
+                incoming_relative = incoming_target.relative_to(home_mount)
                 incoming_fsroot = (
-                    "/home"
-                    if incoming_target == home_mount
-                    else "/home/incoming"
-                )
+                    PurePosixPath("/home") / PurePosixPath(incoming_relative.as_posix())
+                ).as_posix()
                 return preflight.CommandResult(
                     0,
                     f"{incoming_target.as_posix()} /dev/root[{incoming_fsroot}] ext4 ro,relatime {incoming_device} {incoming_fsroot}",
@@ -3645,7 +4025,18 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         refused_unlisted_source_mount["errors"]
     )
     source_mount_target_override = None
-    incoming_mount_target_override = incoming.parent
+    for incoming_mount_target_override in (home_mount, incoming.parent, incoming):
+        coalesced_incoming_green = preflight.runner_namespace_admission(
+            handoff_path,
+            install_admission_path,
+            venue="polymarket",
+            run=live_command,
+        )
+        assert coalesced_incoming_green["namespace_admissible"] is True
+        incoming_observed = coalesced_incoming_green["observed_mounts"]["incoming"]  # type: ignore[index]
+        assert incoming_observed["mount"] == incoming_mount_target_override.as_posix()  # type: ignore[index]
+        assert incoming_observed["logical_path"] == incoming.as_posix()  # type: ignore[index]
+    incoming_mount_target_override = home_mount / "cousin"
     refused_unlisted_incoming_mount = preflight.runner_namespace_admission(
         handoff_path,
         install_admission_path,
@@ -3653,7 +4044,7 @@ def test_post_bootstrap_install_admission_reauthenticates_units_and_live_margin(
         run=live_command,
     )
     assert refused_unlisted_incoming_mount["namespace_admissible"] is False
-    assert "mount target is not allowlisted" in " ".join(  # type: ignore[arg-type]
+    assert "authenticated ancestor" in " ".join(  # type: ignore[arg-type]
         refused_unlisted_incoming_mount["errors"]
     )
     incoming_mount_target_override = None

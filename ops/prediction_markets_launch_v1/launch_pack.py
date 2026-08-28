@@ -444,8 +444,9 @@ donnée, mais reste `source_usable=false`, `economic_eligible=false` et n'est
 jamais rejoué. Une divergence de reçu, plan, identité, hash, manifest ou ledger
 reste `INTEGRITY_FAILED` et ne redémarre pas en boucle.
 
-Le moniteur utilise exclusivement le Python du venv offline lié au source root
-authentifié. Avant tout collecteur, B exige en même temps le HTTP loopback
+B exécute et authentifie d'abord les deux probes namespace oneshot, avant tout
+service persistant. Le moniteur utilise exclusivement le Python du venv offline
+lié au source root authentifié. Avant tout collecteur, B exige ensuite le HTTP loopback
 readonly, `orders_enabled=false`, le PID/commande et l'unité systemd exacts, et
 la preuve que ce PID possède `127.0.0.1:18081`. Une course de premier bind ou un
 503 est retenté de façon bornée; aucune preuve divergente n'est admise. Le
@@ -462,17 +463,20 @@ La sélection des collecteurs provient de ce même moniteur authentifié et tout
 La capacité est remesurée après bootstrap puis immédiatement avant les
 collecteurs. Si les 194 347 270 144 octets réservés ne sont plus libres, B refuse
 et demande un volume ext4 plus grand ou distinct; il ne réduit jamais le budget
-H1 ni la marge. La dernière marge observée n'était que de 1 137 221 632 octets :
-une extension ou un autre volume ext4 sera probablement nécessaire, sans jamais
-supprimer un historique. Chaque reprise systemd réauthentifie handoff, admission,
+H1 ni la marge. L'essai `73c6d2d2` a observé environ 296,3 GB disponibles, mais
+cette preuve historique ne vaut jamais admission future et aucun historique ne
+peut être supprimé pour gagner de la place. Chaque reprise systemd réauthentifie handoff, admission,
 transfert, source, NTP, racines et device ext4 avant de sélectionner un ordinal.
 Sous le namespace durci, le target volume admis reste exact read-only. systemd
 peut coalescer les `ReadOnlyPaths` imbriqués : `volume_base`, source et campagne
-ne peuvent résoudre que vers leurs targets RO allowlistés, et l'incoming vers
-`/home` ou son target exact. Leur `MAJ:MIN`/`FSROOT` est réauthentifié depuis le
-target effectif ; seule la venue doit rester un bind exact read-write. B exécute d'abord
-le probe oneshot `Restart=no`, puis le runner répète create/fsync/unlink/fsync.
-Un refus avant state produit un diagnostic borné et désarme les cinq unités du
+ne peuvent résoudre que vers leurs targets RO allowlistés. L'incoming accepte
+uniquement son target exact ou un ancêtre canonique de sa chaîne entre `/home`
+et lui-même; `/`, autre home, cousin, descendant arbitraire et symlink restent
+refusés. Leur device ext4, `MAJ:MIN` et relation `SOURCE`/`FSROOT` sont
+réauthentifiés depuis le target effectif ; seule la venue doit rester un bind
+exact read-write. Le runner répète create/fsync/unlink/fsync avant chaque slot.
+Un refus produit un diagnostic borné avec `TARGET`, `SOURCE`, `FSTYPE`,
+`VFS_OPTIONS`, `MAJ:MIN`, `FSROOT` et chemin logique, puis désarme les cinq unités du
 slug; aucun raw n'est supprimé. Le runner applique ensuite son gate capacité lié
 au ledger. Un refus antérieur au slot sort en code 4 sans boucle de restart.
 """

@@ -1,8 +1,8 @@
 # Prediction Markets Prospective Launch V1
 
-Verdict terminal logiciel après admission des reçus forensics réels et fermeture
-du bootstrap moniteur :
-`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_MONITOR_BOOTSTRAP_FIXED_AWAITING_SINGLE_HUMAN_EXECUTION`.
+Verdict terminal logiciel après admission des reçus forensics réels, fermeture
+du bootstrap moniteur et correction du namespace incoming systemd :
+`PREDICTION_MARKETS_PROSPECTIVE_LAUNCH_V1_GREEN_SYSTEMD_INCOMING_NAMESPACE_FIXED_COMMITTED_LOCALLY_AWAITING_PUSH`.
 
 Verdict économique : `ECONOMIC_EVIDENCE_NOT_YET_AVAILABLE`.
 
@@ -148,17 +148,15 @@ La cohabitation réserve 144 GiB pour H1, 21 GiB pour les 1 344 shards Predictio
 Markets et 16 GiB de marge, soit 181 GiB libres. Si cette marge n'est pas prouvée,
 le pack refuse et recommande un hôte ou volume distinct sans toucher à H1.
 
-La dernière mesure acquise était `195 484 491 776` octets libres pour
-`194 347 270 144` requis : seulement `1 137 221 632` octets restaient en
-marge. Cette mesure n'est pas réutilisée comme preuve pour un prochain B. Le
+L'essai `73c6d2d2` a observé environ 296,3 GB disponibles pour
+`194 347 270 144` octets requis. Cette mesure historique n'est pas réutilisée
+comme preuve pour un prochain B. Le
 pack réauthentifie après bootstrap l'identité du handoff/source/inventaire et les
 hashes des unités, remesure NTP/montage/capacité avant toute mutation systemd,
 puis remesure encore NTP/montage/capacité immédiatement avant les collecteurs.
-Si H1 a consommé la marge, le lancement refuse avec recommandation d'agrandir ou
-de choisir un autre volume ext4. Les réserves ne sont jamais réduites.
-Vu cette marge minime et l'interdiction de supprimer les tentatives historiques,
-une extension du volume ext4 ou un autre volume est probablement nécessaire
-avant le prochain lancement humain.
+Si H1 ou les preuves historiques ont consommé la marge, le lancement refuse avec
+recommandation d'agrandir ou de choisir un autre volume ext4. Les réserves ne
+sont jamais réduites et aucune tentative historique n'est supprimée.
 
 Chaque démarrage ou redémarrage systemd d'un runner réauthentifie également le
 handoff, l'admission d'installation, l'inventaire transféré, l'inventaire et le
@@ -172,14 +170,23 @@ L'admission hôte continue d'exiger la vue interactive du volume ext4 `rw`. Sous
 `ProtectSystem=strict`, le target volume admis est exact et read-only. systemd
 peut coalescer les `ReadOnlyPaths` imbriqués : les targets effectifs de
 `volume_base`/source/campagne sont donc strictement allowlistés entre le volume,
-le `volume_base` et le chemin exact concerné ; l'incoming accepte seulement
-`/home` ou son target exact. Seul le bind venue reste target exact `rw`.
-`ReadOnlyPaths` applique cette vue sans modifier H1. L'admission compare
-`MAJ:MIN` à `stat(2)`, le fstype et le `FSROOT` dérivé du target effectif ; le
-texte `SOURCE` reste informatif. Le probe venue fait une création exclusive,
+le `volume_base` et le chemin exact concerné. Pour l'incoming, seul le chemin
+exact ou un ancêtre canonique de sa chaîne entre `/home` et l'incoming est admis;
+`/`, autre home, cousin, descendant arbitraire et symlink restent refusés. Seul
+le bind venue reste target exact `rw`. `ReadOnlyPaths` applique cette vue sans
+modifier H1. L'admission compare `MAJ:MIN` à `stat(2)`, le fstype et la relation
+`SOURCE`/`FSROOT` dérivée du target effectif. Le probe venue fait une création exclusive,
 fsync fichier/répertoire, suppression et second fsync, puis le runner répète la
 preuve avant tout ordinal. Un autre device,
 fstype, bind, symlink ou échec fsync reste un refus fail-closed.
+
+La tentative historique `pm-20260827t234404z-73c6d2d2` a passé les admissions
+hôte, installation, capacité et activation guard. Le premier probe namespace
+Kalshi a ensuite refusé avant tout service persistant : `_mount_evidence`
+reconnaissait correctement un ancêtre de l'incoming coalescé par systemd, mais
+`_authenticate_incoming_namespace_target` n'acceptait littéralement que `/home`
+ou l'incoming exact. La cleanup a désarmé les unités et aucun collecteur n'a
+démarré. Cette racine et toutes ses preuves restent immuables.
 
 Une venue DNS/HTTPS/WSS indisponible reçoit son propre verdict; l'autre venue et
 le cockpit restent installables. Kalshi WSS n'est jamais sondé car le contrat
@@ -209,7 +216,8 @@ readiness devient non verte et le moniteur s'arrête sur alerte sans inventer un
 corruption d'intégrité.
 
 B tolère de façon bornée une première connexion loopback refusée ou un 503 de
-démarrage. Avant le moindre collecteur, le verdict dashboard exige simultanément
+démarrage et publie un motif court sans traceback. Avant le moindre collecteur,
+le verdict dashboard exige simultanément
 le HTTP live readonly, `orders_enabled=false`, le PID/commande systemd exacts,
 le `FragmentPath` exact et la preuve `/proc` que ce même PID possède l'unique
 listener IPv4 `127.0.0.1:18081`. Un serveur étranger, un mauvais PID, une
@@ -226,12 +234,14 @@ propage tout échec de parsing. Il ne relit pas l'incoming mutable pour décider
 démarrage. `eligible_venues=[]` reste admis comme `BOTH_UNAVAILABLE` explicite,
 dashboard-only, sans faux collecteur ni faux métrique.
 
-Avant d'activer ces collecteurs, B exécute les deux unités oneshot namespace
-éligibles et exige `Result=success`, exit 0 et zéro restart. Si un probe ou un
-collecteur échoue avant un state authentifié, B capture immédiatement Result,
-exit, présence state/ledger, monitor JSON et journal borné, puis arrête/désactive
-les trois services persistants et les deux probes du nouveau slug. Il ne boucle
-plus sur un service déjà terminal et ne laisse plus le dashboard isolément actif.
+Avant d'activer le dashboard ou un collecteur, B exécute les deux unités oneshot
+namespace et exige pour chacune `Result=success`, exit 0 et zéro restart. Un
+refus expose de façon bornée `TARGET`, `SOURCE`, `FSTYPE`, `VFS_OPTIONS`,
+`MAJ:MIN`, `FSROOT` et le chemin logique. Si un probe ou un collecteur échoue
+avant un state authentifié, B capture immédiatement Result, exit, présence
+state/ledger, monitor JSON et journal borné, puis arrête/désactive les trois
+services persistants et les deux probes du nouveau slug. Il ne boucle plus sur
+un service déjà terminal et ne laisse plus le dashboard isolément actif.
 
 Le recovery applique les mêmes preuves exactes de fragment au dashboard et aux
 collecteurs, plus la possession du listener dashboard. Sa fermeture exige une

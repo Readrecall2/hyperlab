@@ -107,18 +107,15 @@ octets libres. Si le minimum n'est plus disponible, le verdict est
 `PREDICTION_CAPACITY_REFUSED_COEXISTENCE_NOT_PROVEN` avec recommandation d'un
 hôte ou volume ext4 distinct. Aucun chemin H1 n'est lu pour obtenir ce verdict.
 
-La dernière observation humaine acquise donnait `195 484 491 776` octets libres
-pour `194 347 270 144` requis, soit seulement `1 137 221 632` octets de marge.
-Cette valeur est historique, pas une admission future. Après bootstrap, B
+L'essai `73c6d2d2` annonçait environ 296,3 GB disponibles pour
+`194 347 270 144` octets requis. Cette valeur est historique, pas une admission
+future. Après bootstrap, B
 réauthentifie le handoff, le source, les inventaires et les unités, puis mesure
 à nouveau NTP/montage/capacité avant toute mutation systemd. Il refait encore le
-contrôle NTP/montage/capacité juste avant le premier collecteur. Si la croissance
-H1 a consommé la marge, B doit refuser et demander d'agrandir ou de choisir un
-autre volume ext4; il est interdit de réduire les réserves ou contourner ce gate.
-Compte tenu de cette marge minime et de la conservation obligatoire de toutes
-les tentatives, une extension du volume ext4 ou un autre volume est probablement
-nécessaire avant le prochain B. Il ne faut supprimer aucun historique ni réduire
-H1 pour récupérer de l'espace.
+contrôle NTP/montage/capacité juste avant le premier collecteur. Si H1 ou les
+preuves historiques ont consommé la marge, B doit refuser et demander d'agrandir
+ou de choisir un autre volume ext4; il est interdit de réduire les réserves, de
+supprimer une tentative ou de contourner ce gate.
 
 Chaque runner recalcule ensuite la réservation avant chaque créneau. Il ne lit
 que son propre ledger : le budget de l'autre venue reste donc volontairement
@@ -137,9 +134,11 @@ Dans le namespace systemd durci, le mount du volume admis doit rester le target
 exact read-only. systemd peut coalescer les `ReadOnlyPaths` imbriqués devenus
 redondants : `volume_base`, source et campagne doivent alors résoudre seulement
 vers le mount volume, le `volume_base` ou leur target exact suivant une allowlist
-fixe ; l'incoming seulement vers `/home` ou son target exact. L'identité reste
-liée au superblock par `MAJ:MIN` concordant avec `stat(2)`, au type ext4 et au
-`FSROOT` dérivé du target effectif, jamais au texte variable `SOURCE`.
+fixe. Pour l'incoming, le target observé doit être exactement l'incoming ou un
+membre canonique de sa chaîne d'ancêtres entre `/home` et cet incoming. `/`, un
+autre home, un cousin, un descendant arbitraire et tout symlink sont refusés.
+L'identité est liée au même superblock ext4 par `MAJ:MIN` concordant avec
+`stat(2)`, ainsi qu'à la relation `SOURCE`/`FSROOT` dérivée du target effectif.
 `ReadOnlyPaths` ne modifie pas H1. Seul `campaign_root/<venue>` doit être un bind
 exact `rw` vers le sous-chemin attendu.
 Le probe oneshot y effectue une création exclusive, fsync fichier, fsync
@@ -221,6 +220,12 @@ immuables. Elle a prouvé le dashboard et l'activation guard, puis les deux
 collecteurs ont refusé avant state/ledger parce que l'ancien runner exigeait à
 tort le parent `rw` dans le namespace systemd. Son rollback humain est acquis.
 
+La tentative `pm-20260827t234404z-73c6d2d2` et toutes ses racines restent
+également immuables. Tous ses contrôles hôte et l'activation guard étaient verts,
+mais le premier probe Kalshi a refusé un ancêtre intermédiaire authentique de
+l'incoming à cause de l'ancienne allowlist littérale. Aucun collecteur n'a
+démarré et la cleanup ciblée a désarmé les cinq unités sans supprimer de preuve.
+
 ## Preflight cible
 
 Avant clone/venv/campagne/systemd, le bloc B vérifie de façon bornée :
@@ -301,8 +306,12 @@ refuse pas une simple alerte de qualité `PUBLIC_SOURCE_INVALID` authentique, ma
 ne peut jamais publier le signal de reprise sur une divergence opérationnelle.
 
 `bash operator/E-recovery-rollback.sh rollback` arrête et désactive uniquement
-ces trois services et les deux probes oneshot du même slug. Il ne supprime ni unité, source, venv, campagne, raw,
-manifest, ledger, run ou rapport; il ne nomme aucun service H1.
+ces trois services et les deux probes oneshot du même slug. Il ne supprime ni
+unité, source, venv, campagne, raw, manifest, ledger, run ou rapport; il ne nomme
+aucun service H1. À l'installation, B exécute et authentifie désormais les deux
+probes avant d'activer le dashboard ou un collecteur. Un refus expose de façon
+bornée `TARGET`, `SOURCE`, `FSTYPE`, `VFS_OPTIONS`, `MAJ:MIN`, `FSROOT` et le
+chemin logique, puis laisse tous les services persistants inactifs.
 
 ## Limites
 

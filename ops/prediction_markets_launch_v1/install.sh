@@ -270,6 +270,110 @@ cleanup_prediction_services() {
   return "$cleanup_errors"
 }
 
+namespace_probe_diagnostic() {
+  local venue=$1 service=$2 properties journal
+  properties=$(timeout 5 systemctl show "$service" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager 2>&1) || properties='SYSTEMCTL_SHOW_UNAVAILABLE'
+  properties=${properties:0:4096}
+  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
+    || journal='JOURNAL_UNAVAILABLE'
+  [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
+  VENUE="$venue" SERVICE="$service" PROPERTIES="$properties" JOURNAL="$journal" \
+    "$VENV_PYTHON" -I - <<'PY' >&2 \
+    || printf 'PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=ENCODING_FAILED\n' >&2
+import json,os
+journal=os.environ["JOURNAL"][:4096]
+report=None
+for line in reversed(journal.splitlines()):
+ try:
+  candidate=json.loads(line)
+ except (TypeError,ValueError,json.JSONDecodeError):
+  continue
+ if isinstance(candidate,dict) and candidate.get("terminal_signal") in {
+  "PREDICTION_RUNNER_NAMESPACE_GREEN","PREDICTION_RUNNER_NAMESPACE_REFUSED"
+ }:
+  report=candidate; break
+def public_mount(row):
+ if not isinstance(row,dict): return None
+ return {
+  "FSROOT":row.get("filesystem_root"),
+  "FSTYPE":row.get("filesystem"),
+  "LOGICAL_PATH":row.get("logical_path"),
+  "MAJ:MIN":row.get("device_major_minor"),
+  "SOURCE":row.get("source"),
+  "TARGET":row.get("mount"),
+  "VFS_OPTIONS":row.get("options"),
+ }
+observed={}
+if isinstance(report,dict):
+ for name,row in report.get("observed_mounts",{}).items():
+  public=public_mount(row)
+  if public is not None: observed[name]=public
+value={
+ "journal":journal,
+ "observed_mounts":observed,
+ "properties":os.environ["PROPERTIES"][:4096],
+ "runner_errors":report.get("errors",[]) if isinstance(report,dict) else [],
+ "service":os.environ["SERVICE"],
+ "venue":os.environ["VENUE"],
+}
+print("PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC="+json.dumps(value,ensure_ascii=False,separators=(",",":"),sort_keys=True))
+PY
+  return 0
+}
+
+for VENUE in polymarket kalshi; do
+  case "$VENUE" in
+    polymarket) NAMESPACE_PROBE_SERVICE=$POLYMARKET_NAMESPACE_PROBE_SERVICE ;;
+    kalshi) NAMESPACE_PROBE_SERVICE=$KALSHI_NAMESPACE_PROBE_SERVICE ;;
+    *)
+      cleanup_prediction_services \
+        || fail 'namespace probe venue invalid and Prediction Markets cleanup also failed'
+      fail 'namespace probe venue is invalid'
+      ;;
+  esac
+  if ! sudo systemctl start "$NAMESPACE_PROBE_SERVICE"; then
+    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+    cleanup_prediction_services \
+      || fail 'namespace probe refused and Prediction Markets cleanup also failed'
+    fail "collector namespace probe refused before any persistent service activation: $VENUE"
+  fi
+  NAMESPACE_PROBE_PROPERTIES=$(timeout 5 systemctl show "$NAMESPACE_PROBE_SERVICE" \
+    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
+    --no-pager) || {
+      namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+      cleanup_prediction_services \
+        || fail 'namespace probe properties unavailable and Prediction Markets cleanup also failed'
+      fail "collector namespace probe properties unavailable: $VENUE"
+    }
+  if ! NAMESPACE_PROBE_PROPERTIES="$NAMESPACE_PROBE_PROPERTIES" NAMESPACE_PROBE_SERVICE="$NAMESPACE_PROBE_SERVICE" "$VENV_PYTHON" -I - <<'PY'
+import os
+properties={}
+for line in os.environ['NAMESPACE_PROBE_PROPERTIES'].splitlines():
+ if '=' not in line: raise SystemExit('namespace-probe:malformed-property')
+ key,value=line.split('=',1); properties[key]=value
+def require(condition,label):
+ if not condition: raise SystemExit('namespace-probe:'+label)
+require(properties.get('LoadState')=='loaded','load-state')
+require(properties.get('ActiveState')=='inactive','active-state')
+require(properties.get('SubState')=='dead','sub-state')
+require(properties.get('Result')=='success','result')
+require(properties.get('MainPID')=='0','main-pid')
+require(properties.get('NRestarts')=='0','restart-count')
+require(properties.get('ExecMainCode')=='1','exit-code-kind')
+require(properties.get('ExecMainStatus')=='0','exit-status')
+require(properties.get('FragmentPath')=='/etc/systemd/system/'+os.environ['NAMESPACE_PROBE_SERVICE'],'fragment')
+PY
+  then
+    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
+    cleanup_prediction_services \
+      || fail 'namespace probe result diverged and Prediction Markets cleanup also failed'
+    fail "collector namespace probe result diverged before any persistent service activation: $VENUE"
+  fi
+  printf 'PREDICTION_NAMESPACE_PROBE_GREEN=%s\n' "$VENUE"
+done
+
 if ! sudo systemctl enable --now "$DASHBOARD_SERVICE"; then
   cleanup_prediction_services || fail 'dashboard activation failed and Prediction Markets cleanup also failed'
   fail 'dashboard activation failed before any venue start'
@@ -281,17 +385,21 @@ for _attempt in {1..20}; do
   if "$VENV_PYTHON" - <<'PY' && \
      DASHBOARD_MONITOR=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json" dashboard-only) && \
      DASHBOARD_MONITOR="$DASHBOARD_MONITOR" "$VENV_PYTHON" - <<'PY'
-import json,urllib.request
+import json,sys,urllib.request
 def require(condition,label):
  if not condition: raise SystemExit('dashboard-live:'+label)
-with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
- raw=response.read(65537)
- require(len(raw)<=65536,'payload-size')
- value=json.loads(raw)
- require(response.status==200,'http-status')
- require(value.get('status')=='alive','live-status')
- require(value.get('mode')=='readonly','readonly-mode')
- require(value.get('orders_enabled') is False,'orders-disabled')
+try:
+ with urllib.request.urlopen('http://127.0.0.1:18081/health/live',timeout=1) as response:
+  raw=response.read(65537)
+  require(len(raw)<=65536,'payload-size')
+  value=json.loads(raw)
+  require(response.status==200,'http-status')
+  require(value.get('status')=='alive','live-status')
+  require(value.get('mode')=='readonly','readonly-mode')
+  require(value.get('orders_enabled') is False,'orders-disabled')
+except Exception as error:
+ print('PREDICTION_DASHBOARD_READINESS_WAIT='+type(error).__name__,file=sys.stderr)
+ raise SystemExit(1)
 PY
 import json,os
 value=json.loads(os.environ['DASHBOARD_MONITOR'])
@@ -365,81 +473,6 @@ if [[ -n $ELIGIBLE_RAW ]]; then
     ELIGIBLE[$ELIGIBLE_INDEX]=${ELIGIBLE[$ELIGIBLE_INDEX]%$'\r'}
   done
 fi
-
-namespace_probe_diagnostic() {
-  local venue=$1 service=$2 properties journal
-  properties=$(timeout 5 systemctl show "$service" \
-    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
-    --no-pager 2>&1) || properties='SYSTEMCTL_SHOW_UNAVAILABLE'
-  properties=${properties:0:4096}
-  journal=$( { timeout 5 sudo journalctl --unit "$service" --no-pager -n 20 -o cat 2>&1 || true; } | head -c 4096 ) \
-    || journal='JOURNAL_UNAVAILABLE'
-  [[ -n $journal ]] || journal='JOURNAL_UNAVAILABLE'
-  VENUE="$venue" SERVICE="$service" PROPERTIES="$properties" JOURNAL="$journal" \
-    "$VENV_PYTHON" -I - <<'PY' >&2 \
-    || printf 'PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC=ENCODING_FAILED\n' >&2
-import json,os
-value={
- "journal":os.environ["JOURNAL"][:4096],
- "properties":os.environ["PROPERTIES"][:4096],
- "service":os.environ["SERVICE"],
- "venue":os.environ["VENUE"],
-}
-print("PREDICTION_NAMESPACE_PROBE_DIAGNOSTIC="+json.dumps(value,ensure_ascii=False,separators=(",",":"),sort_keys=True))
-PY
-  return 0
-}
-
-for VENUE in "${ELIGIBLE[@]}"; do
-  case "$VENUE" in
-    polymarket) NAMESPACE_PROBE_SERVICE=$POLYMARKET_NAMESPACE_PROBE_SERVICE ;;
-    kalshi) NAMESPACE_PROBE_SERVICE=$KALSHI_NAMESPACE_PROBE_SERVICE ;;
-    *)
-      cleanup_prediction_services \
-        || fail 'eligible venue invalid and Prediction Markets cleanup also failed'
-      fail 'preflight eligible venue is invalid'
-      ;;
-  esac
-  if ! sudo systemctl start "$NAMESPACE_PROBE_SERVICE"; then
-    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
-    cleanup_prediction_services \
-      || fail 'namespace probe refused and Prediction Markets cleanup also failed'
-    fail "collector namespace probe refused before runner activation: $VENUE"
-  fi
-  NAMESPACE_PROBE_PROPERTIES=$(timeout 5 systemctl show "$NAMESPACE_PROBE_SERVICE" \
-    --property=LoadState,ActiveState,SubState,Result,MainPID,NRestarts,ExecMainCode,ExecMainStatus,FragmentPath \
-    --no-pager) || {
-      namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
-      cleanup_prediction_services \
-        || fail 'namespace probe properties unavailable and Prediction Markets cleanup also failed'
-      fail "collector namespace probe properties unavailable: $VENUE"
-    }
-  if ! NAMESPACE_PROBE_PROPERTIES="$NAMESPACE_PROBE_PROPERTIES" NAMESPACE_PROBE_SERVICE="$NAMESPACE_PROBE_SERVICE" "$VENV_PYTHON" -I - <<'PY'
-import os
-properties={}
-for line in os.environ['NAMESPACE_PROBE_PROPERTIES'].splitlines():
- if '=' not in line: raise SystemExit('namespace-probe:malformed-property')
- key,value=line.split('=',1); properties[key]=value
-def require(condition,label):
- if not condition: raise SystemExit('namespace-probe:'+label)
-require(properties.get('LoadState')=='loaded','load-state')
-require(properties.get('ActiveState')=='inactive','active-state')
-require(properties.get('SubState')=='dead','sub-state')
-require(properties.get('Result')=='success','result')
-require(properties.get('MainPID')=='0','main-pid')
-require(properties.get('NRestarts')=='0','restart-count')
-require(properties.get('ExecMainCode')=='1','exit-code-kind')
-require(properties.get('ExecMainStatus')=='0','exit-status')
-require(properties.get('FragmentPath')=='/etc/systemd/system/'+os.environ['NAMESPACE_PROBE_SERVICE'],'fragment')
-PY
-  then
-    namespace_probe_diagnostic "$VENUE" "$NAMESPACE_PROBE_SERVICE"
-    cleanup_prediction_services \
-      || fail 'namespace probe result diverged and Prediction Markets cleanup also failed'
-    fail "collector namespace probe result diverged before runner activation: $VENUE"
-  fi
-  printf 'PREDICTION_NAMESPACE_PROBE_GREEN=%s\n' "$VENUE"
-done
 
 STARTED_VENUES=()
 collector_ready() {
@@ -590,15 +623,19 @@ for _attempt in {1..20}; do
   if "$VENV_PYTHON" - <<'PY' && \
      MONITOR_JSON=$(bash "$SOURCE_ROOT/ops/prediction_markets_launch_v1/monitor.sh" "$INCOMING_ROOT/handoff.json") && \
      CAMPAIGN_ROOT="$CAMPAIGN_ROOT" MONITOR_JSON="$MONITOR_JSON" "$VENV_PYTHON" - "${ELIGIBLE[@]}" <<'PY'
-import json,urllib.request
+import json,sys,urllib.request
 def require(condition,label):
  if not condition: raise SystemExit('final-dashboard:'+label)
-with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
- raw=response.read(65537)
- require(len(raw)<=65536,'payload-size')
- value=json.loads(raw)
- require(response.status==200 and value.get('status')=='ready','ready-status')
- require(value.get('mode')=='readonly' and value.get('orders_enabled') is False,'readonly-orders')
+try:
+ with urllib.request.urlopen('http://127.0.0.1:18081/health/ready',timeout=1) as response:
+  raw=response.read(65537)
+  require(len(raw)<=65536,'payload-size')
+  value=json.loads(raw)
+  require(response.status==200 and value.get('status')=='ready','ready-status')
+  require(value.get('mode')=='readonly' and value.get('orders_enabled') is False,'readonly-orders')
+except Exception as error:
+ print('PREDICTION_FINAL_DASHBOARD_READINESS_WAIT='+type(error).__name__,file=sys.stderr)
+ raise SystemExit(1)
 PY
 from datetime import UTC,datetime
 import json,os,sys

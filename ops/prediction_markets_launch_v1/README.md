@@ -151,14 +151,21 @@ symlink ou origine hors allowlist sont refusés. Le résultat est un unique JSON
 canonique auto-hashé, lié au commit/inventaire et terminé par
 `PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN`.
 
-B exécute réellement ce contrat avec le venv frais, depuis l'incoming
-authentifié et sous une borne de 180 secondes, avant `verify-old` et
+B exécute réellement ce contrat avec le venv frais, depuis le fichier Git
+canonique `SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py` et sous
+une borne de 180 secondes, avant `verify-old` et
 `disarm-old`. Le même contrat précède l'installation, chaque monitor, le
 démarrage des trois services, le resume/recovery et l'admission runner; la
 réauthentification de l'ancienne campagne l'utilise aussi avant sa preuve de
 ledger. Les unités bornent leur phase de démarrage à 180 secondes. Aucun retrait
 de `-I`, aucune installation réseau/editable, aucun system-site-packages et
 aucune confiance implicite dans le cwd ou `PYTHONPATH` ne sont admis.
+
+Le script d'admission est lui-même authentifié comme fichier régulier,
+non-symlinké, présent une seule fois dans l'inventaire Git exact et
+byte-identique à son blob. Les contrôles strictement pré-clone restent exécutés
+depuis la copie `incoming`, puisque le clone n'existe pas encore; aucune copie
+`incoming`, externe, ancienne ou non inventoriée n'est admise après clone.
 
 La restauration historique qui a dépassé trente minutes était bloquée avant
 toute mutation dans une substitution de commande

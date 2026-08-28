@@ -161,8 +161,8 @@ def test_proof_pack_finalizes_authenticates_and_verifies_retrieved_output(
         expected_branch=AUDIT_BRANCH,
     )
     assert result["terminal_signal"] == (
-        "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V2_GREEN_"
-        "OS_RELEASE_LAYOUT_FIXED_AWAITING_HUMAN_EXECUTION"
+        "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V4_GREEN_"
+        "SOURCE_ROOT_ADMISSION_FIXED_AWAITING_HUMAN_EXECUTION"
     )
     verified = precutover_proof.verify_input(proof_pack.resolve(strict=True))
     assert verified["source_commit"] == commit
@@ -178,6 +178,15 @@ def test_proof_pack_finalizes_authenticates_and_verifies_retrieved_output(
     assert production_b0.index("verify-linux-environment") < production_b0.index(
         "git clone --no-checkout"
     )
+    assert (
+        '"$VENV_PYTHON" -I '
+        '"$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" '
+        "runtime-import-admission"
+    ) in production_b0
+    assert (
+        '"$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" '
+        "runtime-import-admission"
+    ) not in production_b0
 
     manifest, manifest_digest = precutover_proof._proof_manifest(proof_pack)
     evidence = tmp_path / "retrieved-evidence"

@@ -290,11 +290,40 @@ def test_runtime_import_admission_isolated_fresh_venv_from_untrusted_cwd(
         "raise RuntimeError('user-site hyperlab must be ignored')\n", encoding="utf-8"
     )
     report_path = handoff_path.parent / "runtime-import-admission.json"
-    completed = subprocess.run(
-        [
+    incoming_script = handoff_path.parent / "scripts" / "preflight.py"
+    source_script = source / preflight._RUNTIME_ADMISSION_SCRIPT_RELATIVE
+    alias_probe = handoff_path.parent / "scripts" / "runtime-alias-probe.py"
+    alias_probe.write_text(
+        """import json,sys
+before=set(sys.modules)
+import uvicorn
+module=sys.modules.get('__mp_main__')
+print(json.dumps({'file':getattr(module,'__file__',None),'name':'__mp_main__','new': '__mp_main__' not in before,'same_as_main':module is sys.modules['__main__']},sort_keys=True))
+""",
+        encoding="utf-8",
+    )
+    alias = subprocess.run(
+        [str(runtime), "-I", str(alias_probe)],
+        capture_output=True,
+        check=False,
+        cwd=untrusted_cwd,
+        env={**os.environ, "PYTHONNOUSERSITE": "1"},
+        text=True,
+        timeout=60,
+    )
+    assert alias.returncode == 0, alias.stderr
+    assert json.loads(alias.stdout) == {
+        "file": str(alias_probe),
+        "name": "__mp_main__",
+        "new": True,
+        "same_as_main": True,
+    }
+
+    def run_admission(script: Path, *, report: bool) -> subprocess.CompletedProcess[str]:
+        arguments = [
             str(runtime),
             "-I",
-            str(handoff_path.parent / "scripts" / "preflight.py"),
+            str(script),
             "runtime-import-admission",
             "--handoff",
             str(handoff_path),
@@ -302,27 +331,53 @@ def test_runtime_import_admission_isolated_fresh_venv_from_untrusted_cwd(
             str(source),
             "--source-inventory",
             str(inventory_path),
-            "--report",
-            str(report_path),
-        ],
-        capture_output=True,
-        check=False,
-        cwd=untrusted_cwd,
-        env={
-            **os.environ,
-            "PYTHONNOUSERSITE": "1",
-            "PYTHONPATH": os.pathsep.join((str(untrusted_cwd), str(user_site))),
-            "PYTHONUSERBASE": str(user_base),
-        },
-        text=True,
-        timeout=60,
+        ]
+        if report:
+            arguments.extend(("--report", str(report_path)))
+        return subprocess.run(
+            arguments,
+            capture_output=True,
+            check=False,
+            cwd=untrusted_cwd,
+            env={
+                **os.environ,
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONPATH": os.pathsep.join((str(untrusted_cwd), str(user_site))),
+                "PYTHONUSERBASE": str(user_base),
+            },
+            text=True,
+            timeout=60,
+        )
+
+    incoming_refusal = run_admission(incoming_script, report=False)
+    assert incoming_refusal.returncode == 4
+    assert (
+        "runtime admission script escaped the authenticated source root"
+        in incoming_refusal.stderr
     )
+    assert not report_path.exists()
+
+    completed = run_admission(source_script, report=True)
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout)
     assert report_path.read_bytes() == preflight.canonical_json_bytes(report) + b"\n"
     assert report["terminal_signal"] == "PREDICTION_RUNTIME_IMPORT_ADMISSION_GREEN"
     assert report["isolated"] is True
     assert report["no_user_site"] is True
+    assert report["admission_script"] == {
+        "class": "source",
+        "file": str(source_script),
+        "git_blob_sha1": next(
+            row["blob_sha1"]
+            for row in launch_pack.build_source_inventory(
+                source, str(handoff["source_commit"])
+            )["files"]
+            if row["path"] == preflight._RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix()
+        ),
+        "relative_path": preflight._RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix(),
+        "sha256": preflight.sha256_bytes(source_script.read_bytes()),
+        "size": source_script.stat().st_size,
+    }
     assert report["modules"]["hyperlab"] == {
         "class": "source",
         "file": str(source / "src" / "hyperlab" / "__init__.py"),
@@ -351,6 +406,23 @@ def test_runtime_import_admission_isolated_fresh_venv_from_untrusted_cwd(
     with pytest.raises(preflight.PreflightError, match="escaped venv site-packages"):
         preflight.validate_runtime_import_admission(
             forged,
+            source_root=source,
+            source_commit=str(handoff["source_commit"]),
+            inventory_sha256=str(handoff["source_inventory_sha256"]),
+        )
+    forged_script = json.loads(json.dumps(report))
+    forged_script["admission_script"]["sha256"] = "0" * 64
+    forged_script_body = {
+        key: value
+        for key, value in forged_script.items()
+        if key != "admission_sha256"
+    }
+    forged_script["admission_sha256"] = preflight.sha256_bytes(
+        preflight.canonical_json_bytes(forged_script_body)
+    )
+    with pytest.raises(preflight.PreflightError, match="content binding diverged"):
+        preflight.validate_runtime_import_admission(
+            forged_script,
             source_root=source,
             source_commit=str(handoff["source_commit"]),
             inventory_sha256=str(handoff["source_inventory_sha256"]),
@@ -392,6 +464,92 @@ def test_runtime_import_admission_refuses_symlink_and_external_module_file(
             venv_root=venv_root,
             stdlib_roots=(stdlib_root,),
         )
+
+
+def test_runtime_import_admission_subprocess_refuses_external_stale_and_uninventoried_scripts(
+    tmp_path: Path,
+) -> None:
+    runtime, handoff_path, source, inventory_path, _handoff = (
+        _isolated_runtime_import_fixture(tmp_path)
+    )
+    source_script = source / preflight._RUNTIME_ADMISSION_SCRIPT_RELATIVE
+
+    def run(script: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(runtime),
+                "-I",
+                str(script),
+                "runtime-import-admission",
+                "--handoff",
+                str(handoff_path),
+                "--source-root",
+                str(source),
+                "--source-inventory",
+                str(inventory_path),
+            ],
+            capture_output=True,
+            check=False,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONNOUSERSITE": "1"},
+            text=True,
+            timeout=60,
+        )
+
+    external = tmp_path / "external-preflight.py"
+    shutil.copy2(source_script, external)
+    external_result = run(external)
+    assert external_result.returncode == 4
+    assert "escaped the authenticated source root" in external_result.stderr
+
+    uninventoried = source_script.with_name("preflight-uninventoried.py")
+    shutil.copy2(source_script, uninventoried)
+    uninventoried_result = run(uninventoried)
+    assert uninventoried_result.returncode == 4
+    assert "source checkout is not clean" in uninventoried_result.stderr
+    uninventoried.unlink()
+
+    original = source_script.read_bytes()
+    source_script.write_bytes(original + b"# STALE_SYNTHETIC_FIXTURE\n")
+    stale_result = run(source_script)
+    assert stale_result.returncode == 4
+    assert "source checkout is not clean" in stale_result.stderr
+    source_script.write_bytes(original)
+    assert _git_output("status", "--porcelain", cwd=source) == ""
+
+    linked = tmp_path / "linked-preflight.py"
+    try:
+        linked.symlink_to(source_script)
+    except OSError:
+        if os.name != "nt":
+            pytest.fail("file symlink creation unexpectedly failed")
+        linked_parent = tmp_path / "linked-preflight-parent"
+        junction = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(linked_parent),
+                str(source_script.parent),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert junction.returncode == 0, junction.stderr
+        try:
+            linked_result = run(linked_parent / source_script.name)
+            assert linked_result.returncode == 4
+            assert "runtime admission script is symlinked" in linked_result.stderr
+        finally:
+            linked_parent.rmdir()
+    else:
+        linked_result = run(linked)
+        assert linked_result.returncode == 4
+        assert "runtime admission script is symlinked" in linked_result.stderr
 
 
 def _git_bash_path(path: Path) -> str:
@@ -3003,6 +3161,8 @@ def test_materialized_tabby_b_executes_real_isolated_import_admission_before_cut
     _run_git(
         "-c",
         "core.longpaths=true",
+        "-c",
+        "core.autocrlf=false",
         "clone",
         "--quiet",
         "--no-hardlinks",
@@ -3043,7 +3203,9 @@ runtime=source/'.venv'/('Scripts/python.exe' if sys.platform=='win32' else 'bin/
 query=subprocess.run([str(runtime),'-I','-c',"import site; print(next(p for p in site.getsitepackages() if p.lower().endswith('site-packages')))"],capture_output=True,check=True,text=True)
 site_packages=Path(query.stdout.strip())
 for name in ('fastapi','requests','uvicorn','websocket'):
- (site_packages/f'{name}.py').write_text('SYNTHETIC_FIXTURE = True\\n',encoding='utf-8')
+ payload='SYNTHETIC_FIXTURE = True\\n'
+ if name=='uvicorn': payload+="import sys\\nsys.modules['__mp_main__'] = sys.modules['__main__']\\n"
+ (site_packages/f'{name}.py').write_text(payload,encoding='utf-8')
 wrapper=source/'.venv'/'bin'/'python'; wrapper.parent.mkdir(parents=True,exist_ok=True)
 wrapper_payload=("#!/usr/bin/bash\\n"+"printf 'venv-python|%s\\\\n' \\"$*\\" >> \\"$HYPERLAB_FAKE_LOG\\"\\n"+f'PATH="$HYPERLAB_REAL_WINDOWS_PATH" exec "{runtime.as_posix()}" "$@"\\n')
 wrapper.write_text(wrapper_payload,encoding='utf-8')
@@ -3084,6 +3246,10 @@ print('PREDICTION_TEST_FRESH_OFFLINE_VENV_GREEN')
         for index, line in enumerate(lines)
         if line.startswith("venv-python|-I ") and " runtime-import-admission " in line
     )
+    assert (
+        f"-I {source.as_posix()}/ops/prediction_markets_launch_v1/preflight.py "
+        "runtime-import-admission"
+    ) in lines[admission_index]
     verify_old_index = next(
         index for index, line in enumerate(lines) if "cutover.sh verify-old" in line
     )
@@ -4060,11 +4226,13 @@ def _isolated_runtime_import_fixture(
     (source / "ops" / "prediction_markets_launch_v1" / "runner.py").write_text(
         runner_helpers, encoding="utf-8"
     )
-    (source / "ops" / "prediction_markets_launch_v1" / "preflight.py").write_text(
-        "SYNTHETIC_FIXTURE = True\n", encoding="utf-8"
+    shutil.copy2(
+        OPS / "preflight.py",
+        source / "ops" / "prediction_markets_launch_v1" / "preflight.py",
     )
     _run_git("init", "--quiet", str(source))
     _run_git("config", "core.longpaths", "true", cwd=source)
+    _run_git("config", "core.autocrlf", "false", cwd=source)
     _run_git("config", "user.email", "synthetic-fixture@invalid.example", cwd=source)
     _run_git("config", "user.name", "Synthetic Fixture", cwd=source)
     _run_git("add", ".", cwd=source)
@@ -4096,8 +4264,14 @@ def _isolated_runtime_import_fixture(
     assert site_query.returncode == 0, site_query.stderr
     site_packages = Path(site_query.stdout.strip())
     for module_name in preflight._RUNTIME_VENV_MODULES:
+        payload = "SYNTHETIC_FIXTURE = True\n"
+        if module_name == "uvicorn":
+            payload += (
+                "import sys\n"
+                "sys.modules['__mp_main__'] = sys.modules['__main__']\n"
+            )
         (site_packages / f"{module_name}.py").write_text(
-            "SYNTHETIC_FIXTURE = True\n", encoding="utf-8"
+            payload, encoding="utf-8"
         )
 
     handoff = {
@@ -6909,7 +7083,10 @@ def test_scripts_forbid_network_pip_and_target_only_prediction_services() -> Non
     assert "PREDICTION_OLD_CAMPAIGN_DISARMED_EVIDENCE_PRESERVED" in cutover
     assert "PREDICTION_OLD_CAMPAIGN_RESTORED_NO_SLOT_RETRY" in cutover
     assert "hyperlab-h1" not in cutover
-    assert '"$OLD_PYTHON" -I "$NEW_INCOMING/scripts/preflight.py"' in cutover
+    assert (
+        '"$OLD_PYTHON" -I '
+        '"$OLD_SOURCE/ops/prediction_markets_launch_v1/preflight.py"'
+    ) in cutover
     assert "$INCOMING_ROOT" not in cutover
     assert "run_hyperlab_isolated research-data prediction-prepare" in install
     assert '"$VENV_PYTHON" -m hyperlab' not in install

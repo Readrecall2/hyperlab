@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - Windows pack verification path
     pwd = None  # type: ignore[assignment]
 
 BOUNDARY = "PAPER_ONLY/GHOST_ONLY/PUBLIC_DATA_ONLY"
-PROOF_ID = "prediction-markets-linux-precutover-proof-v2"
+PROOF_ID = "prediction-markets-linux-precutover-proof-v4"
 EXPECTED_PROOF_BRANCH = "codex/prediction-markets-v3-independent-audit"
 TERMINAL_SIGNAL = "PREDICTION_RUNTIME_PREPARED_BEFORE_CUTOVER"
 TRANSFER_SIGNAL = "PREDICTION_LINUX_PRECUTOVER_PROOF_WINDOWS_TRANSFER_VERIFIED"
@@ -1204,6 +1204,7 @@ def _verify_runtime_report(
 ) -> dict[str, object]:
     report, raw = _canonical_object(path)
     expected_fields = {
+        "admission_script",
         "admission_sha256",
         "boundary",
         "inventory_sha256",
@@ -1220,6 +1221,7 @@ def _verify_runtime_report(
     }
     body = {key: value for key, value in report.items() if key != "admission_sha256"}
     modules = report.get("modules")
+    admission_script = report.get("admission_script")
     loaded_module_files = report.get("loaded_module_files_validated")
     if (
         set(report) != expected_fields
@@ -1236,8 +1238,39 @@ def _verify_runtime_report(
         or loaded_module_files < len(_EXPECTED_SOURCE_MODULES) + len(_EXPECTED_VENV_MODULES)
         or not isinstance(modules, dict)
         or set(modules) != set(_EXPECTED_SOURCE_MODULES) | _EXPECTED_VENV_MODULES
+        or not isinstance(admission_script, dict)
     ):
         raise ProofError("runtime import admission report diverged")
+    expected_admission = source_root / "ops/prediction_markets_launch_v1/preflight.py"
+    if (
+        set(admission_script)
+        != {"class", "file", "git_blob_sha1", "relative_path", "sha256", "size"}
+        or admission_script.get("class") != "source"
+        or admission_script.get("file") != str(expected_admission)
+        or admission_script.get("relative_path")
+        != "ops/prediction_markets_launch_v1/preflight.py"
+        or not isinstance(admission_script.get("git_blob_sha1"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", str(admission_script.get("git_blob_sha1")))
+        is None
+        or not isinstance(admission_script.get("sha256"), str)
+        or _SHA256.fullmatch(str(admission_script.get("sha256"))) is None
+        or type(admission_script.get("size")) is not int
+        or int(admission_script.get("size", 0)) < 1
+    ):
+        raise ProofError("runtime admission script identity diverged")
+    authenticated_admission = _exact_file(
+        expected_admission, label="runtime admission source script"
+    )
+    admission_raw = _safe_regular_bytes(authenticated_admission)
+    admission_blob_sha1 = hashlib.sha1(
+        f"blob {len(admission_raw)}\0".encode("ascii") + admission_raw
+    ).hexdigest()
+    if (
+        admission_script.get("git_blob_sha1") != admission_blob_sha1
+        or admission_script.get("sha256") != sha256_bytes(admission_raw)
+        or admission_script.get("size") != len(admission_raw)
+    ):
+        raise ProofError("runtime admission source content diverged")
     for name, relative in _EXPECTED_SOURCE_MODULES.items():
         row = modules[name]
         expected = (source_root / relative).resolve(strict=True)
@@ -1265,6 +1298,7 @@ def _verify_runtime_report(
         raise ProofError("runtime Python escaped the prepared venv")
     return {
         "admission_sha256": report["admission_sha256"],
+        "admission_script": admission_script,
         "file_sha256": sha256_bytes(raw),
         "loaded_module_files_validated": report["loaded_module_files_validated"],
         "modules": modules,
@@ -1516,7 +1550,7 @@ def _git_blob(repo_root: Path, commit: str, relative: str) -> bytes:
 
 
 def render_readme(manifest: Mapping[str, object]) -> str:
-    return f"""# Prediction Markets Linux pre-cutover proof v2
+    return f"""# Prediction Markets Linux pre-cutover proof v4
 
 Boundary: `{BOUNDARY}`. This pack prepares no campaign and changes no service.
 
@@ -1529,6 +1563,9 @@ Boundary: `{BOUNDARY}`. This pack prepares no campaign and changes no service.
 
 Run A on Windows, B0 in Tabby as `hyperlab`, then C0 on Windows. B0 stops at
 `{TERMINAL_SIGNAL}`. It is not a cutover, activation, publication, or economic gate.
+Prerequisite: `/home/hyperlab/hyperlab-prediction-markets` and its `incoming`
+child must already be owned by `hyperlab` and be non-group/world-writable (0750
+is accepted). B0 rechecks this before clone and refuses without mutation otherwise.
 Before clone, B0 emits one canonical JSON inventory of every independent Linux
 prerequisite. Any incompatibility produces one `{PREFLIGHT_REFUSED}:codes=...`
 summary and stops without starting the clone.
@@ -1630,7 +1667,7 @@ NEUTRAL_ROOT="$INCOMING_ROOT/{NEUTRAL_CWD}"
 mkdir -m 0700 -- "$NEUTRAL_ROOT"
 cd "$NEUTRAL_ROOT"
 timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-  "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" runtime-import-admission \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
   --handoff "$INCOMING_ROOT/handoff.json" \
   --source-root "$SOURCE_ROOT" \
   --source-inventory "$INCOMING_ROOT/source-inventory.json" \
@@ -1821,7 +1858,7 @@ def finalize(
     return {
         **verified,
         "output_root": str(output_root.resolve(strict=True)),
-        "terminal_signal": "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V2_GREEN_OS_RELEASE_LAYOUT_FIXED_AWAITING_HUMAN_EXECUTION",
+        "terminal_signal": "PREDICTION_MARKETS_LINUX_PRECUTOVER_PROOF_PACK_V4_GREEN_SOURCE_ROOT_ADMISSION_FIXED_AWAITING_HUMAN_EXECUTION",
     }
 
 

@@ -62,6 +62,9 @@ _RUNTIME_SOURCE_RELATIVE_FILES = {
         "ops/prediction_markets_launch_v1/runner.py"
     ),
 }
+_RUNTIME_ADMISSION_SCRIPT_RELATIVE = Path(
+    "ops/prediction_markets_launch_v1/preflight.py"
+)
 _RUNTIME_VENV_MODULES = ("fastapi", "requests", "uvicorn", "websocket")
 _RUNTIME_HELPERS = {
     "ops.prediction_markets_launch_v1.cockpit": (
@@ -281,16 +284,75 @@ def _runtime_module_class(
     source_root: Path,
     venv_root: Path,
     stdlib_roots: Sequence[Path],
+    name: str | None = None,
 ) -> str:
+    identity = f"{name}:{path}" if name is not None else str(path)
     if _runtime_path_within(path, venv_root):
         return "venv"
     if _runtime_path_within(path, source_root):
         return "source"
     if "site-packages" in path.parts or "dist-packages" in path.parts:
-        raise PreflightError(f"runtime module escaped the venv site-packages: {path}")
+        raise PreflightError(f"runtime module escaped the venv site-packages: {identity}")
     if any(_runtime_path_within(path, root) for root in stdlib_roots):
         return "stdlib"
-    raise PreflightError(f"runtime module escaped source, venv, and stdlib roots: {path}")
+    raise PreflightError(
+        f"runtime module escaped source, venv, and stdlib roots: {identity}"
+    )
+
+
+def _runtime_admission_script_identity(
+    executed_path: Path,
+    *,
+    source_root: Path,
+    source_inventory: Mapping[str, object],
+) -> dict[str, object]:
+    expected = source_root / _RUNTIME_ADMISSION_SCRIPT_RELATIVE
+    executed = _runtime_reported_file(
+        str(executed_path), label="runtime admission script"
+    )
+    if executed != expected:
+        raise PreflightError(
+            "runtime admission script escaped the authenticated source root"
+        )
+    rows = source_inventory.get("files")
+    if not isinstance(rows, list):
+        raise PreflightError("runtime source inventory file list is malformed")
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("path") == _RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix()
+    ]
+    if len(matches) != 1:
+        raise PreflightError("runtime admission script is not uniquely inventoried")
+    row = matches[0]
+    blob_sha1 = row.get("blob_sha1")
+    mode = row.get("mode")
+    size = row.get("size")
+    if (
+        set(row) != {"blob_sha1", "mode", "path", "size"}
+        or not isinstance(blob_sha1, str)
+        or len(blob_sha1) != 40
+        or any(character not in _SHA256 for character in blob_sha1)
+        or mode not in {"100644", "100755"}
+        or type(size) is not int
+        or size < 1
+    ):
+        raise PreflightError("runtime admission script inventory row is malformed")
+    raw = _safe_regular_bytes(executed)
+    git_blob_sha1 = hashlib.sha1(
+        f"blob {len(raw)}\0".encode("ascii") + raw
+    ).hexdigest()
+    if len(raw) != size or git_blob_sha1 != blob_sha1:
+        raise PreflightError("runtime admission script diverged from its Git blob")
+    return {
+        "class": "source",
+        "file": str(executed),
+        "git_blob_sha1": git_blob_sha1,
+        "relative_path": _RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix(),
+        "sha256": sha256_bytes(raw),
+        "size": len(raw),
+    }
 
 
 def validate_runtime_import_admission(
@@ -301,6 +363,7 @@ def validate_runtime_import_admission(
     inventory_sha256: str,
 ) -> None:
     expected_fields = {
+        "admission_script",
         "admission_sha256",
         "boundary",
         "inventory_sha256",
@@ -322,6 +385,7 @@ def validate_runtime_import_admission(
     )
     body = {key: value for key, value in report.items() if key != "admission_sha256"}
     modules = report.get("modules")
+    admission_script = report.get("admission_script")
     expected_modules = set(_RUNTIME_SOURCE_MODULES) | set(_RUNTIME_VENV_MODULES)
     loaded_module_files = report.get("loaded_module_files_validated")
     if type(loaded_module_files) is not int:
@@ -336,6 +400,7 @@ def validate_runtime_import_admission(
         or loaded_module_files < len(expected_modules)
         or not isinstance(modules, Mapping)
         or set(modules) != expected_modules
+        or not isinstance(admission_script, Mapping)
         or report.get("schema_version") != 1
         or report.get("source_commit") != source_commit
         or report.get("source_root") != str(source_root)
@@ -344,6 +409,45 @@ def validate_runtime_import_admission(
         or report.get("venv_root") != str(source_root / ".venv")
     ):
         raise PreflightError("runtime import admission binding diverged")
+    expected_admission_script = source_root / _RUNTIME_ADMISSION_SCRIPT_RELATIVE
+    if (
+        set(admission_script)
+        != {"class", "file", "git_blob_sha1", "relative_path", "sha256", "size"}
+        or admission_script.get("class") != "source"
+        or admission_script.get("file") != str(expected_admission_script)
+        or admission_script.get("relative_path")
+        != _RUNTIME_ADMISSION_SCRIPT_RELATIVE.as_posix()
+        or not isinstance(admission_script.get("git_blob_sha1"), str)
+        or len(str(admission_script.get("git_blob_sha1"))) != 40
+        or any(
+            character not in _SHA256
+            for character in str(admission_script.get("git_blob_sha1"))
+        )
+        or not isinstance(admission_script.get("sha256"), str)
+        or len(str(admission_script.get("sha256"))) != 64
+        or any(
+            character not in _SHA256
+            for character in str(admission_script.get("sha256"))
+        )
+        or type(admission_script.get("size")) is not int
+        or int(admission_script.get("size", 0)) < 1
+    ):
+        raise PreflightError("runtime admission script binding diverged")
+    authenticated_admission_script = _runtime_reported_file(
+        str(expected_admission_script), label="runtime admission script file"
+    )
+    if authenticated_admission_script != expected_admission_script:
+        raise PreflightError("runtime admission script canonical path diverged")
+    admission_raw = _safe_regular_bytes(authenticated_admission_script)
+    admission_blob_sha1 = hashlib.sha1(
+        f"blob {len(admission_raw)}\0".encode("ascii") + admission_raw
+    ).hexdigest()
+    if (
+        admission_script.get("git_blob_sha1") != admission_blob_sha1
+        or admission_script.get("sha256") != sha256_bytes(admission_raw)
+        or admission_script.get("size") != len(admission_raw)
+    ):
+        raise PreflightError("runtime admission script content binding diverged")
     venv_root = source_root / ".venv"
     executable = _runtime_reported_file(
         report.get("python_executable"), label="runtime Python executable"
@@ -456,6 +560,11 @@ def runtime_import_admission(
     actual_inventory = _runtime_source_inventory(source_root, source_commit)
     if expected_inventory_value != actual_inventory:
         raise PreflightError("runtime source Git inventory diverged")
+    admission_script = _runtime_admission_script_identity(
+        Path(__file__),
+        source_root=source_root,
+        source_inventory=actual_inventory,
+    )
 
     venv_root = _runtime_exact_directory(
         source_root / ".venv", label="runtime virtual environment"
@@ -535,6 +644,7 @@ def runtime_import_admission(
             source_root=source_root,
             venv_root=venv_root,
             stdlib_roots=stdlib_roots,
+            name=name,
         )
         expected_class = "source" if name in _RUNTIME_SOURCE_MODULES else "venv"
         if actual_class != expected_class:
@@ -553,9 +663,11 @@ def runtime_import_admission(
             source_root=source_root,
             venv_root=venv_root,
             stdlib_roots=stdlib_roots,
+            name=name,
         )
         validated_files += 1
     body: dict[str, object] = {
+        "admission_script": admission_script,
         "boundary": BOUNDARY,
         "inventory_sha256": inventory_sha256,
         "isolated": True,
@@ -592,7 +704,7 @@ def _runtime_import_subprocess_admission(
         [
             str(runtime),
             "-I",
-            str(incoming_root / "scripts" / "preflight.py"),
+            str(source_root / _RUNTIME_ADMISSION_SCRIPT_RELATIVE),
             "runtime-import-admission",
             "--handoff",
             str(incoming_root / "handoff.json"),

@@ -900,7 +900,7 @@ VENV_PYTHON="$SOURCE_ROOT/.venv/bin/python"
 "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/launch_pack.py" verify-source --source-root "$SOURCE_ROOT" --inventory "$INCOMING_ROOT/source-inventory.json" --expected-commit '{commit}'
 RUNTIME_IMPORT_REPORT="$INCOMING_ROOT/runtime-import-admission.json"
 timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-  "$VENV_PYTHON" -I "$INCOMING_ROOT/scripts/preflight.py" runtime-import-admission \
+  "$VENV_PYTHON" -I "$SOURCE_ROOT/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
   --handoff "$INCOMING_ROOT/handoff.json" \
   --source-root "$SOURCE_ROOT" \
   --source-inventory "$INCOMING_ROOT/source-inventory.json" \

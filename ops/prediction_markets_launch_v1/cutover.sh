@@ -118,7 +118,7 @@ OLD_PYTHON="$OLD_SOURCE/.venv/bin/python"
 
 authenticate_old_evidence() {
   timeout --signal=TERM --kill-after=5s 180s env PYTHONNOUSERSITE=1 \
-    "$OLD_PYTHON" -I "$NEW_INCOMING/scripts/preflight.py" runtime-import-admission \
+    "$OLD_PYTHON" -I "$OLD_SOURCE/ops/prediction_markets_launch_v1/preflight.py" runtime-import-admission \
     --handoff "$OLD_INCOMING/handoff.json" \
     --source-root "$OLD_SOURCE" \
     --source-inventory "$OLD_INCOMING/source-inventory.json" \
